@@ -2787,7 +2787,19 @@ fn find_opt(
         if bml < mls {
             continue;
         }
-        let seq_cost = 24u32.saturating_sub(extra);
+        // BRICK 72: price a sequence by its OFFSET, not a flat constant.
+        //
+        // This was a flat `24 - extra` for EVERY match, so the dynamic program
+        // could not distinguish a match 100 bytes back from one 2 MB back --
+        // it optimised a cost function that does not describe the bitstream.
+        // C prices offsets through `ZSTD_getMatchPrice` / the offset code,
+        // which is ~log2(offset) bits.
+        //
+        // `of_code` is the RFC's offset code = floor(log2(offset_value)), and
+        // the encoder then writes that many extra bits, so the true cost grows
+        // with the offset's magnitude. A near match is genuinely cheaper.
+        let off_bits = 32 - ((ip - bm) as u32 | 1).leading_zeros();
+        let seq_cost = (12u32 + off_bits).saturating_sub(extra);
         let mut len = mls;
         while len <= bml {
             let j = i + len;

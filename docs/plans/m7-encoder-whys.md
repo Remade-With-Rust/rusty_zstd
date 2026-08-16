@@ -2364,6 +2364,48 @@ RATIO, not correctness. Assert on every replace, and when porting a feature betw
 similar functions, verify the port FIRES -- a control file that should improve and does
 not is the cheapest possible detector.
 
+## BRICK 72 -- offset-aware sequence pricing in `find_opt`
+
+`find_opt` priced EVERY match at a flat `24 - extra`, so the dynamic program could not
+distinguish a match 100 bytes back from one 2 MB back. A DP is only as good as its cost
+function, and that one does not describe the bitstream: the encoder writes ~log2(offset)
+extra bits for the offset code, so a near match is genuinely cheaper.
+
+Replaced with `(12 + off_bits) - extra`, where `off_bits = 32 - leading_zeros(offset)` --
+the RFC's offset code, which is what C prices through `ZSTD_getMatchPrice`.
+
+`versions-16m` L16 68,453 -> 68,048; **L19 48,720 = us/c 0.912, beating C.**
+
+Gates: 172 tests; C-decodes-us 27/27 at L13/16/19; 27/27 at L20-22 with `--ultra`.
+
+**This remains a CRUDE model.** C prices literals from accumulated `litFreq` and match
+lengths from `matchLengthFreq`; we still charge a flat 12 base and a flat 6 per literal.
+The offset term is the single largest of the three errors, not the only one.
+
+### THE L22 SCARE: a broken GATE, not a broken codec (4th instrument defect this session)
+
+The conformance sweep reported L22 failing on all 9 files, with our own decoder also
+rejecting the stream ("unexpected end of file"). Before touching anything, the change was
+attributed by `git stash`: **L22 failed identically WITHOUT brick 72** -- pre-existing, so
+brick 72 had merely exposed it.
+
+Then the level sweep localised it: L19 OK, L20/21/22 fail, and **L20 emitted ZERO bytes**.
+A zero-byte output is not a malformed stream, it is a refusal. The cause:
+
+```
+rzstd: levels 20-22 require --ultra
+```
+
+**Correct, zstd-compatible behaviour.** Levels 20-22 demand windows a decoder may refuse,
+so the CLI requires an explicit opt-in; C enforces the same policy (it warns and clamps to
+19 instead of refusing). The gate had passed `-22` without `--ultra`, collected a refusal
+on stderr and 0 bytes on stdout, and scored it FAIL. **With the flag: 27/27.**
+
+**LESSON:** every level-sweeping gate must pass the flags those levels REQUIRE, and a
+zero-byte output should be read as "the tool declined" before "the tool is broken". The
+attribution step (`git stash`, re-measure) is what prevented a day spent fixing a codec
+that was already correct.
+
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 
 Runtime arms added to every brick that had been judged with the broken method, then all
