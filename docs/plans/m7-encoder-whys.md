@@ -2457,6 +2457,37 @@ state per DP position (C carries a rep array in `ZSTD_optimal_t`), so a path tha
 new offset mid-block still consults the stale entry value. Conservative -- it only ever
 OFFERS a candidate -- but it leaves ratio on the table.
 
+## BRICK 76 REVERTED -- entropy literal pricing from the WRONG histogram
+
+`find_opt` prices every literal at a flat 6, so the DP cannot tell a frequent literal from
+a rare one. C prices them from accumulated `litFreq`. The chicken-and-egg (literal
+frequencies depend on the parse, which depends on the prices) was attacked with the
+BLOCK'S OWN byte histogram, available before the parse.
+
+**Net WORSE, so reverted.** L16: nci 1.0845 -> 1.0663 (better), but webster
+1.1391 -> 1.1621, mr 1.0538 -> 1.0679, xml 1.1240 -> 1.1267. Conformance was fine
+(12/12) -- this was a pure ratio regression, caught only because the ratio was checked.
+
+### The first explanation was ALSO refuted -- record both
+
+The obvious story: bytes common in a block get consumed into MATCHES, so they are
+under-represented among the literals that reach the entropy coder, making the block
+histogram anti-correlated with literal frequency.
+
+**The data does not support it.** If that were the mechanism, high `match_frac` files
+would suffer most. Instead: webster (0.606) WORSE, mr (0.309) WORSE, **nci (0.943, the
+most match-dense) BETTER.** The one file the story predicts should be hurt worst is the
+only one that improved. **Mechanism unknown -- do not repeat this explanation.**
+
+### The right source already exists
+
+Brick 74 computes `freq[256]` from the ACTUAL literals, and the Huffman path already
+carries a previous-block table forward (`HuffUpdate::Unchanged` / `state.huff`). C's
+`btultra2` warms its price table from exactly those accumulated statistics rather than
+guessing from the source bytes. **The next attempt should price from the PREVIOUS block's
+literal frequencies -- real literal statistics, already computed, already plumbed -- not
+from a proxy derived off the raw block.**
+
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 
 Runtime arms added to every brick that had been judged with the broken method, then all
