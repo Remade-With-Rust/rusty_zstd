@@ -1418,6 +1418,7 @@ fn find_fast_impl<
     let mut anchor = block_start;
     let ilimit = block_end.saturating_sub(8);
     if block_start >= ilimit {
+        crate::prof::note_huff_path(10);
         lits.extend_from_slice(&src[block_start..block_end]);
         crate::prof::note_search(0, 0, 0, 0, lits.len() as u64);
         tables.last_nseq = 0;
@@ -1511,7 +1512,9 @@ fn find_fast_impl<
                         }
                     }
                     let mstart = ip + 1;
+                    crate::prof::note_huff_path(11);
                     lits.extend_from_slice(&src[anchor..mstart]);
+                    crate::prof::note_huff_path(13);
                     seqs.push(Seq {
                         litlen: (mstart - anchor) as u32,
                         matchlen: ml as u32,
@@ -1565,6 +1568,7 @@ fn find_fast_impl<
                     mls,
                     ilimit,
                     frame_start,
+                    reserve,
                 );
                 anchor = ip;
                 if ip > ilimit {
@@ -1584,6 +1588,7 @@ fn find_fast_impl<
             g0 = g1;
             m0 = m1;
         }
+        crate::prof::note_huff_path(12);
         lits.extend_from_slice(&src[anchor..block_end]);
         let match_bytes: u64 = if cfg!(feature = "profile") {
             seqs.iter().map(|s| u64::from(s.matchlen)).sum()
@@ -1629,7 +1634,9 @@ fn find_fast_impl<
                     }
                 }
                 let mstart = ip + 1;
+                crate::prof::note_huff_path(11);
                 lits.extend_from_slice(&src[anchor..mstart]);
+                crate::prof::note_huff_path(13);
                 seqs.push(Seq {
                     litlen: (mstart - anchor) as u32,
                     matchlen: ml as u32,
@@ -1656,6 +1663,7 @@ fn find_fast_impl<
                 mls,
                 ilimit,
                 frame_start,
+                reserve,
             );
             anchor = ip;
             if let Some(sq) = seqs.last() {
@@ -1692,6 +1700,7 @@ fn find_fast_impl<
                         mls,
                         ilimit,
                         frame_start,
+                        reserve,
                     );
                     anchor = ip;
                     continue;
@@ -1700,6 +1709,7 @@ fn find_fast_impl<
         }
         ip += step0 + ((ip - anchor) >> 8);
     }
+    crate::prof::note_huff_path(12);
     lits.extend_from_slice(&src[anchor..block_end]);
     let match_bytes: u64 = if cfg!(feature = "profile") {
         seqs.iter().map(|s| u64::from(s.matchlen)).sum()
@@ -2087,12 +2097,22 @@ pub(crate) const LIT_PUSH_WIDTH: usize = 16;
 /// fixed-width read or write would not fit.
 #[allow(unsafe_code)]
 #[inline]
-fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize) {
+/// BRICK 77: the arm is a PARAMETER, not a per-call read.
+///
+/// This called `lit_push_enabled()` inside its guard -- an env/OnceLock read
+/// executed **15,687,334 times** across the corpus (measured: it is the hot
+/// plumbing site in the match finder, ~2800x more often than any other).
+/// `find_fast_impl` already computes the same value once per block as
+/// `reserve`; it is frame-constant, so it is threaded in instead.
+///
+/// Same disease as brick 49 (`use_rep`) and brick 64 (`seqcheck_hoisted`):
+/// a fixed-for-the-block flag re-read in the hottest loop.
+fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize, arm: bool) {
     let n = to - from;
     if n <= LIT_PUSH_WIDTH
         && from + LIT_PUSH_WIDTH <= src.len()
         && lits.capacity() - lits.len() >= LIT_PUSH_WIDTH
-        && lit_push_enabled()
+        && arm
     {
         let len = lits.len();
         // SAFETY: `from + 16 <= src.len()` gives 16 readable source bytes;
@@ -2125,6 +2145,7 @@ fn emit_fast_seq<const PACKED: bool>(
     mls: usize,
     ilimit: usize,
     frame_start: usize,
+    arm: bool,
 ) -> usize {
     let mut ip = found_ip;
     let mut mm = m;
@@ -2136,7 +2157,7 @@ fn emit_fast_seq<const PACKED: bool>(
         n += 1;
     }
     crate::prof::note_back_ext((back_from - ip) as u64);
-    push_literals(lits, src, anchor, ip);
+    push_literals(lits, src, anchor, ip, arm);
     seqs.push(Seq {
         litlen: (ip - anchor) as u32,
         matchlen: n as u32,
@@ -3152,7 +3173,7 @@ mod tests {
                     fast.extend_from_slice(b"HEAD");
                     let mut want = fast.clone();
                     want.extend_from_slice(&src[from..from + n]);
-                    super::push_literals(&mut fast, &src, from, from + n);
+                    super::push_literals(&mut fast, &src, from, from + n, true);
                     assert_eq!(fast, want, "from={from} n={n} spare={spare}");
                 }
             }
