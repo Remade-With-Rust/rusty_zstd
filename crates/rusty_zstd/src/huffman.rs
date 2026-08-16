@@ -1507,7 +1507,28 @@ pub(crate) fn encode_literals_section(
     // it emits nothing and mutates nothing -- so hoisting it above the previous
     // -table attempt cannot change which section wins. It buys the size we need
     // to prove the speculative encode futile.
-    let new_tbl = build_ctable(lits)
+    // BRICK 74: ONE pass over the literals, not two.
+    //
+    // Brick 61 added `segment_histograms` (a full O(n) walk) while
+    // `build_ctable(lits)` was already doing its own full O(n) histogram --
+    // so a block with a usable previous table walked 24.4 MB of mozilla's
+    // literals TWICE. A brick that removes expensive work can still add
+    // cheaper work nobody counted.
+    //
+    // The per-segment histograms SUM to the whole-input histogram, so build
+    // them once and derive the overall frequencies from them. Byte-identical:
+    // `build_ctable_from_freq` receives exactly the counts `build_ctable`
+    // would have computed. Costs no extra work when there is no previous
+    // table either -- a segment histogram is the same increments as a whole
+    // one, just indexed by segment.
+    let segs = segment_histograms(lits, preferred);
+    let mut freq = [0u32; 256];
+    for h in segs.iter() {
+        for (s, &c) in h.iter().enumerate() {
+            freq[s] += c;
+        }
+    }
+    let new_tbl = build_ctable_from_freq(&freq)
         .ok()
         .and_then(|ct| write_tree(&ct).ok().map(|t| (ct, t)));
 
@@ -1523,7 +1544,6 @@ pub(crate) fn encode_literals_section(
             // retry below would not have run either.
             let futile = match &new_tbl {
                 Some((ct, tree)) => {
-                    let segs = segment_histograms(lits, preferred);
                     match (
                         body_bytes_exact(prev_ct, &segs, preferred),
                         body_bytes_exact(ct, &segs, preferred),
