@@ -1274,9 +1274,9 @@ fn find_sequences_strategy(
         Strategy::Greedy => find_greedy(src, block_start, block_end, window, params, tables, reps),
         Strategy::Lazy => find_lazy(src, block_start, block_end, window, params, tables, 1, reps),
         Strategy::Lazy2 => find_lazy(src, block_start, block_end, window, params, tables, 2, reps),
-        Strategy::BtLazy2 => find_bt_lazy(src, block_start, block_end, window, params, tables, 2),
+        Strategy::BtLazy2 => find_bt_lazy(src, block_start, block_end, window, params, tables, 2, reps),
         Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
-            find_opt(src, block_start, block_end, window, params, tables)
+            find_opt(src, block_start, block_end, window, params, tables, reps)
         }
         Strategy::Fast => find_fast(src, block_start, block_end, window, params, tables, reps),
     }
@@ -2676,6 +2676,7 @@ fn find_bt_lazy(
     params: CompressionParameters,
     tables: &mut MatchTables,
     depth: usize,
+    reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
     let mls = params.min_match.max(3) as usize;
     let mut seqs = Vec::new();
@@ -2686,8 +2687,28 @@ fn find_bt_lazy(
         lits.extend_from_slice(&src[block_start..block_end]);
         return (seqs, lits);
     }
+    // BRICK 73: repcode-1 in BtLazy2 (L13-L14) -- the last finder without it.
+    let use_rep = rep1_enabled() || tables.rep_yield >= REP_YIELD_MIN;
+    let mut rep1 = reps[0] as usize;
+    let mut rep_hits = 0u64;
+    let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
     let mut ip = block_start;
     while ip <= ilimit {
+        if use_rep {
+            if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
+                rep_hits += 1;
+                let mstart = ip + 1;
+                lits.extend_from_slice(&src[anchor..mstart]);
+                seqs.push(Seq {
+                    litlen: (mstart - anchor) as u32,
+                    matchlen: ml as u32,
+                    offset: rep1 as u32,
+                });
+                ip = mstart + ml;
+                anchor = ip;
+                continue;
+            }
+        }
         let (mut best_m, mut best_ml) =
             bt_find_best(src, ip, block_start, block_end, window, mls, params, tables);
         let mut best_ip = ip;
@@ -2721,6 +2742,8 @@ fn find_bt_lazy(
                 matchlen: best_ml as u32,
                 offset: (best_ip - best_m) as u32,
             });
+            // Commits at the look-ahead winner (brick 71b).
+            rep1 = best_ip - best_m;
             // DEFECT B1 FIX (btlazy2): same missing back-fill as find_lazy.
             // `bt_find_best` inserts `ip` into the tree as a side effect, so
             // walking the covered span re-uses it rather than duplicating the
@@ -2740,6 +2763,11 @@ fn find_bt_lazy(
             ip += 1;
         }
     }
+    tables.rep_yield = if seqs.is_empty() {
+        1.0
+    } else {
+        (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
+    };
     lits.extend_from_slice(&src[anchor..block_end]);
     (seqs, lits)
 }
@@ -2751,6 +2779,7 @@ fn find_opt(
     window: usize,
     params: CompressionParameters,
     tables: &mut MatchTables,
+    reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
     let n = block_end - block_start;
     let mls = params.min_match.max(3) as usize;
@@ -2825,7 +2854,7 @@ fn find_opt(
         }
     }
     if price[n] >= inf {
-        return find_bt_lazy(src, block_start, block_end, window, params, tables, 2);
+        return find_bt_lazy(src, block_start, block_end, window, params, tables, 2, reps);
     }
     let mut ops: Vec<(usize, usize, bool, u32, u32)> = Vec::new();
     let mut i = n;
