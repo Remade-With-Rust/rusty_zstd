@@ -2299,6 +2299,37 @@ C's entropy-aware model (`ZSTD_rawLiteralsCost` / `ZSTD_getMatchPrice` over accu
 `litFreq`/`offCodeFreq`). L5 sitting unmoved at 1.950 is the direct evidence for the
 first; the second means our optimal parse optimises the wrong objective at high levels.
 
+## BRICK 71 -- repcode into Greedy and Lazy: Greedy FIXED, Lazy PARTIAL
+
+Applied brick 70's template to `find_greedy` and `find_lazy`. Neither took `reps` either.
+
+| level  | strategy   |      C |              before |          **after** |
+| ------ | ---------- | -----: | ------------------: | -----------------: |
+| L3     | DFast      | 87,361 |               0.648 |   0.648 (brick 70) |
+| **L5** | **Greedy** | 76,880 | 149,938 (**1.950**) | **49,729 (0.647)** |
+| L7     | Lazy       | 81,513 |                  -- | 88,452 (**1.085**) |
+| L9     | Lazy2      | 64,531 |                  -- |     88,468 (1.371) |
+| L12    | Lazy2      | 61,566 |                  -- |     88,234 (1.433) |
+
+**Greedy is FIXED: `versions-16m` L5 goes 1.950 -> 0.647, beating C by 35%**, matching what
+DFast achieved at L3.
+
+**Lazy is only PARTIALLY fixed and is NOT claimed.** L7/L9/L12 land at 1.085/1.371/1.433
+against Greedy's 0.647 on the same content. The port compiles, runs and is conformant, but
+`find_lazy` clearly is not getting the same benefit -- its loop structure differs from
+greedy/dfast (it evaluates a candidate, then looks ahead one or two positions before
+committing), so the insertion at the top of `while ip <= ilimit` is probably not on the
+path that decides the emit. **The lazy port needs its insertion point re-derived from that
+function's actual control flow, not pattern-matched from dfast.**
+
+Silesia L5 ratios after the change: webster 1.2146, nci 1.1577, mozilla 1.1106,
+mr 1.0907, dickens 1.2256, xml 1.2379 -- no regression.
+
+Gates: 172 tests; **C-decodes-us 72/72** (12 files x 6 levels).
+
+**Remaining:** the Lazy insertion point (above), `find_bt_lazy` (untouched), and
+`find_opt`'s flat price model (literals 6, sequences 24) for L13-L22.
+
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 
 Runtime arms added to every brick that had been judged with the broken method, then all

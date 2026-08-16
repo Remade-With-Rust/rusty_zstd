@@ -1271,9 +1271,9 @@ fn find_sequences_strategy(
 ) -> (Vec<Seq>, Vec<u8>) {
     match params.strategy {
         Strategy::DFast => find_dfast(src, block_start, block_end, window, params, tables, reps),
-        Strategy::Greedy => find_greedy(src, block_start, block_end, window, params, tables),
-        Strategy::Lazy => find_lazy(src, block_start, block_end, window, params, tables, 1),
-        Strategy::Lazy2 => find_lazy(src, block_start, block_end, window, params, tables, 2),
+        Strategy::Greedy => find_greedy(src, block_start, block_end, window, params, tables, reps),
+        Strategy::Lazy => find_lazy(src, block_start, block_end, window, params, tables, 1, reps),
+        Strategy::Lazy2 => find_lazy(src, block_start, block_end, window, params, tables, 2, reps),
         Strategy::BtLazy2 => find_bt_lazy(src, block_start, block_end, window, params, tables, 2),
         Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
             find_opt(src, block_start, block_end, window, params, tables)
@@ -2323,6 +2323,7 @@ fn find_greedy(
     window: usize,
     params: CompressionParameters,
     tables: &mut MatchTables,
+    reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
     let mls = params.min_match.max(3) as usize;
     let hash_log = params.hash_log;
@@ -2336,8 +2337,30 @@ fn find_greedy(
         lits.extend_from_slice(&src[block_start..block_end]);
         return (seqs, lits);
     }
+    // BRICK 71: repcode-1 search in find_greedy -- L5-L6 had none
+    // C checks `offset_1` at every position in `_greedy`/`_lazy` exactly as in
+    // `_fast`/`_doubleFast`. Same dispatch on measured yield as bricks 67/70.
+    let use_rep = rep1_enabled() || tables.rep_yield >= REP_YIELD_MIN;
+    let mut rep1 = reps[0] as usize;
+    let mut rep_hits = 0u64;
+    let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
     let mut ip = block_start;
     while ip <= ilimit {
+        if use_rep {
+            if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
+                rep_hits += 1;
+                let mstart = ip + 1;
+                lits.extend_from_slice(&src[anchor..mstart]);
+                seqs.push(Seq {
+                    litlen: (mstart - anchor) as u32,
+                    matchlen: ml as u32,
+                    offset: rep1 as u32,
+                });
+                ip = mstart + ml;
+                anchor = ip;
+                continue;
+            }
+        }
         let h = hash_mls(src, ip, mls, hash_log);
         let prev = tables.get_h(h);
         tables.chain[ip & chain_mask] = prev.map(|p| p as u32).unwrap_or(0);
@@ -2369,6 +2392,7 @@ fn find_greedy(
                 matchlen: best_ml as u32,
                 offset: (ip - best_m) as u32,
             });
+            rep1 = ip - best_m;
             let end = ip + best_ml;
             let mut p = ip + 1;
             while p < end && p <= ilimit {
@@ -2383,6 +2407,11 @@ fn find_greedy(
             ip += 1;
         }
     }
+    tables.rep_yield = if seqs.is_empty() {
+        1.0
+    } else {
+        (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
+    };
     lits.extend_from_slice(&src[anchor..block_end]);
     (seqs, lits)
 }
@@ -2438,6 +2467,7 @@ fn find_lazy(
     params: CompressionParameters,
     tables: &mut MatchTables,
     depth: usize,
+    reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
     let mls = params.min_match.max(3) as usize;
     let hash_log = params.hash_log;
@@ -2450,10 +2480,32 @@ fn find_lazy(
         lits.extend_from_slice(&src[block_start..block_end]);
         return (seqs, lits);
     }
+    // BRICK 71: repcode-1 search in find_lazy -- L7-L12 had none
+    // C checks `offset_1` at every position in `_greedy`/`_lazy` exactly as in
+    // `_fast`/`_doubleFast`. Same dispatch on measured yield as bricks 67/70.
+    let use_rep = rep1_enabled() || tables.rep_yield >= REP_YIELD_MIN;
+    let mut rep1 = reps[0] as usize;
+    let mut rep_hits = 0u64;
+    let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
     let mut ip = block_start;
     let mut searches = 0u64;
     let fill = lazy_fill_enabled() && tables.last_search_per_byte >= lazy_fill_threshold();
     while ip <= ilimit {
+        if use_rep {
+            if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
+                rep_hits += 1;
+                let mstart = ip + 1;
+                lits.extend_from_slice(&src[anchor..mstart]);
+                seqs.push(Seq {
+                    litlen: (mstart - anchor) as u32,
+                    matchlen: ml as u32,
+                    offset: rep1 as u32,
+                });
+                ip = mstart + ml;
+                anchor = ip;
+                continue;
+            }
+        }
         searches += 1;
         let (mut best_m, mut best_ml) =
             chain_find_best(src, ip, block_start, block_end, window, mls, params, tables);
@@ -2516,6 +2568,11 @@ fn find_lazy(
             ip += 1;
         }
     }
+    tables.rep_yield = if seqs.is_empty() {
+        1.0
+    } else {
+        (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
+    };
     lits.extend_from_slice(&src[anchor..block_end]);
     let span = (block_end - block_start).max(1) as f32;
     tables.last_search_per_byte = searches as f32 / span;
