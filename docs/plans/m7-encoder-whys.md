@@ -2208,6 +2208,53 @@ This wants the same treatment the Huffman path got, in this order:
 webster's -- so plumbing that costs ~4 calls per monomorphization is worth real time, but
 it is NOT the 19-instruction probe loop. The loop is done; the copies around it are not.
 
+## RE-ADJUDICATING THE ARMS AFTER THE CAMPAIGN (2026-08-16, quiet box 1/24 cores)
+
+Every arm-able brick was measured BEFORE bricks 46-69 reshaped the code underneath it.
+Re-flipped them on the in-process ABBA harness to see whether the verdicts still hold.
+
+### Brick 16/29/32 (`huff`): STILL A WIN, but the margin HALVED
+
+6/6, **z=+2.45**, spreads 0.5-2.1%.
+
+| file    | recorded |        now |
+| ------- | -------: | ---------: |
+| mr      |   +33.3% | **+10.0%** |
+| dickens |   +16.5% |      +8.7% |
+| osdb    |       -- |     +10.6% |
+| ooffice |       -- |      +3.4% |
+| nci     |    +4.1% |      +2.8% |
+| webster |    +4.2% |      +2.2% |
+
+**The brick did not get worse -- its COMPETITION got better.** Brick 68's fixed-width
+`flush` lives in `BitCStream`, which BOTH arms use, so speeding the shared primitive
+shrinks the unrolled path's relative advantage. A brick's measured margin is a statement
+about the baseline as much as about the brick.
+
+### Brick 39 (`pipe`): DEMOTED to NOT PROVEN
+
+Was 6/6 z=+2.45 at +0.3-3.5%. Now **5/6, z=+1.63** -- below the |z|>2 bar.
+
+| file    |       now | spread |
+| ------- | --------: | -----: |
+| sao     | **+7.2%** |   1.5% |
+| webster | **+6.8%** |   0.5% |
+| mozilla |     +2.2% |   0.5% |
+| xml     |     +2.1% |   0.6% |
+| mr      |     +0.7% |   1.9% |
+| nci     | **-1.3%** |   1.9% |
+
+The magnitudes GREW on the latency-bound files while `nci` flipped negative. That fits the
+mechanism: the 2-way pipeline overlaps two dependent loads, which matters MORE now the
+loop is 19 instructions rather than 47 (less independent work to hide the latency), and
+`sao` is the most miss-heavy file on the board. Kept ON -- positive on 5/6 and largest
+where the mechanism predicts -- but its verdict is now **not proven**, not confirmed.
+
+**The general lesson:** a verdict is only valid against the code that surrounded it when it
+was taken. Bricks 46-69 changed that surround substantially, so every pre-campaign arm
+verdict is stale until re-flipped. Two done; `lut`, `litcopy`, `matchcopy`, `litpush`,
+`payload`, `seqcheck`, `lazyfill` and `rep1` remain.
+
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 
 Runtime arms added to every brick that had been judged with the broken method, then all
