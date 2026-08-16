@@ -1270,7 +1270,7 @@ fn find_sequences_strategy(
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
     match params.strategy {
-        Strategy::DFast => find_dfast(src, block_start, block_end, window, params, tables),
+        Strategy::DFast => find_dfast(src, block_start, block_end, window, params, tables, reps),
         Strategy::Greedy => find_greedy(src, block_start, block_end, window, params, tables),
         Strategy::Lazy => find_lazy(src, block_start, block_end, window, params, tables, 1),
         Strategy::Lazy2 => find_lazy(src, block_start, block_end, window, params, tables, 2),
@@ -2208,6 +2208,7 @@ fn find_dfast(
     window: usize,
     params: CompressionParameters,
     tables: &mut MatchTables,
+    reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
     let mls = params.min_match.max(3) as usize;
     let hash_log = params.hash_log;
@@ -2219,8 +2220,36 @@ fn find_dfast(
         lits.extend_from_slice(&src[block_start..block_end]);
         return (seqs, lits);
     }
+    // BRICK 70: repcode-1 search in DFast.
+    //
+    // C checks `offset_1` at every position in `_doubleFast` exactly as it does
+    // in `_fast`; we had it ONLY in `find_fast`, so L3 -- the SHIPPING DEFAULT --
+    // had no repcode search at all. That is the whole of the 4.3x versions-16m
+    // hole at L2-L4 (L1/L2 collapse to 0.07x/0.62x with it on, L3/L4 do not move).
+    //
+    // Dispatched on the same measured yield as brick 67, so content without a
+    // constant stride does not pay for a search that cannot hit.
+    let use_rep = rep1_enabled() || tables.rep_yield >= REP_YIELD_MIN;
+    let mut rep1 = reps[0] as usize;
+    let mut rep_hits = 0u64;
+    let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
     let mut ip = block_start;
     while ip <= ilimit {
+        if use_rep {
+            if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
+                rep_hits += 1;
+                let mstart = ip + 1;
+                lits.extend_from_slice(&src[anchor..mstart]);
+                seqs.push(Seq {
+                    litlen: (mstart - anchor) as u32,
+                    matchlen: ml as u32,
+                    offset: rep1 as u32,
+                });
+                ip = mstart + ml;
+                anchor = ip;
+                continue;
+            }
+        }
         let h4 = hash_mls(src, ip, 4, hash_log);
         let h8 = hash8(src, ip, hash_log);
         let m4 = tables.get_h(h4);
@@ -2265,6 +2294,7 @@ fn find_dfast(
                 matchlen: best_ml as u32,
                 offset: (ip - best_m) as u32,
             });
+            rep1 = ip - best_m;
             let end = ip + best_ml;
             // DFast never sets `packed` (it is gated on Strategy::Fast).
             fill_hash_after_match::<false>(tables, src, ip, end, mls, ilimit);
@@ -2275,6 +2305,11 @@ fn find_dfast(
             ip += 1 + ((ip - anchor) >> 8);
         }
     }
+    tables.rep_yield = if seqs.is_empty() {
+        1.0
+    } else {
+        (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
+    };
     lits.extend_from_slice(&src[anchor..block_end]);
     (seqs, lits)
 }

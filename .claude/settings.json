@@ -12,7 +12,8 @@
       "Bash(sed -n '/pub\\(crate\\) fn add_bits_huff/,/^    }/p' crates/rusty_zstd/src/bit.rs)",
       "Bash(sed -n '/pub\\(crate\\) fn huff_fits/,/^    }/p' crates/rusty_zstd/src/bit.rs)",
       "Bash(sed -n '/pub\\(crate\\) fn flush/,/^    }/p' crates/rusty_zstd/src/bit.rs)",
-      "Bash(cd c:/Users/talmo/coding/rusty_zstd && sed -n '/fn emit_tail/,/^    }/p' crates/rusty_zstd/src/huffman.rs | head -24)"
+      "Bash(cd c:/Users/talmo/coding/rusty_zstd && sed -n '/fn emit_tail/,/^    }/p' crates/rusty_zstd/src/huffman.rs | head -24)",
+      "Bash(grep -vE \"^file|^$\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\talmo\\coding\\rusty_zstd\\crates\\rusty_zstd\\src"

@@ -2255,6 +2255,50 @@ was taken. Bricks 46-69 changed that surround substantially, so every pre-campai
 verdict is stale until re-flipped. Two done; `lut`, `litcopy`, `matchcopy`, `litpush`,
 `payload`, `seqcheck`, `lazyfill` and `rep1` remain.
 
+## BRICK 70 -- repcode search in DFast: the 4.3x hole CLOSED (2026-08-16)
+
+`find_dfast` did not even TAKE `reps`. C checks `offset_1` at every position in
+`_doubleFast` exactly as it does in `_fast`; we had the search only in `find_fast`, so
+**L3 -- the SHIPPING DEFAULT -- had no repcode search at all.** Ported it, dispatched on
+the same measured yield as brick 67.
+
+### The target
+
+| level  | strategy  |       C |              before |          **after** |
+| ------ | --------- | ------: | ------------------: | -----------------: |
+| L2     | Fast      | 128,346 |               0.622 |              0.622 |
+| **L3** | **DFast** |  87,361 | 375,347 (**4.297**) | **56,600 (0.648)** |
+| **L4** | DFast     |  87,756 |     374,954 (4.273) | **56,600 (0.645)** |
+| L5     | Greedy    |  76,880 |               1.950 |  1.950 (unchanged) |
+
+**`versions-16m` at L3 goes 375,347 -> 56,600 bytes: from 4.3x WORSE than C to 35%
+SMALLER.** L5 not moving is the control -- Greedy still has no repcode, which localises
+the remaining gap exactly.
+
+### Silesia L3 IMPROVED -- this was not a trade
+
+| file    | L3 before |      after |
+| ------- | --------: | ---------: |
+| nci     |     1.221 | **1.1517** |
+| dickens |     1.129 | **1.1213** |
+| webster |     1.141 | **1.1352** |
+| mr      |     1.052 | **1.0447** |
+| xml     |     1.185 |     1.1881 |
+
+Every file but `xml` (+0.3%) got smaller. Repcode is not a versions-only trick -- real
+content has constant-stride repetition too; we simply were not looking for it.
+
+Gates: 172 tests; **C-decodes-us 60/60** (12 files x 5 levels); **generated 18/18**
+(6 corpora x 3 levels); 0 warnings.
+
+### Still missing, and now precisely localised
+
+`find_greedy`, `find_lazy` and `find_bt_lazy` still have NO repcode search (L5-L12), and
+`find_opt` (L13-L22) prices literals at a flat 6 and sequences at a flat 24 instead of
+C's entropy-aware model (`ZSTD_rawLiteralsCost` / `ZSTD_getMatchPrice` over accumulated
+`litFreq`/`offCodeFreq`). L5 sitting unmoved at 1.950 is the direct evidence for the
+first; the second means our optimal parse optimises the wrong objective at high levels.
+
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 
 Runtime arms added to every brick that had been judged with the broken method, then all
