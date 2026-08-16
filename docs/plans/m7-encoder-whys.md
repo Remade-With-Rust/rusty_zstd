@@ -2330,6 +2330,40 @@ Gates: 172 tests; **C-decodes-us 72/72** (12 files x 6 levels).
 **Remaining:** the Lazy insertion point (above), `find_bt_lazy` (untouched), and
 `find_opt`'s flat price model (literals 6, sequences 24) for L13-L22.
 
+### BRICK 71b -- the Lazy repcode was never UPDATED (one line, silent no-op)
+
+Brick 71's Lazy port compiled, ran and was conformant, yet L7 sat at 1.085 against
+Greedy's 0.647 on identical content. **Cause: `rep1` was initialised from `reps[0]` and
+NEVER UPDATED for the whole block**, so `try_rep1` tested a stale offset and could not hit.
+
+The script that inserted the update searched for `offset: (ip - best_m)`, but `find_lazy`
+emits **`offset: (best_ip - best_m)`** -- it commits at the LOOK-AHEAD winner, not the
+current position. The pattern did not match, the replace was a **silent no-op**, and
+nothing failed: tests passed, conformance passed, output was valid. Only the RATIO showed
+it, and only against the Greedy control on the same file.
+
+| level   | strategy |      C |         before |          **after** |
+| ------- | -------- | -----: | -------------: | -----------------: |
+| L5      | Greedy   | 76,880 |          0.647 |              0.647 |
+| **L7**  | **Lazy** | 81,513 | 88,452 (1.085) | **49,697 (0.610)** |
+| **L9**  | Lazy2    | 64,531 | 88,468 (1.371) | **49,697 (0.770)** |
+| **L12** | Lazy2    | 61,566 | 88,234 (1.433) | **49,697 (0.807)** |
+| L16     | BtOpt    | 60,656 |             -- |     68,453 (1.129) |
+
+**We are now SMALLER than C at every level from 1 to 12** on this corpus. L16 unmoved is
+the control: `find_bt_lazy`/`find_opt` are still untouched.
+
+Silesia L7: webster 1.2639, nci 1.2285, mozilla 1.1306, mr 1.0762, dickens 1.2955,
+xml 1.2959 -- no regression.
+
+Gates: 172 tests; **C-decodes-us 84/84** (12 files x 7 levels).
+
+**LESSON (third time this session):** a pattern-based edit that does not match is a SILENT
+no-op. It passed every gate because the code it failed to write would only have changed a
+RATIO, not correctness. Assert on every replace, and when porting a feature between
+similar functions, verify the port FIRES -- a control file that should improve and does
+not is the cheapest possible detector.
+
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 
 Runtime arms added to every brick that had been judged with the broken method, then all

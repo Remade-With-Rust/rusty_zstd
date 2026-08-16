@@ -2540,6 +2540,9 @@ fn find_lazy(
                 matchlen: best_ml as u32,
                 offset: (best_ip - best_m) as u32,
             });
+            // The repcode must track the offset ACTUALLY EMITTED. Lazy
+            // commits at `best_ip` (the look-ahead winner), not `ip`.
+            rep1 = best_ip - best_m;
             // DEFECT B1 FIX: back-fill every position the match covers.
             // `find_greedy` already did this; lazy/lazy2 jumped straight to
             // `best_ip + best_ml`, so every byte inside a match was absent
