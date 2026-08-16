@@ -13,7 +13,12 @@
       "Bash(sed -n '/pub\\(crate\\) fn huff_fits/,/^    }/p' crates/rusty_zstd/src/bit.rs)",
       "Bash(sed -n '/pub\\(crate\\) fn flush/,/^    }/p' crates/rusty_zstd/src/bit.rs)",
       "Bash(cd c:/Users/talmo/coding/rusty_zstd && sed -n '/fn emit_tail/,/^    }/p' crates/rusty_zstd/src/huffman.rs | head -24)",
-      "Bash(grep -vE \"^file|^$\")"
+      "Bash(grep -vE \"^file|^$\")",
+      "Bash(awk '{p+=$4; f+=$6} END {print \"tests: \"p\" passed, \"f\" failed\"}')",
+      "Bash(python3 -)",
+      "Bash(python \"C:\\\\Users\\\\talmo\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-talmo-coding-rusty-zstd\\\\6ef1a5e8-8f1f-4aaf-940e-b850c1781e27\\\\scratchpad\\\\align_md.py\" docs/plans/m7-encoder-whys.md)",
+      "Bash(rm -rf target/ab)",
+      "Bash(git -c user.name=Tim -c user.email=tim.almond@thehouseinc.xyz commit -qam 'encode: brick 77 A/B arm + measured verdict \\(~1%, below the bar\\) *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\talmo\\coding\\rusty_zstd\\crates\\rusty_zstd\\src"

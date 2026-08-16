@@ -2505,13 +2505,13 @@ not yet usable.
 
 ### NOT TRUSTWORTHY: the lines it produced
 
-| kind               |   n | reported line | what is actually there                                         |
+| kind               | n   | reported line | what is actually there                                         |
 | ------------------ | --: | ------------: | -------------------------------------------------------------- |
-| memcpy             |  39 |           547 | `h.update(&workspace[off..end])` -- xxhash, in `compress_with` |
-| slice_index_fail   |  40 |           443 | dictionary id resolution                                       |
-| do_reserve         |  40 |           673 | the RAW-block emit path                                        |
-| grow_one           |   6 |          1029 | `write_sequences`                                              |
-| panic_bounds_check |   2 |           272 | `MatchTables::new`                                             |
+| memcpy             | 39  | 547           | `h.update(&workspace[off..end])` -- xxhash, in `compress_with` |
+| slice_index_fail   | 40  | 443           | dictionary id resolution                                       |
+| do_reserve         | 40  | 673           | the RAW-block emit path                                        |
+| grow_one           | 6   | 1029          | `write_sequences`                                              |
+| panic_bounds_check | 2   | 272           | `MatchTables::new`                                             |
 
 **None of these are inside `find_fast_impl`.** The debuginfo build inlines differently
 from the release build in which the 39/40/46 counts were taken, so the symbol ranges do
@@ -2530,6 +2530,42 @@ wrong-loop-detector error from earlier in this campaign.
 **Not attempted: any edit.** The invariants here (literal-copy bounds from the match
 finder's state machine, `seqs` capacity from a heuristic guess) are not one-liners, and
 getting them wrong is memory corruption rather than a wrong byte.
+
+### BRICK 77 MEASURED: ~1%, consistent but below the bar
+
+The cross-process A/B was INCONCLUSIVE and is withdrawn: two separate builds put C's own
+throughput 14-17% apart, leaving `cyc/byte` (worse on 5/6) and `C/us` (better on 5/6)
+flatly contradicting each other. **Both were measuring the box.** `cycles/byte` is
+frequency-invariant but NOT contention-invariant -- stalls count as cycles -- so a busier
+second run raises it regardless of the code.
+
+*(Asked whether that disagreement was a DISPATCH signal: no. A dispatch trigger is a
+SIGN-FLIP across content; here both metrics moved uniformly in the same direction on
+nearly every file. Nothing separates the corpora, so there is no axis to dispatch on.)*
+
+Gave brick 77 a runtime arm and re-measured IN-PROCESS (A = hoisted parameter,
+B = per-call read):
+
+| file    | c delta |     spread |
+| ------- | ------: | ---------: |
+| dickens |   +1.6% | 5.3% NOISY |
+| mozilla |   +1.4% | 5.1% NOISY |
+| mr      |   +1.0% |       3.7% |
+| xml     |   +0.5% |       3.0% |
+| webster |   +0.4% |       4.3% |
+| nci     |   -0.4% |       2.2% |
+
+**5/6, z=+1.63 -- below the |z|>2 bar.** Consistently positive, magnitude ~1%, and the
+effects are smaller than the spreads at 7/24 cores of background load.
+
+**The arithmetic predicts this exactly, and that is the point.** `lit_push_enabled()` is a
+`OnceLock` read: a relaxed atomic load that hits L1, ~1-2 cycles. 15.7M x 2 = **~31M
+cycles**. Webster alone costs ~520M cycles (12.5 cyc/byte x 41.5 MB) and the corpus runs
+to billions -- so ~31M is ~1%. **A large COUNT is not a large COST; count x unit-cost is.**
+15.7M atomic loads is ~1%; 2.7M memcpy CALLS (brick 68) was not.
+
+Kept: byte-identical, strictly less work, and the arithmetic and the measurement agree.
+**Not claimed as a win** -- it does not clear the bar this campaign holds everything to.
 
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 

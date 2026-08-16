@@ -971,6 +971,7 @@ fn run_ab_tag(root: &Path, _oracle: &Oracle, levels: &[i32], only: &[String]) ->
         "lut" => rusty_zstd::set_lut_arm,
         "litcopy" => rusty_zstd::set_litcopy_arm,
         "litpush" => rusty_zstd::set_litpush_arm,
+        "litpushhoist" => rusty_zstd::set_litpush_hoist_arm,
         "payload" => rusty_zstd::set_payload_arm,
         "matchcopy" => rusty_zstd::set_matchcopy_arm,
         "seqcheck" => rusty_zstd::set_seqcheck_arm,

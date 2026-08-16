@@ -2056,6 +2056,30 @@ fn payload_reserve_enabled() -> bool {
 static LITPUSH_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Bench hook; shipping default comes from `RZSTD_LIT_PUSH`.
+/// Brick 77 A/B arm: hoisted flag (A) vs per-call read (B).
+///
+/// Brick 77 replaced `lit_push_enabled()` in `push_literals`' guard -- executed
+/// 15,687,334 times across the corpus -- with a value threaded from the caller.
+/// The two paths must be alternated IN-PROCESS to be measurable: a cross-process
+/// comparison of two builds put C's own throughput 14-17% apart and left
+/// `cyc/byte` and `C/us` disagreeing, because both were measuring the box.
+static LITPUSH_HOIST_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: `true` = use the hoisted parameter, `false` = re-read per call.
+pub fn set_litpush_hoist_arm(on: bool) {
+    LITPUSH_HOIST_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn litpush_hoist_enabled() -> bool {
+    match LITPUSH_HOIST_ARM.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        _ => true,
+    }
+}
+
 pub fn set_litpush_arm(on: bool) {
     LITPUSH_ARM.store(
         if on { 2 } else { 1 },
@@ -2112,7 +2136,7 @@ fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize, arm: bo
     if n <= LIT_PUSH_WIDTH
         && from + LIT_PUSH_WIDTH <= src.len()
         && lits.capacity() - lits.len() >= LIT_PUSH_WIDTH
-        && arm
+        && if litpush_hoist_enabled() { arm } else { lit_push_enabled() }
     {
         let len = lits.len();
         // SAFETY: `from + 16 <= src.len()` gives 16 readable source bytes;
