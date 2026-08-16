@@ -2793,11 +2793,21 @@ fn find_opt(
     let mut match_off = vec![0u32; n + 1];
     let mut match_ml = vec![0u32; n + 1];
     price[0] = 0;
+    // BRICK 75: offer the REPCODE as a DP candidate (find_opt was the last
+    // finder without repcode search).
+    //
+    // Correctness is the emit path's job: we record a candidate at byte
+    // DISTANCE `rep1`, and `offset_value_for` turns that into a repcode code
+    // using the real rep state at emit time. What the DP must get right is
+    // WHERE the match starts and what it costs.
+    let rep1 = reps[0] as usize;
+    let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
     let extra = match params.strategy {
         Strategy::BtUltra2 => 2u32,
         Strategy::BtUltra => 1,
         _ => 0,
     };
+    let rep_cost = 12u32.saturating_sub(extra).saturating_add(2);
     for i in 0..n {
         if price[i] >= inf {
             continue;
@@ -2811,6 +2821,26 @@ fn find_opt(
         let ip = block_start + i;
         if ip + 8 > block_end {
             continue;
+        }
+        // `try_rep1` matches at ip+1: a rep0 code requires litlen >= 1. So the DP
+        // edge must ORIGINATE AT i+1 (after that literal), not at i. Basing it on
+        // `price[i]` was the first attempt and it emitted every sequence with
+        // litlen off by one -- an invalid stream that 36 conformance cases caught.
+        // `price[i + 1]` is final here: the literal edge above already set it.
+        if i + 1 <= n && price[i + 1] < inf {
+            if let Some(rml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
+                let j = i + 1 + rml;
+                if j <= n {
+                    let np = price[i + 1].saturating_add(rep_cost);
+                    if np < price[j] {
+                        price[j] = np;
+                        prev[j] = i + 1;
+                        is_match[j] = true;
+                        match_off[j] = rep1 as u32;
+                        match_ml[j] = rml as u32;
+                    }
+                }
+            }
         }
         let (bm, bml) = bt_find_best(src, ip, block_start, block_end, window, mls, params, tables);
         if bml < mls {

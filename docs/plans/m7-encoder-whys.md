@@ -2406,6 +2406,57 @@ zero-byte output should be read as "the tool declined" before "the tool is broke
 attribution step (`git stash`, re-measure) is what prevented a day spent fixing a codec
 that was already correct.
 
+## BRICK 75 -- repcode as a DP candidate in `find_opt` (the last finder)
+
+`find_opt` was the only finder left with no repcode search. Unlike the greedy finders it
+cannot simply take one and continue -- a DP must PRICE it against the alternatives.
+
+Two things make that tractable:
+* **correctness belongs to the emit path.** The DP records a candidate at byte DISTANCE
+  `rep1`; `offset_value_for` converts that to a repcode code (or a literal offset) using
+  the real rep state at emit time. The DP cannot emit an illegal offset.
+* **the price must reflect the bitstream.** A repcode offset codes in ~1-3 bits, not
+  ~log2(offset), so it gets `12 - extra + 2` rather than brick 72's offset-scaled cost.
+
+| versions-16m |    before | **after** |
+| ------------ | --------: | --------: |
+| L15          |     0.912 | **0.912** |
+| **L16**      | **1.122** | **0.732** |
+| L17          |     0.836 | **0.822** |
+| L19          |     0.912 | **0.822** |
+
+**L16 was the last level where C beat us on this corpus. It no longer does.**
+
+### THE BUG, AND WHAT CAUGHT IT
+
+The first version put the edge at `prev[j] = i` with `j = i + 1 + rml`. But `try_rep1`
+matches at **`ip + 1`** -- a rep0 code REQUIRES `litlen >= 1` -- so the DP claimed the
+match occupied `i..j` when it actually occupied `i+1..j`. Every repcode sequence was
+emitted with **litlen off by one**: an invalid stream.
+
+**36 conformance cases caught it immediately** (L16/L17/L19 x 12 files, plus all of
+L20-22). Tests still passed -- 172/172 -- because our own encoder and decoder agreed with
+each other; only decoding through C exposed it. **A self-consistent bitstream is not a
+legal one**, which is exactly why `codec-bringup-encoder` insists on a strict external
+decoder.
+
+Fix: originate the edge at `i + 1` and base it on `price[i + 1]`, which is already final
+at that point because the literal edge is computed at the top of the same iteration. The
+corrected version is also BETTER than the broken one (L16 0.732 vs 0.761) -- the invalid
+version was mispricing, not out-optimising.
+
+Gates: 172 tests; **C-decodes-us 60/60** (12 files x L13/15/16/17/19); **8/8** at
+L20/22 with `--ultra`. Silesia L16: webster 1.1391, nci 1.0845, mr 1.0538, xml 1.1240,
+mozilla 1.1068.
+
+**Repcode coverage is now COMPLETE across every finder** (`find_fast_impl`, `find_dfast`,
+`find_greedy`, `find_lazy`, `find_bt_lazy`, `find_opt`).
+
+**Still approximate:** `rep1` here is the block's ENTRY repcode. A full model tracks rep
+state per DP position (C carries a rep array in `ZSTD_optimal_t`), so a path that emits a
+new offset mid-block still consults the stale entry value. Conservative -- it only ever
+OFFERS a candidate -- but it leaves ratio on the table.
+
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 
 Runtime arms added to every brick that had been judged with the broken method, then all
