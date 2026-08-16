@@ -2488,6 +2488,49 @@ guessing from the source bytes. **The next attempt should price from the PREVIOU
 literal frequencies -- real literal statistics, already computed, already plumbed -- not
 from a proxy derived off the raw block.**
 
+## MATCHFIND PLUMBING: attribution ATTEMPTED, result NOT TRUSTWORTHY
+
+The plan required attributing the 39 memcpy / 40 `slice_index_fail` / 46 realloc sites to
+SOURCE LINES before editing anything. Two things were learned; the attribution itself is
+not yet usable.
+
+### WORKS: how to get line attribution on this target
+
+* `RUSTFLAGS="-C debuginfo=1"` does NOT survive a `cargo rustc ... -- --emit asm`
+  invocation. Pass it after the `--`: `-- --emit asm -C debuginfo=2`.
+* **This target is MSVC, so debug info is CodeView, not DWARF.** There are no `.loc`
+  directives to grep -- the earlier "no .loc debug info" conclusion was a TOOLING gap, not
+  a missing-symbols problem. The directives are **`.cv_loc`** (18,212 of them once
+  debuginfo is on).
+
+### NOT TRUSTWORTHY: the lines it produced
+
+| kind               |   n | reported line | what is actually there                                         |
+| ------------------ | --: | ------------: | -------------------------------------------------------------- |
+| memcpy             |  39 |           547 | `h.update(&workspace[off..end])` -- xxhash, in `compress_with` |
+| slice_index_fail   |  40 |           443 | dictionary id resolution                                       |
+| do_reserve         |  40 |           673 | the RAW-block emit path                                        |
+| grow_one           |   6 |          1029 | `write_sequences`                                              |
+| panic_bounds_check |   2 |           272 | `MatchTables::new`                                             |
+
+**None of these are inside `find_fast_impl`.** The debuginfo build inlines differently
+from the release build in which the 39/40/46 counts were taken, so the symbol ranges do
+not correspond between the two binaries. Acting on these line numbers would repeat the
+wrong-loop-detector error from earlier in this campaign.
+
+### What the next attempt must do differently
+
+1. Count and attribute in the **SAME** binary -- add `-C debuginfo=2` to the build whose
+   symbol ranges are being walked, and re-derive the 39/40/46 counts there before trusting
+   any mapping.
+2. Confirm the counts still hold in the debuginfo build; if they change, the inlining
+   differs and per-line attribution across builds is invalid by construction.
+3. Only then fix sites whose invariant is provable in one line, as bricks 68/69 were.
+
+**Not attempted: any edit.** The invariants here (literal-copy bounds from the match
+finder's state machine, `seqs` capacity from a heuristic guess) are not one-liners, and
+getting them wrong is memory corruption rather than a wrong byte.
+
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 
 Runtime arms added to every brick that had been judged with the broken method, then all
