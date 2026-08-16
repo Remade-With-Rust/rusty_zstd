@@ -1073,6 +1073,11 @@ fn pack_huff_entries(nbits: &[u8; 256], code: &[u16; 256]) -> [u32; 256] {
 }
 
 #[cfg(feature = "alloc")]
+/// Whole-input convenience wrapper. The SHIPPING path no longer uses this:
+/// brick 74 derives the frequencies from the per-segment histograms it
+/// already builds, so calling this would walk the literals a second time.
+/// Retained as the oracle the histogram tests compare against.
+#[cfg(test)]
 pub(crate) fn build_ctable(src: &[u8]) -> Result<HuffCTable, Error> {
     let mut freq = [0u32; 256];
     for &b in src {
