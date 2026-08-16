@@ -2156,6 +2156,58 @@ encodes eliminated -- and it silently added a full data pass to pay for it. A br
 removes expensive work can still ADD cheaper work that nobody counted. Count the passes,
 not just the calls.)*
 
+## MATCHFIND, AUDITED THE WAY HUFFMAN WAS (2026-08-16)
+
+The Huffman audit found its wins NOT in the loop structure (which was sound) but in the
+PRIMITIVES underneath -- a variable-length memcpy in `flush`, provably-dead bounds checks,
+and a duplicated data pass. Applied the same lens to MatchFind, whose probe loop is
+already 19 instructions / 1 stack access.
+
+Aggregated over `find_fast_impl`'s 10 monomorphizations:
+
+| symbol               | instrs | memcpy | panic | slice_fail | realloc |
+| -------------------- | -----: | -----: | ----: | ---------: | ------: |
+| **`find_fast_impl`** |   8396 | **39** |     2 |     **40** |  **46** |
+| `find_dfast`         |    459 |      3 |     4 |          3 |       4 |
+| `emit_fast_seq`      |    250 |      0 |     4 |          0 |       2 |
+| **`count_match`**    |    143 |  **0** | **0** |      **0** |   **0** |
+| `push_literals`      |    119 |      1 |     0 |          1 |       1 |
+
+**~4 memcpy, ~4 `slice_index_fail` and ~4.6 `RawVec` growth calls per monomorphization.**
+
+**`count_match` is the control that makes this readable: 0/0/0/0.** The MATCHING itself is
+tight; the PLUMBING around it is not. That is the same shape Huffman had -- `emit_fill`'s
+structure was correct while `flush` underneath it called memcpy 2.7M times.
+
+### The three suspected sources (located, NOT yet fixed)
+
+1. **Literal copies** -- `lits.extend_from_slice(&src[anchor..ip])` and `push_literals`.
+   The `&src[a..b]` range check is the `slice_index_fail`; the variable-length copy is the
+   memcpy. Brick 38 already made the COMMON case a fixed-width 16-byte push, so what
+   remains is the tail and the rep/flush paths.
+2. **`seqs.push(Seq{..})`** -- a capacity check per SEQUENCE (1.84M on webster). Brick 38
+   reserves `last_nseq + 25% + 64`, but that is a GUESS, so the check cannot simply be
+   deleted; it needs a per-block "capacity known good" fast path.
+3. **`RawVec` growth** -- 46 call sites, the other half of the same story.
+
+### Why this is NOT yet a brick
+
+The Huffman equivalents (bricks 68/69) were safe because the invariants were provable in
+one line: `nbytes <= 8`, and `i` only decreases from `src.len()`. **The literal-copy
+invariants are not** -- `anchor..ip` bounds depend on the match finder's state machine, and
+`seqs` capacity depends on a heuristic guess that can be exceeded. Getting either wrong is
+memory corruption, not a wrong byte.
+
+This wants the same treatment the Huffman path got, in this order:
+1. attribute the 39 memcpy / 40 slice_fail sites to SOURCE LINES (the `.loc` trick failed
+   here -- release has no debug info; build with `-C debuginfo=1` to map them);
+2. fix only the sites whose invariant is provable in one line;
+3. gate on the eleven-file byte-identity set, which is now re-baselined and committed.
+
+**Expected value:** MatchFind is 43.9% of nci's encode, 43.4% of mozilla's, 62.6% of
+webster's -- so plumbing that costs ~4 calls per monomorphization is worth real time, but
+it is NOT the 19-instruction probe loop. The loop is done; the copies around it are not.
+
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 
 Runtime arms added to every brick that had been judged with the broken method, then all
