@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+.idea/
+.vscode/
+
+# Fetched blobs — hashes live in git, bytes do not.
+/corpora/data/
+/third_party/zstd/*.zip
+/third_party/zstd/extracted/
+
+# Local bench scratch
+/bench/tmp/
+*.zst
+
+# Great Gate -- private content-adaptive-dispatch campaign (doc + gate
+# calculator). Local-only, never published. Same policy as remade_ffmpeg_rs.
+/_greatgate/

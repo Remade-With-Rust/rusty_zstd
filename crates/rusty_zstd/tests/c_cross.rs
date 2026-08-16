@@ -1,0 +1,179 @@
+//! C libzstd v1.5.7 compress -> rusty_zstd decompress, bit-exact.
+//!
+//! Skips when the pinned oracle is not on disk (CI without fetch-oracle).
+//! The holdout file is `incomp-32m` (split=holdout). Train files are extra coverage.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("crates/rusty_zstd -> repo root")
+        .to_path_buf()
+}
+
+fn find_oracle() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("RUSTY_ZSTD_ORACLE") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    let extracted = repo_root().join("third_party/zstd/extracted");
+    walk(&extracted).ok()?.into_iter().find(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("zstd.exe") || n.eq_ignore_ascii_case("zstd"))
+    })
+}
+
+fn walk(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    if !dir.is_dir() {
+        return Ok(out);
+    }
+    for ent in fs::read_dir(dir)? {
+        let p = ent?.path();
+        if p.is_dir() {
+            out.extend(walk(&p)?);
+        } else {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+fn c_compress(oracle: &Path, src: &[u8], level: i32) -> Vec<u8> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("rzstd-m1-{}-{}-{}", level, src.len(), nonce));
+    let inn = tmp.with_extension("in");
+    let out = tmp.with_extension("zst");
+    fs::write(&inn, src).unwrap();
+    let status = Command::new(oracle)
+        .args([
+            "-f",
+            "-q",
+            &format!("-{level}"),
+            "-o",
+            out.to_str().unwrap(),
+            inn.to_str().unwrap(),
+        ])
+        .status()
+        .expect("spawn zstd");
+    assert!(status.success(), "zstd -{level} failed");
+    let zst = fs::read(&out).unwrap();
+    let _ = fs::remove_file(&inn);
+    let _ = fs::remove_file(&out);
+    zst
+}
+
+fn xorshift_bytes(seed: u64, n: usize) -> Vec<u8> {
+    let mut s = seed;
+    let mut v = vec![0u8; n];
+    for b in &mut v {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        *b = (s & 0xFF) as u8;
+        if *b == 0 {
+            *b = 1;
+        }
+    }
+    v
+}
+
+fn assert_roundtrip(oracle: &Path, src: &[u8], level: i32) {
+    let zst = c_compress(oracle, src, level);
+    let got = rusty_zstd::decompress(&zst).unwrap_or_else(|e| {
+        panic!(
+            "decompress L{level} {} bytes: {e:?} zst={}",
+            src.len(),
+            zst.len()
+        )
+    });
+    if got.len() != src.len() {
+        panic!(
+            "len mismatch L{level}: got {} want {}",
+            got.len(),
+            src.len()
+        );
+    }
+    if got != src {
+        let pos = got
+            .iter()
+            .zip(src.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(got.len());
+        panic!(
+            "mismatch L{level} at byte {pos}/{} got={:02x} want={:02x}",
+            src.len(),
+            got.get(pos).copied().unwrap_or(0),
+            src.get(pos).copied().unwrap_or(0)
+        );
+    }
+}
+
+#[test]
+fn c_small_corpus() {
+    let Some(oracle) = find_oracle() else {
+        eprintln!("skip: pinned C zstd not found");
+        return;
+    };
+    let fox = b"The quick brown fox jumps over the lazy dog. 0123456789.\n";
+    let mut text = Vec::new();
+    while text.len() < 4096 {
+        text.extend_from_slice(fox);
+    }
+    for level in [1, 3, 19] {
+        assert_roundtrip(&oracle, b"", level);
+        assert_roundtrip(&oracle, b"a", level);
+        assert_roundtrip(&oracle, b"hello", level);
+        assert_roundtrip(&oracle, &[0u8; 16], level);
+        assert_roundtrip(&oracle, &vec![0u8; 256], level);
+        assert_roundtrip(&oracle, &vec![0u8; 4096], level);
+        assert_roundtrip(&oracle, &text, level);
+        assert_roundtrip(&oracle, &xorshift_bytes(0xA5A5_5A5A, 1024), level);
+        assert_roundtrip(&oracle, &xorshift_bytes(0xA5A5_5A5A, 128 * 1024), level);
+        assert_roundtrip(&oracle, &xorshift_bytes(0xA5A5_5A5A, 256 * 1024), level);
+        assert_roundtrip(&oracle, &xorshift_bytes(0xA5A5_5A5A, 1024 * 1024), level);
+    }
+}
+
+#[test]
+fn c_holdout_incomp_32m() {
+    let Some(oracle) = find_oracle() else {
+        eprintln!("skip: pinned C zstd not found");
+        return;
+    };
+    let n = 32 * 1024 * 1024;
+    let src = xorshift_bytes(0xA5A5_5A5A, n);
+    for level in [1, 3] {
+        assert_roundtrip(&oracle, &src, level);
+    }
+}
+
+#[test]
+fn c_train_zeros_and_text_32m() {
+    let Some(oracle) = find_oracle() else {
+        eprintln!("skip: pinned C zstd not found");
+        return;
+    };
+    let n = 32 * 1024 * 1024;
+    let zeros = vec![0u8; n];
+    let fox = b"The quick brown fox jumps over the lazy dog. 0123456789.\n";
+    let mut text = Vec::with_capacity(n);
+    while text.len() < n {
+        let take = (n - text.len()).min(fox.len());
+        text.extend_from_slice(&fox[..take]);
+    }
+    for level in [1, 3] {
+        assert_roundtrip(&oracle, &zeros, level);
+        assert_roundtrip(&oracle, &text, level);
+    }
+}

@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cp crates/rusty_zstd/src/compressed.rs /tmp/compressed_b66.rs)",
+      "Bash(python -)",
+      "Bash(cp /tmp/compressed_b66.rs crates/rusty_zstd/src/compressed.rs)",
+      "Bash(./target/f2/release/rzstd-bench.exe --m7-speed --files webster,nci,samba,xml --levels 1)",
+      "Bash(sed 's/  size.*//')",
+      "Bash(cd c:/Users/talmo/coding/rusty_zstd && grep -n \"fn use_fill\\\\|fn emit_fill\\\\|max_nbits\" crates/rusty_zstd/src/huffman.rs | head -12 && echo \"=== the K dispatch ===\" && sed -n '/fn encode_rev_into/,/^    }/p' crates/rusty_zstd/src/huffman.rs | head -22)",
+      "Bash(cd c:/Users/talmo/coding/rusty_zstd && sed -n '/fn literals_and_sequence_modes_coverage/,/let mut seen_lit/p' crates/rusty_zstd/src/encode.rs | head -40)",
+      "Bash(cd c:/Users/talmo/coding/rusty_zstd && sed -n '/fn emit_fill/,/^    fn /p' crates/rusty_zstd/src/huffman.rs | head -46)",
+      "Bash(sed -n '/pub\\(crate\\) fn add_bits_huff/,/^    }/p' crates/rusty_zstd/src/bit.rs)",
+      "Bash(sed -n '/pub\\(crate\\) fn huff_fits/,/^    }/p' crates/rusty_zstd/src/bit.rs)",
+      "Bash(sed -n '/pub\\(crate\\) fn flush/,/^    }/p' crates/rusty_zstd/src/bit.rs)",
+      "Bash(cd c:/Users/talmo/coding/rusty_zstd && sed -n '/fn emit_tail/,/^    }/p' crates/rusty_zstd/src/huffman.rs | head -24)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\talmo\\coding\\rusty_zstd\\crates\\rusty_zstd\\src"
+    ]
+  }
+}

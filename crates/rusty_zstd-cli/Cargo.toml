@@ -1,0 +1,35 @@
+[package]
+name = "rusty_zstd-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "zstd-compatible CLI for rusty_zstd (M6: MT, list, bench, aliases)"
+publish = false
+
+[[bin]]
+name = "rzstd"
+path = "src/main.rs"
+
+[[bin]]
+name = "unzstd"
+path = "src/main.rs"
+
+[[bin]]
+name = "zstdcat"
+path = "src/main.rs"
+
+[[bin]]
+name = "zstdmt"
+path = "src/main.rs"
+
+[dependencies]
+rzstd-alloc = { path = "../rzstd-alloc" }
+rusty_zstd = { path = "../rusty_zstd" }
+thoth = { git = "https://github.com/Remade-With-Rust/thoth", tag = "v0.3.0", default-features = false }
+
+[lints]
+workspace = true

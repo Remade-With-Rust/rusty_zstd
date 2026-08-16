@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rusty_zstd",
+    "crates/rusty_zstd-cli",
+    "crates/rusty_zstd-bench",
+    "crates/rzstd-alloc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/rusty_zstd"
+authors = ["Mata Network <https://www.mata.network>"]
+homepage = "https://www.mata.network/remade-with-rust"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "allow"

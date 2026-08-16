@@ -1,0 +1,30 @@
+[package]
+name = "rusty_zstd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Pure-Rust Zstandard (RFC 8878) codec — compress + decompress, no C/FFI"
+readme = "../../README.md"
+keywords = ["zstd", "zstandard", "compression", "codec"]
+categories = ["compression", "encoding"]
+
+[lib]
+name = "rusty_zstd"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = ["alloc"]
+alloc = []
+legacy = ["std"]
+seekable = ["std"]
+train = ["std"]
+mt = ["std"]
+profile = ["std"]
+
+[lints]
+workspace = true
