@@ -1484,7 +1484,7 @@ fn run_gg_matchfind(
     // against the shipped arm (step0 = 2). Positive = routing this block wins.
     if writeln!(
         w,
-        "gain,clip,clip_total,split,work,cpu_ms,shipped,clevel,block_idx,match_frac,lit_share,nseq_per_kb,hit_rate,probes_per_byte,rep_yield,lit_peak,early_raw,csize_shipped,csize_routed"
+        "gain,clip,clip_total,split,work,cpu_ms,shipped,clevel,block_idx,match_frac,lit_share,nseq_per_kb,hit_rate,probes_per_byte,rep_yield,off_collision,off_buckets,lit_peak,early_raw,csize_shipped,csize_routed"
     )
     .is_err()
     {
@@ -1562,7 +1562,7 @@ fn run_gg_matchfind(
                 };
                 if writeln!(
                     w,
-                    "{:.4},{},{},{},{:.1},{:.6},0,{},{},{:.6},{:.6},{:.4},{:.6},{:.6},{:.4},{},{},{},{}",
+                    "{:.4},{},{},{},{:.1},{:.6},0,{},{},{:.6},{:.6},{:.4},{:.6},{:.6},{:.4},{:.4},{},{},{},{},{}",
                     gain,
                     f.id,
                     clip_total,
@@ -1577,6 +1577,8 @@ fn run_gg_matchfind(
                     hit_rate,
                     probes_a as f64 / bl,
                     f64::from(a.rep_yield_x1000) / 1000.0,
+                    f64::from(a.off_collision_x1000) / 1000.0,
+                    a.off_buckets,
                     a.lit_peak,
                     a.early_raw,
                     a.csize,

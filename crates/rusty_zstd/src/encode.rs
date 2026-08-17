@@ -629,6 +629,24 @@ pub(crate) fn encode_block(
     }
     if let Some(b) = rle_byte(block) {
         crate::prof::note_rle_block();
+        // P1/gg-matchfind: RLE blocks returned BEFORE `tap_block`, so
+        // `zeros-32m` contributed 0 rows to the harvest and the corpus count was
+        // 17, not 18. A degenerate class that emits no rows cannot be shown to
+        // be unharmed by a gate -- which is exactly what the finish line
+        // ("worst of the 18 <= 0") requires. One tap, 1 byte emitted.
+        tap_block(
+            block.len(),
+            0,
+            block.len(),
+            0,
+            1000,
+            params.strategy,
+            false,
+            1,
+            tables.rep_yield,
+            0,
+            0,
+        );
         write_block_header(out, last, BlockType::Rle, block.len() as u32);
         out.push(b);
         return Ok(());
@@ -648,6 +666,12 @@ pub(crate) fn encode_block(
             *reps,
         )
     };
+    // P1/gg-matchfind candidate signal, computed once for every tap below.
+    let (off_coll, off_bkt) = if cfg!(feature = "profile") {
+        offset_stats(&seqs)
+    } else {
+        (0, 0)
+    };
     if seqs.is_empty() && !huffman::literals_worth_huffman(block) {
         crate::prof::note_raw_block();
         tap_block(
@@ -660,6 +684,8 @@ pub(crate) fn encode_block(
             false,
             block.len(),
             tables.rep_yield,
+            off_coll,
+            off_bkt,
         );
         write_block_header(out, last, BlockType::Raw, block.len() as u32);
         out.extend_from_slice(block);
@@ -682,6 +708,8 @@ pub(crate) fn encode_block(
             true,
             block.len(),
             tables.rep_yield,
+            off_coll,
+            off_bkt,
         );
         write_block_header(out, last, BlockType::Raw, block.len() as u32);
         out.extend_from_slice(block);
@@ -733,6 +761,8 @@ pub(crate) fn encode_block(
             false,
             block.len(),
             tables.rep_yield,
+            off_coll,
+            off_bkt,
         );
         write_block_header(out, last, BlockType::Raw, block.len() as u32);
         out.extend_from_slice(block);
@@ -749,6 +779,8 @@ pub(crate) fn encode_block(
         false,
         payload.len(),
         tables.rep_yield,
+        off_coll,
+        off_bkt,
     );
     write_block_header(out, last, BlockType::Compressed, payload.len() as u32);
     out.extend_from_slice(&payload);
@@ -857,6 +889,34 @@ fn early_raw_skip(match_bytes: usize, block_len: usize, params: CompressionParam
 }
 
 #[allow(clippy::too_many_arguments)]
+/// P1/gg-matchfind candidate signal: how CONCENTRATED this block's match offsets
+/// are, bucketed by `log2(offset)` into 32 bins.
+///
+/// Returns `(collision_probability * 1000, distinct_buckets)`. Collision
+/// probability is `sum(p^2)` -- the Renyi-2 form already used by
+/// `literals_worth_huffman` -- so it needs no logarithm and is monotone in
+/// concentration: 1000 = every match at one offset scale, ~31 = perfectly spread
+/// across all 32.
+///
+/// Physical premise being tested: record-structured content (fixed-width rows,
+/// log lines) matches at a near-constant offset that the REPCODE path already
+/// captures for free, so extra probe density re-discovers matches it already
+/// had. If that is true, this separates such content from genuinely matchy text.
+fn offset_stats(seqs: &[Seq]) -> (u32, u8) {
+    if seqs.is_empty() {
+        return (0, 0);
+    }
+    let mut bins = [0u32; 32];
+    for s in seqs {
+        let b = (31 - s.offset.max(1).leading_zeros()) as usize;
+        bins[b.min(31)] += 1;
+    }
+    let n = seqs.len() as u64;
+    let sum_sq: u64 = bins.iter().map(|&c| u64::from(c) * u64::from(c)).sum();
+    let used = bins.iter().filter(|&&c| c != 0).count() as u8;
+    (((sum_sq * 1000) / (n * n)) as u32, used)
+}
+
 fn tap_block(
     block_len: usize,
     nseq: usize,
@@ -867,6 +927,8 @@ fn tap_block(
     early_raw: bool,
     csize: usize,
     rep_yield: f32,
+    off_collision_x1000: u32,
+    off_buckets: u8,
 ) {
     // Cumulative at block exit; the harvest differences consecutive rows.
     let c = crate::prof::encode_counts();
@@ -882,6 +944,8 @@ fn tap_block(
         probes: c.hash_probes,
         hits: c.probe_hits,
         rep_yield_x1000: (rep_yield * 1000.0) as u32,
+        off_collision_x1000,
+        off_buckets,
         mf_ns: crate::prof::stage_ns(crate::prof::Stage::EncodeMatchFind),
     });
 }

@@ -76,6 +76,12 @@ pub struct BlockTap {
     pub hits: u64,
     /// Tier-A signal: the repcode yield carried INTO this block, x1000.
     pub rep_yield_x1000: u32,
+    /// P1/gg-matchfind candidate signal: collision probability over log2-offset
+    /// buckets, x1000. HIGH = this block's matches cluster at a few offset
+    /// scales; LOW = they are spread. Cheap (32-entry histogram over `nseq`).
+    pub off_collision_x1000: u32,
+    /// P1 candidate signal: how many of the 32 log2-offset buckets were used.
+    pub off_buckets: u8,
     /// Cumulative `EncodeMatchFind` nanoseconds at block exit. Differenced by
     /// the harvest to give this block's `cpu_ms` -- the CONFIRMATORY half of
     /// the Great Gate speed pair (the counter rules when they disagree).
