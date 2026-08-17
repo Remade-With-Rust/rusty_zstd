@@ -3355,3 +3355,102 @@ Pair search is the cause; parity is a ~2% second-order effect, and `STEP0=5`
    not reason about it.
 2. **`pair` and `step` are coupled.** The existing comment records that growing
    step without the pair blew `--fast=4` ratio 0.845 -> 1.272. Re-gate `--fast`.
+
+## D9 — the chain-fill descent (2026-08-16)
+
+Entered from the osdb level non-monotonicity gate (`289e734`), which recorded
+"prime suspect is the chain FILL density". It was, twice over.
+
+### B2 — the chain amputated itself (SHIPPED `9a7250e`)
+
+- ASKED: `find_greedy`/`find_lazy` both use `tables.chain`, and depth is
+  `1 << search_log` exactly as C. So what is different?
+- COUNTED, before touching anything: the lazy look-ahead calls
+  `chain_find_best(ip+d)` for `d in 1..=depth`, which INSERTS those positions.
+  The back-fill then started at `best_ip + 1` and re-inserted them. osdb:
+  **501,705 double-inserts at L7, 791,088 at L9 — 10.9% of all back-fill
+  inserts**, scaling with `depth` exactly as the mechanism predicts.
+- MECHANISM: inserting `p` a second time stores `chain[p] = get_h(h)` when the
+  head IS already `p`, i.e. `chain[p] = p`. The walk's `if next >= m { break }`
+  fires on that, so every candidate below `p` in that bucket is unreachable
+  FOREVER. Half a million amputated buckets.
+- WHY C CANNOT HIT IT: `ZSTD_insertAndFindFirstIndex` advances a monotone
+  `nextToUpdate` cursor, so every position is inserted exactly once.
+- FIX: start the back-fill at `max(best_ip + 1, look_hi + 1)`.
+
+### B3 — greedy/lazy/btlazy2 never back-extended (SHIPPED `9a7250e`)
+
+- The sideways read, per `rusty_curiosity`: while standing in the commit path
+  for B2, look at the SIBLING finders' commit paths. `emit_fast_seq`
+  (fast/dfast) has always run the backward byte-compare; greedy, lazy and
+  btlazy2 never did. C's lazy has it as its "catch up" loop.
+- Same shape as the repcode discovery: **a capability present in one finder,
+  absent in its neighbours.**
+
+Joint result, Silesia, 60 cells (12 files x L5/7/9/13/19): **-3.74% total**,
+57 cells smaller, 3 regressions all under 0.12%. reymont L13 -21.6%,
+dickens L13 -15.1%, xml L13 -13.8%, nci L13 -13.0%, webster L13 -12.7%.
+Ratio vs C: osdb L13 1.068 -> **0.999**, dickens L13 1.201 -> **1.020**,
+xml L13 1.164 -> **1.003**. L19 (find_opt) untouched at 0.00%, as predicted.
+
+Cost: L7/L9 compress -15% to -25%. **We were fast because the chains were
+amputated** — the walk terminated early. L5 (greedy, no look-ahead, so B3 only)
+is the single-variable instrument that splits it: B3 costs ~2%, B2 the rest.
+
+### The prefilter that paid part of it back (SHIPPED `c2f8d63`)
+
+- ASKED: what does C's chain walk do per candidate that ours does not?
+- ANSWER: `match[ml] == ip[ml]` — one byte load at the CURRENT BEST length.
+  A candidate differing there cannot be longer, so the count is provably
+  wasted. We ran a full `count_match` on every candidate. **Exactly
+  equivalent, hence byte-identical**: the rejects are precisely those
+  `ml > best_ml` would have rejected.
+- Gated on all 60 size cells identical. osdb L7 +7.2%, xml L7 +10.2%,
+  **xml L9 +19.9%**, L5 +4.5%. Recovers ~a third of B2's cost for zero size.
+
+### REFUTED — defect A: filling the span a REPCODE match covers
+
+- The obvious sibling of B2: on a rep hit we jump past the match and insert
+  NOTHING, where C's cursor catches those positions up.
+- COUNTED first: only 3,788 skipped positions on osdb L7 — 0.04%. Built it
+  anyway because rep-heavy content would be different. It is.
+- MEASURED: Silesia **-0.0398%** total (nci -1.5%/-1.2%/-1.1% is the only real
+  winner, 4 sub-0.07% L7 regressions), and on `versions-16m` compress goes
+  **4034.9 -> 642.5 MB/s (-84%)** while the ratio gets **WORSE, 0.647 ->
+  0.734**.
+- LAW: **more chain density is not monotonically better.** Positions from
+  inside long repeated runs displace more useful bucket heads. Reverted; do
+  not retry.
+
+### PROBE DENSITY / pair search — measured, NOT flipped (`62cafe4`)
+
+`step0 = 2` probes every other position; C probes ~1.0/byte. Setting
+`RZSTD_STEP0=1` (which is the same probe SET as pairing at step 2, and unlike
+`pair` keeps the software pipeline, since `PIPE && !pair`):
+
+- **Silesia L1 total -6.67%**, every file a win or flat. mozilla -9.54%,
+  reymont -9.05%, samba -7.95%, webster -7.76%, dickens -7.44%.
+- Ratio vs C: webster 1.137 -> **1.049**, osdb 1.100 -> **1.043**,
+  nci 1.301 -> **1.219**.
+- Cost: nci -3.2%, x-ray -1.8%, osdb -9.1%, incomp -9.5%, webster -15.7%,
+  jsonlog -17.1%.
+
+REFUTED en route: the first step-1 measurement was a **work-parity break** —
+only step 2 had `(HLOG, STEP)` monomorphizations, so step 1 fell through to the
+fully generic arm. Fixed (byte-identical); at parity step 1 gains only ~1%.
+The density cost is REAL, not a specialization artifact.
+
+Three files pay full price for zero ratio: x-ray (hit_rate 0.0005), incomp-32m
+(0.0000), jsonlog-16m (0.278). A single `hit_rate` gate separates the first two
+with the threshold in a **measured empty interval** — x-ray 0.0005 vs sao
+0.0119, and sao is the weakest real winner at -1.67%. jsonlog is separated by
+NOTHING available: nci (0.472) and xml (0.322) bracket its 0.278 and are both
+large winners; `probes/byte` and `match_frac` fail the same way. jsonlog-16m is
+synthetic and already slated for replacement with captured traffic, so no gate
+term is fitted to it — per the dispatch skill, a term built to reject one
+unexplained point is how a dispatch ends up rejecting a real win.
+
+**Default left at `step0 = 2`.** The flip is one constant in `step0_default()`
+and trades ~10% L1 compress for ~6.7% L1 size — a change to what L1 is FOR,
+so it is a decision, not a brick. `probe_density_truth_table` (`#[ignore]`,
+`--features profile`) regenerates the table.
