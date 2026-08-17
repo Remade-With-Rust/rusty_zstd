@@ -2426,10 +2426,20 @@ fn find_greedy(
                 if !match_ok(src, m, ip, window, block_start, mls, tables.frame_start) {
                     break;
                 }
-                let ml = count_match(src, m, ip, block_end);
-                if ml >= mls && ml > best_ml {
-                    best_ml = ml;
-                    best_m = m;
+                // C's `match[ml] == ip[ml]` prefilter (`ZSTD_HcFindBestMatch`):
+                // a candidate that DIFFERS at the current best length cannot
+                // exceed it, so the full `count_match` is provably wasted. The
+                // same candidate still wins, so this is byte-identical.
+                if best_ml == 0 || src[m + best_ml] == src[ip + best_ml] {
+                    let ml = count_match(src, m, ip, block_end);
+                    if ml >= mls && ml > best_ml {
+                        best_ml = ml;
+                        best_m = m;
+                        // Reaches the block end -- nothing can be longer.
+                        if ip + best_ml >= block_end {
+                            break;
+                        }
+                    }
                 }
                 let next = tables.chain[m & chain_mask] as usize;
                 if next >= m {
@@ -2512,10 +2522,16 @@ fn chain_find_best(
         if !match_ok(src, m, ip, window, block_start, mls, tables.frame_start) {
             break;
         }
-        let ml = count_match(src, m, ip, block_end);
-        if ml >= mls && ml > best_ml && offset_ok(ip - m, window) && m >= tables.frame_start {
-            best_ml = ml;
-            best_m = m;
+        // C's `match[ml] == ip[ml]` prefilter -- see `find_greedy`.
+        if best_ml == 0 || src[m + best_ml] == src[ip + best_ml] {
+            let ml = count_match(src, m, ip, block_end);
+            if ml >= mls && ml > best_ml && offset_ok(ip - m, window) && m >= tables.frame_start {
+                best_ml = ml;
+                best_m = m;
+                if ip + best_ml >= block_end {
+                    break;
+                }
+            }
         }
         let next = tables.chain[m & chain_mask] as usize;
         if next >= m {
