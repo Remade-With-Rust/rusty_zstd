@@ -20,7 +20,9 @@
       "Bash(rm -rf target/ab)",
       "Bash(git -c user.name=Tim -c user.email=tim.almond@thehouseinc.xyz commit -qam 'encode: brick 77 A/B arm + measured verdict \\(~1%, below the bar\\) *)",
       "Bash(rm -rf target/d2)",
-      "Bash(git -c user.name=Tim -c user.email=tim.almond@thehouseinc.xyz commit -qam 'decode: bricks 78+79 — per-block output reserve, and hoist the literal-copy arm *)"
+      "Bash(git -c user.name=Tim -c user.email=tim.almond@thehouseinc.xyz commit -qam 'decode: bricks 78+79 — per-block output reserve, and hoist the literal-copy arm *)",
+      "Bash(xargs -I{} echo \"diagnostics: {}\")",
+      "Bash(git -c user.name=Tim -c user.email=tim.almond@thehouseinc.xyz commit -qam 'decode: brick 80 — 32-byte literal copy tier, measured before building *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\talmo\\coding\\rusty_zstd\\crates\\rusty_zstd\\src"

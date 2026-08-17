@@ -631,6 +631,30 @@ fn copy_literals(
         *lit_pos = end;
         return Ok(());
     }
+    // BRICK 80: a 32-byte tier above the 16-byte one.
+    //
+    // MEASURED FIRST (19.6M literal copies across the corpus):
+    //   <=16B  17,775,105  90.5%  -- already fast
+    //   17-32B  1,128,428   5.7%  -- fell to `extend_from_slice`, i.e. a memcpy CALL
+    //   >32B      728,346   3.7%  -- memcpy regardless
+    // So this tier converts 1.13M memcpy calls, 61% of the remaining slow path.
+    // Same invariant as the 16-byte tier, just wider -- and the same shape brick
+    // 37 already proved on match copies.
+    if arm && n <= 32 && *lit_pos + 32 <= literals.len() && out.capacity() - len >= 32 {
+        // SAFETY: 32 readable source bytes and 32 writable destination bytes are
+        // guaranteed by the two bounds above; `literals` and `out` are distinct
+        // buffers. Exactly `n <= 32` bytes are published by `set_len`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                literals.as_ptr().add(*lit_pos),
+                out.as_mut_ptr().add(len),
+                32,
+            );
+            out.set_len(len + n);
+        }
+        *lit_pos = end;
+        return Ok(());
+    }
     out.extend_from_slice(&literals[*lit_pos..end]);
     *lit_pos = end;
     Ok(())

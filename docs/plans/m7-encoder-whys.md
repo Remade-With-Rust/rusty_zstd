@@ -2611,6 +2611,39 @@ Gates for both: 172 tests; us-decodes-C 45/45; C-decodes-us 8/8; generated round
 build was broken -- three `copy_literals` call sites needed the new argument. Gate order
 must be tests-then-commit.)*
 
+### BRICK 80 -- a 32-byte literal tier, MEASURED BEFORE BUILDING
+
+Having twice read a static call-site count as a work count, this one started with the
+counter. Instrumented `copy_literals` and ran the corpus -- **19.6M literal copies**:
+
+| literal run               |         count |    share |
+| ------------------------- | ------------: | -------: |
+| <=16 B (already fast)     |    17,775,105 |    90.5% |
+| **17-32 B**               | **1,128,428** | **5.7%** |
+| >32 B (memcpy regardless) |       728,346 |     3.7% |
+
+The 16-byte fast path is doing its job at 90.5%. The remaining slow path is 1.85M real
+`extend_from_slice` calls, and **61% of them are runs of 17-32 bytes** -- exactly the band
+a wider tier captures.
+
+Added a 32-byte tier above the 16-byte one: same invariant, just wider, and the same shape
+brick 37 already proved on match copies. **1,128,428 memcpy calls converted to inline
+stores.**
+
+Gates: 172 tests; **us-decodes-C 36/36**; generated round-trip 6/6; debug-build decode
+clean (exercises the `set_len` bound); 0 diagnostics.
+
+**The contrast with brick 78 is the lesson.** Brick 78 was built on `grow_one` APPEARING in
+the loop's call list -- and re-reading the asm after the fix showed it still there, because
+LLVM emits the growth path as a cold branch it cannot prove unreachable. Brick 80 was built
+on 1,128,428 COUNTED executions. Same loop, same session: one brick rests on a
+disassembly reading and is unproven, the other rests on a count and is not.
+
+**Still unmeasured in wall clock.** The count justifies the change; it does not size the
+win. Brick 77's arithmetic applies -- 1.13M memcpy CALLS is a much larger unit cost than
+1.13M atomic loads, so this should exceed brick 77's ~1%, but that needs an A/B on a quiet
+box to claim.
+
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 
 Runtime arms added to every brick that had been judged with the broken method, then all
