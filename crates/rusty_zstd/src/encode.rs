@@ -35,7 +35,15 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
 pub struct CompressOptions {
     /// Compression level (-7..=22).
     pub level: i32,
-    /// Write the XXH64 content checksum (libzstd default: on).
+    /// Write the XXH64 content checksum.
+    ///
+    /// **The LIBRARY default is OFF** (`ZSTD_c_checksumFlag = 0`); it is the
+    /// zstd CLI that turns it on for files. We match the CLI, because that is
+    /// what a user of this crate expects. Do not "correct" this to match
+    /// libzstd -- but DO remember which default you are comparing against:
+    /// benchmarking us against `zstd -b` (no `--check`) with this on charges
+    /// us a full xxh64 pass over every byte that C never runs. That mistake
+    /// cost this campaign a phantom 2.2x. See docs/plans/m7-encoder-whys.md.
     pub checksum: bool,
 }
 
@@ -4237,7 +4245,8 @@ mod tests {
             crate::decompress_with(
                 &zst,
                 crate::DecompressOptions {
-                    window_max: 32 * 1024
+                    window_max: 32 * 1024,
+                    ..Default::default()
                 }
             )
             .unwrap_err(),
@@ -4247,7 +4256,8 @@ mod tests {
             crate::decompress_with(
                 &zst,
                 crate::DecompressOptions {
-                    window_max: 1u64 << 16
+                    window_max: 1u64 << 16,
+                    ..Default::default()
                 }
             )
             .unwrap(),

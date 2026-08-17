@@ -17,12 +17,24 @@ use alloc::vec::Vec;
 pub struct DecompressOptions {
     /// Reject frames whose window exceeds this (bytes). Default 128 MiB.
     pub window_max: u64,
+    /// Skip XXH64 content-checksum VERIFICATION (`ZSTD_d_forceIgnoreChecksum`).
+    ///
+    /// The 4 checksum bytes are still consumed, so concatenated frames keep
+    /// parsing; only the comparison is skipped. Default `false`.
+    ///
+    /// This is a real cost, not a micro-optimisation: xxh64 over the output is
+    /// **the majority of decode time on high-ratio content** (measured 61% on a
+    /// 32 MiB all-zeros frame -- 7792 MB/s with verification, 20150 without).
+    /// Set this only where the transport already guarantees integrity; it
+    /// disables the frame's own corruption detection.
+    pub force_ignore_checksum: bool,
 }
 
 impl Default for DecompressOptions {
     fn default() -> Self {
         Self {
             window_max: DEFAULT_WINDOW_MAX,
+            force_ignore_checksum: false,
         }
     }
 }
@@ -355,10 +367,14 @@ fn decode_zstd_frame(
 
     if header.checksum {
         let _c = crate::prof::scope(crate::prof::Stage::DecodeChecksum);
+        // The 4 bytes are consumed either way -- skipping the READ as well
+        // would desync every following frame in a concatenated stream.
         let got = r.u32_le()?;
-        let produced = &out[start_len..];
-        if content_checksum(produced) != got {
-            return Err(Error::ChecksumMismatch);
+        if !opts.force_ignore_checksum {
+            let produced = &out[start_len..];
+            if content_checksum(produced) != got {
+                return Err(Error::ChecksumMismatch);
+            }
         }
     }
 
@@ -447,6 +463,42 @@ mod tests {
             assert_eq!(decompress_into(&mut buf, &b).unwrap(), 21);
             assert_eq!(&buf[..], b"second frame contents");
         }
+    }
+
+    /// `force_ignore_checksum` skips VERIFICATION but must still consume the
+    /// 4 checksum bytes -- otherwise a following frame desyncs.
+    #[test]
+    fn force_ignore_checksum_skips_verification_not_parsing() {
+        let src: Vec<u8> = (0..50_000u32).map(|i| (i % 131) as u8).collect();
+        let f = crate::compress(&src, 3).unwrap();
+        let skip = DecompressOptions {
+            force_ignore_checksum: true,
+            ..Default::default()
+        };
+
+        // Good frame decodes identically with and without verification.
+        assert_eq!(decompress_with(&f, skip).unwrap(), src);
+        assert_eq!(decompress_with(&f, DecompressOptions::default()).unwrap(), src);
+
+        // Corrupt the stored checksum ONLY (last 4 bytes of the frame).
+        let mut bad = f.clone();
+        let n = bad.len();
+        bad[n - 1] ^= 0xFF;
+        // Default: rejected.
+        assert!(matches!(
+            decompress_with(&bad, DecompressOptions::default()),
+            Err(Error::ChecksumMismatch)
+        ));
+        // Skipping: accepted, and the CONTENT is still correct.
+        assert_eq!(decompress_with(&bad, skip).unwrap(), src);
+
+        // Concatenated frames still parse -- proves the bytes were consumed.
+        let mut two = f.clone();
+        two.extend_from_slice(&f);
+        let got = decompress_with(&two, skip).unwrap();
+        assert_eq!(got.len(), src.len() * 2);
+        assert_eq!(&got[..src.len()], &src[..]);
+        assert_eq!(&got[src.len()..], &src[..]);
     }
 
     /// A failing decode must not be reported as success. The buffer is left
