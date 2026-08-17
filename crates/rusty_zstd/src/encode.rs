@@ -2296,6 +2296,10 @@ fn find_dfast(
     //
     // Dispatched on the same measured yield as brick 67, so content without a
     // constant stride does not pay for a search that cannot hit.
+    // P0/gg-matchfind: work counter -- see `chain_find_best`.
+    const COUNT: bool = cfg!(feature = "profile");
+    let mut probes = 0u64;
+    let mut hits = 0u64;
     let use_rep = rep1_enabled() || tables.rep_yield >= REP_YIELD_MIN;
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
@@ -2327,6 +2331,9 @@ fn find_dfast(
         let mut best_m = 0usize;
         let mut best_ml = 0usize;
         if let Some(m8) = m8 {
+            if COUNT {
+                probes += 1;
+            }
             if match_ok(
                 src,
                 m8,
@@ -2345,6 +2352,9 @@ fn find_dfast(
         }
         if best_ml < 8 {
             if let Some(m4) = m4 {
+                if COUNT {
+                    probes += 1;
+                }
                 if match_ok(src, m4, ip, window, block_start, mls, tables.frame_start) {
                     let ml = count_match(src, m4, ip, block_end);
                     if ml >= mls && ml > best_ml {
@@ -2362,6 +2372,9 @@ fn find_dfast(
                 offset: (ip - best_m) as u32,
             });
             rep1 = ip - best_m;
+            if COUNT {
+                hits += 1;
+            }
             let end = ip + best_ml;
             // DFast never sets `packed` (it is gated on Strategy::Fast).
             fill_hash_after_match::<false>(tables, src, ip, end, mls, ilimit);
@@ -2378,7 +2391,28 @@ fn find_dfast(
         (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
     };
     lits.extend_from_slice(&src[anchor..block_end]);
+    note_finder_work(COUNT, probes, hits, &seqs, &lits);
     (seqs, lits)
+}
+
+/// P0/gg-matchfind: one reporting point for every finder, so `work` (candidate
+/// examinations) is defined the SAME way across arms. Finders whose probe loop
+/// lives in `chain_find_best` / `bt_find_best` pass `probes = 0` -- those
+/// helpers already reported their own via `note_probes`.
+#[inline]
+fn note_finder_work(count: bool, probes: u64, hits: u64, seqs: &[Seq], lits: &[u8]) {
+    let match_bytes: u64 = if count {
+        seqs.iter().map(|s| u64::from(s.matchlen)).sum()
+    } else {
+        0
+    };
+    crate::prof::note_search(
+        probes,
+        hits,
+        seqs.len() as u64,
+        match_bytes,
+        lits.len() as u64,
+    );
 }
 
 /// Split out for register allocation -- see brick 48 on `find_fast_impl`.
@@ -2396,6 +2430,10 @@ fn find_greedy(
     let hash_log = params.hash_log;
     let chain_mask = tables.chain.len() - 1;
     let attempts = 1usize << params.search_log.min(12);
+    // P0/gg-matchfind: work counter -- see `chain_find_best`.
+    const COUNT: bool = cfg!(feature = "profile");
+    let mut probes = 0u64;
+    let mut hits = 0u64;
     let mut seqs = Vec::new();
     let mut lits = Vec::new();
     let mut anchor = block_start;
@@ -2440,6 +2478,9 @@ fn find_greedy(
                 if !match_ok(src, m, ip, window, block_start, mls, tables.frame_start) {
                     break;
                 }
+                if COUNT {
+                    probes += 1;
+                }
                 // C's `match[ml] == ip[ml]` prefilter (`ZSTD_HcFindBestMatch`):
                 // a candidate that DIFFERS at the current best length cannot
                 // exceed it, so the full `count_match` is provably wasted. The
@@ -2463,6 +2504,9 @@ fn find_greedy(
             }
         }
         if best_ml >= mls {
+            if COUNT {
+                hits += 1;
+            }
             // DEFECT B3 FIX: back-extend the match (C's "catch up" loop in
             // `ZSTD_compressBlock_lazy_generic`). `emit_fast_seq` -- i.e.
             // fast/dfast -- has always done this; greedy and lazy never did,
@@ -2506,6 +2550,7 @@ fn find_greedy(
         (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
     };
     lits.extend_from_slice(&src[anchor..block_end]);
+    note_finder_work(COUNT, probes, hits, &seqs, &lits);
     (seqs, lits)
 }
 
@@ -2527,6 +2572,11 @@ fn chain_find_best(
     let prev = tables.get_h(h);
     tables.chain[ip & chain_mask] = prev.map(|p| p as u32).unwrap_or(0);
     tables.put_h(h, ip);
+    // P0/gg-matchfind: candidate examinations are the WORK COUNTER, the primary
+    // evidence under the Great Gate 2026-08-06 law. Compiled out entirely when
+    // the profile feature is off.
+    const COUNT: bool = cfg!(feature = "profile");
+    let mut probes = 0u64;
     let mut best_m = 0usize;
     let mut best_ml = 0usize;
     let Some(mut m) = prev else {
@@ -2535,6 +2585,9 @@ fn chain_find_best(
     for _ in 0..attempts {
         if !match_ok(src, m, ip, window, block_start, mls, tables.frame_start) {
             break;
+        }
+        if COUNT {
+            probes += 1;
         }
         // C's `match[ml] == ip[ml]` prefilter -- see `find_greedy`.
         if best_ml == 0 || src[m + best_ml] == src[ip + best_ml] {
@@ -2552,6 +2605,9 @@ fn chain_find_best(
             break;
         }
         m = next;
+    }
+    if COUNT {
+        crate::prof::note_probes(probes);
     }
     (best_m, best_ml)
 }
@@ -2700,18 +2756,10 @@ fn find_lazy(
     lits.extend_from_slice(&src[anchor..block_end]);
     let span = (block_end - block_start).max(1) as f32;
     tables.last_search_per_byte = searches as f32 / span;
-    let match_bytes: u64 = if cfg!(feature = "profile") {
-        seqs.iter().map(|s| u64::from(s.matchlen)).sum()
-    } else {
-        0
-    };
-    crate::prof::note_search(
-        searches,
-        seqs.len() as u64,
-        seqs.len() as u64,
-        match_bytes,
-        lits.len() as u64,
-    );
+    // `searches` is SEARCH POSITIONS, not candidate examinations -- reporting it
+    // as `probes` was a work-count parity break against `find_fast`. The real
+    // probe count comes from `chain_find_best` via `note_probes`, so pass 0.
+    note_finder_work(cfg!(feature = "profile"), 0, seqs.len() as u64, &seqs, &lits);
     (seqs, lits)
 }
 
@@ -2744,6 +2792,9 @@ fn bt_find_best(
         return (0, 0);
     }
     let attempts = 1usize << params.search_log.min(12);
+    // P0/gg-matchfind: work counter -- see `chain_find_best`.
+    const COUNT: bool = cfg!(feature = "profile");
+    let mut probes = 0u64;
     let mut best_ml = 0usize;
     let mut best_m = 0usize;
     for _ in 0..attempts {
@@ -2763,6 +2814,9 @@ fn bt_find_best(
         let bt_idx = (m & bt_mask) << 1;
         if bt_idx + 1 >= tables.chain.len() {
             break;
+        }
+        if COUNT {
+            probes += 1;
         }
         let ml = count_match(src, m, ip, block_end);
         if ml >= mls && ml > best_ml && offset_ok(ip - m, window) && m >= tables.frame_start {
@@ -2785,6 +2839,9 @@ fn bt_find_best(
         if smaller >= tables.chain.len() || larger >= tables.chain.len() {
             break;
         }
+    }
+    if COUNT {
+        crate::prof::note_probes(probes);
     }
     (best_m, best_ml)
 }
@@ -2902,6 +2959,8 @@ fn find_bt_lazy(
         (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
     };
     lits.extend_from_slice(&src[anchor..block_end]);
+    // Probes reported by `bt_find_best`.
+    note_finder_work(cfg!(feature = "profile"), 0, seqs.len() as u64, &seqs, &lits);
     (seqs, lits)
 }
 
@@ -3043,6 +3102,8 @@ fn find_opt(
         }
     }
     lits.extend_from_slice(&src[block_start + anchor..block_end]);
+    // Probes reported by `bt_find_best`, which the DP calls per position.
+    note_finder_work(cfg!(feature = "profile"), 0, seqs.len() as u64, &seqs, &lits);
     (seqs, lits)
 }
 
@@ -3656,6 +3717,44 @@ mod tests {
                 c.lit_bytes as f64 / b,
                 c.seqs as f64 / b,
             );
+        }
+    }
+
+    /// P0/gg-matchfind gate: the deterministic WORK COUNTER must be non-zero at
+    /// EVERY level, for every strategy. It was reported only by `find_fast` and
+    /// `find_lazy`, so `work` -- the PRIMARY evidence under the Great Gate
+    /// 2026-08-06 law -- did not exist for levels 2-22 and no gate on them could
+    /// be banked. Needs `--features profile`.
+    #[cfg(feature = "profile")]
+    #[test]
+    fn work_counter_covers_every_strategy() {
+        let Ok(src) = std::fs::read("../../corpora/data/silesia/xml") else {
+            return; // corpus absent
+        };
+        // one level per strategy: fast, dfast, greedy, lazy, lazy2, btlazy2, btopt, btultra
+        for (lvl, strat) in [
+            (1, "fast"),
+            (3, "dfast"),
+            (5, "greedy"),
+            (7, "lazy"),
+            (9, "lazy2"),
+            (13, "btlazy2"),
+            (17, "btopt"),
+            (19, "btultra"),
+        ] {
+            crate::prof::reset();
+            let _ = crate::compress(&src, lvl).unwrap();
+            let c = crate::prof::encode_counts();
+            println!(
+                "WORK L{lvl:<2} {strat:<8} probes={:<12} hits={:<10} seqs={:<10}",
+                c.hash_probes, c.probe_hits, c.seqs
+            );
+            assert!(
+                c.hash_probes > 0,
+                "L{lvl} ({strat}) reported ZERO probes -- the work counter is \
+                 missing for this strategy, so no gate on it is bankable"
+            );
+            assert!(c.seqs > 0, "L{lvl} ({strat}) reported zero sequences");
         }
     }
 

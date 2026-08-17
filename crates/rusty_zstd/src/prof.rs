@@ -209,6 +209,14 @@ mod on {
         HASH_FILLS.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Candidate examinations only, for finders whose probe loop lives in a
+    /// shared helper (`chain_find_best`, `bt_find_best`). Those helpers report
+    /// their own work; their callers then pass `probes = 0` to `note_search`
+    /// so the count is not doubled.
+    pub fn note_probes(n: u64) {
+        HASH_PROBES.fetch_add(n, Ordering::Relaxed);
+    }
+
     pub fn note_search(probes: u64, hits: u64, seqs: u64, match_bytes: u64, lit_bytes: u64) {
         HASH_PROBES.fetch_add(probes, Ordering::Relaxed);
         PROBE_HITS.fetch_add(hits, Ordering::Relaxed);
@@ -402,6 +410,9 @@ mod off {
     pub fn note_hash_fill(_n: u64) {}
 
     #[inline(always)]
+    pub fn note_probes(_n: u64) {}
+
+    #[inline(always)]
     pub fn note_search(_p: u64, _h: u64, _s: u64, _m: u64, _l: u64) {}
 
     #[inline(always)]
@@ -463,7 +474,8 @@ mod off {
 pub use on::{
     dump, encode_counts, note_back_ext, note_block_tap, note_checksum_bytes, note_comp_block,
     note_early_raw, note_emit_lit, note_emit_seq, note_hash_fill, note_huff_path, note_lit_try, note_raw_block,
-    note_rle_block, note_scratch, note_search, note_seq_mode, note_tables, reset, scope,
+    note_probes, note_rle_block, note_scratch, note_search, note_seq_mode, note_tables, reset,
+    scope,
     take_block_taps,
 };
 
@@ -471,7 +483,8 @@ pub use on::{
 pub use off::{
     dump, encode_counts, note_back_ext, note_block_tap, note_checksum_bytes, note_comp_block,
     note_early_raw, note_emit_lit, note_emit_seq, note_hash_fill, note_huff_path, note_lit_try, note_raw_block,
-    note_rle_block, note_scratch, note_search, note_seq_mode, note_tables, reset, scope,
+    note_probes, note_rle_block, note_scratch, note_search, note_seq_mode, note_tables, reset,
+    scope,
     take_block_taps,
 };
 
