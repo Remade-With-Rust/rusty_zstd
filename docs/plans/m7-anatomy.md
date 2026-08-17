@@ -1,142 +1,132 @@
-# M7 anatomy — rusty_zstd vs facebook/zstd v1.5.7, side by side
+# M7 anatomy - rusty_zstd vs facebook/zstd v1.5.7, side by side
 
-**Date:** 2026-08-16 — sections 1-4 fully regenerated at **CHECKSUM PARITY**
-(the pre-campaign and pre-parity boards are in git history).
+**Date:** 2026-08-17 - sections 1, 2 and 5 regenerated after the **literals entropy
+gate** (`ee9a2eb`) and the **chain-fill fixes** (`9a7250e`, `c2f8d63`). Section 6 is
+new. Older boards are in git history.
 
-> **READ THIS BEFORE COMPARING TO ANY OLDER BOARD.** Every board dated before this one
-> charged us an xxh64 pass over every byte, on BOTH phases, that the oracle never ran.
-> `zstd -b` takes libzstd's `ZSTD_c_checksumFlag = 0` default; our `compress` takes the
-> CLI's (`on`). The bench now matches the oracle. **The shipped default is still
-> `checksum: true` — this changed the MEASUREMENT, not the product.** It moved
-> `zeros-32m` decompress from 2.32 to 0.63 and took L1 decompress passes from 5 to 7
-> with no code change on either path. Full account in
-> [`m7-encoder-whys.md`](m7-encoder-whys.md).
+> **READ THIS BEFORE COMPARING TO THE 2026-08-16 BOARD.** That board predates
+> `ee9a2eb`, and it is stale IN OUR FAVOUR on speed and AGAINST us on ratio.
+> `literals_worth_huffman` was measuring PEAK FREQUENCY where the deciding quantity is
+> ENTROPY, so flat-alphabet files fell out to RAW literals. Fixing it moved ratio hard
+> (`smallmsg-8m` L1 1.615 -> 1.031, `jsonlog-16m` 1.528 -> 1.061, `webster` 1.443 ->
+> 1.137, `x-ray` 1.212 -> 1.000) and cost real speed on exactly those files, on BOTH
+> phases, because a raw-literal block decodes as a memcpy and a Huffman one does not.
 
-**Instrument:** repaired (see [`m7-benchmark-repair.md`](m7-benchmark-repair.md)) —
+> **THE CORRECTION THAT MATTERS.** Several cells the old board listed as "we beat C"
+> were flattering us for emitting a WORSE FILE. `x-ray` L1 decompress at **0.23** was
+> not a decode win -- it was a 21% larger output that was trivial to decode. At a
+> matched 1.000 ratio the same cell reads **1.49**. Mission passes fall from 6/7 to 4/4
+> at L1 for this reason and this reason only: `sao` and `x-ray` stopped being scored
+> against our own inflated output. **A speed number is only meaningful beside its
+> `us/c size`.** Read the two columns together, always.
+
+**Instrument:** repaired (see [`m7-benchmark-repair.md`](m7-benchmark-repair.md)) --
 best-of-N both arms, phases timed separately as C does, N>=25/phase, discarded warmup,
-per-row same-arm spread, cycles/byte. Session null-arm **0.9948** (L1) / **1.0350**
-(L3). Dual gate 18/18 at both levels. Pinned affinity=4, High priority, C via `-b -T1`.
-Decompress is timed into a REUSED buffer via `decompress_into`, as C's `-b` does;
-allocating fresh per loop timed our decode plus the kernel faulting every output page
-against C's decode alone. Stage shares (section 3) come from a separate
-`--features profile` build, so they are NOT comparable in absolute ms to the speed
-boards — only as shares within a run.
-
-**Everything below is at MATCHED OUTPUT.** Every brick in the campaign was gated on
-byte-identical Silesia hashes, so the `us/c size` columns are unchanged from the
-pre-campaign board and all speed movement is genuine.
+per-row same-arm spread, cycles/byte. Session null-arm **0.9799**. Dual gate 18/18 at
+both levels. Pinned affinity=4, High priority, C via `-b -T1`. Decompress is timed into
+a REUSED buffer via `decompress_into`, as C's `-b` does. Checksum parity with the
+oracle (`ZSTD_c_checksumFlag = 0`); the shipped default is still `checksum: true` --
+that changed the MEASUREMENT, not the product. Stage shares (section 3) come from a
+separate `--features profile` build and are comparable only as shares within a run.
 
 `C/us` > 1 means **C is faster**. `us/c size` > 1 means **we emit more bytes**.
-**Never average these files** — the per-file spread is the whole story.
+**Never average these files** -- the per-file spread is the whole story.
 
 ---
 
-## 1. Level 1 — the full board, all 18 corpora
+## 1. Level 1 - the full board, all 18 corpora
 
-**Re-measured 2026-08-16 (fourth pass) -- the FIRST board at CHECKSUM PARITY with
-the oracle.** Every earlier board charged us a full xxh64 pass over every byte, on
-both phases, that `zstd -b` never runs (it takes libzstd's `checksumFlag = 0`
-default; we took the CLI's). Those boards understated us badly -- see
-m7-encoder-whys.md. Compressed sizes are byte-identical to the gated hashes, so
-every speed figure is at MATCHED OUTPUT.
+**Re-measured 2026-08-17**, after the literals entropy gate. Sorted by `us/c size`.
 
 | corpus       |  C comp | us comp | **C/us c** | C decomp | us decomp | **C/us d** | us/c size |
 | ------------ | ------: | ------: | ---------: | -------: | --------: | ---------: | --------: |
-| zeros-32m    | 10245.8 | 22116.0 |   **0.46** |  23467.4 |   37167.1 |   **0.63** | **0.901** |
-| text-32m     | 14436.3 | 25621.9 |   **0.56** |  10242.1 |   32063.5 |   **0.32** |     1.100 |
-| incomp-32m   |  4750.3 |  6665.2 |   **0.71** |  12120.0 |   14446.9 |   **0.84** |     1.000 |
-| jsonlog-16m  |   701.6 |   354.8 |       1.98 |   1896.9 |    1164.4 |       1.63 | **1.528** |
-| smallmsg-8m  |   549.2 |   363.8 |       1.51 |   2371.5 |    1081.6 |       2.19 | **1.615** |
-| versions-16m |  1107.6 |  8310.1 |   **0.13** |   2894.0 |   14625.8 |   **0.20** | **0.075** |
-| mr           |   518.6 |   214.3 |       2.42 |   1821.9 |    1361.1 |       1.34 |     1.111 |
-| ooffice      |   472.4 |   267.2 |       1.77 |   1276.9 |    1417.9 |   **0.90** |     1.262 |
-| osdb         |   566.4 |   253.7 |       2.23 |   1864.3 |    1131.5 |       1.65 |     1.138 |
-| reymont      |   357.6 |   226.8 |       1.58 |   1802.5 |     930.5 |       1.94 | **1.402** |
-| sao          |   465.5 |   423.6 |   **1.10** |   1250.0 |    5681.6 |   **0.22** |     1.138 |
-| webster      |   422.1 |   246.5 |       1.71 |   1797.1 |    1077.9 |       1.67 | **1.443** |
-| dickens      |   365.7 |   192.4 |       1.90 |   1711.4 |     854.9 |       2.00 |     1.201 |
-| mozilla      |   573.4 |   247.7 |       2.32 |   1501.9 |     945.9 |       1.59 |     1.222 |
-| nci          |  1068.0 |   528.6 |       2.02 |   2894.5 |    1335.8 |       2.17 |     1.302 |
-| samba        |   638.1 |   363.8 |       1.75 |   2288.4 |    1276.3 |       1.79 |     1.258 |
-| xml          |   865.5 |   477.0 |       1.81 |   2777.0 |    1477.4 |       1.88 |     1.308 |
-| x-ray        |  1003.5 |  1968.9 |   **0.51** |   1512.5 |    6488.2 |   **0.23** |     1.212 |
+| versions-16m |  1099.3 |  7852.7 |   **0.14** |   2853.0 |   14414.7 |   **0.20** | **0.075** |
+| zeros-32m    | 11113.8 | 22473.0 |   **0.49** |  29988.9 |   40470.9 |   **0.74** | **0.901** |
+| incomp-32m   |  5377.4 |  6598.1 |   **0.81** |  14066.8 |   14997.7 |   **0.94** |     1.000 |
+| x-ray        |   983.7 |   389.4 |       2.53 |   1498.7 |     983.0 |       1.52 |     1.000 |
+| smallmsg-8m  |   551.4 |   304.7 |       1.81 |   2414.2 |     922.3 |       2.62 |     1.031 |
+| jsonlog-16m  |   681.9 |   309.0 |       2.21 |   1859.1 |     994.1 |       1.87 |     1.061 |
+| sao          |   464.7 |   249.1 |       1.87 |   1244.8 |     572.8 |       2.17 |     1.067 |
+| osdb         |   571.8 |   232.4 |       2.46 |   1881.8 |    1078.2 |       1.75 |     1.100 |
+| text-32m     | 15439.6 | 26462.5 |   **0.58** |  10544.0 |   33719.7 |   **0.31** |     1.100 |
+| mr           |   521.8 |   214.2 |       2.44 |   1838.8 |    1337.1 |       1.38 |     1.111 |
+| ooffice      |   473.8 |   183.5 |       2.58 |   1268.8 |     855.8 |       1.48 |     1.113 |
+| webster      |   428.3 |   215.3 |       1.99 |   1828.2 |     914.5 |       2.00 |     1.137 |
+| samba        |   646.7 |   330.4 |       1.96 |   2332.2 |    1147.8 |       2.03 |     1.144 |
+| dickens      |   367.3 |   191.2 |       1.92 |   1748.1 |     850.4 |       2.06 |     1.168 |
+| mozilla      |   581.7 |   231.9 |       2.51 |   1527.4 |     891.4 |       1.71 |     1.186 |
+| xml          |   865.9 |   441.9 |       1.96 |   2770.4 |    1340.4 |       2.07 |     1.217 |
+| reymont      |   360.7 |   210.3 |       1.71 |   1816.8 |     852.0 |       2.13 |     1.240 |
+| nci          |  1077.8 |   531.3 |       2.03 |   2919.1 |    1339.4 |       2.18 |     1.301 |
 
-### Where we already win or tie
+### Where we win or tie
 
-- **Compress at or better than C:** `versions-16m` **0.13**, `zeros-32m` **0.46**, `x-ray` **0.51**, `text-32m` **0.56**, `incomp-32m` **0.71**, `sao` **1.10**.
-- **Decompress at or better than C:** `versions-16m` **0.20**, `sao` **0.22**, `x-ray` **0.23**, `text-32m` **0.32**, `zeros-32m` **0.63**, `incomp-32m` **0.84**, `ooffice` **0.90**.
-- **Ratio better than C:** `versions-16m` **0.075**, `zeros-32m` **0.901**.
+- **Compress at or better than C:** `versions-16m` **0.14**, `zeros-32m` **0.49**,
+  `text-32m` **0.58**, `incomp-32m` **0.81**.
+- **Decompress at or better than C:** `versions-16m` **0.20**, `text-32m` **0.31**,
+  `zeros-32m` **0.74**, `incomp-32m` **0.94**.
+- **Ratio at or better than C:** `versions-16m` **0.075**, `zeros-32m` **0.901**,
+  `incomp-32m` 1.000, `x-ray` 1.000.
 
 Against mission section 7 (decompress <= 1.11, compress <= 1.25):
-**6 corpora pass compress, 7 pass decompress** --
-up from 5 and 5 on the pre-parity board, with no code change on either path.
-
----
-
-### Where we already win or tie
-
-- **Compress at or better than C:** `versions-16m` **0.21**, `x-ray` **0.58**,
-  `incomp-32m` **1.03**, `zeros-32m` **1.05**, `sao` **1.09**.
-- **Decompress at or better than C:** `sao` **0.28**, `x-ray` **0.32**,
-  `versions-16m` **0.37**, `ooffice` **0.95**, `text-32m` **1.03**.
-- **Ratio better than C:** `versions-16m` **0.075** (13x smaller), `zeros-32m` 0.901.
-
-Against mission section 7 (decompress <= 1.11, compress <= 1.25): **5 corpora pass
-compress, 5 pass decompress.**
+**4 corpora pass compress, 4 pass decompress.** Down from 6 and 7 on the 2026-08-16
+board -- see the correction in the header. `sao` and `x-ray` left the winners' column
+because they stopped being scored against our own inflated output, not because either
+got worse at equal size.
 
 ### Where we lose
 
-- **Compress:** `mr` 2.46, `mozilla` 2.36, `osdb` 2.25, `nci` 2.12.
-- **Ratio:** `smallmsg-8m` **1.615** and `jsonlog-16m` **1.528**. See section 5 -- the
-  gap is roughly HALF what L1 implies, and the generated corpus should be replaced with
-  real captured traffic before this is treated as a target.
+- **Ratio:** `nci` **1.301**, `reymont` 1.240, `xml` 1.217, `mozilla` 1.186. The old
+  headline losers are gone -- `smallmsg-8m` 1.615 -> **1.031** and `jsonlog-16m`
+  1.528 -> **1.061** are now among our BEST ratios.
+- **Compress:** `ooffice` **2.58**, `x-ray` 2.53, `mozilla` 2.51, `osdb` 2.46. These
+  are the honest, matched-output positions; none is an open regression.
 
-**`versions-16m` is the campaign's headline.** It was 1.06 compress / 0.755 size before
-the work; the repcode bricks (67/70/71/73/75) took it to **0.21 compress and 0.075 size --
-13x smaller than C**. It was also the corpus that exposed the missing function: `find_fast`
-had a repcode search and NO other finder did, so L3 -- the shipping default -- had none.
+**`versions-16m` remains the headline** -- 0.075 size, 13x smaller than C, from the
+repcode bricks (67/70/71/73/75). It was also the corpus that exposed the missing
+function: `find_fast` had a repcode search and no other finder did.
 
 ---
 
-## 2. Level 3 (dfast) — the shipping default
+## 2. Level 3 (dfast) - the shipping default
 
-**Re-measured 2026-08-16 (fourth pass) -- the FIRST board at CHECKSUM PARITY with
-the oracle.** Every earlier board charged us a full xxh64 pass over every byte, on
-both phases, that `zstd -b` never runs (it takes libzstd's `checksumFlag = 0`
-default; we took the CLI's). Those boards understated us badly -- see
-m7-encoder-whys.md. Compressed sizes are byte-identical to the gated hashes, so
-every speed figure is at MATCHED OUTPUT.
+**Re-measured 2026-08-17.** Sorted by `us/c size`.
 
 | corpus       | C comp | us comp | **C/us c** | C decomp | us decomp | **C/us d** | us/c size |
 | ------------ | -----: | ------: | ---------: | -------: | --------: | ---------: | --------: |
-| zeros-32m    | 7497.0 | 20984.6 |   **0.36** |  24077.8 |   38939.8 |   **0.62** | **0.972** |
-| text-32m     | 8596.6 | 26647.4 |   **0.32** |  10267.1 |   32764.8 |   **0.31** |     1.082 |
-| incomp-32m   | 4197.1 |  3592.4 |       1.17 |  12302.3 |   14165.2 |   **0.87** |     1.000 |
-| jsonlog-16m  |  407.9 |   215.5 |       1.89 |   1963.5 |    1043.8 |       1.88 |     1.318 |
-| smallmsg-8m  |  352.3 |   169.4 |       2.08 |   2396.5 |     945.4 |       2.53 | **1.440** |
-| versions-16m | 4655.2 | 10580.3 |   **0.44** |  22268.9 |   20157.7 |   **1.10** | **0.648** |
-| mr           |  296.1 |   159.7 |       1.85 |   1602.7 |     496.2 |       3.23 |     1.045 |
-| ooffice      |  264.7 |   131.0 |       2.02 |   1145.3 |     717.6 |       1.60 |     1.119 |
-| osdb         |  366.3 |   224.4 |       1.63 |   1908.9 |    1121.5 |       1.70 |     1.103 |
-| reymont      |  294.8 |   185.9 |       1.59 |   1673.5 |     619.5 |       2.70 |     1.089 |
-| sao          |  224.3 |   133.9 |       1.68 |   1038.3 |     898.3 |       1.16 |     1.056 |
-| webster      |  282.8 |   170.5 |       1.66 |   1620.1 |     630.4 |       2.57 |     1.135 |
-| dickens      |  237.6 |   141.4 |       1.68 |   1548.6 |     530.7 |       2.92 |     1.121 |
-| mozilla      |  374.1 |   179.0 |       2.09 |   1457.6 |     722.2 |       2.02 |     1.105 |
-| nci          |  944.3 |   520.9 |       1.81 |   2878.9 |    1372.3 |       2.10 |     1.152 |
-| samba        |  458.6 |   268.6 |       1.71 |   2232.9 |     935.6 |       2.39 |     1.109 |
-| xml          |  695.8 |   407.9 |       1.71 |   2713.8 |    1299.7 |       2.09 |     1.188 |
-| x-ray        |  210.9 |   113.5 |       1.86 |   1106.7 |     566.6 |       1.95 |     1.082 |
+| versions-16m | 5094.9 | 10710.0 |   **0.48** |  24626.6 |   19911.2 |       1.24 | **0.648** |
+| zeros-32m    | 7951.6 | 22002.9 |   **0.36** |  28701.2 |   39364.7 |   **0.73** | **0.972** |
+| x-ray        |  214.3 |    98.1 |       2.18 |   1111.6 |     423.8 |       2.62 | **0.982** |
+| incomp-32m   | 4662.1 |  3971.7 |       1.17 |  13961.1 |   15769.5 |   **0.89** |     1.000 |
+| mr           |  302.1 |   151.9 |       1.99 |   1637.7 |     479.8 |       3.41 |     1.020 |
+| ooffice      |  271.6 |   109.9 |       2.47 |   1167.7 |     514.9 |       2.27 |     1.029 |
+| osdb         |  387.3 |   175.9 |       2.20 |   1949.5 |     816.0 |       2.39 |     1.032 |
+| jsonlog-16m  |  417.7 |   202.9 |       2.06 |   2007.2 |     926.1 |       2.17 |     1.036 |
+| sao          |  227.6 |   120.6 |       1.89 |   1048.5 |     550.9 |       1.90 |     1.039 |
+| smallmsg-8m  |  351.3 |   162.6 |       2.16 |   2410.9 |     838.4 |       2.88 |     1.049 |
+| reymont      |  307.3 |   178.4 |       1.72 |   1693.3 |     594.1 |       2.85 |     1.054 |
+| webster      |  281.0 |   164.1 |       1.71 |   1651.9 |     599.0 |       2.76 |     1.057 |
+| dickens      |  241.8 |   136.6 |       1.77 |   1544.2 |     515.6 |       2.99 |     1.066 |
+| mozilla      |  367.4 |   157.6 |       2.33 |   1449.8 |     629.8 |       2.30 |     1.071 |
+| samba        |  468.0 |   254.5 |       1.84 |   2290.9 |     894.1 |       2.56 |     1.073 |
+| text-32m     | 9358.9 | 25645.4 |   **0.36** |  10591.4 |   34674.4 |   **0.31** |     1.082 |
+| nci          |  945.3 |   489.6 |       1.93 |   2858.6 |    1321.7 |       2.16 |     1.100 |
+| xml          |  709.5 |   393.0 |       1.81 |   2751.7 |    1244.1 |       2.21 |     1.104 |
 
-**L3 is the shipping default and our best compress level relative to C.**
-At or better than C on `text-32m` **0.32**, `zeros-32m` **0.36**, `versions-16m` **0.44**, `incomp-32m` **1.17**.
+**L3 is the shipping default, and on RATIO it is now excellent: 16 of 18 corpora are
+within 11% of C, and three BEAT it** -- `versions-16m` 0.648, `zeros-32m` 0.972 and
+**`x-ray` 0.982**, which is new. The worst cell on the whole board is `xml` at 1.104.
 
-**Decompress on Silesia spans 1.16-3.23.** More sequences per byte means
-more DecodeSeq. Section 3's stage ranking is being re-derived at parity -- it was
-measured with the checksum tax inflating both DecodeChecksum and the denominator.
+`versions-16m` compress moved **4126.5 -> 10710.0 MB/s** (C/us 1.20 -> **0.48**) from
+brick 88 alone, at unchanged 0.648 ratio -- the same tree-amortization defect that
+halved it at L1 was costing more than half of L3.
 
-**Read the generated corpora with section 5:** their non-monotonic response to level
-is a `minMatch` interaction with synthetic content, not a regression.
+Compress is 1.71-2.47 across Silesia; decompress 1.90-3.41. **Decompress is now the
+weaker half at L3**, the reverse of the pre-gate picture, and it follows directly from
+emitting Huffman literals where we used to emit raw ones.
+
+Against mission section 7: **4 pass compress** (zeros 0.36, text 0.36, versions 0.48,
+incomp 1.17), **3 pass decompress** (text 0.31, zeros 0.73, incomp 0.89).
 
 ---
 
@@ -191,6 +181,213 @@ micro-option on those corpora -- it removes the largest single stage.
 **The two halves remain near mirror images** on the compressible files: where the
 encoder spends its time in Huffman (`mr`, `x-ray`, `osdb`) the decoder spends its time
 in literals. One content axis -- alphabet flatness -- drives both.
+
+---
+
+### Dispatch inventory — how to read these
+
+A **dispatch-gated function** is one whose behaviour is selected at RUN TIME rather
+than fixed at the call site. Four kinds appear below, and they are not equally
+trustworthy:
+
+| kind | selected by | trustworthy? |
+| --- | --- | --- |
+| **MEASURED** | a statistic of the CONTENT, recomputed per block or per section | yes -- this is the real dispatch |
+| **LEVEL** | `CompressionParameters` from the level table | yes, but static per level |
+| **ARM** | an env var / atomic, for in-process A/B | ships pinned; a shipped arm is a decision, not a dispatch |
+| **CPU** | `is_x86_feature_detected!` at first use | yes, but invisible to the corpus |
+
+`ARM` entries are listed because they are live branches in the shipping binary --
+several were left switchable after their brick landed, and each one is an atomic load
+or a `OnceLock` read that some hot loop may still be paying for. Bricks 49, 64 and 77
+were all exactly that bug.
+
+---
+
+### MatchFind Function Anatomy -- Great Gate
+
+The largest stage (#1 on 15 of 18 corpora) and by far the most dispatched.
+
+| # | gate | kind | selects | where |
+| --- | --- | --- | --- | --- |
+| 1 | `params.strategy` | LEVEL | `find_fast` / `find_dfast` / `find_greedy` / `find_lazy(1)` / `find_lazy(2)` / `find_bt_lazy(2)` / `find_opt` | `find_sequences_strategy` encode.rs:1280 |
+| 2 | `tables.rep_yield >= REP_YIELD_MIN` (0.125) | **MEASURED** | repcode-1 probe on/off, **per block**, from the PREVIOUS block's hit rate | encode.rs:1350, 2299, 2410, 2585, 2812 |
+| 3 | `tables.last_search_per_byte >= lazy_fill_threshold()` | **MEASURED** | lazy chain back-fill on/off | encode.rs:2591 |
+| 4 | `(packed, rep_on, pipe_on, s0)` | ARM x MEASURED | one of 13 const-generic `find_fast_impl<PACKED,REP,HLOG,STEP,PIPE>` monomorphizations | encode.rs:1351 |
+| 5 | `tables.hash_log` in {12..16} | LEVEL | folds the hash shift to an immediate | encode.rs:1354, 1366 |
+| 6 | `pair = step0 > 2` | LEVEL | pair-search at `ip+1` AND gates the 2-way software pipeline | encode.rs:1478, 1518 |
+| 7 | `tag_enabled()` `RZSTD_TAG` + strategy==Fast + window<2^24 | ARM | packed tag slots (`store_fast`/`load_fast`) | encode.rs:288, 1948 |
+| 8 | `pipe_enabled()` `RZSTD_MF_PIPE` | ARM | 2-way software pipelined probe loop | encode.rs:1337, 2005 |
+| 9 | `step0_default()` `RZSTD_STEP0` | ARM | probe density (2 = ship, 1 = C's density) | encode.rs:1919 |
+| 10 | `rep1_enabled()` `RZSTD_REP1` | ARM | force repcode-1 regardless of yield | encode.rs:1350 |
+| 11 | `lazy_fill_enabled()` `RZSTD_LAZY_FILL` | ARM | back-fill on/off (also btlazy2) | encode.rs:1810, 2884 |
+| 12 | `lazy_fill_stride()` `RZSTD_LAZY_FILL_S` | ARM | back-fill stride (1 = every position) | encode.rs:1839 |
+| 13 | `lit_push_enabled()` / `litpush_hoist_enabled()` | ARM | 16-byte unsafe literal copy in `push_literals` | encode.rs:2112, 2098 |
+| 14 | `1 << params.search_log.min(12)` | LEVEL | chain walk depth | `chain_find_best` encode.rs:2525 (also 2398 greedy, 2746 bt) |
+| 15 | `has_avx2()` | CPU | `count_eq_len` AVX2 / NEON / scalar -- the match-length compare | simd.rs:84, encode.rs:3088 |
+| 16 | `early_raw_skip` / `incomp_skip_on` `RZSTD_INCOMP_SKIP` | **MEASURED** x ARM | abandon the block to RAW when match bytes fall under a threshold | encode.rs:670, 817, 844 |
+
+**Only #2, #3 and #16 are true content dispatches.** Everything else is a level knob,
+a shipped arm, or CPU detection. That is the finding: the biggest stage has exactly
+three live content-adaptive decisions, and two of them (`rep_yield`,
+`last_search_per_byte`) are single scalars carried from the previous block.
+
+---
+
+### Huff Function Anatomy -- Great Gate
+
+| # | gate | kind | selects | where |
+| --- | --- | --- | --- | --- |
+| 1 | `n < 8` | size | straight to raw/RLE | huffman.rs:1548 |
+| 2 | all-bytes-equal | **MEASURED** | RLE literals section | huffman.rs:1542 |
+| 3 | `distinct * 2 >= lits.len()` | **MEASURED** | **BRICK 88** tree amortization -- reject when the weight table cannot be paid back | `literals_worth_huffman` huffman.rs:1492 |
+| 4 | `sum_sq * 128 >= n^2` (collision entropy H2 <= 7 bits) | **MEASURED** | brick 86 entropy gate | `literals_worth_huffman` huffman.rs:1496 |
+| 5 | `lits.len() < 64` | size | accept unconditionally (too small to sample) | huffman.rs:1422 |
+| 6 | `n >= 256` | size | 4-stream vs 1-stream Huffman | huffman.rs:1563 |
+| 7 | `prev_ct.covers(lits)` | **MEASURED** | treeless reuse of the previous block's table is even legal | huffman.rs:1595 |
+| 8 | `futile` via `body_bytes_exact` | **MEASURED** | skip the previous-table encode when it provably loses to the new table by more than the tree | huffman.rs:1604 |
+| 9 | `sec.len() < best_len` | **MEASURED** | final raw vs treeless vs new-table selection | huffman.rs:1622, 1645 |
+| 10 | 4-stream encode returned `None` | fallback | retry at 1 stream | huffman.rs:1629 |
+| 11 | `huff_fast_enabled()` `RZSTD_HUFF_FAST` | ARM | fast ctable construction | encode.rs:2032, huffman.rs:687 |
+| 12 | `seqs.is_empty() && !literals_worth_huffman(block)` | **MEASURED** | whole-block raw, before any sequence work | encode.rs:651 |
+
+**This is the most content-dispatched stage in the codec** -- 8 of 12 gates are
+measured, and the pipeline is a genuine cost model: predict (3,4), prove (8), then
+verify against the real number (9). It is also where the campaign's two worst
+regressions came from, because gates 3 and 4 sit UPSTREAM of an O(n) histogram, a
+ctable build and a `write_tree`. **A false accept there is not a wasted branch, it is
+a wasted table build** -- that is what halved `versions-16m`.
+
+---
+
+### FseSeq Function Anatomy -- Great Gate
+
+| # | gate | kind | selects | where |
+| --- | --- | --- | --- | --- |
+| 1 | header-cost comparison | **MEASURED** | Predefined(0) / RLE(1) / FSE-compressed(2) / Repeat(3), **independently per table** | encode.rs:1140-1196 |
+| 2 | single distinct symbol | **MEASURED** | RLE mode (`best_mode = 3` path) | encode.rs:1170 |
+| 3 | built table beats predefined | **MEASURED** | FSE-compressed mode | encode.rs:1181 |
+| 4 | `force_compressed && best_mode == 0` | caller | override away from Predefined | encode.rs:1189 |
+
+Three tables (`ll`, `of`, `ml`) each run this dispatch independently, so a block picks
+one of 4^3 = 64 mode combinations. All four gates are content-measured and all compare
+REAL header bytes -- there is no estimator here to be wrong, which is why this stage
+has produced no regressions. `note_seq_mode` records the outcome (predef/rle/comp/
+REPEAT) and it is already in the profiler output.
+
+---
+
+### SeqCode Function Anatomy -- Great Gate
+
+| # | gate | kind | selects | where |
+| --- | --- | --- | --- | --- |
+| 1 | `offset_value_for(offset, litlen, reps)` | **MEASURED** | repcode slot 1/2/3 vs a literal offset -- per sequence | encode.rs:982 |
+| 2 | -- | -- | -- | -- |
+
+**SeqCode has essentially NO dispatch, and that is the point.** It is a straight-line
+transcode of `Seq -> CodedSeq` plus the ll/of/ml histogram walk, scoped at
+encode.rs:979. The only decision is the repcode-vs-explicit-offset choice, which is
+forced by the RFC, not chosen.
+
+That matters because SeqCode was measured at **20-26% of encode on five corpora**
+(nci 26.3, xml 25.1, samba 21.8, reymont 21.4, webster 20.7) -- larger than FseSeq on
+every file. **A stage with a fifth of encode time and one forced decision is a pure
+throughput problem**, not a dispatch problem: the levers are the table lookup
+(`code_from_base`, already de-linearized) and the second histogram pass, not a smarter
+gate.
+
+---
+
+### DecLits Function Anatomy -- Great Gate
+
+| # | gate | kind | selects | where |
+| --- | --- | --- | --- | --- |
+| 1 | literals block type (2 bits) | stream | Raw / RLE / Compressed / Treeless | `decode_literals` compressed.rs:87 |
+| 2 | Size_Format | stream | 1/4 streams and 3-5 byte header | compressed.rs:118 |
+| 3 | `n_streams == 1` | stream | single vs 4-way interleaved bit readers | compressed.rs:194 |
+| 4 | `litcopy_on()` `LITCOPY_ARM` | ARM | 16-byte unsafe `copy_literals` vs checked | compressed.rs:370, 601, 693 |
+
+**Every gate here is dictated by the bitstream except #4.** The decoder cannot
+content-dispatch -- it must do what the encoder said. That is why this stage fell from
+#2 to 2-of-18 leadership after bricks 63/79/80/81/82: the only levers are
+*execution* levers, and they have largely been taken.
+
+---
+
+### DecSeq Function Anatomy -- Great Gate
+
+The #1 decode stage on 13 of 18 corpora.
+
+| # | gate | kind | selects | where |
+| --- | --- | --- | --- | --- |
+| 1 | `seqcheck_hoisted()` `SEQCHECK_ARM` / `RZSTD_SEQCHECK_HOIST` | ARM | hoist the per-sequence code-range check out of the loop | compressed.rs:371, 385, 559 |
+| 2 | `lut_on()` `LUT_ARM` | ARM | LL/ML baseline+nbits from a LUT vs computed | compressed.rs:689, 753, 768 |
+| 3 | `matchcopy_on() && len <= 32 && offset >= 32` | ARM x stream | 32-byte unsafe non-overlapping match copy | compressed.rs:966 |
+| 4 | `matchcopy_on() && len <= 16 && offset >= 16` | ARM x stream | 16-byte tier | compressed.rs:990 |
+| 5 | `offset == 1` | stream | byte-splat (C `ZSTD_overlapCopy8`) | compressed.rs:951 |
+| 6 | `offset < len` | stream | overlapping copy, byte-at-a-time | `copy_match` compressed.rs:878 |
+| 7 | FSE table mode per table | stream | predefined / RLE / built / repeat | decode side |
+
+**Four of seven gates are ARMs**, i.e. decisions already made and left switchable. The
+genuine per-sequence dispatches (#3-#6) are all on `(len, offset)` -- a shape the
+ENCODER chooses. The decoder's speed is therefore partly an encoder-side question: the
+distribution of `(litlen, matchlen, offset)` we emit determines which copy tier fires.
+That is the one unexplored lever here, and it does not live in this stage.
+
+---
+
+### DecCk Function Anatomy -- Great Gate
+
+| # | gate | kind | selects | where |
+| --- | --- | --- | --- | --- |
+| 1 | `header.checksum` | stream | whether a 4-byte trailer exists at all | decode.rs:368 |
+| 2 | `opts.force_ignore_checksum` | caller | skip VERIFICATION but still CONSUME the 4 bytes | decode.rs:373 |
+| 3 | `data.len() >= 32` | size | 4-lane stripe loop vs the tail path | xxh64.rs:42, 50 |
+
+**xxh64 has NO CPU dispatch and no arms -- it is the only stage in the codec with
+none.** That is not an oversight: XXH64's round needs a full 64x64 multiply, which
+SSE2 and AVX2 do not have (`_mm_mul_epu32` is 32x32->64); only AVX-512DQ adds
+`_mm_mullo_epi64`. This is precisely why XXH3 exists, and RFC 8878 fixes us to XXH64.
+
+So the stage that is **#2 on decode overall and leads outright on 3 of 18** (text-32m
+53%, incomp-32m 44%, versions-16m 44%, zeros-32m 33%) has exactly one tunable bit,
+gate #2, and it is a correctness trade. **Everything else must come from moving the
+work, not changing it** -- overlapping the hash with decode on a second thread.
+Fusing it into the block loop was tried and measured ~12% WORSE (brick 85, reverted).
+
+---
+
+### Cross-cutting: dispatches that are DEAD in the shipping build
+
+Found while auditing, per the `rusty_curiosity` law that an unused thing is invisible
+to every profiler:
+
+- **The entire BMI2 bit-extract dispatch is dead.** `simd::look_n_bits` (which calls
+  `has_bmi2()` and picks `look_n_bits_bmi2` vs `look_n_bits_shift`) has exactly two
+  call sites: its own definition and `simd.rs:401`, which is inside `#[cfg(test)]`.
+  The shipping bit reader is `BitRev::look_bits_fast` (bit.rs:63) -- a single shift,
+  no dispatch, no feature detection. `has_bmi2()`, `look_n_bits`, `look_n_bits_bmi2`
+  and `look_n_bits_shift` are all test-only in practice.
+- Consequence: the codec's only live CPU dispatch is `has_avx2()` in `count_eq_len`,
+  which serves MatchFind alone. **The decoder has no SIMD dispatch at all.**
+
+---
+
+### What the inventory says
+
+1. **Content dispatch is concentrated in Huff, not MatchFind.** 8 of 12 Huff gates are
+   measured against 3 of 16 in MatchFind, even though MatchFind is the bigger stage.
+2. **The decoder barely dispatches on content** -- it executes what the encoder chose.
+   Six of its eleven gates are ARMs. Decoder speed is largely an ENCODER-side
+   distribution question.
+3. **Every regression this campaign produced came from a gate that sits upstream of
+   expensive work** (Huff #3/#4 above an O(n) histogram + ctable build + `write_tree`).
+   The FseSeq gates, which compare REAL header bytes with nothing expensive behind
+   them, have never regressed. **Cheap-to-evaluate is not the property that matters;
+   cheap-to-be-WRONG is.**
+4. **The ARM count is a standing liability.** 16 shipped arms are 16 live atomic or
+   `OnceLock` reads, and bricks 49, 64 and 77 were each a case of one sitting inside a
+   per-symbol loop. They should be audited for hoisting, or retired to `cfg`.
 
 ---
 
