@@ -3188,3 +3188,55 @@ Session null-arm **1.125** — treat &lt;~12% as noise.
 | incomp-32m | `--fast=4` |      2000 |     2014 | flat, no loss                            |
 
 No content class got slower. Sizes unchanged (zeros us/c 0.901, text 1.022 / 0.818, incomp 1.000).
+
+---
+
+## Brick 84 — REFUTED: `Vec::resize` was already a memset
+
+**The trigger.** The fresh L1 board showed `zeros-32m` emitting **fewer bytes than C**
+(us/c size 0.901) while decompressing **2.2x slower** (23799 -> 10713 MB/s). Less data
+to move, more time to move it -- the arithmetic does not close, so the decomposition was
+suspect.
+
+**The hypothesis.** All-zeros decodes through two run paths: RLE blocks
+(`decode.rs`, up to 128 KiB each) and `offset == 1` matches
+(`compressed.rs::copy_from_decoded`). Both used `Vec::resize`, which reaches std's
+`extend_with` -- an element-at-a-time loop under a `SetLenOnDrop` guard. The claim was
+that LLVM's memset idiom recognition cannot see through that guard's `&mut usize`, so
+`ptr::write_bytes` (memset by definition) would be faster.
+
+**The result: FLAT.** In-process ABBA, four independent runs, arm confirmed in the
+header:
+
+| corpus    | run 1 | run 2 | run 3 | run 4 | mean |
+| --------- | ----: | ----: | ----: | ----: | ---: |
+| zeros-32m | +1.6% | -0.8% | +0.8% | -0.2% | ~0   |
+| text-32m  | +2.4% | -0.8% | -0.7% | +1.1% | ~0   |
+
+The sign flips run to run. **LLVM already lowers `Vec::resize` for `u8` to `memset`;
+the `SetLenOnDrop` guard does not block the idiom.** Reverted -- `unsafe` that buys
+nothing measurable is a cost, not a win. Conformance had passed 54/54 (zeros-32m plus
+run-length edges 0..262145, round-trip and C-decode), so this is a refutation on
+SPEED, not on correctness. **Do not retry this.**
+
+### Two instrument defects this brick exposed (both fixed, both kept)
+
+**1. `--ab-tag <name>` silently measured the WRONG ARM.** `--ab-tag` is parsed as a
+boolean; the arm comes from the `RZSTD_AB_ARM` **environment variable**. So
+`--ab-tag rlememset` fell through `_ => set_tag_arm` and measured an *encoder* brick.
+The tell was a decoder-only change moving **compress** by -13.8% -- an impossible
+magnitude. The header prints `arm=<name>`; **read it before trusting a board.**
+For a decoder-only brick the compress column IS a free null arm -- and vice versa.
+
+**2. `run_ab_tag` listed Silesia ONLY.** The generated corpora were structurally
+unreachable, so any brick whose mechanism lives in RLE blocks or constant runs could
+not be measured at all -- and `--files zeros-32m` returned a board with the row simply
+ABSENT rather than an error. Fixed: generated files are now included, and a `--files`
+name matching nothing exits 2 instead of silently shrinking the board.
+
+> **Law: a filter that matches nothing must FAIL, never silently narrow the work.**
+> A missing row reads as "not applicable"; it actually meant "never ran".
+
+**`zeros-32m` decompress 2.2x remains OPEN and unexplained.** The run paths are not
+the cause. Next suspects: output-buffer growth policy, and whether C is hitting a
+path that skips the write entirely.

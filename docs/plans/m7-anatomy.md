@@ -76,53 +76,42 @@ had a repcode search and NO other finder did, so L3 -- the shipping default -- h
 
 ## 2. Level 3 (dfast) — the shipping default
 
-**Re-measured 2026-08-16 (second pass)** after the repcode campaign (bricks 70-75),
-the Huffman histogram fix (74) and the decoder work (79/80). Session null-arm
-**0.9470** at L1 / **1.0316** at L3; worst L1 same-arm spread 16.8%, so treat individual
-speed rows with spreads above ~5% as indicative only.
-
-**PROVENANCE, stated plainly:** these runs predate bricks 79/80 and the brick-78
-REVERT, which are decoder-only. The **compress and `us/c size` columns are
-current**; the **decompress columns are STALE and understate us by ~2-4%** (measured
-separately on a quiet box: xml 1292->1340, nci 1191->1217, webster 982->994 MB/s).
+**Re-measured 2026-08-16 (third pass)** -- CURRENT as of bricks 46-84. Session
+null-arm **0.9839**. The decompress columns now include the decoder work
+(bricks 79-82); the previous pass's did not.
 
 | corpus       | C comp | us comp | **C/us c** | C decomp | us decomp | **C/us d** | us/c size |
 | ------------ | -----: | ------: | ---------: | -------: | --------: | ---------: | --------: |
-| zeros-32m    | 5867.8 |  8264.6 |   **0.71** |  16655.7 |    8196.6 |       2.03 | **0.972** |
-| text-32m     | 6531.7 |  7779.3 |   **0.84** |   7479.0 |    6970.6 |   **1.07** |     1.082 |
-| incomp-32m   | 2961.3 |  2406.4 |       1.23 |   8912.4 |    6036.5 |       1.48 |     1.000 |
-| jsonlog-16m  |  266.6 |   142.5 |       1.87 |   1270.5 |     779.2 |       1.63 |     1.318 |
-| smallmsg-8m  |  268.0 |   139.7 |       1.92 |   1901.2 |     789.6 |       2.41 | **1.440** |
-| versions-16m | 3383.4 |  5396.7 |   **0.63** |  13685.5 |    7220.7 |       1.90 | **0.648** |
-| mr           |  237.2 |   129.5 |       1.83 |   1301.1 |     439.3 |       2.96 |     1.045 |
-| ooffice      |  205.2 |   107.0 |       1.92 |    926.2 |     639.3 |       1.45 |     1.119 |
-| osdb         |  288.7 |   185.3 |       1.56 |   1519.4 |     924.5 |       1.64 |     1.103 |
-| reymont      |  227.4 |   154.9 |       1.47 |   1319.1 |     538.3 |       2.45 |     1.089 |
-| sao          |  169.1 |   104.9 |       1.61 |    822.0 |     763.3 |   **1.08** |     1.056 |
-| webster      |  216.7 |   131.7 |       1.64 |   1295.4 |     506.0 |       2.56 |     1.135 |
-| dickens      |  182.3 |   108.4 |       1.68 |   1183.9 |     445.5 |       2.66 |     1.121 |
-| mozilla      |  276.1 |   134.9 |       2.05 |   1108.8 |     540.9 |       2.05 |     1.105 |
-| nci          |  689.8 |   365.7 |       1.89 |   2137.5 |    1004.1 |       2.13 |     1.152 |
-| samba        |  345.0 |   201.1 |       1.72 |   1713.4 |     755.7 |       2.27 |     1.109 |
-| xml          |  541.7 |   368.8 |       1.47 |   2151.5 |    1162.2 |       1.85 |     1.188 |
-| x-ray        |  164.9 |    92.0 |       1.79 |    878.7 |     520.9 |       1.69 |     1.082 |
+| zeros-32m    | 7483.1 |  9778.4 |   **0.77** |  24342.4 |   10502.2 |       2.32 | **0.972** |
+| text-32m     | 8702.8 | 10277.0 |   **0.85** |  10332.9 |    9672.9 |   **1.07** |     1.082 |
+| incomp-32m   | 4277.3 |  3112.4 |       1.37 |  12255.7 |    7553.6 |       1.62 |     1.000 |
+| jsonlog-16m  |  384.3 |   206.3 |       1.86 |   1907.2 |     950.0 |       2.01 |     1.318 |
+| smallmsg-8m  |  340.6 |   168.5 |       2.02 |   2383.0 |     899.6 |       2.65 | **1.440** |
+| versions-16m | 4858.2 |  6870.6 |   **0.71** |  23194.5 |    9681.0 |       2.40 | **0.648** |
+| mr           |  297.5 |   162.7 |       1.83 |   1605.8 |     487.9 |       3.29 |     1.045 |
+| ooffice      |  265.4 |   130.2 |       2.04 |   1151.5 |     694.1 |       1.66 |     1.119 |
+| osdb         |  360.5 |   221.1 |       1.63 |   1889.0 |    1032.0 |       1.83 |     1.103 |
+| reymont      |  289.7 |   182.1 |       1.59 |   1659.4 |     596.0 |       2.78 |     1.089 |
+| sao          |  223.2 |   132.2 |       1.69 |   1041.5 |     839.1 |       1.24 |     1.056 |
+| webster      |  283.9 |   169.2 |       1.68 |   1629.9 |     602.4 |       2.71 |     1.135 |
+| dickens      |  237.8 |   138.7 |       1.71 |   1525.2 |     506.0 |       3.01 |     1.121 |
+| mozilla      |  361.6 |   171.4 |       2.11 |   1387.9 |     672.0 |       2.07 |     1.105 |
+| nci          |  903.8 |   477.5 |       1.89 |   2724.4 |    1207.5 |       2.26 |     1.152 |
+| samba        |  459.3 |   258.9 |       1.77 |   2184.9 |     881.8 |       2.48 |     1.109 |
+| xml          |  690.0 |   408.4 |       1.69 |   2696.4 |    1243.3 |       2.17 |     1.188 |
+| x-ray        |  207.6 |   110.1 |       1.89 |   1090.1 |     543.9 |       2.00 |     1.082 |
 
-**L3 remains our strongest compress level relative to C on Silesia** (1.73-2.26 vs
-L1's 1.72-2.70) **and its ratio is much better** (1.052-1.221 vs L1's 1.114-1.437).
-L3 decompress is worse than L1 — more sequences to decode — which is the same trade the
-pre-campaign board showed.
+**L3 is the shipping default, and it is where we compress BEST relative to C.**
+At or better than C on `versions-16m` **0.71**, `zeros-32m` **0.77**, `text-32m`
+**0.85**. Worst are `mozilla` 2.11, `ooffice` 2.04, `smallmsg-8m` 2.02.
 
-**New at L3: we compress the trivial corpora FASTER than C** — `zeros-32m` **0.74**,
-`text-32m` **0.80**. Those are the RLE/near-RLE paths where dfast's cheaper parse and our
-now-19-instruction probe loop combine.
+**Ratio at L3 is much better than L1** -- Silesia spans 1.045-1.188 here against L1's
+1.111-1.443. `versions-16m` is the one inversion (0.648 vs L1's 0.075): L1's
+Fast+repcode suits constant-stride content better than dfast does.
 
-**L3 is the shipping default.** Compress at or better than C on `versions-16m`
-**0.63**, `zeros-32m` **0.71**, `text-32m` **0.84**; worst are `mozilla` 2.05,
-`smallmsg-8m` 1.92, `ooffice` 1.92, `nci` 1.89.
-
-**Ratio at L3 is much better than L1** (`versions-16m` 0.648 vs 0.075 is the exception --
-L1 wins there because Fast+repcode suits constant-stride content; `jsonlog` 1.318 vs
-1.528 and `smallmsg` 1.440 vs 1.615 are the normal direction).
+**Decompress is our weak axis at L3** (1.24-3.29 on Silesia, against
+L1's 0.28-2.39). More sequences per byte means more DecodeSeq, which section 3 shows
+is the #1 stage on 16 of 18 corpora. This is the standing target, not the encoder.
 
 **Read the generated corpora with section 5:** their non-monotonic response to level is
 a `minMatch` interaction with synthetic content, not a regression, and real content does

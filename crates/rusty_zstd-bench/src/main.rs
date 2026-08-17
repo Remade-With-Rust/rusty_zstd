@@ -982,9 +982,24 @@ fn run_ab_tag(root: &Path, _oracle: &Oracle, levels: &[i32], only: &[String]) ->
     };
     pin_current_process();
     let min = std::time::Duration::from_secs(3);
+    // The A/B harness used to list Silesia ONLY, which made the generated
+    // corpora unreachable -- so any brick whose mechanism lives in RLE blocks
+    // or constant-run content (zeros-32m, text-32m) could not be measured here
+    // at all, and silently returned a board with those rows simply absent.
     let mut files = list_silesia(root);
+    let gen_dir = root.join("corpora").join("data").join("generated");
+    if let Ok(g) = ensure_generated(&gen_dir, false) {
+        files.extend(g);
+    }
     if !only.is_empty() {
         files.retain(|f| only.contains(&f.id));
+        // A name that matches nothing must FAIL, not silently shrink the board.
+        for want in only {
+            if !files.iter().any(|f| &f.id == want) {
+                eprintln!("--files: no corpus named {want:?}");
+                return ExitCode::from(2);
+            }
+        }
     }
     let level = levels[0];
     println!("A/B arm={name} in-process ABBA per file, level {level}  (A=on, B=off)");
