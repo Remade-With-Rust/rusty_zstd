@@ -977,6 +977,30 @@ fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize) -> Result<(), Er
         }
         return Ok(());
     }
+    // BRICK 82: a 16-byte tier for short matches with SHORT offsets.
+    //
+    // The 32-byte path above needs `offset >= 32` so the 32-byte source read
+    // cannot overlap the destination. The census found **1,153,839 copies
+    // (5.8%)** with `len <= 32` and `2 <= offset < 32` falling past it to
+    // `extend_from_within` -- a runtime-length memcpy CALL.
+    //
+    // Halving the width halves the requirement: `offset >= 16` guarantees the
+    // 16-byte regions are disjoint, capturing the `len <= 16` part of that
+    // slice. Same invariant as the 32-byte tier, same shape as brick 80 on
+    // literals.
+    if matchcopy_on() && len <= 16 && offset >= 16 && out.capacity() - out.len() >= 16 {
+        let dst_at = out.len();
+        // SAFETY: `offset >= 16` means `src + 16 <= out.len() == dst_at`, so the
+        // source is initialised and disjoint from the destination.
+        // `capacity - len >= 16` gives 16 writable bytes. Only `len <= 16`
+        // bytes are published by `set_len`.
+        unsafe {
+            let p = out.as_mut_ptr();
+            core::ptr::copy_nonoverlapping(p.add(src), p.add(dst_at), 16);
+            out.set_len(dst_at + len);
+        }
+        return Ok(());
+    }
     if offset >= len {
         out.extend_from_within(src..src + len);
         return Ok(());

@@ -29,7 +29,9 @@
       "Bash(xargs -I{} echo \"provenance notes: {}\")",
       "Bash(xargs -I{} echo \"L3 prose blocks: {}\")",
       "Bash(sed -n '/## 2. Level 3/,/^## /p' docs/plans/m7-anatomy.md)",
-      "Bash(git -c user.name=Tim -c user.email=tim.almond@thehouseinc.xyz commit -qam 'decode: brick 81 — inline copy_literals; DecSeq is MEMORY-bound *)"
+      "Bash(git -c user.name=Tim -c user.email=tim.almond@thehouseinc.xyz commit -qam 'decode: brick 81 — inline copy_literals; DecSeq is MEMORY-bound *)",
+      "Bash(git -c user.name=Tim -c user.email=tim.almond@thehouseinc.xyz commit -qam 'decode: brick 82 — 16-byte match-copy tier for short offsets *)",
+      "Bash(xargs -I{} echo \"uncommitted: {}\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\talmo\\coding\\rusty_zstd\\crates\\rusty_zstd\\src"

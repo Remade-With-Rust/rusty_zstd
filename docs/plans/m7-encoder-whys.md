@@ -2774,6 +2774,38 @@ a structural change to sequence decoding, and brick 42 measured that class at ~2
 Further DecSeq work should be justified by a NEW mechanism, not another attempt at the
 same one.
 
+### BRICK 82 -- a 16-byte match-copy tier: the predicted small win, delivered
+
+The census said the only addressable slice was the **5.8% (1,153,839 copies)** with
+`len <= 32` and `2 <= offset < 32`, which cannot use the 32-byte path because the source
+read would overlap the destination. Halving the width halves the requirement:
+`offset >= 16` makes the 16-byte regions disjoint.
+
+Measured on a quiet box (spreads 0.1-1.2%):
+
+| file    | decomp before |  after |     delta |
+| ------- | ------------: | -----: | --------: |
+| xml     |        1324.9 | 1341.8 | **+1.3%** |
+| webster |         992.4 | 1001.0 | **+0.9%** |
+| mr      |        1219.2 | 1224.0 |     +0.4% |
+| nci     |        1231.8 | 1220.8 | **-0.9%** |
+
+3/4 positive, right on the **~0.5% estimate**. C/us decompress: xml 2.06 -> 2.03,
+webster 1.80 -> 1.78, mr 1.48 -> 1.47, nci 2.33 -> 2.37.
+
+**`nci` going the other way is content, not noise.** It is the most match-dense corpus
+(`match_frac` 0.943), so its copies skew longer and fewer land in the `len <= 16` band this
+tier serves -- it pays the extra branch without collecting the benefit. A cleaner version
+would gate the tier on the previous block's mean match length, but at this effect size that
+is fitting noise.
+
+Gates: 172 tests; us-decodes-C 36/36; debug-build decode clean on 3 files (exercises the
+`set_len` bound).
+
+**The estimate was made BEFORE the build and matched the measurement.** That is the census
+paying for itself: 19.9M copies counted, 85.5% already fast, one addressable slice
+identified at 5.8%, predicted ~0.5%, delivered ~0.5%. No surprises in either direction.
+
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 
 Runtime arms added to every brick that had been judged with the broken method, then all
