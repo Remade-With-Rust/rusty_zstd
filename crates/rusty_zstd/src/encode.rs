@@ -1531,7 +1531,59 @@ fn fast_lazy_threshold() -> f32 {
 /// is a pure hoist -- both arms are byte-identical to the pre-brick code.
 /// Repcode-1 stays on while at least this fraction of a block's sequences
 /// were repcode hits. Below it the search is pure per-probe cost.
-const REP_YIELD_MIN: f32 = 0.125;
+const REP_YIELD_MIN_DEFAULT: f32 = 0.125;
+
+/// GATE 2 threshold, BY STRATEGY. Swept via `RZSTD_REPMIN` (overrides both).
+///
+/// The right constant is not the same across the ladder. Silesia totals,
+/// shipped 0.125 vs always-on 0.0 (`text` fence so rustdoc does not run it):
+///
+/// ```text
+/// L3  DFast     -0.472%   always-on WINS   (xml -3.390%, mozilla -2.117%)
+/// L5  Greedy    -0.342%   always-on wins   -- NOT deployed, L5 not yet gated
+/// L7  Lazy      +0.060%   always-on loses
+/// L9  Lazy2     +0.092%   always-on loses
+/// L13 BtLazy2   +0.225%   always-on loses  (xml +1.345%)
+/// L19 BtUltra2   0.000%   no effect        (find_opt prices reps itself)
+/// ```
+///
+/// DEPLOYED FOR `DFast` ONLY -- i.e. L3/L4, the level this gate was evaluated
+/// at. `Greedy` shows the same sign but belongs to L5's own gate and is left
+/// alone until that level is measured on its own terms.
+///
+/// The mechanism is the look-ahead. `try_rep1` commits a match at `ip+1`, which
+/// in a LAZY finder PREEMPTS the deferred search that might have found a better
+/// one at `ip+1` or `ip+2`. Fast/DFast/Greedy have no look-ahead to preempt, so
+/// there the repcode probe is pure gain and gating it only loses bytes.
+///
+/// Always-on is also 0.6% FASTER on Silesia at L3, so the dispatch it replaces
+/// was costing ratio and buying no speed.
+fn rep_yield_min_for(strategy: Strategy) -> f32 {
+    #[cfg(feature = "std")]
+    if let Some(v) = std::env::var("RZSTD_REPMIN")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+    {
+        return v;
+    }
+    match strategy {
+        Strategy::DFast => 0.0,
+        _ => REP_YIELD_MIN_DEFAULT,
+    }
+}
+
+#[allow(dead_code)]
+fn rep_yield_min() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_REPMIN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(REP_YIELD_MIN_DEFAULT)
+    }
+    #[cfg(not(feature = "std"))]
+    REP_YIELD_MIN_DEFAULT
+}
 
 fn find_fast(
     src: &[u8],
@@ -1582,7 +1634,7 @@ fn find_fast(
     // (versions-16m L1: 820,848 -> 81,206 bytes). A global default cannot serve
     // both, so each block inherits the previous block's measured repcode yield.
     // `rep_yield` starts at 1.0, so the first block of every frame always probes.
-    let rep_on = rep1_enabled() || tables.rep_yield >= REP_YIELD_MIN;
+    let rep_on = rep_search_on(tables.rep_yield, params.strategy);
     match (tables.packed, rep_on, pipe_on, s0) {
         // The shipping configuration: no tag, no rep1, pipelined, default step.
         // Specialized on hash_log so the shift is an immediate too.
@@ -2115,6 +2167,34 @@ pub fn set_rep1_arm(on: bool) {
     );
 }
 
+/// GATE 2 arm: the repcode-1 search, as a THREE-state choice so both constants
+/// are reachable. `rep1_enabled()` alone can only force ON, which cannot answer
+/// "does any corpus lose under a constant" -- the OFF constant was untestable.
+/// 0 = unset (measured dispatch), 1 = force OFF, 2 = force ON.
+static REP1_MODE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook. `None` restores the measured dispatch.
+pub fn set_rep1_mode(m: Option<bool>) {
+    REP1_MODE_ARM.store(
+        match m {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The Gate 2 decision for this block: forced constant, or the measured yield.
+#[inline]
+fn rep_search_on(rep_yield: f32, strategy: Strategy) -> bool {
+    match REP1_MODE_ARM.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => rep1_enabled() || rep_yield >= rep_yield_min_for(strategy),
+    }
+}
+
 fn rep1_enabled() -> bool {
     use core::sync::atomic::Ordering;
     match REP1_ENABLED_ARM.load(Ordering::Relaxed) {
@@ -2553,7 +2633,7 @@ fn find_dfast(
     const COUNT: bool = cfg!(feature = "profile");
     let mut probes = 0u64;
     let mut hits = 0u64;
-    let use_rep = rep1_enabled() || tables.rep_yield >= REP_YIELD_MIN;
+    let use_rep = rep_search_on(tables.rep_yield, params.strategy);
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
     let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
@@ -2698,7 +2778,7 @@ fn find_greedy(
     // BRICK 71: repcode-1 search in find_greedy -- L5-L6 had none
     // C checks `offset_1` at every position in `_greedy`/`_lazy` exactly as in
     // `_fast`/`_doubleFast`. Same dispatch on measured yield as bricks 67/70.
-    let use_rep = rep1_enabled() || tables.rep_yield >= REP_YIELD_MIN;
+    let use_rep = rep_search_on(tables.rep_yield, params.strategy);
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
     let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
@@ -2891,7 +2971,7 @@ fn find_lazy(
     // BRICK 71: repcode-1 search in find_lazy -- L7-L12 had none
     // C checks `offset_1` at every position in `_greedy`/`_lazy` exactly as in
     // `_fast`/`_doubleFast`. Same dispatch on measured yield as bricks 67/70.
-    let use_rep = rep1_enabled() || tables.rep_yield >= REP_YIELD_MIN;
+    let use_rep = rep_search_on(tables.rep_yield, params.strategy);
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
     let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
@@ -3143,7 +3223,7 @@ fn find_bt_lazy(
         return (seqs, lits);
     }
     // BRICK 73: repcode-1 in BtLazy2 (L13-L14) -- the last finder without it.
-    let use_rep = rep1_enabled() || tables.rep_yield >= REP_YIELD_MIN;
+    let use_rep = rep_search_on(tables.rep_yield, params.strategy);
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
     let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
