@@ -2439,14 +2439,30 @@ fn find_greedy(
             }
         }
         if best_ml >= mls {
-            lits.extend_from_slice(&src[anchor..ip]);
+            // DEFECT B3 FIX: back-extend the match (C's "catch up" loop in
+            // `ZSTD_compressBlock_lazy_generic`). `emit_fast_seq` -- i.e.
+            // fast/dfast -- has always done this; greedy and lazy never did,
+            // so every literal that also sat just before the match stayed a
+            // literal. The offset is unchanged, so validity is preserved: only
+            // `litlen` shrinks and `matchlen` grows by the same amount.
+            let mut s = ip;
+            let mut mm = best_m;
+            let mut n = best_ml;
+            while s > anchor && mm > tables.frame_start && src[s - 1] == src[mm - 1] {
+                s -= 1;
+                mm -= 1;
+                n += 1;
+            }
+            lits.extend_from_slice(&src[anchor..s]);
             seqs.push(Seq {
-                litlen: (ip - anchor) as u32,
-                matchlen: best_ml as u32,
-                offset: (ip - best_m) as u32,
+                litlen: (s - anchor) as u32,
+                matchlen: n as u32,
+                offset: (s - mm) as u32,
             });
             rep1 = ip - best_m;
             let end = ip + best_ml;
+            // Positions `s..=ip` were ALREADY inserted as the loop walked to
+            // `ip`; re-inserting them would self-loop the chain (see B2).
             let mut p = ip + 1;
             while p < end && p <= ilimit {
                 let hh = hash_mls(src, p, mls, hash_log);
@@ -2563,12 +2579,14 @@ fn find_lazy(
         let (mut best_m, mut best_ml) =
             chain_find_best(src, ip, block_start, block_end, window, mls, params, tables);
         let mut best_ip = ip;
+        let mut look_hi = ip; // PROBE: highest position the look-ahead inserted
         if best_ml >= mls {
             for d in 1..=depth {
                 let ip2 = ip + d;
                 if ip2 > ilimit {
                     break;
                 }
+                look_hi = ip2;
                 let (m, ml) = chain_find_best(
                     src,
                     ip2,
@@ -2587,11 +2605,20 @@ fn find_lazy(
             }
         }
         if best_ml >= mls {
-            lits.extend_from_slice(&src[anchor..best_ip]);
+            // DEFECT B3 FIX: back-extend the match -- see `find_greedy`.
+            let mut s = best_ip;
+            let mut mm = best_m;
+            let mut n = best_ml;
+            while s > anchor && mm > tables.frame_start && src[s - 1] == src[mm - 1] {
+                s -= 1;
+                mm -= 1;
+                n += 1;
+            }
+            lits.extend_from_slice(&src[anchor..s]);
             seqs.push(Seq {
-                litlen: (best_ip - anchor) as u32,
-                matchlen: best_ml as u32,
-                offset: (best_ip - best_m) as u32,
+                litlen: (s - anchor) as u32,
+                matchlen: n as u32,
+                offset: (s - mm) as u32,
             });
             // The repcode must track the offset ACTUALLY EMITTED. Lazy
             // commits at `best_ip` (the look-ahead winner), not `ip`.
@@ -2610,7 +2637,18 @@ fn find_lazy(
                 // Larger strides thin the chain: the cost of the back-fill is
                 // the chain DENSITY it creates, not the inserts themselves.
                 let stride = lazy_fill_stride();
-                let mut p = best_ip + 1;
+                // DEFECT B2 FIX: never insert a position TWICE. The look-ahead
+                // already inserted `ip+1 ..= look_hi` via `chain_find_best`, and
+                // re-inserting `p` stores `chain[p] = get_h(h)` when the head IS
+                // already `p` -- i.e. `chain[p] = p`, a self-loop. The walk's
+                // `next >= m` guard then breaks on it, so the whole bucket's
+                // history below `p` is unreachable FOREVER. Measured on osdb:
+                // 501,705 such amputations at L7 and 791,088 at L9 (10.9% of all
+                // back-fill inserts) -- which is why lazy/lazy2 emitted MORE bytes
+                // than the cheaper dfast below them. C cannot hit this: its
+                // `nextToUpdate` cursor is monotone, so every position is inserted
+                // exactly once.
+                let mut p = (best_ip + 1).max(look_hi + 1);
                 while p < end && p <= ilimit {
                     let hh = hash_mls(src, p, mls, hash_log);
                     tables.chain[p & chain_mask] = tables.get_h(hh).map(|x| x as u32).unwrap_or(0);
@@ -2765,12 +2803,14 @@ fn find_bt_lazy(
         let (mut best_m, mut best_ml) =
             bt_find_best(src, ip, block_start, block_end, window, mls, params, tables);
         let mut best_ip = ip;
+        let mut look_hi = ip;
         if best_ml >= mls {
             for d in 1..=depth {
                 let ip2 = ip + d;
                 if ip2 > ilimit {
                     break;
                 }
+                look_hi = ip2;
                 let (m, ml) = bt_find_best(
                     src,
                     ip2,
@@ -2789,11 +2829,20 @@ fn find_bt_lazy(
             }
         }
         if best_ml >= mls {
-            lits.extend_from_slice(&src[anchor..best_ip]);
+            // DEFECT B3 FIX (btlazy2): back-extend -- see `find_greedy`.
+            let mut s = best_ip;
+            let mut mm = best_m;
+            let mut n = best_ml;
+            while s > anchor && mm > tables.frame_start && src[s - 1] == src[mm - 1] {
+                s -= 1;
+                mm -= 1;
+                n += 1;
+            }
+            lits.extend_from_slice(&src[anchor..s]);
             seqs.push(Seq {
-                litlen: (best_ip - anchor) as u32,
-                matchlen: best_ml as u32,
-                offset: (best_ip - best_m) as u32,
+                litlen: (s - anchor) as u32,
+                matchlen: n as u32,
+                offset: (s - mm) as u32,
             });
             // Commits at the look-ahead winner (brick 71b).
             rep1 = best_ip - best_m;
@@ -2803,7 +2852,8 @@ fn find_bt_lazy(
             // insertion logic.
             let end = best_ip + best_ml;
             if lazy_fill_enabled() {
-                let mut p = best_ip + 1;
+                // B2: the look-ahead already inserted up to `look_hi`.
+                let mut p = (best_ip + 1).max(look_hi + 1);
                 while p < end && p <= ilimit {
                     let _ =
                         bt_find_best(src, p, block_start, block_end, window, mls, params, tables);
@@ -3512,26 +3562,24 @@ mod tests {
         }
     }
 
-    /// A HIGHER level must never produce a LARGER file. This currently FAILS on
-    /// osdb: L5 (greedy) and L7 (lazy2) both emit more than L3 (dfast).
+    /// A HIGHER level must never produce a LARGER file. This FAILED on osdb --
+    /// L5 (greedy) and L7 (lazy2) both emitted more than L3 (dfast) -- until
+    /// defects B2 and B3 were fixed. Kept as a standing gate: it is the only
+    /// thing that catches a match finder silently losing a capability its
+    /// cheaper neighbour has.
     ///
-    ///   level  strategy  us          C
-    ///   3      dfast     3,613,320   3,501,634
-    ///   5      greedy    3,658,497   3,431,228   <-- BIGGER than L3
-    ///   7      lazy2     3,625,184   3,359,176   <-- BIGGER than L3
+    ///   level  strategy  was         now         C
+    ///   3      dfast     3,613,320   3,613,320   3,501,634
+    ///   5      greedy    3,658,497   3,520,086   3,431,228
+    ///   7      lazy2     3,625,184   3,461,023   3,359,176
+    ///   13     btlazy2   3,370,051   3,152,921
     ///
-    /// C is monotone over the same range, so this is ours, and it is confined to
-    /// greedy/lazy2 -- the strategies BETWEEN dfast and the bt-family. dfast
-    /// (1.032 vs C) and btultra (0.991) are both strong; only the middle sags.
-    /// A strategy losing to the CHEAPER one below it is the same shape as the
-    /// repcode discovery: a capability present in one finder, absent in its
-    /// neighbours. Ruled out so far: the chain table IS allocated and used by
-    /// both, and depth is `1 << search_log` exactly as C. Prime suspect is the
-    /// chain FILL density (see the note in `find_lazy` about thinned chains).
-    ///
-    /// `#[ignore]` because it documents a KNOWN defect -- un-ignore it when
-    /// fixed; do not delete it to make the suite green.
-    #[ignore]
+    /// B2: the lazy look-ahead inserted `ip+1 ..= ip+depth` into the chain, then
+    /// the back-fill re-inserted them -- `chain[p] = p`, a self-loop the walk
+    /// breaks on, amputating that hash bucket's whole history (501,705 of them
+    /// at L7). B3: greedy/lazy/btlazy2 never back-extended a match, a capability
+    /// `emit_fast_seq` (fast/dfast) has always had and C's lazy has as its
+    /// "catch up" loop.
     #[test]
     fn higher_level_never_larger_osdb() {
         let Ok(src) = std::fs::read("../../corpora/data/silesia/osdb") else {
@@ -3545,6 +3593,28 @@ mod tests {
                 "level {lvl} emitted {n} bytes, more than the previous level's {prev}"
             );
             prev = n;
+        }
+    }
+
+    /// Deterministic compressed-size table over Silesia -- run before and
+    /// after a size-affecting change and diff the rows.
+    #[ignore]
+    #[test]
+    fn size_table_silesia() {
+        const FILES: &[&str] = &[
+            "dickens", "mozilla", "mr", "nci", "ooffice", "osdb", "reymont", "samba", "sao",
+            "webster", "x-ray", "xml",
+        ];
+        for f in FILES {
+            let Ok(src) = std::fs::read(format!("../../corpora/data/silesia/{f}")) else {
+                continue;
+            };
+            let mut row = format!("{f:<8}");
+            for lvl in [5, 7, 9, 13, 19] {
+                let n = crate::compress(&src, lvl).unwrap().len();
+                row.push_str(&format!(" L{lvl}={n}"));
+            }
+            println!("SIZETABLE {row}");
         }
     }
 
