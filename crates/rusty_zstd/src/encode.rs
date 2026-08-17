@@ -3374,6 +3374,7 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
     params: CompressionParameters,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
+    BT_SPEC_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     const fn btlog(c: u32) -> u32 { let c = if c > 24 { 24 } else { c }; let c = c.saturating_sub(1); if c < 1 { 1 } else { c } }
     let bt_log = btlog(CLOG);
     let bt_mask = (1usize << bt_log) - 1;
@@ -3457,6 +3458,7 @@ fn bt_find_best_runtime(
     params: CompressionParameters,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
+    BT_RUNTIME_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let hash_log = tables.hash_log;
     let bt_log = params.chain_log.min(24).saturating_sub(1).max(1);
     let bt_mask = (1usize << bt_log) - 1;
@@ -5486,5 +5488,18 @@ pub fn take_finder_calls() -> (u64, u64) {
     (
         FAST_CALLS.swap(0, Ordering::Relaxed),
         OPT_CALLS.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Which `bt_find_best` body ran: `(specialised, runtime_fallback)`.
+pub static BT_SPEC_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BT_RUNTIME_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear the bt-path body counters.
+pub fn take_bt_calls() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        BT_SPEC_CALLS.swap(0, Ordering::Relaxed),
+        BT_RUNTIME_CALLS.swap(0, Ordering::Relaxed),
     )
 }
