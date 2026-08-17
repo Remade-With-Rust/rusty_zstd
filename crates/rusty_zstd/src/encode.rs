@@ -2977,7 +2977,24 @@ fn find_lazy(
     let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
     let mut ip = block_start;
     let mut searches = 0u64;
-    let fill = lazy_fill_enabled() && tables.last_search_per_byte >= lazy_fill_threshold();
+    // GATE 3 @ L1 -- CONSTANT OFF when the caller is the Fast ladder.
+    //
+    // `find_lazy` is reachable at L1 ONLY through the Gate 1 dispatch, which
+    // leaves `params.strategy == Fast`, so that flag identifies the routed case
+    // exactly. There the back-fill is a REGRESSION:
+    //
+    //   L1 (routed)  versions-16m  OFF 46,025  ON 47,037   ON is +2.199% WORSE
+    //   L7 (native)  every corpus wins with ON: mr -6.237%, webster -5.580%,
+    //                xml -3.505%, nci -2.358%, jsonlog -1.384%, sao -0.901%
+    //
+    // Not a content split -- at L7 no corpus loses. It is a PARAMETER split:
+    // L1 has `chain_log` 13 (8,192 entries) against L7's 19 (524,288), 64x
+    // smaller. Filling every position a long match covers floods a chain that
+    // size and evicts the entries the next search needs. The fill's value is
+    // conditional on there being room for it.
+    let fill = lazy_fill_enabled()
+        && params.strategy != Strategy::Fast
+        && tables.last_search_per_byte >= lazy_fill_threshold();
     while ip <= ilimit {
         if use_rep {
             if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
