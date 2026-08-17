@@ -1105,7 +1105,7 @@ mod tests {
                     want.extend_from_slice(&lits[pos..pos + n]);
 
                     let mut p = pos;
-                    copy_literals(&lits, &mut p, n as u32, &mut fast).unwrap();
+                    copy_literals(&lits, &mut p, n as u32, &mut fast, true).unwrap();
                     assert_eq!(fast, want, "pos={pos} n={n} spare={spare}");
                     assert_eq!(p, pos + n, "lit_pos pos={pos} n={n}");
                 }
@@ -1118,9 +1118,9 @@ mod tests {
         let lits = [1u8, 2, 3];
         let mut out = Vec::with_capacity(64);
         let mut p = 0usize;
-        assert!(copy_literals(&lits, &mut p, 4, &mut out).is_err());
+        assert!(copy_literals(&lits, &mut p, 4, &mut out, true).is_err());
         let mut p2 = 2usize;
-        assert!(copy_literals(&lits, &mut p2, u32::MAX, &mut out).is_err());
+        assert!(copy_literals(&lits, &mut p2, u32::MAX, &mut out, true).is_err());
     }
 
     /// Exhaustive over the whole LUT range -- no sampling.
