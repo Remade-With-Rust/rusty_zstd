@@ -590,6 +590,15 @@ fn seqcheck_hoisted() -> bool {
 /// (~15M across the corpus). It is fixed for the whole process. Fourth instance
 /// of this shape: brick 49 (`use_rep`), 64 (`seqcheck_hoisted`), 77
 /// (`lit_push_enabled`), now this.
+/// BRICK 81: inlined into the sequence loop.
+///
+/// The decode loop's stack traffic is DIFFUSE -- ~12 slots touched 1-3x each,
+/// with no dominant frame-constant. That signature is not missing
+/// specialisation, it is a CALL BOUNDARY: everything live across a call must be
+/// spilled because caller-saved registers are clobbered. `copy_literals`' fast
+/// path is a 16/32-byte copy, so inlining it removes the boundary without
+/// meaningful code growth.
+#[inline(always)]
 fn copy_literals(
     literals: &[u8],
     lit_pos: &mut usize,

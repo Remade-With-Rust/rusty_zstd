@@ -2685,6 +2685,62 @@ grounds that it looks harmless.
 
 Gates after removal: 172 tests; us-decodes-C 36/36.
 
+## BRICK 81 + THE DECISIVE DECSEQ FINDING: the loop is MEMORY-bound
+
+Fresh stage shares confirm the target: **`DecodeSeq` is #1 on 16 of 18** (was 14 of 17),
+at 62-90% of decode. So the loop is worth attacking -- the question was how.
+
+**Diagnosis corrected.** Its stack traffic is diffuse (~12 slots, 1-3 touches each) with no
+dominant frame-constant, which reads like "nothing to specialise". It is not: **that is a
+CALL BOUNDARY signature.** Everything live across a call must be spilled because
+caller-saved registers are clobbered, and the loop makes real calls to `copy_literals` and
+`copy_match`.
+
+`#[inline(always)]` on `copy_literals` (its fast path is a 16/32-byte copy, so no
+meaningful code growth):
+
+|                       |  before |         after |
+| --------------------- | ------: | ------------: |
+| hot loop instructions | 109-120 | **71** (-35%) |
+| stack accesses        |      27 |        **21** |
+
+*(The same treatment on `copy_match` went the WRONG way -- 21 -> 22 stack, no loop shrink --
+and was reverted. Inlining is not uniformly good; it is good where it removes a boundary
+without adding live range.)*
+
+### And then the wall clock, on a quiet box (spreads 0.1-0.7%)
+
+| file    | decomp before |  after | delta |
+| ------- | ------------: | -----: | ----: |
+| xml     |        1314.6 | 1322.5 | +0.6% |
+| webster |         990.4 |  995.1 | +0.5% |
+| mr      |        1222.9 | 1227.0 | +0.3% |
+| nci     |        1228.2 | 1230.1 | +0.2% |
+
+**A 35% instruction cut bought 0.4%.** 4/4 positive, so it is real -- and kept -- but it is
+nowhere near what the instruction count implied.
+
+### THE FINDING: DecSeq is MEMORY-bound; the encoder's probe loop was INSTRUCTION-bound
+
+That single sentence explains every previous result in this loop:
+
+* brick 42 (one-ahead restructure): ~2x SLOWER
+* brick 78 (per-block reserve): 4-11% SLOWER -- it added memory traffic
+* brick 65 (hoist FSE slices): exactly FLAT
+* brick 81 (35% fewer instructions): +0.4%
+
+`copy_from_decoded` moves the actual bytes; instructions around it are not the constraint.
+**Contrast the encoder, where instruction count WAS the constraint and 47 -> 19 bought
+10-43%.** The same technique applied to the two loops gives wildly different returns, and
+the reason is the bottleneck, not the technique.
+
+**Consequence for planning: stop optimising instructions in DecSeq.** Future gains there
+must reduce or improve MEMORY TRAFFIC -- copy width, alignment, prefetch distance, output
+locality -- or they will keep landing at ~0.4%. The remaining 728K literal runs >32 B and
+the match-copy path are where the bytes actually move.
+
+Gates: 172 tests; us-decodes-C 36/36.
+
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 
 Runtime arms added to every brick that had been judged with the broken method, then all

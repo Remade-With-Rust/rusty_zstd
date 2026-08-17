@@ -28,7 +28,8 @@
       "Bash(sed -n '/## 1. Level 1/,/^$/p' docs/plans/m7-anatomy.md)",
       "Bash(xargs -I{} echo \"provenance notes: {}\")",
       "Bash(xargs -I{} echo \"L3 prose blocks: {}\")",
-      "Bash(sed -n '/## 2. Level 3/,/^## /p' docs/plans/m7-anatomy.md)"
+      "Bash(sed -n '/## 2. Level 3/,/^## /p' docs/plans/m7-anatomy.md)",
+      "Bash(git -c user.name=Tim -c user.email=tim.almond@thehouseinc.xyz commit -qam 'decode: brick 81 — inline copy_literals; DecSeq is MEMORY-bound *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\talmo\\coding\\rusty_zstd\\crates\\rusty_zstd\\src"
