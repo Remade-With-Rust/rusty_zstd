@@ -1,14 +1,26 @@
 # M7 anatomy — rusty_zstd vs facebook/zstd v1.5.7, side by side
 
-**Date:** 2026-08-16 — re-measured in full after the optimisation campaign
-(sections 1, 2, 3 and 4 all regenerated; the pre-campaign board is in git history).
+**Date:** 2026-08-16 — sections 1-4 fully regenerated at **CHECKSUM PARITY**
+(the pre-campaign and pre-parity boards are in git history).
+
+> **READ THIS BEFORE COMPARING TO ANY OLDER BOARD.** Every board dated before this one
+> charged us an xxh64 pass over every byte, on BOTH phases, that the oracle never ran.
+> `zstd -b` takes libzstd's `ZSTD_c_checksumFlag = 0` default; our `compress` takes the
+> CLI's (`on`). The bench now matches the oracle. **The shipped default is still
+> `checksum: true` — this changed the MEASUREMENT, not the product.** It moved
+> `zeros-32m` decompress from 2.32 to 0.63 and took L1 decompress passes from 5 to 7
+> with no code change on either path. Full account in
+> [`m7-encoder-whys.md`](m7-encoder-whys.md).
+
 **Instrument:** repaired (see [`m7-benchmark-repair.md`](m7-benchmark-repair.md)) —
 best-of-N both arms, phases timed separately as C does, N>=25/phase, discarded warmup,
-per-row same-arm spread, cycles/byte. Session null-arm **1.0384** (L1, worst same-arm
-spread 4.8%) / **1.0084** (L3). Dual gate **18/18** at L1 and **18/18** at L3 (widened
-from 8). Pinned affinity=4, High priority, C via `-b -T1`. Stage shares (section 3) come
-from a separate `--features profile` build, so they are NOT comparable in absolute ms to
-the speed boards — only as shares within a run.
+per-row same-arm spread, cycles/byte. Session null-arm **0.9948** (L1) / **1.0350**
+(L3). Dual gate 18/18 at both levels. Pinned affinity=4, High priority, C via `-b -T1`.
+Decompress is timed into a REUSED buffer via `decompress_into`, as C's `-b` does;
+allocating fresh per loop timed our decode plus the kernel faulting every output page
+against C's decode alone. Stage shares (section 3) come from a separate
+`--features profile` build, so they are NOT comparable in absolute ms to the speed
+boards — only as shares within a run.
 
 **Everything below is at MATCHED OUTPUT.** Every brick in the campaign was gated on
 byte-identical Silesia hashes, so the `us/c size` columns are unchanged from the
@@ -130,82 +142,101 @@ is a `minMatch` interaction with synthetic content, not a regression.
 
 ## 3. Stage anatomy — where OUR time goes
 
-**Re-measured 2026-08-16 (second pass)**, AFTER the repcode campaign (bricks 67/70/71/73/75)
-and the decoder work (79-82). Share of encode (`stage / EncodeTotal`) and of decode
-(`stage / DecodeTotal`); bold marks the LEADING stage on each half.
+**Re-measured 2026-08-16 (third pass), at CHECKSUM PARITY.** Share of encode
+(`stage / EncodeTotal`) and of decode (`stage / DecodeTotal`); bold marks the LEADING
+stage on each half. Leaf stages only -- `EncodeEntropy`, `EncodeBlocks` and
+`DecodeBlocks` are PARENT scopes and ranking them against their own children is
+meaningless (a mistake made twice while deriving this board).
 
-| corpus       | MatchFind |     Huff | FseSeq | SeqCode |  DecLits |   DecSeq |
-| ------------ | --------: | -------: | -----: | ------: | -------: | -------: |
-| sao          |  **86.8** |      1.8 |    2.3 |     2.4 |     22.6 | **54.4** |
-| webster      |  **67.5** |      7.8 |   12.0 |     8.6 |     11.0 | **82.4** |
-| smallmsg-8m  |  **66.7** |      0.9 |   16.6 |    10.3 |      2.5 | **90.0** |
-| ooffice      |  **65.8** |     18.3 |    7.0 |     4.5 |     27.2 | **62.8** |
-| jsonlog-16m  |  **63.2** |      2.7 |   16.1 |    12.7 |      3.8 | **89.1** |
-| reymont      |  **60.9** |     15.5 |   12.1 |     8.0 |     16.5 | **77.6** |
-| dickens      |  **60.5** |     22.4 |    9.0 |     5.0 |     31.9 | **62.2** |
-| samba        |  **60.5** |     11.2 |   13.5 |     9.6 |     13.9 | **77.9** |
-| xml          |  **55.1** |     10.2 |   16.6 |    11.9 |     10.5 | **80.5** |
-| mozilla      |  **47.9** |     33.4 |    8.6 |     6.1 |     31.7 | **61.8** |
-| nci          |  **47.4** |     11.8 |   20.3 |    13.5 |     11.9 | **78.8** |
-| text-32m     |  **42.7** |      1.8 |    0.5 |     0.3 |      0.6 | **47.4** |
-| mr           |      40.2 | **52.7** |    1.6 |     1.5 | **66.9** |     24.6 |
-| osdb         |      39.7 | **40.3** |   10.4 |     5.8 |     26.4 | **66.1** |
-| versions-16m |  **39.3** |      0.8 |    9.8 |     8.4 |      0.3 | **59.9** |
-| incomp-32m   |  **30.4** |      0.0 |    0.0 |     0.0 |      0.0 |  **0.0** |
-| x-ray        |      21.4 | **58.9** |    0.4 |     0.0 | **48.0** |      3.9 |
-| zeros-32m    |   **0.0** |      0.0 |    0.0 |     0.0 |      0.0 |  **0.0** |
+| corpus       | MatchFind |     Huff | FseSeq | SeqCode |  DecLits |   DecSeq |    DecCk |
+| ------------ | --------: | -------: | -----: | ------: | -------: | -------: | -------: |
+| sao          |  **85.8** |      2.7 |    2.4 |     2.4 |     17.8 | **58.2** |     23.5 |
+| webster      |  **66.7** |      7.8 |   12.4 |     8.9 |     10.9 | **82.1** |      6.9 |
+| smallmsg-8m  |  **66.5** |      0.9 |   16.7 |    10.0 |      2.6 | **89.5** |      7.8 |
+| ooffice      |  **65.1** |     18.6 |    7.2 |     4.6 |     27.3 | **63.7** |      8.8 |
+| jsonlog-16m  |  **62.9** |      2.7 |   16.4 |    12.9 |      3.8 | **89.3** |      6.8 |
+| reymont      |  **60.5** |     15.4 |   12.5 |     8.0 |     16.5 | **77.9** |      5.5 |
+| dickens      |  **60.2** |     22.5 |    9.2 |     5.0 |     31.9 | **62.2** |      5.8 |
+| samba        |  **60.1** |     11.0 |   13.8 |     9.7 |     13.7 | **77.9** |      8.2 |
+| xml          |  **54.5** |     10.3 |   16.9 |    11.9 |     10.4 | **80.4** |      9.2 |
+| mozilla      |  **47.4** |     33.7 |    8.7 |     6.2 |     32.0 | **61.8** |      6.0 |
+| nci          |  **47.3** |     11.8 |   20.4 |    13.5 |     11.8 | **79.6** |      8.6 |
+| text-32m     |  **40.8** |      1.9 |    0.5 |     0.3 |      0.5 |     44.2 | **53.4** |
+| mr           |      40.3 | **52.5** |    1.7 |     1.5 | **65.7** |     24.4 |      9.6 |
+| versions-16m |  **39.2** |      0.9 |    9.9 |     8.8 |      0.3 | **55.7** |     43.6 |
+| osdb         |      39.1 | **40.5** |   10.4 |     6.0 |     26.1 | **66.2** |      7.6 |
+| incomp-32m   |  **30.0** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **43.7** |
+| x-ray        |      22.2 | **56.8** |    0.4 |     0.0 | **47.5** |      3.6 |     24.4 |
+| zeros-32m    |   **0.0** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **32.6** |
 
-**`EncodeMatchFind` is #1 on 15 of 18**, Huffman on 3 (`mr`, `x-ray`, `osdb`).
-**`DecodeSeq` is #1 on 16 of 18** -- UP from 14 of 17 before the campaign, and now
-62-90% of decode on the sequence-heavy files.
+**`EncodeMatchFind` is #1 on 15 of 18**, Huffman on 3 (`mr`, `x-ray`, `osdb`) --
+**unchanged** from the pre-parity board. The encoder ranking was never distorted.
 
-**That rise is the campaign working, not a regression.** Bricks 63/79/80/81/82 cut the
-LITERALS side of decode (per-block Huffman table clone, the arm read, two copy tiers,
-the inlined literal copy), so `DecodeLiterals` shrank and `DecodeSeq`'s share grew
-correspondingly. The sequence loop is now a LARGER fraction of a SMALLER decode.
+**`DecodeSeq` is #1 on 13 of 18** -- DOWN from the 16 of 18 previously claimed, and
+the correction matters. It is still the single biggest decode stage and still the right
+standing target, but its dominance was overstated.
 
-**The two halves remain near mirror images:** the files where the encoder spends its time
-in Huffman (`mr`, `x-ray`, `osdb`) are the files where the decoder spends its time in
-literals. One content axis -- alphabet flatness -- drives both.
+**The runner-up changed identity: it is now `DecodeChecksum`, leading on 3 of 18.**
+Previously the #2 was `DecodeLiterals`; bricks 63/79/80/81/82 shrank that side (a
+per-block Huffman table clone, the arm read, two copy tiers, the inlined literal copy),
+so literals fell to 2 of 18 and the checksum surfaced behind it. Where it leads it
+leads by a lot: **`text-32m` 53%, `incomp-32m` 44%, `versions-16m` 44%, `zeros-32m`
+33% of decode.**
+
+That is a real finding, not an artefact of the parity fix. On high-ratio and
+incompressible content there is little to decode, so VERIFICATION IS THE DECODER.
+It also means `--no-check` / `DecompressOptions::force_ignore_checksum` is not a
+micro-option on those corpora -- it removes the largest single stage.
+
+**The two halves remain near mirror images** on the compressible files: where the
+encoder spends its time in Huffman (`mr`, `x-ray`, `osdb`) the decoder spends its time
+in literals. One content axis -- alphabet flatness -- drives both.
 
 ---
 
 ## 4. What this says to do next
 
-Rewritten 2026-08-16 (second pass), after the repcode campaign and the decoder work.
+Rewritten 2026-08-16 (third pass), at checksum parity.
 
-1. **Encoder = MatchFind, and its seam is WORKED OUT.** The probe loop is **19
+1. **Encoder = MatchFind (15/18), and its seam is WORKED OUT.** The probe loop is **19
    instructions with 1 stack access** (from 47 / 20); every frame-constant (`hash_log`,
-   `step0`, the tag/rep flags, the pipeline flag) is specialised away. The remaining
-   reload is one L1-hot slot. Plumbing was MEASURED rather than inferred: of ~40 static
-   call sites, one ran ZERO times and the only hot one was `push_literals`
-   (15,687,334 executions), whose cost was a flag read -- fixed, ~1%.
-   **Further gains need a different lever than const-specialisation.**
+   `step0`, the tag/rep flags, the pipeline flag) is specialised away. Plumbing was
+   MEASURED, not inferred: of ~40 static call sites one ran ZERO times and the only hot
+   one was `push_literals` (15,687,334 executions), whose cost was a flag read -- fixed,
+   ~1%. **Further gains need a different lever than const-specialisation.**
 
 2. **REPCODE now fires in EVERY finder** (`fast`, `dfast`, `greedy`, `lazy`, `bt_lazy`,
    `opt`). It was present only in `fast`, so L3 -- the shipping default -- had none.
    `versions-16m` went from **4.3x WORSE than C at L3 to 0.648**, and now beats C at
    every level 1-22. Silesia ratios IMPROVED rather than traded.
 
-3. **Decoder = DecodeSeq, #1 on 14 of 17.** Hot loop is **~109 instructions / 27 stack
+3. **Decoder = DecodeSeq (13/18).** Hot loop is **~109 instructions / 27 stack
    accesses**, and the stack traffic is DIFFUSE -- ~12 slots touched 1-3x each, with no
-   dominant frame-constant to specialise. That is structurally unlike the probe loop,
-   where five constants carried nearly all of it. Literal copies are now measured:
-   90.5% take the 16-byte tier, brick 80's 32-byte tier captured 61% of the remainder,
-   and what is left (728K runs >32 B) genuinely wants a memcpy.
-   **Treat this loop as near its structural limit unless a COUNT says otherwise** --
-   brick 42 showed a rewrite here costs ~2x, and brick 78 showed a well-meant reserve
-   costs 4-11%.
+   dominant frame-constant to specialise, structurally unlike the probe loop.
+   **Treat it as near its structural limit unless a COUNT says otherwise:** brick 42
+   showed a rewrite costs ~2x, brick 78 showed a well-meant reserve costs 4-11%, and
+   brick 84 showed the RLE/offset-1 runs are already memset.
 
-4. **Ratio = the product corpus.** `smallmsg-8m` 1.615 / `jsonlog-16m` 1.528 at L1,
+4. **NEW: xxh64 is the #2 decode stage and the best-evidenced remaining lever.**
+   It leads outright on 3 of 18 and is 33-53% of decode there. It is **memory-bound,
+   not compute-bound** (17.9/18.0/18.0 GB/s at 32 KiB/256 KiB/4 MiB working sets vs
+   **12.5 GB/s over 32 MiB** -- see the `#[ignore]` `xxh64::locality_probe`). Two dead
+   ends already paid for: the ALGORITHM is fixed by RFC 8878 (XXH64's 64x64 multiply
+   has no SSE2/AVX2 equivalent -- that is why XXH3 exists), and FUSING the hash into
+   the block loop to catch the data hot measured **~12% WORSE** (brick 85, reverted).
+   **What is left is overlapping it with decode on a second thread.**
+
+5. **Ratio = the product corpus.** `smallmsg-8m` 1.615 / `jsonlog-16m` 1.528 at L1,
    but 1.440 / 1.318 at L3 -- section 5 has the `minMatch` explanation. Replace the
    generated corpus with real captured traffic before treating this as a target.
 
-5. **`find_opt`'s price model is still crude.** Literals cost a flat 6; brick 72 made
-   the offset term ~log2(offset) and brick 75 added repcode candidates, but C prices
-   from accumulated `litFreq`/`matchLengthFreq`. Brick 76 tried the block's byte
-   histogram as a proxy and was REVERTED (net worse, mechanism unexplained). The right
-   source -- the previous block's ACTUAL literal frequencies -- is already computed.
+6. **`find_opt`'s price model is still crude, and BOTH repairs failed the same way.**
+   Literals cost a flat 6; brick 72 made the offset term ~log2(offset), brick 75 added
+   repcode candidates. Brick 76 (block byte histogram) and brick 83 (the previous
+   block's ACTUAL Huffman code lengths) were both REVERTED. The unifying cause: each
+   made the LITERAL term accurate while sequences kept brick 72's invented
+   `12 + log2(offset)` scale, which SKEWS the comparison rather than improving it.
+   **A correct attempt must price literals AND sequences in real bits as one unit.**
 
 ---
 
