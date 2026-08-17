@@ -2610,8 +2610,185 @@ fn find_dfast(
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
+    // Fold the hash shift to an immediate for the values the level table
+    // actually produces: L3 uses 17, L4 uses 18, smaller inputs pick lower rows.
+    // 12..=20 covers every reachable case; the runtime arm is a safety net, not
+    // a hot path. `tables.hash_log` is the AUTHORITATIVE clamped value (brick
+    // 52) -- `find_dfast` had been reading `params.hash_log` instead, which is
+    // the same today only because `compression_params` clamps to the same range.
+    macro_rules! go {
+        ($h:expr) => {
+            find_dfast_impl::<$h>(src, block_start, block_end, window, params, tables, reps)
+        };
+    }
+    if !dfast_spec_enabled() {
+        return find_dfast_runtime(src, block_start, block_end, window, params, tables, reps);
+    }
+    match tables.hash_log {
+        12 => go!(12),
+        13 => go!(13),
+        14 => go!(14),
+        15 => go!(15),
+        16 => go!(16),
+        17 => go!(17),
+        18 => go!(18),
+        19 => go!(19),
+        20 => go!(20),
+        _ => find_dfast_runtime(src, block_start, block_end, window, params, tables, reps),
+    }
+}
+
+/// GATE 4/5 EXTENDED TO L3 -- the DEFAULT level's finder.
+///
+/// `find_fast` has been specialised since bricks 46/48/59 into
+/// `find_fast_impl<PACKED, REP, HLOG, STEP, PIPE>`, 13 monomorphizations, so its
+/// hash shift folds to an IMMEDIATE. `find_dfast` never got that treatment, and
+/// it is the finder the shipping DEFAULT (L3/L4) runs: the shift amount was a
+/// runtime value feeding TWO hashes on EVERY probe (4-byte + 8-byte), i.e. a
+/// variable-count shift twice per position, plus a third in the post-match fill.
+///
+/// Nine levels were specialised (-7..-1, 1, 2); the one carrying most real
+/// traffic was not.
+///
+/// Byte-identical by construction: `HLOG` takes the value the runtime variable
+/// already held, so every hash index is unchanged.
+fn find_dfast_impl<const HLOG: u32>(
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
     let mls = params.min_match.max(3) as usize;
-    let hash_log = params.hash_log;
+    let mut seqs = Vec::new();
+    let mut lits = Vec::new();
+    let mut anchor = block_start;
+    let ilimit = block_end.saturating_sub(8);
+    if block_start >= ilimit {
+        lits.extend_from_slice(&src[block_start..block_end]);
+        return (seqs, lits);
+    }
+    // BRICK 70: repcode-1 search in DFast.
+    //
+    // C checks `offset_1` at every position in `_doubleFast` exactly as it does
+    // in `_fast`; we had it ONLY in `find_fast`, so L3 -- the SHIPPING DEFAULT --
+    // had no repcode search at all. That is the whole of the 4.3x versions-16m
+    // hole at L2-L4 (L1/L2 collapse to 0.07x/0.62x with it on, L3/L4 do not move).
+    //
+    // Dispatched on the same measured yield as brick 67, so content without a
+    // constant stride does not pay for a search that cannot hit.
+    // P0/gg-matchfind: work counter -- see `chain_find_best`.
+    const COUNT: bool = cfg!(feature = "profile");
+    let mut probes = 0u64;
+    let mut hits = 0u64;
+    let use_rep = rep_search_on(tables.rep_yield, params.strategy);
+    let mut rep1 = reps[0] as usize;
+    let mut rep_hits = 0u64;
+    let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
+    let mut ip = block_start;
+    while ip <= ilimit {
+        if use_rep {
+            if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
+                rep_hits += 1;
+                let mstart = ip + 1;
+                lits.extend_from_slice(&src[anchor..mstart]);
+                seqs.push(Seq {
+                    litlen: (mstart - anchor) as u32,
+                    matchlen: ml as u32,
+                    offset: rep1 as u32,
+                });
+                ip = mstart + ml;
+                anchor = ip;
+                continue;
+            }
+        }
+        let h4 = hash_mls(src, ip, 4, HLOG);
+        let h8 = hash8(src, ip, HLOG);
+        let m4 = tables.get_h(h4);
+        let m8 = tables.get_hl(h8);
+        tables.put_h(h4, ip);
+        tables.put_hl(h8, ip);
+
+        let mut best_m = 0usize;
+        let mut best_ml = 0usize;
+        if let Some(m8) = m8 {
+            if COUNT {
+                probes += 1;
+            }
+            if match_ok(
+                src,
+                m8,
+                ip,
+                window,
+                block_start,
+                8.min(mls).max(4),
+                tables.frame_start,
+            ) {
+                let ml = count_match(src, m8, ip, block_end);
+                if ml >= mls {
+                    best_m = m8;
+                    best_ml = ml;
+                }
+            }
+        }
+        if best_ml < 8 {
+            if let Some(m4) = m4 {
+                if COUNT {
+                    probes += 1;
+                }
+                if match_ok(src, m4, ip, window, block_start, mls, tables.frame_start) {
+                    let ml = count_match(src, m4, ip, block_end);
+                    if ml >= mls && ml > best_ml {
+                        best_m = m4;
+                        best_ml = ml;
+                    }
+                }
+            }
+        }
+        if best_ml >= mls {
+            lits.extend_from_slice(&src[anchor..ip]);
+            seqs.push(Seq {
+                litlen: (ip - anchor) as u32,
+                matchlen: best_ml as u32,
+                offset: (ip - best_m) as u32,
+            });
+            rep1 = ip - best_m;
+            if COUNT {
+                hits += 1;
+            }
+            let end = ip + best_ml;
+            // DFast never sets `packed` (it is gated on Strategy::Fast).
+            fill_hash_after_match::<false>(tables, src, ip, end, mls, ilimit);
+            fill_hash_long_after_match(tables, src, ip, end, HLOG, ilimit);
+            ip = end;
+            anchor = ip;
+        } else {
+            ip += 1 + ((ip - anchor) >> 8);
+        }
+    }
+    tables.rep_yield = if seqs.is_empty() {
+        1.0
+    } else {
+        (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
+    };
+    lits.extend_from_slice(&src[anchor..block_end]);
+    note_finder_work(COUNT, probes, hits, &seqs, &lits);
+    (seqs, lits)
+}
+
+fn find_dfast_runtime(
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
+    let mls = params.min_match.max(3) as usize;
+    let hash_log = tables.hash_log;
     let mut seqs = Vec::new();
     let mut lits = Vec::new();
     let mut anchor = block_start;
@@ -5075,5 +5252,48 @@ mod tests {
             on_c.raw >= off_c.raw,
             "skip-on should dump at least as many raw blocks"
         );
+    }
+}
+
+/// Clear every cached env-var arm so a later `std::env::set_var` is observed.
+///
+/// Each arm caches its env read in an atomic on first use -- bricks 49/64/77
+/// removed those reads from hot loops. That makes an IN-PROCESS A/B that flips
+/// an env var read stale: the second arm silently re-measures the first. Only
+/// needed by probes that set env vars mid-process; the shipped paths never do.
+pub fn reset_env_arms() {
+    use core::sync::atomic::Ordering;
+    STEP0_ARM.store(0, Ordering::Relaxed);
+    TAG_ARM.store(0, Ordering::Relaxed);
+    PIPE_ARM.store(0, Ordering::Relaxed);
+    REP1_ENABLED_ARM.store(0, Ordering::Relaxed);
+    LAZY_FILL_ENABLED_ARM.store(0, Ordering::Relaxed);
+    FAST_LAZY_ARM.store(0, Ordering::Relaxed);
+}
+
+/// Arm for the `find_dfast` HLOG specialisation, so it can be A/B'd IN-PROCESS
+/// rather than across two binaries (a cross-binary compare buries the kernel
+/// delta under process-start cost). `RZSTD_DFAST_SPEC=0` selects the old
+/// runtime-shift path.
+static DFAST_SPEC_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for in-process ABBA.
+pub fn set_dfast_spec_arm(on: bool) {
+    DFAST_SPEC_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn dfast_spec_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match DFAST_SPEC_ARM.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var("RZSTD_DFAST_SPEC")
+                .map(|v| v.trim() != "0")
+                .unwrap_or(true);
+            DFAST_SPEC_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
     }
 }
