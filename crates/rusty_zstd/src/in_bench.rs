@@ -18,7 +18,7 @@
 //! the distribution.
 
 use crate::error::Error;
-use crate::{compress, decompress};
+use crate::{compress_with, decompress, decompress_into, CompressOptions};
 use std::time::{Duration, Instant};
 
 /// Cap on retained per-loop samples (a very fast loop on a small input can
@@ -222,7 +222,26 @@ where
     // DETERMINISTIC PASS -- runs once, outside every timed region
     // (codec-measurement 13: never share a loop between deterministic and
     // timed quantities). This is also the correctness gate.
-    let zst = compress(src, level)?;
+    // WORK PARITY WITH THE C ORACLE (codec-measurement 9).
+    //
+    // The oracle runs `zstd -bN -iN -T1` with no `--check`, so libzstd's
+    // default `ZSTD_c_checksumFlag = 0` applies: C's benchmark computes NO
+    // xxh64 on compress and verifies NONE on decompress. Our `compress`
+    // defaults `checksum: true` (the CLI default), so we were timing an extra
+    // full pass over every byte -- on BOTH phases -- that C never runs.
+    //
+    // Measured on zeros-32m: checksum verification alone was **61% of our
+    // decompress time** (7792 -> 20150 MB/s with it off). It is the whole of
+    // the reported 2.2x decompress "gap" on that corpus.
+    //
+    // The shipped default stays `checksum: true`. This is the BENCH matching
+    // the oracle's configuration, not a change to what users get.
+    let opts = CompressOptions {
+        level,
+        checksum: false,
+        ..Default::default()
+    };
+    let zst = compress_with(src, opts)?;
     let raw = decompress(&zst)?;
     if raw.as_slice() != src {
         return Err(Error::Corruption);
@@ -235,14 +254,25 @@ where
     // separately, so a shared loop would hand C ~3x our sample count in the
     // same budget and make its best-of-N strictly better than ours.
     let c = time_phase(min, &mut tick, || {
-        compress(src, level)?;
+        compress_with(src, opts)?;
         Ok(())
     })?;
     // TIMED PASS 2 -- decompress only, off the already-built frame.
+    //
+    // WORK PARITY (codec-measurement 9). C `-b` decompresses into a destination
+    // buffer it allocates ONCE and reuses every round. Calling `decompress`
+    // here allocates a fresh `Vec` per loop, so we timed our decode PLUS the
+    // kernel faulting and zeroing every output page, against C's decode alone.
+    // Measured on zeros-32m that asymmetry was **82% of our reported time** and
+    // accounted for the entire 2.2x "gap" -- a harness defect, not a decoder
+    // one. Reuse the buffer, exactly as C does.
+    let mut dst = Vec::with_capacity(src.len());
     let d = time_phase(min, &mut tick, || {
-        decompress(&zst)?;
+        dst.clear();
+        decompress_into(&mut dst, &zst)?;
         Ok(())
     })?;
+    debug_assert_eq!(dst.len(), src.len());
 
     Ok(InProcessBench {
         loops: c.loops.min(d.loops),

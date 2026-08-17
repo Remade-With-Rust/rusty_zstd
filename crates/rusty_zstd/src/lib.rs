@@ -55,7 +55,8 @@ pub use frame::{
 #[cfg(feature = "alloc")]
 pub use decode::{
     decompress, decompress_using_dict, decompress_using_dict_with, decompress_using_prefix,
-    decompress_using_prefix_with, frame_block_census, inspect_frames, BlockCensus, ListedFrame,
+    decompress_into, decompress_into_with, decompress_using_prefix_with, frame_block_census,
+    inspect_frames, BlockCensus, ListedFrame,
 };
 #[cfg(feature = "alloc")]
 pub use dict::{
