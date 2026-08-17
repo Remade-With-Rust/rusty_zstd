@@ -226,11 +226,20 @@ The largest stage (#1 on 15 of 18 corpora) and by far the most dispatched.
 | 14 | `1 << params.search_log.min(12)` | LEVEL | chain walk depth | `chain_find_best` encode.rs:2525 (also 2398 greedy, 2746 bt) |
 | 15 | `has_avx2()` | CPU | `count_eq_len` AVX2 / NEON / scalar -- the match-length compare | simd.rs:84, encode.rs:3088 |
 | 16 | `early_raw_skip` / `incomp_skip_on` `RZSTD_INCOMP_SKIP` | **MEASURED** x ARM | abandon the block to RAW when match bytes fall under a threshold | encode.rs:670, 817, 844 |
+| 17 | `params.strategy` -> `extra` (BtUltra2=2, BtUltra=1, else 0) | LEVEL | the DP's repcode price `12 - extra + 2` | `find_opt` encode.rs:2938 |
+| 18 | `params.strategy == BtUltra2` | LEVEL | DP length step: every length vs `(bml-len).clamp(1,4)` | `find_opt` encode.rs:3012 |
+| 19 | `price[j] < inf` / `np < price[j]` | **MEASURED** | the optimal-parse DP itself -- per position, per candidate length | `find_opt` encode.rs:2949-3002 |
+| 20 | `try_rep1` candidate admitted to the DP | **MEASURED** | brick 75 repcode candidate at `ip+1` | `find_opt` encode.rs:2964 |
 
-**Only #2, #3 and #16 are true content dispatches.** Everything else is a level knob,
-a shipped arm, or CPU detection. That is the finding: the biggest stage has exactly
-three live content-adaptive decisions, and two of them (`rep_yield`,
-`last_search_per_byte`) are single scalars carried from the previous block.
+**Only #2, #3, #16, #19 and #20 are true content dispatches**, and #19/#20 exist only
+at L16+ (`find_opt`). At the shipping levels the biggest stage has exactly THREE live
+content-adaptive decisions, and two of them (`rep_yield`, `last_search_per_byte`) are
+single scalars carried from the previous block.
+
+`find_opt` (rows 17-20) is the codec's only true cost model on the encode side -- a DP
+over per-position prices. Its price terms are the known-crude part (literals flat 6,
+offsets `12 + log2(offset)` from brick 72); bricks 76 and 83 both tried to make the
+LITERAL term accurate while leaving the sequence term invented, and both reverted.
 
 ---
 
@@ -385,9 +394,63 @@ to every profiler:
    The FseSeq gates, which compare REAL header bytes with nothing expensive behind
    them, have never regressed. **Cheap-to-evaluate is not the property that matters;
    cheap-to-be-WRONG is.**
-4. **The ARM count is a standing liability.** 16 shipped arms are 16 live atomic or
-   `OnceLock` reads, and bricks 49, 64 and 77 were each a case of one sitting inside a
-   per-symbol loop. They should be audited for hoisting, or retired to `cfg`.
+4. **The knob count is a standing liability: 17 of them.** 12 atomic arms, 3
+   `OnceLock`s, and 2 UNCACHED `std::env::var` reads. Bricks 49, 64 and 77 were each a
+   case of one sitting inside a per-symbol loop. They should be audited for hoisting,
+   or retired to `cfg`. Full list in the addendum below.
+
+---
+
+### Addendum -- gates OUTSIDE the seven stages, and the full knob list
+
+The seven inventories above cover only the stages in the section 3 table. These gates
+are real, live, and belong to no stage in it.
+
+**Frame and block level (encode):**
+
+| gate | kind | selects | where |
+| --- | --- | --- | --- |
+| `adv.nb_workers > 0` | caller | whole-frame multithreaded path `mt::compress_mt` | encode.rs:193 |
+| `dict` / `prefix` present | caller | dictionary priming, `--patch-from`, `frame_start` offset | encode.rs:108-177 |
+| `write_dict_id` | caller | Dictionary_ID field in the frame header | encode.rs:112 |
+| `opts.checksum` | caller | 4-byte xxh64 trailer (default ON for us, OFF for `zstd -b`) | encode.rs:478 |
+| `RZSTD_BLOCK_KB` | ARM (uncached env) | caps `block_max` below 128 KiB | encode.rs:488 |
+| `payload_reserve_enabled()` `RZSTD_PAYLOAD_RES` | ARM | pre-reserve the block payload `Vec` | encode.rs:694, 2064 |
+| `raw_limit` vs payload length | **MEASURED** | final Raw / RLE / Compressed block type | encode.rs:713-735 |
+| single-byte block | **MEASURED** | RLE block | encode.rs:631 |
+
+**Frame level (decode):**
+
+| gate | kind | selects | where |
+| --- | --- | --- | --- |
+| `opts.window_max` (default 128 MiB) | caller | reject over-large-window frames (`-d --long`) | decode.rs:18, 36 |
+| `dict` / `prefix` present | caller | history priming before block decode | decode.rs:48-77 |
+| frame magic | stream | zstd frame vs SKIPPABLE frame vs end of input | decode.rs |
+
+**The full knob list -- 17 runtime-selected switches in the shipping binary:**
+
+12 atomic arms:
+`SEQCHECK_ARM`, `LUT_ARM`, `LITCOPY_ARM`, `MATCHCOPY_ARM` (compressed.rs:548, 662-664);
+`LAZY_FILL_ENABLED_ARM`, `REP1_ENABLED_ARM`, `TAG_ARM`, `PIPE_ARM`,
+`HUFF_FAST_ENABLED_ARM`, `PAYLOAD_ARM`, `LITPUSH_ARM`, `LITPUSH_HOIST_ARM`
+(encode.rs:1800, 1869, 1937, 1995, 2022, 2048, 2078, 2088).
+
+3 `OnceLock`s: `lazy_fill_threshold` (1827), `lazy_fill_stride` (1839),
+`step0_default` (1917).
+
+2 UNCACHED `std::env::var` reads -- these allocate and hit the process environment on
+EVERY call, unlike the arms and `OnceLock`s:
+- `RZSTD_BLOCK_KB` (encode.rs:488) -- once per frame, harmless.
+- **`RZSTD_INCOMP_SKIP` (encode.rs:826) -- once per BLOCK**, via
+  `incomp_skip_on` <- `early_raw_skip`. Same shape as bricks 49/64/77: a knob read
+  living inside a loop. It is per-block rather than per-symbol so the cost is small,
+  but it is the only uncached env read left on a hot path.
+
+**A methodology note, recorded because it nearly shipped a wrong number.** The first
+pass at this count used `grep "static [A-Z_]*ARM"`, which does not match digits, so
+`REP1_ENABLED_ARM` was invisible and the count read 11. The doc briefly claimed "16
+shipped arms" on that basis. Correct pattern: `[A-Z0-9_]*`. An audit that counts is
+only as good as its pattern -- verify the pattern against a case you KNOW exists.
 
 ---
 
