@@ -2661,6 +2661,7 @@ fn find_dfast_impl<const HLOG: u32>(
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
+    DFAST_SPEC_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mls = params.min_match.max(3) as usize;
     let mut seqs = Vec::new();
     let mut lits = Vec::new();
@@ -2787,6 +2788,7 @@ fn find_dfast_runtime(
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
+    DFAST_RUNTIME_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mls = params.min_match.max(3) as usize;
     let hash_log = tables.hash_log;
     let mut seqs = Vec::new();
@@ -5325,4 +5327,19 @@ fn fast_spec_enabled() -> bool {
             on
         }
     }
+}
+
+/// Which `find_dfast` body actually executed. Probe counts and output bytes are
+/// IDENTICAL between the two, by design -- they examine the same candidates in
+/// the same order -- so neither can show which one ran. These can.
+pub static DFAST_SPEC_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_RUNTIME_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear both call counters.
+pub fn take_dfast_calls() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        DFAST_SPEC_CALLS.swap(0, Ordering::Relaxed),
+        DFAST_RUNTIME_CALLS.swap(0, Ordering::Relaxed),
+    )
 }
