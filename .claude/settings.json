@@ -22,7 +22,13 @@
       "Bash(rm -rf target/d2)",
       "Bash(git -c user.name=Tim -c user.email=tim.almond@thehouseinc.xyz commit -qam 'decode: bricks 78+79 — per-block output reserve, and hoist the literal-copy arm *)",
       "Bash(xargs -I{} echo \"diagnostics: {}\")",
-      "Bash(git -c user.name=Tim -c user.email=tim.almond@thehouseinc.xyz commit -qam 'decode: brick 80 — 32-byte literal copy tier, measured before building *)"
+      "Bash(git -c user.name=Tim -c user.email=tim.almond@thehouseinc.xyz commit -qam 'decode: brick 80 — 32-byte literal copy tier, measured before building *)",
+      "Bash(python \"C:\\\\Users\\\\talmo\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-talmo-coding-rusty-zstd\\\\6ef1a5e8-8f1f-4aaf-940e-b850c1781e27\\\\scratchpad\\\\align_md.py\" docs/plans/m7-anatomy.md)",
+      "Bash(xargs -I{} echo \"table rows in doc: {}\")",
+      "Bash(sed -n '/## 1. Level 1/,/^$/p' docs/plans/m7-anatomy.md)",
+      "Bash(xargs -I{} echo \"provenance notes: {}\")",
+      "Bash(xargs -I{} echo \"L3 prose blocks: {}\")",
+      "Bash(sed -n '/## 2. Level 3/,/^## /p' docs/plans/m7-anatomy.md)"
     ],
     "additionalDirectories": [
       "c:\\Users\\talmo\\coding\\rusty_zstd\\crates\\rusty_zstd\\src"

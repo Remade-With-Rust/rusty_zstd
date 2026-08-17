@@ -21,106 +21,94 @@ pre-campaign board and all speed movement is genuine.
 
 ## 1. Level 1 — the full board, all 18 corpora
 
-**Re-measured 2026-08-16** after the 17-brick optimisation campaign (front 1 match-find,
-the mr Huffman work, front 2 decoder). Session null-arm **1.0384**, worst same-arm spread
-4.8%. Compressed sizes are BYTE-IDENTICAL to the pre-campaign board — every change was
-gated on the Silesia hashes — so the `us/c size` column is unchanged and all movement
-below is pure speed.
+**Re-measured 2026-08-16 (second pass)** after the repcode campaign (bricks 70-75),
+the Huffman histogram fix (74) and the decoder work (79/80). Session null-arm
+**0.9470** at L1 / **1.0316** at L3; worst L1 same-arm spread 16.8%, so treat individual
+speed rows with spreads above ~5% as indicative only.
+
+**PROVENANCE, stated plainly:** these runs predate bricks 79/80 and the brick-78
+REVERT, which are decoder-only. The **compress and `us/c size` columns are
+current**; the **decompress columns are STALE and understate us by ~2-4%** (measured
+separately on a quiet box: xml 1292->1340, nci 1191->1217, webster 982->994 MB/s).
 
 | corpus       |  C comp | us comp | **C/us c** | C decomp | us decomp | **C/us d** | us/c size |
 | ------------ | ------: | ------: | ---------: | -------: | --------: | ---------: | --------: |
-| zeros-32m    | 10931.2 | 10396.4 |   **1.05** |  27316.6 |   11467.7 |       2.38 | **0.901** |
-| text-32m     | 15201.8 | 10833.4 |       1.40 |  10540.3 |   10850.6 |   **0.97** |     1.022 |
-| incomp-32m   |  5155.6 |  4994.2 |   **1.03** |  13028.6 |    7841.7 |       1.66 |     1.000 |
-| jsonlog-16m  |   676.7 |   306.8 |       2.21 |   1848.4 |    1016.6 |       1.82 | **1.527** |
-| smallmsg-8m  |   535.7 |   316.5 |       1.69 |   2323.4 |     985.1 |       2.36 | **1.615** |
-| versions-16m |  1104.6 |  1167.3 |   **0.95** |   2875.9 |    2794.6 |   **1.03** | **0.755** |
-| mr           |   514.3 |   194.1 |       2.65 |   1837.1 |    1322.1 |       1.39 |     1.114 |
-| ooffice      |   468.5 |   253.0 |       1.85 |   1239.2 |    1342.6 |   **0.92** |     1.262 |
-| osdb         |   548.7 |   217.4 |       2.52 |   1848.2 |    1039.5 |       1.78 |     1.144 |
-| reymont      |   357.8 |   208.1 |       1.72 |   1799.2 |     868.8 |       2.07 | **1.437** |
-| sao          |   455.3 |   596.6 |   **0.76** |   1241.4 |    5272.6 |   **0.24** |     1.143 |
-| webster      |   421.2 |   226.6 |       1.86 |   1760.2 |     999.6 |       1.76 | **1.436** |
-| dickens      |   359.4 |   177.6 |       2.02 |   1701.0 |     802.3 |       2.12 |     1.215 |
-| mozilla      |   557.9 |   206.5 |       2.70 |   1468.9 |     833.8 |       1.76 |     1.222 |
-| nci          |  1043.4 |   447.7 |       2.33 |   2861.1 |    1225.1 |       2.34 |     1.303 |
-| samba        |   633.9 |   317.0 |       2.00 |   2254.0 |    1164.7 |       1.94 |     1.255 |
-| xml          |   826.9 |   418.1 |       1.98 |   2651.0 |    1311.1 |       2.02 |     1.308 |
-| x-ray        |   902.8 |  1756.3 |   **0.51** |   1403.3 |    5157.2 |   **0.27** |     1.221 |
+| zeros-32m    |  7528.3 |  8205.6 |   **0.92** |  15626.6 |    8114.7 |       1.93 | **0.901** |
+| text-32m     | 10636.0 |  8608.3 |       1.24 |   8077.2 |    7511.5 |   **1.08** |     1.100 |
+| incomp-32m   |  3905.3 |  4650.3 |   **0.84** |   9034.9 |    6785.4 |       1.33 |     1.000 |
+| jsonlog-16m  |   577.1 |   291.2 |       1.98 |   1527.7 |     996.4 |       1.53 | **1.528** |
+| smallmsg-8m  |   445.7 |   337.9 |       1.32 |   2013.2 |     949.2 |       2.12 | **1.615** |
+| versions-16m |   916.9 |  4997.1 |   **0.18** |   2414.8 |    6663.2 |   **0.36** | **0.075** |
+| mr           |   422.9 |   181.8 |       2.33 |   1469.9 |    1131.8 |       1.30 |     1.111 |
+| ooffice      |   395.4 |   244.9 |       1.61 |    992.2 |    1167.6 |   **0.85** |     1.262 |
+| osdb         |   460.2 |   213.5 |       2.16 |   1537.1 |     961.9 |       1.60 |     1.138 |
+| reymont      |   289.9 |   208.0 |       1.39 |   1470.7 |     813.2 |       1.81 | **1.402** |
+| sao          |   385.4 |   382.8 |   **1.01** |    972.1 |    3253.3 |   **0.30** |     1.138 |
+| webster      |   324.8 |   185.7 |       1.75 |   1337.2 |     816.0 |       1.64 | **1.443** |
+| dickens      |   268.7 |   150.0 |       1.79 |   1264.1 |     673.0 |       1.88 |     1.201 |
+| mozilla      |   429.6 |   188.1 |       2.28 |   1126.7 |     679.1 |       1.66 |     1.222 |
+| nci          |   776.9 |   397.4 |       1.95 |   2248.8 |    1007.0 |       2.23 |     1.302 |
+| samba        |   507.9 |   293.8 |       1.73 |   1847.8 |    1035.3 |       1.78 |     1.258 |
+| xml          |   695.1 |   422.0 |       1.65 |   2262.6 |    1203.3 |       1.88 |     1.308 |
+| x-ray        |   782.1 |  1500.3 |   **0.52** |   1153.0 |    4144.9 |   **0.28** |     1.212 |
 
 ### Where we already win or tie
 
-- **Compress at or better than C:** `x-ray` **0.51**, `sao` **0.76**, `versions-16m`
-  **0.95**, `incomp` **1.03**, `zeros` **1.05**.
-- **Decompress at or better than C:** `sao` **0.24** (4.2x faster), `x-ray` **0.27**,
-  `ooffice` **0.92**, `text-32m` **0.97**, `versions-16m` **1.03**.
-- **Ratio better than C:** `zeros` 0.901, `versions-16m` **0.755** (25% smaller).
+- **Compress at or better than C:** `versions-16m` **0.18**, `x-ray` **0.52**,
+  `incomp-32m` **0.84**, `zeros-32m` **0.92**, `sao` **1.01**.
+- **Decompress at or better than C:** `x-ray` **0.28**, `sao` **0.30**,
+  `versions-16m` **0.36**, `ooffice` **0.85**, `text-32m` **1.08**.
+- **Ratio better than C:** `versions-16m` **0.075** (13x smaller -- see the repcode
+  bricks 67/70/71/73/75), `zeros-32m` 0.901.
 
 Against mission section 7 (decompress <= 1.11, compress <= 1.25): **5 corpora pass
-compress, 5 pass decompress** — the same COUNT as before the campaign, but no longer
-marginal passes: `x-ray` went 0.72 -> 0.51 and `sao` 1.10 -> 0.76.
-
-### What the campaign moved (compress `C/us`, before -> after)
-
-**16 of 18 corpora improved.** Three now compress FASTER than C.
-
-| corpus           | before |    after |     | corpus      | before | after |
-| ---------------- | -----: | -------: | --- | ----------- | -----: | ----: |
-| **x-ray**        |   0.72 | **0.51** |     | dickens     |   2.37 |  2.02 |
-| **sao**          |   1.10 | **0.76** |     | xml         |   2.29 |  1.98 |
-| **versions-16m** |   1.06 | **0.95** |     | samba       |   2.24 |  2.00 |
-| incomp-32m       |   1.09 |     1.03 |     | webster     |   2.12 |  1.86 |
-| mozilla          |   3.22 |     2.70 |     | smallmsg-8m |   1.98 |  1.69 |
-| mr               |   3.20 |     2.65 |     | reymont     |   1.96 |  1.72 |
-| osdb             |   2.82 |     2.52 |     | ooffice     |   2.34 |  1.85 |
-| jsonlog-16m      |   2.56 |     2.21 |     | nci         |   2.52 |  2.33 |
-
-Only `zeros-32m` (0.99 -> 1.05) and `text-32m` (1.37 -> 1.40) moved the wrong way, both
-inside the 3.8% session floor and both on trivial/RLE paths the campaign never touched.
-
-**Decompress** is flat-to-better everywhere, with the gains where the decoder bricks
-landed: `text-32m` 1.10 -> **0.97**, `ooffice` 0.97 -> **0.92**, `xml` 2.09 -> 2.02,
-`webster` 1.80 -> 1.76, `mr` 1.41 -> 1.39. (An earlier decode REGRESSION of 3-7% on
-sequence-heavy files was traced to a const generic splitting `decode_sequences` out of its
-caller, and fixed by hoisting the same value into a plain local — see brick 64b in
-`m7-encoder-whys.md`.)
+compress, 5 pass decompress.**
 
 ### Where we lose
 
-- **Compress:** `mozilla` 2.70, `mr` 2.65, `osdb` 2.52, `nci` 2.33.
-- **Decompress:** `smallmsg` 2.36, `nci` 2.34, `dickens` 2.12, `reymont` 2.07.
-- **Ratio:** `smallmsg-8m` **1.615** and `jsonlog-16m` **1.527** — the product corpus is
-  our worst ratio anywhere. See section 5: the gap is roughly HALF what this L1 figure
-  suggests, because L1 is our worst point measured against C's best.
+- **Compress:** `mr` 2.33, `mozilla` 2.28, `osdb` 2.16, `jsonlog-16m` 1.98.
+- **Ratio:** `smallmsg-8m` **1.615** and `jsonlog-16m` **1.528** -- the product corpus
+  remains our worst ratio. See section 5: the gap is roughly HALF what the L1 figure
+  implies, because L1 is our worst point against C's best.
+
+**`versions-16m` is the headline change.** It was 1.06 compress / 0.755 size before the
+campaign; the repcode work took it to **0.18 compress and 0.075 size -- 13x smaller than
+C**. That single corpus is why every finder now carries a repcode search.
 
 ---
 
 ## 2. Level 3 (dfast) — the shipping default
 
-**Re-measured 2026-08-16**, and widened from 8 Silesia files to **all 18 corpora**.
-Session null-arm **1.0084** (the cleanest of the campaign). Sizes are byte-identical to
-the pre-campaign build.
+**Re-measured 2026-08-16 (second pass)** after the repcode campaign (bricks 70-75),
+the Huffman histogram fix (74) and the decoder work (79/80). Session null-arm
+**0.9470** at L1 / **1.0316** at L3; worst L1 same-arm spread 16.8%, so treat individual
+speed rows with spreads above ~5% as indicative only.
+
+**PROVENANCE, stated plainly:** these runs predate bricks 79/80 and the brick-78
+REVERT, which are decoder-only. The **compress and `us/c size` columns are
+current**; the **decompress columns are STALE and understate us by ~2-4%** (measured
+separately on a quiet box: xml 1292->1340, nci 1191->1217, webster 982->994 MB/s).
 
 | corpus       | C comp | us comp | **C/us c** | C decomp | us decomp | **C/us d** | us/c size |
 | ------------ | -----: | ------: | ---------: | -------: | --------: | ---------: | --------: |
-| zeros-32m    | 7356.5 |  9901.9 |   **0.74** |  24223.2 |   11505.8 |       2.11 | **0.972** |
-| text-32m     | 8375.2 | 10428.7 |   **0.80** |   9330.6 |   10036.0 |   **0.93** |     1.005 |
-| incomp-32m   | 3942.3 |  2897.4 |       1.36 |  11366.8 |    7204.2 |       1.58 |     1.000 |
-| jsonlog-16m  |  373.5 |   188.2 |       1.98 |   1775.5 |     916.3 |       1.94 |     1.320 |
-| smallmsg-8m  |  331.1 |   146.0 |       2.27 |   2153.7 |     801.3 |       2.69 | **1.440** |
-| versions-16m | 4714.2 |  1803.0 |       2.61 |  22793.4 |    4469.2 |       5.10 | **4.297** |
-| mr           |  287.7 |   144.3 |       1.99 |   1515.1 |     464.1 |       3.26 |     1.052 |
-| ooffice      |  248.8 |   118.7 |       2.10 |   1090.6 |     653.7 |       1.67 |     1.136 |
-| osdb         |  362.7 |   190.0 |       1.91 |   1795.3 |     968.1 |       1.85 |     1.104 |
-| reymont      |  263.8 |   152.5 |       1.73 |   1514.9 |     533.9 |       2.84 |     1.092 |
-| sao          |  211.5 |   122.2 |       1.73 |    970.1 |     765.1 |       1.27 |     1.056 |
-| webster      |  265.7 |   152.1 |       1.75 |   1521.0 |     616.0 |       2.47 |     1.141 |
-| dickens      |  236.8 |   122.1 |       1.94 |   1506.0 |     473.5 |       3.18 |     1.129 |
-| mozilla      |  364.4 |   160.9 |       2.26 |   1397.1 |     656.4 |       2.13 |     1.105 |
-| nci          |  919.3 |   453.4 |       2.03 |   2798.9 |    1259.4 |       2.22 |     1.221 |
-| samba        |  457.2 |   211.7 |       2.16 |   2150.0 |     779.9 |       2.76 |     1.111 |
-| xml          |  631.8 |   344.4 |       1.83 |   2492.2 |    1112.5 |       2.24 |     1.185 |
-| x-ray        |  195.0 |   103.5 |       1.88 |   1020.8 |     535.6 |       1.91 |     1.082 |
+| zeros-32m    | 5867.8 |  8264.6 |   **0.71** |  16655.7 |    8196.6 |       2.03 | **0.972** |
+| text-32m     | 6531.7 |  7779.3 |   **0.84** |   7479.0 |    6970.6 |   **1.07** |     1.082 |
+| incomp-32m   | 2961.3 |  2406.4 |       1.23 |   8912.4 |    6036.5 |       1.48 |     1.000 |
+| jsonlog-16m  |  266.6 |   142.5 |       1.87 |   1270.5 |     779.2 |       1.63 |     1.318 |
+| smallmsg-8m  |  268.0 |   139.7 |       1.92 |   1901.2 |     789.6 |       2.41 | **1.440** |
+| versions-16m | 3383.4 |  5396.7 |   **0.63** |  13685.5 |    7220.7 |       1.90 | **0.648** |
+| mr           |  237.2 |   129.5 |       1.83 |   1301.1 |     439.3 |       2.96 |     1.045 |
+| ooffice      |  205.2 |   107.0 |       1.92 |    926.2 |     639.3 |       1.45 |     1.119 |
+| osdb         |  288.7 |   185.3 |       1.56 |   1519.4 |     924.5 |       1.64 |     1.103 |
+| reymont      |  227.4 |   154.9 |       1.47 |   1319.1 |     538.3 |       2.45 |     1.089 |
+| sao          |  169.1 |   104.9 |       1.61 |    822.0 |     763.3 |   **1.08** |     1.056 |
+| webster      |  216.7 |   131.7 |       1.64 |   1295.4 |     506.0 |       2.56 |     1.135 |
+| dickens      |  182.3 |   108.4 |       1.68 |   1183.9 |     445.5 |       2.66 |     1.121 |
+| mozilla      |  276.1 |   134.9 |       2.05 |   1108.8 |     540.9 |       2.05 |     1.105 |
+| nci          |  689.8 |   365.7 |       1.89 |   2137.5 |    1004.1 |       2.13 |     1.152 |
+| samba        |  345.0 |   201.1 |       1.72 |   1713.4 |     755.7 |       2.27 |     1.109 |
+| xml          |  541.7 |   368.8 |       1.47 |   2151.5 |    1162.2 |       1.85 |     1.188 |
+| x-ray        |  164.9 |    92.0 |       1.79 |    878.7 |     520.9 |       1.69 |     1.082 |
 
 **L3 remains our strongest compress level relative to C on Silesia** (1.73-2.26 vs
 L1's 1.72-2.70) **and its ratio is much better** (1.052-1.221 vs L1's 1.114-1.437).
@@ -131,14 +119,26 @@ pre-campaign board showed.
 `text-32m` **0.80**. Those are the RLE/near-RLE paths where dfast's cheaper parse and our
 now-19-instruction probe loop combine.
 
-**Read this table with section 5.** `versions-16m` reads C/us 2.61 here against 0.95 at
-L1, and `smallmsg`/`jsonlog` also degrade relative to C going L1 -> L3. That is the
-`minMatch` interaction documented in section 5, not a regression: the generated corpora
-have a non-monotonic response to level that real content does not share.
+**L3 is the shipping default.** Compress at or better than C on `versions-16m`
+**0.63**, `zeros-32m` **0.71**, `text-32m` **0.84**; worst are `mozilla` 2.05,
+`smallmsg-8m` 1.92, `ooffice` 1.92, `nci` 1.89.
+
+**Ratio at L3 is much better than L1** (`versions-16m` 0.648 vs 0.075 is the exception --
+L1 wins there because Fast+repcode suits constant-stride content; `jsonlog` 1.318 vs
+1.528 and `smallmsg` 1.440 vs 1.615 are the normal direction).
+
+**Read the generated corpora with section 5:** their non-monotonic response to level is
+a `minMatch` interaction with synthetic content, not a regression, and real content does
+not share it.
 
 ---
 
 ## 3. Stage anatomy — where OUR time goes
+
+> **STALE.** These shares predate the repcode campaign (bricks 67/70/71/73/75) and the
+> decoder work (79/80). Repcode now fires in every finder, so MatchFind's share has
+> almost certainly moved and the "#1 on 14 of 17" claim below needs RE-DERIVING from a
+> fresh `--m7-profile` run before it is quoted.
 
 **Re-measured 2026-08-16** on the instrumented build. Share of encode
 (`stage / EncodeTotal`) and of decode (`stage / DecodeTotal`). Bold marks the LEADING
@@ -189,35 +189,40 @@ axis (alphabet flatness) drives both. `osdb` flipping on the encode side while s
 
 ## 4. What this says to do next
 
-Rewritten 2026-08-16. The pre-campaign version of this section is what front 1 was built
-from; three of its four items have now been acted on, so this is the state AFTER.
+Rewritten 2026-08-16 (second pass), after the repcode campaign and the decoder work.
 
-1. **Encoder = MatchFind, still — but by a smaller margin.** #1 on **14 of 17** (was 15),
-   share down on 16 of 17. The probe loop is now **19 instructions with 1 stack access**
-   (from 47 / 20), and compress improved on 16 of 18 corpora, +10% to +43%. What remains
-   in that loop is one L1-hot stack reload of the src base; the frame-constants
-   (`hash_log`, `step0`, the tag and rep flags, the pipeline flag) are all specialised
-   away. **Further gains here need a different lever than const-specialisation** — that
-   seam is worked out.
-2. **Decoder = DecodeSeq, unchanged at #1 on 14 of 17.** Front 2 has only just opened: the
-   per-sequence loop went 50 -> 40 instructions by bundling `copy_match`'s five
-   frame-constant arguments (the Windows x64 ABI passes only 4 in registers), and the
-   per-block Huffman-table clone is gone. **13 stack accesses remain in that loop** — the
-   same shape the encoder's probe loop had before it was worked, and the obvious next
-   target. NOTE the hard-won caveat: a const generic that splits a function out of its
-   INLINED caller can cost more than it saves (brick 64/64b).
-3. **Huffman is now a THREE-file front, not two.** `mr` (61.9%), `x-ray` (61.0%) and now
-   **`osdb` (42.0%)**. Brick 61 removed the speculative second encode (mr: 1.94 -> 1.04
-   encodes per block, +16% compress); `x-ray` and `osdb` have never been examined and are
-   the untouched half of this front.
-4. **Ratio = the product corpus, and it is HALF the problem the L1 board implies.**
-   `smallmsg-8m` 1.615 and `jsonlog-16m` 1.527 at L1, but **1.317 / 1.281 at L5** —
-   section 5 has the `minMatch` explanation. Before spending on this, replace the
-   generated corpus with real captured traffic; its level response is not
-   representative.
-5. **L3 remains the strongest compress level relative to C** (1.73-2.26 on Silesia vs
-   L1's 1.72-2.70) with much better ratio (1.052-1.221 vs 1.114-1.437). Any "how do we
-   compare" claim should quote L3 as well as L1.
+1. **Encoder = MatchFind, and its seam is WORKED OUT.** The probe loop is **19
+   instructions with 1 stack access** (from 47 / 20); every frame-constant (`hash_log`,
+   `step0`, the tag/rep flags, the pipeline flag) is specialised away. The remaining
+   reload is one L1-hot slot. Plumbing was MEASURED rather than inferred: of ~40 static
+   call sites, one ran ZERO times and the only hot one was `push_literals`
+   (15,687,334 executions), whose cost was a flag read -- fixed, ~1%.
+   **Further gains need a different lever than const-specialisation.**
+
+2. **REPCODE now fires in EVERY finder** (`fast`, `dfast`, `greedy`, `lazy`, `bt_lazy`,
+   `opt`). It was present only in `fast`, so L3 -- the shipping default -- had none.
+   `versions-16m` went from **4.3x WORSE than C at L3 to 0.648**, and now beats C at
+   every level 1-22. Silesia ratios IMPROVED rather than traded.
+
+3. **Decoder = DecodeSeq, #1 on 14 of 17.** Hot loop is **~109 instructions / 27 stack
+   accesses**, and the stack traffic is DIFFUSE -- ~12 slots touched 1-3x each, with no
+   dominant frame-constant to specialise. That is structurally unlike the probe loop,
+   where five constants carried nearly all of it. Literal copies are now measured:
+   90.5% take the 16-byte tier, brick 80's 32-byte tier captured 61% of the remainder,
+   and what is left (728K runs >32 B) genuinely wants a memcpy.
+   **Treat this loop as near its structural limit unless a COUNT says otherwise** --
+   brick 42 showed a rewrite here costs ~2x, and brick 78 showed a well-meant reserve
+   costs 4-11%.
+
+4. **Ratio = the product corpus.** `smallmsg-8m` 1.615 / `jsonlog-16m` 1.528 at L1,
+   but 1.440 / 1.318 at L3 -- section 5 has the `minMatch` explanation. Replace the
+   generated corpus with real captured traffic before treating this as a target.
+
+5. **`find_opt`'s price model is still crude.** Literals cost a flat 6; brick 72 made
+   the offset term ~log2(offset) and brick 75 added repcode candidates, but C prices
+   from accumulated `litFreq`/`matchLengthFreq`. Brick 76 tried the block's byte
+   histogram as a proxy and was REVERTED (net worse, mechanism unexplained). The right
+   source -- the previous block's ACTUAL literal frequencies -- is already computed.
 
 ---
 
