@@ -260,6 +260,28 @@ pub(crate) struct MatchTables {
     /// hard to find matches, so a richer chain pays; low = matches come easily
     /// (dense repetitive content) and extra chain density is pure walk cost.
     last_search_per_byte: f32,
+    /// Blocks whose finder has actually RUN and written back its signals.
+    ///
+    /// GATE 1 @ L1 needs this because `rep_yield` starts OPTIMISTIC at 1.0 so
+    /// the first block of every frame probes for repcodes. A dispatch reading
+    /// `rep_yield` directly would therefore fire on block 0 of EVERY file,
+    /// changing output everywhere. Gating on `blocks_done > 0` makes the
+    /// dispatch fire only on measured evidence.
+    blocks_done: u32,
+    /// Consecutive blocks whose `rep_yield` cleared the Gate 1 @ L1 threshold.
+    ///
+    /// The bare threshold does NOT work, and the per-block data says so: `mr`
+    /// has 6 blocks over 0.7 (max 0.809) and `x-ray` has 2 at exactly 1.000, so
+    /// the corpus-MEAN gap [0.4949, 0.9778] was an averaging artefact and the
+    /// per-block distributions overlap completely. Deployed on the mean, the
+    /// gate regressed `mr` by +0.15%.
+    ///
+    /// The property actually wanted is "this FILE is repetitive", not "this
+    /// block was", and RUN LENGTH separates them cleanly:
+    ///     versions-16m 107   text-32m 255   zeros-32m 256
+    ///     mr 1   x-ray 1   every other corpus 0
+    /// A gap of [1, 107] -- a 100x margin against the threshold's zero.
+    rep_run: u32,
 }
 
 impl MatchTables {
@@ -311,6 +333,8 @@ impl MatchTables {
             last_nseq: 0,
             // Start optimistic: the first block back-fills, then measures.
             last_search_per_byte: 1.0,
+            blocks_done: 0,
+            rep_run: 0,
         }
     }
 
@@ -1409,8 +1433,96 @@ fn find_sequences_strategy(
         Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
             find_opt(src, block_start, block_end, window, params, tables, reps)
         }
-        Strategy::Fast => find_fast(src, block_start, block_end, window, params, tables, reps),
+        Strategy::Fast => {
+            // GATE 1 @ L1 -- DEPLOYED DISPATCH.
+            //
+            // Measured (best-of-41, ABBA, both arms in one process, whole file):
+            //   versions-16m  fast 81,206 B / 3.39 ms -> lazy 49,697 B / 2.72 ms
+            //                 38.8% SMALLER and 19.6% FASTER -- dominated, not a trade
+            //   text-32m      1.19% smaller at +0.2% time (noise)
+            //   nci           19.17% smaller but +77.0% time  <- must NOT fire
+            //
+            // SIGNAL: `rep_yield`, not `hit_rate`. Both separate the corpora, but
+            // `rep_yield` is ALREADY maintained in shipping builds for the
+            // repcode dispatch, so this costs one compare and no new counter.
+            //
+            // THRESHOLD sits in a MEASURED EMPTY INTERVAL:
+            //   highest real corpus   mr        0.4949
+            //   lowest firing corpus  versions  0.9778   (~2x margin)
+            // `nci` (0.0039) is nowhere near it, which is what makes this safe.
+            //
+            // At `hit_rate` the same two corpora sit at 0.9846/0.9962 against a
+            // real maximum of 0.491 -- the same shape, but it would need a new
+            // per-block counter in the shipping build.
+            // Advance the run counter on the PREVIOUS block's measured yield.
+            if tables.blocks_done > 0 && tables.rep_yield > fast_lazy_threshold() {
+                tables.rep_run = tables.rep_run.saturating_add(1);
+            } else {
+                tables.rep_run = 0;
+            }
+            if fast_lazy_enabled() && tables.rep_run >= FAST_LAZY_RUN {
+                // `Fast` does not allocate a chain (brick 47), so materialise it
+                // on FIRST FIRE only -- files that never trip the dispatch keep
+                // brick 47's smaller L1 footprint.
+                if tables.chain.is_empty() {
+                    tables.chain = alloc::vec![0u32; 1usize << params.chain_log.min(24)];
+                }
+                let r = find_lazy(src, block_start, block_end, window, params, tables, 1, reps);
+                tables.blocks_done += 1;
+                return r;
+            }
+            let r = find_fast(src, block_start, block_end, window, params, tables, reps);
+            tables.blocks_done += 1;
+            r
+        }
     }
+}
+
+/// GATE 1 @ L1 dispatch: route highly-repetitive content to the lazy finder.
+/// `RZSTD_FASTLAZY=0` disables (reproducing pre-gate bytes exactly).
+static FAST_LAZY_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for in-process ABBA.
+pub fn set_fast_lazy_arm(on: bool) {
+    FAST_LAZY_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn fast_lazy_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match FAST_LAZY_ARM.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            #[cfg(feature = "std")]
+            {
+                let on = std::env::var("RZSTD_FASTLAZY")
+                    .map(|v| v.trim() != "0")
+                    .unwrap_or(true);
+                FAST_LAZY_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+                on
+            }
+            #[cfg(not(feature = "std"))]
+            true
+        }
+    }
+}
+
+/// Consecutive qualifying blocks required before the dispatch engages. Sits in
+/// the measured empty interval [1, 107] -- see `MatchTables::rep_run`.
+const FAST_LAZY_RUN: u32 = 4;
+
+/// Per-block yield threshold feeding the run counter. `RZSTD_FASTLAZY_T` sweeps.
+fn fast_lazy_threshold() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_FASTLAZY_T")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.7)
+    }
+    #[cfg(not(feature = "std"))]
+    0.7
 }
 
 /// Dispatch the Fast match finder on the frame-latched packed flag ONCE per
