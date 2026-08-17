@@ -58,17 +58,6 @@ pub(crate) fn decode_compressed_block(
     frame_start: usize,
     frame_skipped: usize,
 ) -> Result<(), Error> {
-    // BRICK 78: guarantee a block's worth of output capacity ONCE per block.
-    //
-    // `decompress` only calls `try_reserve` when the frame header declares a
-    // content size. Frames without one -- streaming output, and several of C's
-    // modes -- got NO reservation, so the output Vec grew incrementally and
-    // `grow_one` appeared INSIDE the per-sequence loop (visible in the decode
-    // hot loop's call list alongside `copy_from_decoded`).
-    //
-    // One reserve per block replaces a growth check per sequence. Reserving
-    // more can never change the output, so this is byte-identical.
-    out.reserve(block_max as usize);
     let mut r = Reader::new(payload);
     let before = r.remaining();
     let literals = {

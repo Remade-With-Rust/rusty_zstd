@@ -2644,6 +2644,47 @@ win. Brick 77's arithmetic applies -- 1.13M memcpy CALLS is a much larger unit c
 1.13M atomic loads, so this should exceed brick 77's ~1%, but that needs an A/B on a quiet
 box to claim.
 
+## BRICK 78 REVERTED -- it was a REGRESSION hiding two real wins
+
+An A/B of the three decoder bricks on a quiet box (null arms 0.9985 / 0.9998, spreads
+0.0-1.3%, C's own decompress stable within 1%) came back **6/6 SLOWER**: nci -11.2%,
+webster -7.1%, mr -6.1%, xml -4.4%, mozilla -4.1%, dickens -3.8%.
+
+**Three bricks that only REMOVE work cannot make decode uniformly slower.** That
+impossibility is the whole signal -- one of them had to be actively harmful. Bisected by
+removing brick 78 alone:
+
+| file    | pre-all | 78+79+80 | **79+80 only** |
+| ------- | ------: | -------: | -------------: |
+| xml     |  1292.2 |   1235.8 |     **1340.0** |
+| nci     |  1191.1 |   1057.4 |     **1217.3** |
+| webster |   981.6 |    911.5 |      **994.3** |
+| mr      |  1222.3 |   1147.6 |     **1227.8** |
+
+C/us decompress: webster 1.81 -> **1.78**, nci 2.39 -> **2.32**, xml 2.12 -> **2.03**.
+**Bricks 79 and 80 are wins; brick 78 was masking them completely.**
+
+### The mechanism -- the fix did the exact opposite of its intent
+
+`Vec::reserve(additional)` guarantees capacity for `len + additional`. When the frame
+header DOES declare a content size, `try_reserve` has already sized the buffer exactly for
+the whole output. A per-block `out.reserve(block_max)` then demands `len + 128 KiB` beyond
+an already-exact capacity -- **reallocating and copying everything decoded so far, once per
+block.** An O(n) copy per block was added to remove a growth check that never executed.
+
+### What should have stopped this earlier
+
+The premise was ALREADY flagged unverified: after shipping brick 78, re-reading the asm
+showed `grow_one` still in the loop, and that was recorded. It was kept anyway on the
+reasoning that it "cannot hurt" -- byte-identical, strictly more capacity.
+
+**"Byte-identical and cannot change output" says nothing about COST.** Reserving more
+memory is free only if the reservation is free, and `reserve` on an exactly-sized Vec is a
+realloc-and-copy. A change whose PREMISE is disproven should be reverted, not kept on the
+grounds that it looks harmless.
+
+Gates after removal: 172 tests; us-decodes-C 36/36.
+
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 
 Runtime arms added to every brick that had been judged with the broken method, then all
