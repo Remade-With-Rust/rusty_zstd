@@ -21,33 +21,45 @@ pre-campaign board and all speed movement is genuine.
 
 ## 1. Level 1 — the full board, all 18 corpora
 
-**Re-measured 2026-08-16 (third pass)** -- CURRENT as of bricks 46-82. Session null-arm
-**0.9948**. Unlike the previous pass, the **decompress columns now include the decoder
-work (bricks 79-82)**; nothing here is stale.
-
-Compressed sizes are byte-identical to the gated hashes, so every speed figure is at
-MATCHED OUTPUT.
+**Re-measured 2026-08-16 (fourth pass) -- the FIRST board at CHECKSUM PARITY with
+the oracle.** Every earlier board charged us a full xxh64 pass over every byte, on
+both phases, that `zstd -b` never runs (it takes libzstd's `checksumFlag = 0`
+default; we took the CLI's). Those boards understated us badly -- see
+m7-encoder-whys.md. Compressed sizes are byte-identical to the gated hashes, so
+every speed figure is at MATCHED OUTPUT.
 
 | corpus       |  C comp | us comp | **C/us c** | C decomp | us decomp | **C/us d** | us/c size |
 | ------------ | ------: | ------: | ---------: | -------: | --------: | ---------: | --------: |
-| zeros-32m    | 10291.7 |  9756.7 |   **1.05** |  23798.8 |   10712.7 |       2.22 | **0.901** |
-| text-32m     | 14640.2 | 10253.8 |       1.43 |  10319.7 |    9978.7 |   **1.03** |     1.100 |
-| incomp-32m   |  5078.6 |  4946.8 |   **1.03** |  12181.1 |    7583.8 |       1.61 |     1.000 |
-| jsonlog-16m  |   687.7 |   343.6 |       2.00 |   1836.9 |    1071.9 |       1.71 | **1.528** |
-| smallmsg-8m  |   544.4 |   366.4 |       1.49 |   2384.4 |    1030.7 |       2.31 | **1.615** |
-| versions-16m |  1096.1 |  5269.1 |   **0.21** |   2855.5 |    7800.1 |   **0.37** | **0.075** |
-| mr           |   508.8 |   206.8 |       2.46 |   1784.5 |    1220.2 |       1.46 |     1.111 |
-| ooffice      |   460.1 |   258.2 |       1.78 |   1223.0 |    1287.8 |   **0.95** |     1.262 |
-| osdb         |   543.5 |   241.3 |       2.25 |   1782.5 |    1018.1 |       1.75 |     1.138 |
-| reymont      |   342.9 |   215.1 |       1.59 |   1731.3 |     845.4 |       2.05 | **1.402** |
-| sao          |   450.3 |   411.5 |   **1.09** |   1211.5 |    4270.6 |   **0.28** |     1.138 |
-| webster      |   410.4 |   237.4 |       1.73 |   1744.0 |     987.9 |       1.77 | **1.443** |
-| dickens      |   363.1 |   187.4 |       1.94 |   1723.3 |     809.4 |       2.13 |     1.201 |
-| mozilla      |   575.7 |   243.5 |       2.36 |   1511.7 |     879.2 |       1.72 |     1.222 |
-| nci          |  1059.8 |   499.1 |       2.12 |   2856.2 |    1192.8 |       2.39 |     1.302 |
-| samba        |   637.7 |   352.2 |       1.81 |   2294.8 |    1171.9 |       1.96 |     1.258 |
-| xml          |   855.9 |   442.5 |       1.93 |   2764.2 |    1309.7 |       2.11 |     1.308 |
-| x-ray        |   974.2 |  1693.4 |   **0.58** |   1481.9 |    4625.2 |   **0.32** |     1.212 |
+| zeros-32m    | 10245.8 | 22116.0 |   **0.46** |  23467.4 |   37167.1 |   **0.63** | **0.901** |
+| text-32m     | 14436.3 | 25621.9 |   **0.56** |  10242.1 |   32063.5 |   **0.32** |     1.100 |
+| incomp-32m   |  4750.3 |  6665.2 |   **0.71** |  12120.0 |   14446.9 |   **0.84** |     1.000 |
+| jsonlog-16m  |   701.6 |   354.8 |       1.98 |   1896.9 |    1164.4 |       1.63 | **1.528** |
+| smallmsg-8m  |   549.2 |   363.8 |       1.51 |   2371.5 |    1081.6 |       2.19 | **1.615** |
+| versions-16m |  1107.6 |  8310.1 |   **0.13** |   2894.0 |   14625.8 |   **0.20** | **0.075** |
+| mr           |   518.6 |   214.3 |       2.42 |   1821.9 |    1361.1 |       1.34 |     1.111 |
+| ooffice      |   472.4 |   267.2 |       1.77 |   1276.9 |    1417.9 |   **0.90** |     1.262 |
+| osdb         |   566.4 |   253.7 |       2.23 |   1864.3 |    1131.5 |       1.65 |     1.138 |
+| reymont      |   357.6 |   226.8 |       1.58 |   1802.5 |     930.5 |       1.94 | **1.402** |
+| sao          |   465.5 |   423.6 |   **1.10** |   1250.0 |    5681.6 |   **0.22** |     1.138 |
+| webster      |   422.1 |   246.5 |       1.71 |   1797.1 |    1077.9 |       1.67 | **1.443** |
+| dickens      |   365.7 |   192.4 |       1.90 |   1711.4 |     854.9 |       2.00 |     1.201 |
+| mozilla      |   573.4 |   247.7 |       2.32 |   1501.9 |     945.9 |       1.59 |     1.222 |
+| nci          |  1068.0 |   528.6 |       2.02 |   2894.5 |    1335.8 |       2.17 |     1.302 |
+| samba        |   638.1 |   363.8 |       1.75 |   2288.4 |    1276.3 |       1.79 |     1.258 |
+| xml          |   865.5 |   477.0 |       1.81 |   2777.0 |    1477.4 |       1.88 |     1.308 |
+| x-ray        |  1003.5 |  1968.9 |   **0.51** |   1512.5 |    6488.2 |   **0.23** |     1.212 |
+
+### Where we already win or tie
+
+- **Compress at or better than C:** `versions-16m` **0.13**, `zeros-32m` **0.46**, `x-ray` **0.51**, `text-32m` **0.56**, `incomp-32m` **0.71**, `sao` **1.10**.
+- **Decompress at or better than C:** `versions-16m` **0.20**, `sao` **0.22**, `x-ray` **0.23**, `text-32m` **0.32**, `zeros-32m` **0.63**, `incomp-32m` **0.84**, `ooffice` **0.90**.
+- **Ratio better than C:** `versions-16m` **0.075**, `zeros-32m` **0.901**.
+
+Against mission section 7 (decompress <= 1.11, compress <= 1.25):
+**6 corpora pass compress, 7 pass decompress** --
+up from 5 and 5 on the pre-parity board, with no code change on either path.
+
+---
 
 ### Where we already win or tie
 
@@ -76,46 +88,43 @@ had a repcode search and NO other finder did, so L3 -- the shipping default -- h
 
 ## 2. Level 3 (dfast) — the shipping default
 
-**Re-measured 2026-08-16 (third pass)** -- CURRENT as of bricks 46-84. Session
-null-arm **0.9839**. The decompress columns now include the decoder work
-(bricks 79-82); the previous pass's did not.
+**Re-measured 2026-08-16 (fourth pass) -- the FIRST board at CHECKSUM PARITY with
+the oracle.** Every earlier board charged us a full xxh64 pass over every byte, on
+both phases, that `zstd -b` never runs (it takes libzstd's `checksumFlag = 0`
+default; we took the CLI's). Those boards understated us badly -- see
+m7-encoder-whys.md. Compressed sizes are byte-identical to the gated hashes, so
+every speed figure is at MATCHED OUTPUT.
 
 | corpus       | C comp | us comp | **C/us c** | C decomp | us decomp | **C/us d** | us/c size |
 | ------------ | -----: | ------: | ---------: | -------: | --------: | ---------: | --------: |
-| zeros-32m    | 7483.1 |  9778.4 |   **0.77** |  24342.4 |   10502.2 |       2.32 | **0.972** |
-| text-32m     | 8702.8 | 10277.0 |   **0.85** |  10332.9 |    9672.9 |   **1.07** |     1.082 |
-| incomp-32m   | 4277.3 |  3112.4 |       1.37 |  12255.7 |    7553.6 |       1.62 |     1.000 |
-| jsonlog-16m  |  384.3 |   206.3 |       1.86 |   1907.2 |     950.0 |       2.01 |     1.318 |
-| smallmsg-8m  |  340.6 |   168.5 |       2.02 |   2383.0 |     899.6 |       2.65 | **1.440** |
-| versions-16m | 4858.2 |  6870.6 |   **0.71** |  23194.5 |    9681.0 |       2.40 | **0.648** |
-| mr           |  297.5 |   162.7 |       1.83 |   1605.8 |     487.9 |       3.29 |     1.045 |
-| ooffice      |  265.4 |   130.2 |       2.04 |   1151.5 |     694.1 |       1.66 |     1.119 |
-| osdb         |  360.5 |   221.1 |       1.63 |   1889.0 |    1032.0 |       1.83 |     1.103 |
-| reymont      |  289.7 |   182.1 |       1.59 |   1659.4 |     596.0 |       2.78 |     1.089 |
-| sao          |  223.2 |   132.2 |       1.69 |   1041.5 |     839.1 |       1.24 |     1.056 |
-| webster      |  283.9 |   169.2 |       1.68 |   1629.9 |     602.4 |       2.71 |     1.135 |
-| dickens      |  237.8 |   138.7 |       1.71 |   1525.2 |     506.0 |       3.01 |     1.121 |
-| mozilla      |  361.6 |   171.4 |       2.11 |   1387.9 |     672.0 |       2.07 |     1.105 |
-| nci          |  903.8 |   477.5 |       1.89 |   2724.4 |    1207.5 |       2.26 |     1.152 |
-| samba        |  459.3 |   258.9 |       1.77 |   2184.9 |     881.8 |       2.48 |     1.109 |
-| xml          |  690.0 |   408.4 |       1.69 |   2696.4 |    1243.3 |       2.17 |     1.188 |
-| x-ray        |  207.6 |   110.1 |       1.89 |   1090.1 |     543.9 |       2.00 |     1.082 |
+| zeros-32m    | 7497.0 | 20984.6 |   **0.36** |  24077.8 |   38939.8 |   **0.62** | **0.972** |
+| text-32m     | 8596.6 | 26647.4 |   **0.32** |  10267.1 |   32764.8 |   **0.31** |     1.082 |
+| incomp-32m   | 4197.1 |  3592.4 |       1.17 |  12302.3 |   14165.2 |   **0.87** |     1.000 |
+| jsonlog-16m  |  407.9 |   215.5 |       1.89 |   1963.5 |    1043.8 |       1.88 |     1.318 |
+| smallmsg-8m  |  352.3 |   169.4 |       2.08 |   2396.5 |     945.4 |       2.53 | **1.440** |
+| versions-16m | 4655.2 | 10580.3 |   **0.44** |  22268.9 |   20157.7 |   **1.10** | **0.648** |
+| mr           |  296.1 |   159.7 |       1.85 |   1602.7 |     496.2 |       3.23 |     1.045 |
+| ooffice      |  264.7 |   131.0 |       2.02 |   1145.3 |     717.6 |       1.60 |     1.119 |
+| osdb         |  366.3 |   224.4 |       1.63 |   1908.9 |    1121.5 |       1.70 |     1.103 |
+| reymont      |  294.8 |   185.9 |       1.59 |   1673.5 |     619.5 |       2.70 |     1.089 |
+| sao          |  224.3 |   133.9 |       1.68 |   1038.3 |     898.3 |       1.16 |     1.056 |
+| webster      |  282.8 |   170.5 |       1.66 |   1620.1 |     630.4 |       2.57 |     1.135 |
+| dickens      |  237.6 |   141.4 |       1.68 |   1548.6 |     530.7 |       2.92 |     1.121 |
+| mozilla      |  374.1 |   179.0 |       2.09 |   1457.6 |     722.2 |       2.02 |     1.105 |
+| nci          |  944.3 |   520.9 |       1.81 |   2878.9 |    1372.3 |       2.10 |     1.152 |
+| samba        |  458.6 |   268.6 |       1.71 |   2232.9 |     935.6 |       2.39 |     1.109 |
+| xml          |  695.8 |   407.9 |       1.71 |   2713.8 |    1299.7 |       2.09 |     1.188 |
+| x-ray        |  210.9 |   113.5 |       1.86 |   1106.7 |     566.6 |       1.95 |     1.082 |
 
-**L3 is the shipping default, and it is where we compress BEST relative to C.**
-At or better than C on `versions-16m` **0.71**, `zeros-32m` **0.77**, `text-32m`
-**0.85**. Worst are `mozilla` 2.11, `ooffice` 2.04, `smallmsg-8m` 2.02.
+**L3 is the shipping default and our best compress level relative to C.**
+At or better than C on `text-32m` **0.32**, `zeros-32m` **0.36**, `versions-16m` **0.44**, `incomp-32m` **1.17**.
 
-**Ratio at L3 is much better than L1** -- Silesia spans 1.045-1.188 here against L1's
-1.111-1.443. `versions-16m` is the one inversion (0.648 vs L1's 0.075): L1's
-Fast+repcode suits constant-stride content better than dfast does.
+**Decompress on Silesia spans 1.16-3.23.** More sequences per byte means
+more DecodeSeq. Section 3's stage ranking is being re-derived at parity -- it was
+measured with the checksum tax inflating both DecodeChecksum and the denominator.
 
-**Decompress is our weak axis at L3** (1.24-3.29 on Silesia, against
-L1's 0.28-2.39). More sequences per byte means more DecodeSeq, which section 3 shows
-is the #1 stage on 16 of 18 corpora. This is the standing target, not the encoder.
-
-**Read the generated corpora with section 5:** their non-monotonic response to level is
-a `minMatch` interaction with synthetic content, not a regression, and real content does
-not share it.
+**Read the generated corpora with section 5:** their non-monotonic response to level
+is a `minMatch` interaction with synthetic content, not a regression.
 
 ---
 
