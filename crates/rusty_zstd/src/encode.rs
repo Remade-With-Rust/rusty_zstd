@@ -3512,6 +3512,42 @@ mod tests {
         }
     }
 
+    /// A HIGHER level must never produce a LARGER file. This currently FAILS on
+    /// osdb: L5 (greedy) and L7 (lazy2) both emit more than L3 (dfast).
+    ///
+    ///   level  strategy  us          C
+    ///   3      dfast     3,613,320   3,501,634
+    ///   5      greedy    3,658,497   3,431,228   <-- BIGGER than L3
+    ///   7      lazy2     3,625,184   3,359,176   <-- BIGGER than L3
+    ///
+    /// C is monotone over the same range, so this is ours, and it is confined to
+    /// greedy/lazy2 -- the strategies BETWEEN dfast and the bt-family. dfast
+    /// (1.032 vs C) and btultra (0.991) are both strong; only the middle sags.
+    /// A strategy losing to the CHEAPER one below it is the same shape as the
+    /// repcode discovery: a capability present in one finder, absent in its
+    /// neighbours. Ruled out so far: the chain table IS allocated and used by
+    /// both, and depth is `1 << search_log` exactly as C. Prime suspect is the
+    /// chain FILL density (see the note in `find_lazy` about thinned chains).
+    ///
+    /// `#[ignore]` because it documents a KNOWN defect -- un-ignore it when
+    /// fixed; do not delete it to make the suite green.
+    #[ignore]
+    #[test]
+    fn higher_level_never_larger_osdb() {
+        let Ok(src) = std::fs::read("../../corpora/data/silesia/osdb") else {
+            return; // corpus absent
+        };
+        let mut prev = usize::MAX;
+        for lvl in [1, 3, 5, 7, 9, 13, 16, 19] {
+            let n = crate::compress(&src, lvl).unwrap().len();
+            assert!(
+                n <= prev,
+                "level {lvl} emitted {n} bytes, more than the previous level's {prev}"
+            );
+            prev = n;
+        }
+    }
+
     #[test]
     fn census_zeros_all_rle() {
         let src = vec![0u8; 128 * 1024 * 2];
