@@ -1471,6 +1471,27 @@ pub(crate) fn literals_worth_huffman(lits: &[u8]) -> bool {
     // Being too permissive is the SAFE direction: the caller keeps `raw_len` as
     // the baseline and only emits Huffman if it actually comes out smaller, so
     // a false positive costs encode time, never bytes.
+    // BRICK 88: TREE AMORTIZATION. Entropy alone decides whether Huffman codes
+    // the BODY smaller; it says nothing about whether the section can pay for
+    // the WEIGHT TABLE it must carry (~`distinct/2` bytes, 4 bits per symbol).
+    // When the alphabet is large relative to the SECTION, no distribution can
+    // pay that back.
+    //
+    // `versions-16m` L1 is the case that exposed it: 31,047 literal bytes over
+    // 128 blocks -- ~304 bytes per block across ~200 distinct symbols, so a
+    // ~100-byte tree sits against a 304-byte section. The H2 test accepted 102
+    // of 128 blocks, every one of which then lost to raw (`raw_won=102`), and
+    // the ctable build plus `write_tree` cost 2.24 ms to process 31 KB of
+    // literals -- 13.8 MB/s, which is what halved L1 compress on that corpus.
+    //
+    // `distinct` comes from the SAMPLE, so for a section longer than the sample
+    // it UNDERCOUNTS, and the test fires less often than the true alphabet
+    // warrants -- the safe direction, and it is why this cannot regress the
+    // large-literal corpora the entropy fix was built for.
+    let distinct = freq.iter().filter(|&&f| f != 0).count() as u64;
+    if distinct.saturating_mul(2) >= lits.len() as u64 {
+        return false;
+    }
     let sum_sq: u64 = freq.iter().map(|&f| u64::from(f) * u64::from(f)).sum();
     sum_sq.saturating_mul(128) >= u64::from(n) * u64::from(n)
 }
