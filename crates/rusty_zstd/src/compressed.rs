@@ -583,7 +583,6 @@ fn seqcheck_hoisted() -> bool {
 /// destination bytes are already reserved; otherwise the checked path runs.
 /// Both produce identical output (`copy_literals_fast_matches_checked`).
 #[allow(unsafe_code)]
-#[inline]
 /// BRICK 79: the literal-copy arm is a PARAMETER, not a per-sequence read.
 ///
 /// `litcopy_on()` sat in the fast-path guard, so it was read once per SEQUENCE

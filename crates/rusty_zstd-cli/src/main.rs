@@ -203,6 +203,14 @@ fn decomp_opts(args: &Args) -> DecompressOptions {
     if let Some(m) = args.memory {
         opts.window_max = m;
     }
+    // `--no-check` on a DECOMPRESS is `ZSTD_d_forceIgnoreChecksum`: skip
+    // verification of the stored xxh64. The 4 bytes are still consumed, so
+    // concatenated frames keep parsing. On high-ratio content this is the
+    // majority of decode time (61% on a 32 MiB zeros frame), so it is a real
+    // lever -- at the cost of the frame's own corruption detection.
+    if !args.checksum {
+        opts.force_ignore_checksum = true;
+    }
     opts
 }
 
