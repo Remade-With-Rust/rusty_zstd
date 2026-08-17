@@ -1348,10 +1348,10 @@ fn find_fast(
     // both, so each block inherits the previous block's measured repcode yield.
     // `rep_yield` starts at 1.0, so the first block of every frame always probes.
     let rep_on = rep1_enabled() || tables.rep_yield >= REP_YIELD_MIN;
-    match (tables.packed, rep_on, pipe_on, s0 == 2) {
+    match (tables.packed, rep_on, pipe_on, s0) {
         // The shipping configuration: no tag, no rep1, pipelined, default step.
         // Specialized on hash_log so the shift is an immediate too.
-        (false, false, true, true) => match tables.hash_log {
+        (false, false, true, 2) => match tables.hash_log {
             12 => go!(false, false, 12, 2, true),
             13 => go!(false, false, 13, 2, true),
             14 => go!(false, false, 14, 2, true),
@@ -1359,9 +1359,23 @@ fn find_fast(
             16 => go!(false, false, 16, 2, true),
             _ => go!(false, false, 0, 2, true),
         },
-        (false, false, true, false) => go!(false, false, 0, 0, true),
-        (false, false, false, true) => go!(false, false, 0, 2, false),
-        (false, false, false, false) => go!(false, false, 0, 0, false),
+        // Step 1 (probe EVERY position, C's density) gets the same treatment.
+        // Without this it fell through to the runtime-STEP/runtime-HLOG arm,
+        // so any step-1 measurement was comparing a generic loop against a
+        // fully specialized one -- a work-parity break in the instrument, not
+        // a property of the density.
+        (false, false, true, 1) => match tables.hash_log {
+            12 => go!(false, false, 12, 1, true),
+            13 => go!(false, false, 13, 1, true),
+            14 => go!(false, false, 14, 1, true),
+            15 => go!(false, false, 15, 1, true),
+            16 => go!(false, false, 16, 1, true),
+            _ => go!(false, false, 0, 1, true),
+        },
+        (false, false, true, _) => go!(false, false, 0, 0, true),
+        (false, false, false, 2) => go!(false, false, 0, 2, false),
+        (false, false, false, 1) => go!(false, false, 0, 1, false),
+        (false, false, false, _) => go!(false, false, 0, 0, false),
         (true, true, true, _) => go!(true, true, 0, 0, true),
         (true, true, false, _) => go!(true, true, 0, 0, false),
         (true, false, true, _) => go!(true, false, 0, 0, true),
@@ -3609,6 +3623,39 @@ mod tests {
                 "level {lvl} emitted {n} bytes, more than the previous level's {prev}"
             );
             prev = n;
+        }
+    }
+
+    /// Truth table for the probe-density (pair-search) dispatch: per file, the
+    /// L1 size delta from `RZSTD_STEP0=1` joined to the finder's own counters
+    /// measured at the shipping `step0=2`. Needs `--features profile`.
+    #[ignore]
+    #[test]
+    fn probe_density_truth_table() {
+        const FILES: &[&str] = &[
+            "dickens", "mozilla", "mr", "nci", "ooffice", "osdb", "reymont", "samba", "sao",
+            "webster", "x-ray", "xml",
+        ];
+        println!(
+            "TT {:<9} {:>10} {:>9} {:>9} {:>10} {:>9}",
+            "file", "probes/B", "hit_rate", "matchfrac", "lit_share", "seqs/B"
+        );
+        for f in FILES {
+            let Ok(src) = std::fs::read(format!("../../corpora/data/silesia/{f}")) else {
+                continue;
+            };
+            crate::prof::reset();
+            let n = crate::compress(&src, 1).unwrap().len();
+            let c = crate::prof::encode_counts();
+            let b = src.len() as f64;
+            println!(
+                "TT {f:<9} {:>10.4} {:>9.4} {:>9.4} {:>10.4} {:>9.5}  size={n}",
+                c.hash_probes as f64 / b,
+                c.probe_hits as f64 / (c.hash_probes.max(1)) as f64,
+                c.match_bytes as f64 / b,
+                c.lit_bytes as f64 / b,
+                c.seqs as f64 / b,
+            );
         }
     }
 
