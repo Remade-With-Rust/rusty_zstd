@@ -1498,9 +1498,25 @@ fn apply_gate_arm(gate: &str, routed: bool) -> Result<(), String> {
         "chaindepth" => rusty_zstd::set_search_log_delta(if routed { 1 } else { 0 }),
         // Gate 14, the other direction: half the candidates.
         "chaindepth-down" => rusty_zstd::set_search_log_delta(if routed { -1 } else { 0 }),
+        // Gate 1: the level's strategy vs a cheaper finder.
+        "strategy-fast" => rusty_zstd::set_strategy_arm(if routed {
+            Some(rusty_zstd::Strategy::Fast)
+        } else {
+            None
+        }),
+        "strategy-greedy" => rusty_zstd::set_strategy_arm(if routed {
+            Some(rusty_zstd::Strategy::Greedy)
+        } else {
+            None
+        }),
+        "strategy-lazy2" => rusty_zstd::set_strategy_arm(if routed {
+            Some(rusty_zstd::Strategy::Lazy2)
+        } else {
+            None
+        }),
         other => {
             return Err(format!(
-                "unknown --gate {other}; known: step0, lazyfill, rep1, chaindepth, chaindepth-down"
+                "unknown --gate {other}; known: step0, lazyfill, rep1, chaindepth, chaindepth-down, strategy-fast, strategy-greedy, strategy-lazy2"
             ))
         }
     }
@@ -1513,6 +1529,7 @@ fn reset_gate_arms() {
     rusty_zstd::set_lazy_fill_arm(true);
     rusty_zstd::set_rep1_arm(false);
     rusty_zstd::set_search_log_delta(0);
+    rusty_zstd::set_strategy_arm(None);
 }
 
 fn run_gg_matchfind(
