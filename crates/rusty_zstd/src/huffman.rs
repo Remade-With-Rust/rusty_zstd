@@ -1420,12 +1420,18 @@ fn pack_huff_section(
 /// C `ZSTD_compressLiterals` bails out the same way instead of encoding then discarding.
 #[cfg(feature = "alloc")]
 pub(crate) fn literals_worth_huffman(lits: &[u8]) -> bool {
-    const SAMPLE: usize = 256;
+    const SAMPLE: usize = 1024;
     if lits.len() < 64 {
         return true;
     }
     let mut freq = [0u32; 256];
-    let step = (lits.len() / SAMPLE).max(1);
+    // ODD stride. `len/SAMPLE` is a power of two on 128 KiB blocks, and a
+    // power-of-two stride ALIASES with the period of fixed-width binary
+    // content: x-ray is 16-bit samples, so an even step only ever lands on
+    // one byte-phase and histograms half the data. Measured: x-ray size
+    // ratio 1.030 vs 1.159 purely from the stride landing differently.
+    // `| 1` makes the walk cycle through every phase.
+    let step = ((lits.len() / SAMPLE).max(1)) | 1;
     let mut n = 0u32;
     let mut i = 0usize;
     while i < lits.len() && n < SAMPLE as u32 {
@@ -1433,13 +1439,40 @@ pub(crate) fn literals_worth_huffman(lits: &[u8]) -> bool {
         i += step;
         n += 1;
     }
-    let mut max = 0u32;
-    for f in freq {
-        if f > max {
-            max = f;
-        }
+    if n == 0 {
+        return true;
     }
-    max.saturating_mul(8) >= n
+    // BRICK 86: this used to be `max * 8 >= n` -- "some byte is >= 12.5% of the
+    // sample". That measures PEAK FREQUENCY, but what decides whether Huffman
+    // pays is ENTROPY. Text over a moderate alphabet with no dominant symbol
+    // fails the peak test and is emitted RAW even though Huffman would win
+    // ~30% on it. Measured on jsonlog-16m: 4,069,169 literal bytes went out as
+    // a 3,797,461-byte section -- a 0.93 ratio, i.e. essentially uncompressed --
+    // while C's literals section was 2,052,405. That single gate was **87% of
+    // our whole size gap** on that corpus.
+    //
+    // Use the collision entropy of the sample instead:
+    //   H2 = -log2( sum p^2 ),  worth trying when H2 <= 7 bits/symbol
+    //   => sum(f^2)/n^2 >= 2^-7  =>  sum(f^2) * 128 >= n^2
+    // SAMPLE is 1024, not 256, for ESTIMATOR MARGIN. With 256 samples over a
+    // 256-symbol alphabet, uniform random data gives sum(f^2) ~ 511 against
+    // n^2 = 65536, and 511*128 = 65408 -- within 0.2% of the threshold, so
+    // noise flips it ~half the time and incompressible blocks pay for a full
+    // Huffman attempt that is always discarded (measured: incomp-32m compress
+    // 6640 -> 2020 MB/s at SAMPLE=256, with byte-identical output). At 1024
+    // the expected random sum(f^2) is ~5116 against n^2 = 1048576, a 1.6x
+    // margin on the reject side.
+    //
+    // Integer-only, so this stays no_std-clean, and it is strictly MORE
+    // permissive than the peak test (a dominant symbol makes sum(f^2) large
+    // too). Uniform random bytes still fail: 256 samples over 256 values give
+    // sum(f^2) ~ 256 against n^2 = 65536, and 256*128 < 65536.
+    //
+    // Being too permissive is the SAFE direction: the caller keeps `raw_len` as
+    // the baseline and only emits Huffman if it actually comes out smaller, so
+    // a false positive costs encode time, never bytes.
+    let sum_sq: u64 = freq.iter().map(|&f| u64::from(f) * u64::from(f)).sum();
+    sum_sq.saturating_mul(128) >= u64::from(n) * u64::from(n)
 }
 
 /// Sample peak in 0..=1000 (`max_freq * 1000 / n_sampled`). 0 if too small to sample.
