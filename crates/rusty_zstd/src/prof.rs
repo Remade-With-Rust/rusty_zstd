@@ -65,6 +65,21 @@ pub struct BlockTap {
     pub lit_peak: u32,
     /// 1 if the early-raw skip fired.
     pub early_raw: u8,
+    /// P0/gg-matchfind: bytes this block actually emitted (payload for
+    /// Compressed, `block_len` for Raw). This is the QUALITY half of the
+    /// per-block gain -- without it a harvest can only score speed.
+    pub csize: u32,
+    /// Cumulative candidate examinations at block exit. The harvest differences
+    /// consecutive rows to get this block's `work`.
+    pub probes: u64,
+    /// Cumulative probe hits at block exit.
+    pub hits: u64,
+    /// Tier-A signal: the repcode yield carried INTO this block, x1000.
+    pub rep_yield_x1000: u32,
+    /// Cumulative `EncodeMatchFind` nanoseconds at block exit. Differenced by
+    /// the harvest to give this block's `cpu_ms` -- the CONFIRMATORY half of
+    /// the Great Gate speed pair (the counter rules when they disagree).
+    pub mf_ns: u64,
 }
 
 /// Deterministic encode work counts (`codec-six-whys-unknowns`: count before time).
@@ -207,6 +222,11 @@ mod on {
 
     pub fn note_hash_fill(n: u64) {
         HASH_FILLS.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Cumulative nanoseconds attributed to one stage.
+    pub fn stage_ns(stage: Stage) -> u64 {
+        NS[stage as usize].load(Ordering::Relaxed)
     }
 
     /// Candidate examinations only, for finders whose probe loop lives in a
@@ -410,6 +430,11 @@ mod off {
     pub fn note_hash_fill(_n: u64) {}
 
     #[inline(always)]
+    pub fn stage_ns(_s: super::Stage) -> u64 {
+        0
+    }
+
+    #[inline(always)]
     pub fn note_probes(_n: u64) {}
 
     #[inline(always)]
@@ -474,7 +499,7 @@ mod off {
 pub use on::{
     dump, encode_counts, note_back_ext, note_block_tap, note_checksum_bytes, note_comp_block,
     note_early_raw, note_emit_lit, note_emit_seq, note_hash_fill, note_huff_path, note_lit_try, note_raw_block,
-    note_probes, note_rle_block, note_scratch, note_search, note_seq_mode, note_tables, reset,
+    note_probes, note_rle_block, stage_ns, note_scratch, note_search, note_seq_mode, note_tables, reset,
     scope,
     take_block_taps,
 };
@@ -483,7 +508,7 @@ pub use on::{
 pub use off::{
     dump, encode_counts, note_back_ext, note_block_tap, note_checksum_bytes, note_comp_block,
     note_early_raw, note_emit_lit, note_emit_seq, note_hash_fill, note_huff_path, note_lit_try, note_raw_block,
-    note_probes, note_rle_block, note_scratch, note_search, note_seq_mode, note_tables, reset,
+    note_probes, note_rle_block, stage_ns, note_scratch, note_search, note_seq_mode, note_tables, reset,
     scope,
     take_block_taps,
 };

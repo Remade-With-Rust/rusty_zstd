@@ -108,7 +108,9 @@ fn main() -> ExitCode {
     let m7_profile = args.iter().any(|a| a == "--m7-profile");
     let m7_harvest = args.iter().any(|a| a == "--m7-harvest");
     let ab_tag = args.iter().any(|a| a == "--ab-tag");
-    if !baseline && !m2_ratio && !m7_speed && !m7_profile && !m7_harvest && !ab_tag {
+    let gg_matchfind = args.iter().any(|a| a == "--gg-matchfind");
+    if !baseline && !m2_ratio && !m7_speed && !m7_profile && !m7_harvest && !ab_tag && !gg_matchfind
+    {
         usage();
         return ExitCode::from(2);
     }
@@ -169,6 +171,22 @@ fn main() -> ExitCode {
                 })
             });
         return run_m7_profile(&root, &oracle, &files, &levels, harvest_out.as_deref());
+    }
+    if gg_matchfind {
+        let out = args
+            .windows(2)
+            .find(|w| w[0] == "--harvest-out")
+            .map(|w| PathBuf::from(&w[1]))
+            .unwrap_or_else(|| {
+                root.join("_greatgate")
+                    .join("harvests")
+                    .join("gg-matchfind.csv")
+            });
+        // All 18: the 6 generated classes plus the 12 Silesia files. The gate
+        // must clear the WORST corpus, so the harvest must contain them all.
+        let mut all = files.clone();
+        all.extend(corpus::list_silesia(&root));
+        return run_gg_matchfind(&all, &levels, &only, &out);
     }
     if ab_tag {
         return run_ab_tag(&root, &oracle, &levels, &only);
@@ -1420,4 +1438,176 @@ fn us_arm(
         _ => None,
     };
     Ok((b, cpu_delta))
+}
+
+
+/// P0/gg-matchfind: the per-BLOCK, two-arm harvest that Gate 9 (probe density)
+/// is fitted from.
+///
+/// Why per block, not per file: Gates 3/9/14 decide per block, and
+/// `great-gate.md` law 2 says decide on the unit the metric counts. The existing
+/// `--m7-harvest` CSV is file-grain -- a truth table, not a gate fit.
+///
+/// Why both arms in ONE process: `gain` is a DIFFERENCE, so both arms must be
+/// measured, and this box drifts enough that two process runs minutes apart
+/// produced -36.7% and +2.6% for the same brick. `set_step0_arm` puts the arms
+/// milliseconds apart, ABBA-ordered.
+///
+/// **Known confound, stated rather than hidden.** The match tables carry across
+/// blocks, so block N's gain under the routed arm includes that arm's effect on
+/// blocks 0..N-1. This is not removable -- a shipped per-block gate would do the
+/// same -- but it means one block's row is not an independent experiment. The
+/// verdict rests on the `clip`/`clip_total` macro aggregation, which is exactly
+/// why the calculator reports micro AND macro and flags sign disagreements.
+fn run_gg_matchfind(
+    files: &[corpus::GeneratedFile],
+    levels: &[i32],
+    only: &[String],
+    out_path: &Path,
+) -> ExitCode {
+    pin_current_process();
+    if !cfg!(feature = "profile") {
+        eprintln!("--gg-matchfind requires --features rusty_zstd/profile (per-block taps are off)");
+        return ExitCode::from(2);
+    }
+    if let Some(dir) = out_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut w = match std::fs::File::create(out_path) {
+        Ok(f) => std::io::BufWriter::new(f),
+        Err(e) => {
+            eprintln!("create {}: {e}", out_path.display());
+            return ExitCode::from(1);
+        }
+    };
+    // gain / work / cpu_ms are all signed SAVINGS of the routed arm (step0 = 1)
+    // against the shipped arm (step0 = 2). Positive = routing this block wins.
+    if writeln!(
+        w,
+        "gain,clip,clip_total,split,work,cpu_ms,shipped,clevel,block_idx,match_frac,lit_share,nseq_per_kb,hit_rate,probes_per_byte,rep_yield,lit_peak,early_raw,csize_shipped,csize_routed"
+    )
+    .is_err()
+    {
+        eprintln!("write header failed");
+        return ExitCode::from(1);
+    }
+    let mut rows = 0usize;
+    let mut matched_any = false;
+    for f in files {
+        if !only.is_empty() && !only.iter().any(|o| o == &f.id) {
+            continue;
+        }
+        matched_any = true;
+        let src = match std::fs::read(&f.path) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("read {}: {e}", f.path.display());
+                return ExitCode::from(1);
+            }
+        };
+        for &lvl in levels {
+            // ABBA inside the file; keep the SECOND pass of each arm so both are
+            // equally warm.
+            let mut taps_ship: Vec<rusty_zstd::ProfBlockTap> = Vec::new();
+            let mut taps_rout: Vec<rusty_zstd::ProfBlockTap> = Vec::new();
+            for pass in 0..4 {
+                let step = if pass == 0 || pass == 3 { 2 } else { 1 };
+                rusty_zstd::set_step0_arm(step);
+                rusty_zstd::prof_reset();
+                if rusty_zstd::compress(&src, lvl).is_err() {
+                    eprintln!("{} L{lvl}: compress failed", f.id);
+                    return ExitCode::from(1);
+                }
+                let t = rusty_zstd::prof_take_block_taps();
+                if pass == 3 {
+                    taps_ship = t;
+                } else if pass == 2 {
+                    taps_rout = t;
+                }
+            }
+            rusty_zstd::set_step0_arm(2);
+            if taps_ship.len() != taps_rout.len() {
+                eprintln!(
+                    "{} L{lvl}: block count differs between arms ({} vs {}) -- rows would not align, refusing",
+                    f.id,
+                    taps_ship.len(),
+                    taps_rout.len()
+                );
+                return ExitCode::from(3);
+            }
+            let clip_total: u64 = taps_ship.iter().map(|t| u64::from(t.csize)).sum();
+            let routed_total: u64 = taps_rout.iter().map(|t| u64::from(t.csize)).sum();
+            let (mut pp, mut hp, mut np) = (0u64, 0u64, 0u64);
+            let (mut pr, mut nr) = (0u64, 0u64);
+            for (i, (a, b)) in taps_ship.iter().zip(taps_rout.iter()).enumerate() {
+                let probes_a = a.probes.saturating_sub(pp);
+                let hits_a = a.hits.saturating_sub(hp);
+                let ns_a = a.mf_ns.saturating_sub(np);
+                pp = a.probes;
+                hp = a.hits;
+                np = a.mf_ns;
+                let probes_b = b.probes.saturating_sub(pr);
+                let ns_b = b.mf_ns.saturating_sub(nr);
+                pr = b.probes;
+                nr = b.mf_ns;
+
+                let bl = f64::from(a.block_len).max(1.0);
+                let gain = f64::from(a.csize) - f64::from(b.csize);
+                let work = probes_a as f64 - probes_b as f64;
+                let cpu_ms = (ns_a as f64 - ns_b as f64) / 1.0e6;
+                let hit_rate = if probes_a > 0 {
+                    hits_a as f64 / probes_a as f64
+                } else {
+                    0.0
+                };
+                if writeln!(
+                    w,
+                    "{:.4},{},{},{},{:.1},{:.6},0,{},{},{:.6},{:.6},{:.4},{:.6},{:.6},{:.4},{},{},{},{}",
+                    gain,
+                    f.id,
+                    clip_total,
+                    f.split,
+                    work,
+                    cpu_ms,
+                    lvl,
+                    i,
+                    f64::from(a.match_bytes) / bl,
+                    f64::from(a.lit_bytes) / bl,
+                    f64::from(a.nseq) * 1024.0 / bl,
+                    hit_rate,
+                    probes_a as f64 / bl,
+                    f64::from(a.rep_yield_x1000) / 1000.0,
+                    a.lit_peak,
+                    a.early_raw,
+                    a.csize,
+                    b.csize,
+                )
+                .is_err()
+                {
+                    eprintln!("write row failed");
+                    return ExitCode::from(1);
+                }
+                rows += 1;
+            }
+            println!(
+                "gg-matchfind {} L{}: {} blocks  shipped={} routed={} ({:+.3}%)",
+                f.id,
+                lvl,
+                taps_ship.len(),
+                clip_total,
+                routed_total,
+                100.0 * (routed_total as f64 - clip_total as f64) / (clip_total.max(1) as f64)
+            );
+        }
+    }
+    if !matched_any {
+        eprintln!("--files matched no corpus");
+        return ExitCode::from(2);
+    }
+    if w.flush().is_err() {
+        eprintln!("flush failed");
+        return ExitCode::from(1);
+    }
+    println!("harvest {} ({} block rows)", out_path.display(), rows);
+    ExitCode::SUCCESS
 }

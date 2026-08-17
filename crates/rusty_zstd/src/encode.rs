@@ -658,6 +658,8 @@ pub(crate) fn encode_block(
             huffman::lit_sample_peak(block),
             params.strategy,
             false,
+            block.len(),
+            tables.rep_yield,
         );
         write_block_header(out, last, BlockType::Raw, block.len() as u32);
         out.extend_from_slice(block);
@@ -678,6 +680,8 @@ pub(crate) fn encode_block(
             peak,
             params.strategy,
             true,
+            block.len(),
+            tables.rep_yield,
         );
         write_block_header(out, last, BlockType::Raw, block.len() as u32);
         out.extend_from_slice(block);
@@ -727,6 +731,8 @@ pub(crate) fn encode_block(
             peak,
             params.strategy,
             false,
+            block.len(),
+            tables.rep_yield,
         );
         write_block_header(out, last, BlockType::Raw, block.len() as u32);
         out.extend_from_slice(block);
@@ -741,6 +747,8 @@ pub(crate) fn encode_block(
         peak,
         params.strategy,
         false,
+        payload.len(),
+        tables.rep_yield,
     );
     write_block_header(out, last, BlockType::Compressed, payload.len() as u32);
     out.extend_from_slice(&payload);
@@ -848,6 +856,7 @@ fn early_raw_skip(match_bytes: usize, block_len: usize, params: CompressionParam
     match_bytes < min_gain(block_len, params.strategy)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tap_block(
     block_len: usize,
     nseq: usize,
@@ -856,7 +865,11 @@ fn tap_block(
     lit_peak: u32,
     strategy: Strategy,
     early_raw: bool,
+    csize: usize,
+    rep_yield: f32,
 ) {
+    // Cumulative at block exit; the harvest differences consecutive rows.
+    let c = crate::prof::encode_counts();
     crate::prof::note_block_tap(crate::prof::BlockTap {
         block_len: block_len as u32,
         nseq: nseq as u32,
@@ -865,6 +878,11 @@ fn tap_block(
         min_gain: min_gain(block_len, strategy) as u32,
         lit_peak,
         early_raw: u8::from(early_raw),
+        csize: csize as u32,
+        probes: c.hash_probes,
+        hits: c.probe_hits,
+        rep_yield_x1000: (rep_yield * 1000.0) as u32,
+        mf_ns: crate::prof::stage_ns(crate::prof::Stage::EncodeMatchFind),
     });
 }
 
@@ -1914,16 +1932,30 @@ fn try_rep1(src: &[u8], ip: usize, rep1: usize, lowest: usize, block_end: usize)
 }
 
 /// Base probe step for the Fast strategy when `target_length == 0`.
+/// Probe-density arm (gg-matchfind Gate 9). Settable at RUNTIME so the harvest
+/// can interleave both arms inside ONE process -- a `OnceLock` here made every
+/// step0 measurement a separate process run, minutes apart, on a box that
+/// drifts. 0 = not yet resolved, else `step0 + 1`.
+static STEP0_ARM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Bench hook for in-process ABBA; shipping default from `RZSTD_STEP0`.
+pub fn set_step0_arm(step: usize) {
+    STEP0_ARM.store(step.max(1) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
 fn step0_default() -> usize {
-    use std::sync::OnceLock;
-    static T: OnceLock<usize> = OnceLock::new();
-    *T.get_or_init(|| {
-        std::env::var("RZSTD_STEP0")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&v: &usize| v >= 1)
-            .unwrap_or(2)
-    })
+    use core::sync::atomic::Ordering;
+    let v = STEP0_ARM.load(Ordering::Relaxed);
+    if v != 0 {
+        return v - 1;
+    }
+    let on = std::env::var("RZSTD_STEP0")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v: &usize| v >= 1)
+        .unwrap_or(2);
+    STEP0_ARM.store(on + 1, Ordering::Relaxed);
+    on
 }
 
 /// Brick 41 arm state: packed tag slots. Settable at RUNTIME so a harness can
