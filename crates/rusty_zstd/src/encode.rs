@@ -1634,6 +1634,7 @@ fn find_fast(
     // (versions-16m L1: 820,848 -> 81,206 bytes). A global default cannot serve
     // both, so each block inherits the previous block's measured repcode yield.
     // `rep_yield` starts at 1.0, so the first block of every frame always probes.
+    FAST_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let rep_on = rep_search_on(tables.rep_yield, params.strategy);
     match (tables.packed, rep_on, pipe_on, s0) {
         // The shipping configuration: no tag, no rep1, pipelined, default step.
@@ -3327,7 +3328,136 @@ fn bt_find_best(
     params: CompressionParameters,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
-    let hash_log = params.hash_log;
+    macro_rules! go {
+        ($h:expr, $c:expr) => {
+            bt_find_best_impl::<$h, $c>(src, ip, block_start, block_end, window, mls, params, tables)
+        };
+    }
+    // The (hash_log, chain_log) pairs the level table produces for the bt
+    // strategies: L13-L15 give (22,22) (23,22) (23,23); L16-L22 give (22,22)
+    // (22,23) (22,24) (23,24) (24,24). Anything else falls to the runtime arm.
+    match (tables.hash_log, params.chain_log.min(24)) {
+        (22, 22) => go!(22, 22),
+        (22, 23) => go!(22, 23),
+        (22, 24) => go!(22, 24),
+        (23, 22) => go!(23, 22),
+        (23, 23) => go!(23, 23),
+        (23, 24) => go!(23, 24),
+        (24, 24) => go!(24, 24),
+        _ => bt_find_best_runtime(src, ip, block_start, block_end, window, mls, params, tables),
+    }
+}
+
+/// GATE 4/5 EXTENDED TO THE BT PATH (L13-L22).
+///
+/// Same gap `find_dfast` had: `hash_log` and `chain_log` were read from `params`
+/// at run time, so the hash shift and the binary-tree mask were computed with
+/// variable-count shifts on EVERY position. Measured in the emitted assembly,
+/// `bt_find_best` carried 5 variable shifts in 234 instructions.
+///
+/// The payoff here is structurally SMALLER than at L3 and that is worth stating:
+/// this function is called once per position but then drives ~27 tree probes
+/// (xml at L19: 55,988,704 probes over a 2 MiB prefix), each doing a
+/// `count_match`. The shift is amortised over that walk, where `find_dfast` had
+/// only ~2 candidate checks to amortise against.
+///
+/// Byte-identical by construction: HLOG and CLOG take the values the runtime
+/// variables already held.
+#[inline(never)]
+fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
+    src: &[u8],
+    ip: usize,
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    mls: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+) -> (usize, usize) {
+    const fn btlog(c: u32) -> u32 { let c = if c > 24 { 24 } else { c }; let c = c.saturating_sub(1); if c < 1 { 1 } else { c } }
+    let bt_log = btlog(CLOG);
+    let bt_mask = (1usize << bt_log) - 1;
+    if tables.chain.len() < 2 {
+        return (0, 0);
+    }
+    let h = hash_mls(src, ip, mls, HLOG);
+    if h >= tables.hash.len() {
+        return (0, 0);
+    }
+    let mut match_idx = tables.get_h(h);
+    tables.put_h(h, ip);
+    let mut smaller = (ip & bt_mask) << 1;
+    let mut larger = smaller + 1;
+    if larger >= tables.chain.len() {
+        return (0, 0);
+    }
+    let attempts = search_attempts(params);
+    // P0/gg-matchfind: work counter -- see `chain_find_best`.
+    const COUNT: bool = cfg!(feature = "profile");
+    let mut probes = 0u64;
+    let mut best_ml = 0usize;
+    let mut best_m = 0usize;
+    for _ in 0..attempts {
+        let Some(m) = match_idx else {
+            tables.chain[smaller] = 0;
+            tables.chain[larger] = 0;
+            break;
+        };
+        if m >= ip || ip - m > window {
+            tables.chain[smaller] = 0;
+            tables.chain[larger] = 0;
+            break;
+        }
+        if m < block_start.saturating_sub(window).max(tables.frame_start) {
+            break;
+        }
+        let bt_idx = (m & bt_mask) << 1;
+        if bt_idx + 1 >= tables.chain.len() {
+            break;
+        }
+        if COUNT {
+            probes += 1;
+        }
+        let ml = count_match(src, m, ip, block_end);
+        if ml >= mls && ml > best_ml && offset_ok(ip - m, window) && m >= tables.frame_start {
+            best_ml = ml;
+            best_m = m;
+        }
+        let mb = src.get(m + ml).copied().unwrap_or(0);
+        let ib = src.get(ip + ml).copied().unwrap_or(0);
+        if mb < ib {
+            tables.chain[smaller] = m as u32;
+            smaller = bt_idx + 1;
+            let v = tables.chain[bt_idx + 1];
+            match_idx = if v == 0 { None } else { Some(v as usize) };
+        } else {
+            tables.chain[larger] = m as u32;
+            larger = bt_idx;
+            let v = tables.chain[bt_idx];
+            match_idx = if v == 0 { None } else { Some(v as usize) };
+        }
+        if smaller >= tables.chain.len() || larger >= tables.chain.len() {
+            break;
+        }
+    }
+    if COUNT {
+        crate::prof::note_probes(probes);
+    }
+    (best_m, best_ml)
+}
+
+#[inline(never)]
+fn bt_find_best_runtime(
+    src: &[u8],
+    ip: usize,
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    mls: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+) -> (usize, usize) {
+    let hash_log = tables.hash_log;
     let bt_log = params.chain_log.min(24).saturating_sub(1).max(1);
     let bt_mask = (1usize << bt_log) - 1;
     if tables.chain.len() < 2 {
@@ -3526,6 +3656,7 @@ fn find_opt(
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
+    OPT_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let n = block_end - block_start;
     let mls = params.min_match.max(3) as usize;
     if n < 8 {
@@ -5341,5 +5472,19 @@ pub fn take_dfast_calls() -> (u64, u64) {
     (
         DFAST_SPEC_CALLS.swap(0, Ordering::Relaxed),
         DFAST_RUNTIME_CALLS.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Calls into `find_fast`'s Gate-4 dispatcher, for reachability proofs.
+pub static FAST_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Calls into `find_opt` (L16+).
+pub static OPT_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear the finder reachability counters: `(find_fast, find_opt)`.
+pub fn take_finder_calls() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        FAST_CALLS.swap(0, Ordering::Relaxed),
+        OPT_CALLS.swap(0, Ordering::Relaxed),
     )
 }
