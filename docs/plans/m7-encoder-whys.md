@@ -2806,6 +2806,43 @@ Gates: 172 tests; us-decodes-C 36/36; debug-build decode clean on 3 files (exerc
 paying for itself: 19.9M copies counted, 85.5% already fast, one addressable slice
 identified at 5.8%, predicted ~0.5%, delivered ~0.5%. No surprises in either direction.
 
+## BRICK 83 REVERTED -- and it EXPLAINS brick 76: you cannot make ONE side of a cost function accurate
+
+`find_opt` prices literals at a flat 6. The right statistics were identified and threaded
+in: **`EntropyState` already carries the PREVIOUS BLOCK'S `HuffCTable`**, and
+`entry[b] >> 16` is that byte's real code length in bits -- exactly what `btultra2` warms
+its price table from. Not a proxy like brick 76's raw byte histogram: the actual cost the
+literal section will charge.
+
+**Still worse.** L16: nci 1.0784 -> 1.1006, mr 1.0551 -> 1.0712, xml 1.1145 -> 1.1258;
+L19 worse on all four measured. Reverted.
+
+### The mechanism -- which also explains brick 76
+
+Literals were made to cost REAL BITS (1-11 from the Huffman table) while sequences still
+cost `12 + log2(offset)` -- **an invented scale** (brick 72). A dynamic program compares
+literal cost against sequence cost, so making ONE side true while the other stays arbitrary
+does not improve the comparison, it SKEWS it: real literal costs average ~7-8 bits against
+a flat 6, so literals got relatively dearer and the parse took more, worse matches.
+
+**Two failed attempts, one cause.** Brick 76 (block byte histogram) and brick 83 (previous
+block's Huffman lengths) both failed, and brick 76's mechanism was recorded as "unknown".
+It is now known: **both changed the literal term alone.** The proxy quality was never the
+issue -- the SCALE MISMATCH was.
+
+### What a correct attempt requires
+
+Price BOTH sides in the same units -- real bits:
+* literals: previous block's Huffman code lengths (already plumbed by this attempt);
+* sequences: literal-length code + match-length code + offset code bits, from the FSE
+  tables' accuracy logs, the way `ZSTD_getMatchPrice` does.
+
+That is a whole-cost-model change, not a one-term patch, and it must land as a unit. Until
+then the flat constants are internally consistent and should be left alone.
+
+**LAW: a cost function must be accurate in ALL its terms or arbitrary in all of them.
+Half-accurate is worse than consistently wrong.**
+
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 
 Runtime arms added to every brick that had been judged with the broken method, then all

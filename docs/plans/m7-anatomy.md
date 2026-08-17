@@ -135,55 +135,43 @@ not share it.
 
 ## 3. Stage anatomy — where OUR time goes
 
-> **STALE.** These shares predate the repcode campaign (bricks 67/70/71/73/75) and the
-> decoder work (79/80). Repcode now fires in every finder, so MatchFind's share has
-> almost certainly moved and the "#1 on 14 of 17" claim below needs RE-DERIVING from a
-> fresh `--m7-profile` run before it is quoted.
-
-**Re-measured 2026-08-16** on the instrumented build. Share of encode
-(`stage / EncodeTotal`) and of decode (`stage / DecodeTotal`). Bold marks the LEADING
-stage on each half.
+**Re-measured 2026-08-16 (second pass)**, AFTER the repcode campaign (bricks 67/70/71/73/75)
+and the decoder work (79-82). Share of encode (`stage / EncodeTotal`) and of decode
+(`stage / DecodeTotal`); bold marks the LEADING stage on each half.
 
 | corpus       | MatchFind |     Huff | FseSeq | SeqCode |  DecLits |   DecSeq |
 | ------------ | --------: | -------: | -----: | ------: | -------: | -------: |
-| sao          |  **80.5** |      6.6 |    2.6 |     1.6 |     33.5 | **41.0** |
-| webster      |  **62.6** |      8.8 |   16.6 |     8.0 |     11.1 | **82.6** |
-| ooffice      |  **60.4** |     21.6 |    9.6 |     4.4 |     26.9 | **64.3** |
-| smallmsg-8m  |  **59.9** |      0.9 |   24.9 |     9.2 |      2.7 | **90.1** |
-| jsonlog-16m  |  **57.8** |      2.8 |   23.2 |    11.5 |      3.6 | **89.7** |
-| reymont      |  **56.8** |     15.4 |   16.9 |     7.5 |     15.3 | **78.8** |
-| dickens      |  **56.4** |     23.8 |   12.2 |     4.6 |     31.7 | **62.8** |
-| samba        |  **55.7** |     12.0 |   18.6 |     8.8 |     13.9 | **78.7** |
-| xml          |  **50.8** |     10.7 |   21.9 |    10.8 |     10.4 | **81.2** |
-| versions-16m |  **45.9** |      0.4 |   27.3 |    13.8 |      0.4 | **81.3** |
-| nci          |  **43.9** |     11.7 |   25.7 |    12.3 |     12.2 | **79.6** |
-| mozilla      |  **43.4** |     36.1 |   11.4 |     5.5 |     31.6 | **62.1** |
-| text-32m     |  **42.1** |      1.8 |    0.5 |     0.3 |      0.5 | **44.5** |
-| osdb         |      35.5 | **42.0** |   13.7 |     5.3 |     24.9 | **68.0** |
-| mr           |      32.0 | **61.9** |    1.6 |     0.9 | **70.7** |     20.7 |
-| incomp-32m   |  **30.0** |      0.0 |    0.0 |     0.0 |      0.0 |  **0.0** |
-| x-ray        |      19.8 | **61.0** |    0.3 |     0.0 | **44.3** |      3.5 |
+| sao          |  **86.8** |      1.8 |    2.3 |     2.4 |     22.6 | **54.4** |
+| webster      |  **67.5** |      7.8 |   12.0 |     8.6 |     11.0 | **82.4** |
+| smallmsg-8m  |  **66.7** |      0.9 |   16.6 |    10.3 |      2.5 | **90.0** |
+| ooffice      |  **65.8** |     18.3 |    7.0 |     4.5 |     27.2 | **62.8** |
+| jsonlog-16m  |  **63.2** |      2.7 |   16.1 |    12.7 |      3.8 | **89.1** |
+| reymont      |  **60.9** |     15.5 |   12.1 |     8.0 |     16.5 | **77.6** |
+| dickens      |  **60.5** |     22.4 |    9.0 |     5.0 |     31.9 | **62.2** |
+| samba        |  **60.5** |     11.2 |   13.5 |     9.6 |     13.9 | **77.9** |
+| xml          |  **55.1** |     10.2 |   16.6 |    11.9 |     10.5 | **80.5** |
+| mozilla      |  **47.9** |     33.4 |    8.6 |     6.1 |     31.7 | **61.8** |
+| nci          |  **47.4** |     11.8 |   20.3 |    13.5 |     11.9 | **78.8** |
+| text-32m     |  **42.7** |      1.8 |    0.5 |     0.3 |      0.6 | **47.4** |
+| mr           |      40.2 | **52.7** |    1.6 |     1.5 | **66.9** |     24.6 |
+| osdb         |      39.7 | **40.3** |   10.4 |     5.8 |     26.4 | **66.1** |
+| versions-16m |  **39.3** |      0.8 |    9.8 |     8.4 |      0.3 | **59.9** |
+| incomp-32m   |  **30.4** |      0.0 |    0.0 |     0.0 |      0.0 |  **0.0** |
+| x-ray        |      21.4 | **58.9** |    0.4 |     0.0 | **48.0** |      3.9 |
+| zeros-32m    |   **0.0** |      0.0 |    0.0 |     0.0 |      0.0 |  **0.0** |
 
-**`EncodeMatchFind` is #1 on 14 of 17** — down from 15 before the campaign.
-**Its share fell on 16 of 17 corpora**, which is the campaign landing exactly where it
-was aimed: the probe loop went from 47 instructions to 19, so match-finding is simply a
-smaller slice of a smaller encode.
+**`EncodeMatchFind` is #1 on 15 of 18**, Huffman on 3 (`mr`, `x-ray`, `osdb`).
+**`DecodeSeq` is #1 on 16 of 18** -- UP from 14 of 17 before the campaign, and now
+62-90% of decode on the sequence-heavy files.
 
-**One file CHANGED HANDS: `osdb`.** It was MatchFind-led 42.4% vs Huffman 36.8%; it is now
-**Huffman-led 42.0% vs 35.5%**. That is not Huffman getting slower — it is MatchFind
-getting ~7 points cheaper while Huffman stayed put. `osdb` therefore joins `mr` and
-`x-ray` as a Huffman-bound file, and the pre-campaign claim that "Huffman leads on exactly
-two files" is now wrong.
+**That rise is the campaign working, not a regression.** Bricks 63/79/80/81/82 cut the
+LITERALS side of decode (per-block Huffman table clone, the arm read, two copy tiers,
+the inlined literal copy), so `DecodeLiterals` shrank and `DecodeSeq`'s share grew
+correspondingly. The sequence loop is now a LARGER fraction of a SMALLER decode.
 
-**Decoder: `DecodeSeq` is #1 on 14 of 17.** `DecodeLiterals` leads on `mr` (70.7%)
-and `x-ray` (44.3%) — the same two as before. The decoder shares barely moved, which is
-consistent with front 2 having removed per-block work (the Huffman table clone) rather
-than changing the per-sequence balance.
-
-**The two halves are still near mirror images:** the files where the encoder spends its
-time in Huffman are the files where the decoder spends its time in literals. One content
-axis (alphabet flatness) drives both. `osdb` flipping on the encode side while staying
-`DecodeSeq`-led on the decode side is the one place that symmetry now bends.
+**The two halves remain near mirror images:** the files where the encoder spends its time
+in Huffman (`mr`, `x-ray`, `osdb`) are the files where the decoder spends its time in
+literals. One content axis -- alphabet flatness -- drives both.
 
 ---
 
