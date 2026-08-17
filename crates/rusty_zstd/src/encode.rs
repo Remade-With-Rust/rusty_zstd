@@ -3165,8 +3165,34 @@ fn find_opt(
         _ => 0,
     };
     let rep_cost = 12u32.saturating_sub(extra).saturating_add(2);
-    for i in 0..n {
+    // C's `sufficient_len` (`ZSTD_compressBlock_opt_generic`): a match longer
+    // than `targetLength` is taken IMMEDIATELY -- "large match -> immediate
+    // encoding" -- and the DP is skipped for the span it covers. `find_opt`
+    // never read `target_length` at all, so on content whose matches always
+    // exceed it we ran a full per-byte optimal parse where C commits and jumps.
+    // That is the structural half of the L16+ pathology (the other half was the
+    // length enumeration below).
+    //
+    // ABSOLUTE FLOOR on top of `target_length`. C's opt parse runs its DP inside
+    // a bounded WINDOW and jumps to the end of the committed path; ours prices
+    // the whole block per byte, so a bare `target_length` skip fires on ordinary
+    // matches and forces the parse through them. At L16 `target_length` is 48,
+    // and skipping on 48-byte matches cost osdb 3,141,787 -> 3,156,514 bytes and
+    // broke level monotonicity (L16 > L13).
+    //
+    // The pathology is driven by matches in the tens of THOUSANDS of bytes, so
+    // the floor keeps the whole speed win while leaving ordinary matches to the
+    // DP. `higher_level_never_larger_osdb` is the gate that caught this.
+    const OPT_SKIP_FLOOR: usize = 1024;
+    let sufficient_len = if params.target_length == 0 {
+        usize::MAX
+    } else {
+        (params.target_length as usize).max(OPT_SKIP_FLOOR)
+    };
+    let mut i = 0usize;
+    while i < n {
         if price[i] >= inf {
+            i += 1;
             continue;
         }
         let np = price[i].saturating_add(6);
@@ -3177,6 +3203,7 @@ fn find_opt(
         }
         let ip = block_start + i;
         if ip + 8 > block_end {
+            i += 1;
             continue;
         }
         // `try_rep1` matches at ip+1: a rep0 code requires litlen >= 1. So the DP
@@ -3201,6 +3228,7 @@ fn find_opt(
         }
         let (bm, bml) = bt_find_best(src, ip, block_start, block_end, window, mls, params, tables);
         if bml < mls {
+            i += 1;
             continue;
         }
         // BRICK 72: price a sequence by its OFFSET, not a flat constant.
@@ -3216,8 +3244,30 @@ fn find_opt(
         // with the offset's magnitude. A near match is genuinely cheaper.
         let off_bits = 32 - ((ip - bm) as u32 | 1).leading_zeros();
         let seq_cost = (12u32 + off_bits).saturating_sub(extra);
+        // GATE 19 DEFECT FIX -- the DP enumerated LENGTHS; C enumerates MATCHES.
+        //
+        // `np` below does not depend on `len`: this price model charges a match
+        // `12 + off_bits - extra` whatever its length. So this loop writes the
+        // SAME value into every `price[j]` for `j` in `i+mls ..= i+bml`. On
+        // content whose matches run long, `bml` reaches the block size, and the
+        // DP becomes O(n * bml).
+        //
+        // Measured on an 8 MiB `text-32m` prefix, matched levels:
+        //     L13 BtLazy2   C   107 ms   us     334 ms      3x
+        //     L16 BtOpt     C    71 ms   us 198,441 ms  2,795x
+        //     L22 BtUltra2  C    79 ms   us 409,475 ms  5,183x
+        // The cliff is exactly the BtLazy2 -> BtOpt boundary, i.e. entry to
+        // `find_opt`. C never pays it because `ZSTD_BtGetAllMatches` hands its
+        // DP a BOUNDED list of candidate matches rather than a length range.
+        //
+        // Cap the exploration at `OPT_MAX_LENGTHS` evenly spaced probes, always
+        // including `bml` itself. This is a NO-OP wherever `bml - mls` is
+        // already below the cap -- which is all normal content; only inputs
+        // with very long matches take a different path.
+        const OPT_MAX_LENGTHS: usize = 64;
+        let floor_step = (bml.saturating_sub(mls) / OPT_MAX_LENGTHS).max(1);
         let mut len = mls;
-        while len <= bml {
+        loop {
             let j = i + len;
             if j > n {
                 break;
@@ -3233,12 +3283,24 @@ fn find_opt(
             if len == bml {
                 break;
             }
-            len += if params.strategy == Strategy::BtUltra2 {
+            let step = if params.strategy == Strategy::BtUltra2 {
                 1
             } else {
                 (bml - len).clamp(1, 4)
             };
+            // `.min(bml)` guarantees the longest match is always priced, which
+            // a larger step would otherwise skip past.
+            len = (len + step.max(floor_step)).min(bml);
         }
+        // C's immediate encoding: this match already exceeds `targetLength`, so
+        // commit it and jump the DP past the span it covers instead of pricing
+        // every interior position. Positions inside keep `price == inf`, so no
+        // path can route through them -- exactly the greedy commitment C makes.
+        if bml >= sufficient_len && i + bml <= n {
+            i += bml;
+            continue;
+        }
+        i += 1;
     }
     if price[n] >= inf {
         return find_bt_lazy(src, block_start, block_end, window, params, tables, 2, reps);
