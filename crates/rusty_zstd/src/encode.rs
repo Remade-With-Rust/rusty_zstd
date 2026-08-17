@@ -1638,7 +1638,7 @@ fn find_fast(
     match (tables.packed, rep_on, pipe_on, s0) {
         // The shipping configuration: no tag, no rep1, pipelined, default step.
         // Specialized on hash_log so the shift is an immediate too.
-        (false, false, true, 2) => match tables.hash_log {
+        (false, false, true, 2) if fast_spec_enabled() => match tables.hash_log {
             12 => go!(false, false, 12, 2, true),
             13 => go!(false, false, 13, 2, true),
             14 => go!(false, false, 14, 2, true),
@@ -1651,7 +1651,7 @@ fn find_fast(
         // so any step-1 measurement was comparing a generic loop against a
         // fully specialized one -- a work-parity break in the instrument, not
         // a property of the density.
-        (false, false, true, 1) => match tables.hash_log {
+        (false, false, true, 1) if fast_spec_enabled() => match tables.hash_log {
             12 => go!(false, false, 12, 1, true),
             13 => go!(false, false, 13, 1, true),
             14 => go!(false, false, 14, 1, true),
@@ -5293,6 +5293,35 @@ fn dfast_spec_enabled() -> bool {
                 .map(|v| v.trim() != "0")
                 .unwrap_or(true);
             DFAST_SPEC_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// GATE 4 arm: the `find_fast` HLOG/STEP specialisation itself.
+///
+/// With this OFF the shipping configuration falls through to the generic
+/// `go!(false, false, 0, 0, true)` arm -- runtime HLOG, runtime STEP -- which is
+/// the "constant" alternative to the 13-way dispatch. Default ON, so an A/B
+/// setting it to 0 differs from the default and is not a null comparison.
+static FAST_SPEC_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for in-process ABBA.
+pub fn set_fast_spec_arm(on: bool) {
+    FAST_SPEC_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn fast_spec_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match FAST_SPEC_ARM.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var("RZSTD_FAST_SPEC")
+                .map(|v| v.trim() != "0")
+                .unwrap_or(true);
+            FAST_SPEC_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }
     }
