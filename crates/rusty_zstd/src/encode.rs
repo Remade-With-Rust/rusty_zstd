@@ -2625,16 +2625,17 @@ fn find_dfast(
     if !dfast_spec_enabled() {
         return find_dfast_runtime(src, block_start, block_end, window, params, tables, reps);
     }
+    // GATE 5: the MINIMAL COMPLETE set. Enumerated exhaustively over every
+    // input size 0..2^28 plus the unknown-size (streaming) case, DFast reaches
+    // exactly hash_log {14, 15, 16, 17, 18}. The first cut specialised 12..=20,
+    // so 12/13/19/20 were dead monomorphizations -- roughly 2,100 instructions
+    // of code that no input can execute, paid for in I-cache.
     match tables.hash_log {
-        12 => go!(12),
-        13 => go!(13),
         14 => go!(14),
         15 => go!(15),
         16 => go!(16),
         17 => go!(17),
         18 => go!(18),
-        19 => go!(19),
-        20 => go!(20),
         _ => find_dfast_runtime(src, block_start, block_end, window, params, tables, reps),
     }
 }
@@ -3336,7 +3337,18 @@ fn bt_find_best(
     // The (hash_log, chain_log) pairs the level table produces for the bt
     // strategies: L13-L15 give (22,22) (23,22) (23,23); L16-L22 give (22,22)
     // (22,23) (22,24) (23,24) (24,24). Anything else falls to the runtime arm.
+    // GATE 5: the COMPLETE set. Enumerated exhaustively over every input size
+    // 0..2^28 plus unknown-size, L13-L22 reach exactly these 12 pairs. The first
+    // cut listed only the seven LARGE-input pairs, so every small input fell
+    // through to the runtime arm and got no fold at all -- and the coverage
+    // check that "proved" 0 fallbacks used a 2 MiB file, which can only ever hit
+    // (22,24) and (24,24). A coverage proof is only as wide as its inputs.
     match (tables.hash_log, params.chain_log.min(24)) {
+        (14, 15) => go!(14, 15),
+        (15, 15) => go!(15, 15),
+        (17, 18) => go!(17, 18),
+        (19, 18) => go!(19, 18),
+        (19, 19) => go!(19, 19),
         (22, 22) => go!(22, 22),
         (22, 23) => go!(22, 23),
         (22, 24) => go!(22, 24),
