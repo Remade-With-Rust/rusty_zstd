@@ -58,6 +58,17 @@ pub(crate) fn decode_compressed_block(
     frame_start: usize,
     frame_skipped: usize,
 ) -> Result<(), Error> {
+    // BRICK 78: guarantee a block's worth of output capacity ONCE per block.
+    //
+    // `decompress` only calls `try_reserve` when the frame header declares a
+    // content size. Frames without one -- streaming output, and several of C's
+    // modes -- got NO reservation, so the output Vec grew incrementally and
+    // `grow_one` appeared INSIDE the per-sequence loop (visible in the decode
+    // hot loop's call list alongside `copy_from_decoded`).
+    //
+    // One reserve per block replaces a growth check per sequence. Reserving
+    // more can never change the output, so this is byte-identical.
+    out.reserve(block_max as usize);
     let mut r = Reader::new(payload);
     let before = r.remaining();
     let literals = {
@@ -367,6 +378,7 @@ pub(crate) fn decode_sequences(
     // xml 2.10 -> 2.16, i.e. 3-6% SLOWER on every sequence-heavy file.
     //
     // A plain local gets the same per-sequence saving with no structural change.
+    let litcopy_arm = litcopy_on();
     let seqcheck = seqcheck_hoisted();
     for i in 0..nseq {
         let _ = br.reload();
@@ -395,7 +407,7 @@ pub(crate) fn decode_sequences(
             (1u32 << of_code) + offset_add
         };
 
-        copy_literals(literals, &mut lit_pos, litlen, out)?;
+        copy_literals(literals, &mut lit_pos, litlen, out, litcopy_arm)?;
         let offset = resolve_offset(offset_value, litlen, &mut state.reps)?;
         copy_match(out, &mctx, offset, matchlen)?;
 
@@ -583,11 +595,18 @@ fn seqcheck_hoisted() -> bool {
 /// Both produce identical output (`copy_literals_fast_matches_checked`).
 #[allow(unsafe_code)]
 #[inline]
+/// BRICK 79: the literal-copy arm is a PARAMETER, not a per-sequence read.
+///
+/// `litcopy_on()` sat in the fast-path guard, so it was read once per SEQUENCE
+/// (~15M across the corpus). It is fixed for the whole process. Fourth instance
+/// of this shape: brick 49 (`use_rep`), 64 (`seqcheck_hoisted`), 77
+/// (`lit_push_enabled`), now this.
 fn copy_literals(
     literals: &[u8],
     lit_pos: &mut usize,
     litlen: u32,
     out: &mut Vec<u8>,
+    arm: bool,
 ) -> Result<(), Error> {
     let n = litlen as usize;
     let end = lit_pos.checked_add(n).ok_or(Error::Corruption)?;
@@ -595,7 +614,7 @@ fn copy_literals(
         return Err(Error::Corruption);
     }
     let len = out.len();
-    if litcopy_on() && n <= 16 && *lit_pos + 16 <= literals.len() && out.capacity() - len >= 16 {
+    if arm && n <= 16 && *lit_pos + 16 <= literals.len() && out.capacity() - len >= 16 {
         // SAFETY: `lit_pos + 16 <= literals.len()` gives 16 readable source
         // bytes. `capacity - len >= 16` gives 16 writable destination bytes
         // inside the allocation. `literals` and `out` are distinct buffers
