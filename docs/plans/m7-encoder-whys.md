@@ -3309,3 +3309,49 @@ Every public decompress entry point returned a fresh `Vec`; we had nothing with
 the `ZSTD_decompress(dst, dstCapacity, ..)` shape, so a caller decoding many
 frames could not reuse an allocation. Added with 4 tests (equivalence, append
 semantics, reuse across frames, error paths) plus a doctest.
+
+---
+
+## PROVEN LEVER, NOT YET BUILT: enable the PAIR SEARCH at `step0 == 2`
+
+**The prize (L1, byte counts, deterministic):**
+
+| STEP0 | pair | parity |         nci |        osdb |     webster |
+| ----- | ---- | ------ | ----------: | ----------: | ----------: |
+| 2     | off  | even   |   3,713,891 |   4,101,285 |  15,539,187 |
+| 3     | ON   | odd    | **3,246,835** | **3,952,076** | **14,735,343** |
+| 4     | ON   | even   |   3,319,389 |   4,001,742 |  15,251,089 |
+| 5     | ON   | odd    |   3,310,083 |   4,069,628 |  15,700,372 |
+
+**~10% on nci, 3.6% on osdb, 5% on webster**, from probing `ip+1` as well as
+`ip`. `let pair = step0 > 2;` (encode.rs) is the switch.
+
+### How this was nearly attributed to the WRONG cause
+
+`STEP0=3` won on all seven corpora and was explained as ODD-vs-EVEN stride
+aliasing -- a story that fit because the literals sampler (brick 86) had just
+turned out to be exactly that bug. Brick 87 implemented a stateless 2,3,2,3
+rotation covering every phase mod 4. It came back **faster everywhere (+1-9%)
+but BIGGER on most (+2%)** -- and that result is self-refuting: step 3 probes
+FEWER positions than step 2 and got smaller, while the rotation also probes
+fewer and got bigger. Phase coverage cannot produce both. Reverted.
+
+The decisive test was one command with NO code change: `STEP0=4` is **even**, so
+the aliasing theory predicts it loses -- it beats `STEP0=2` by **10.6%** on nci.
+Pair search is the cause; parity is a ~2% second-order effect, and `STEP0=5`
+(odd, coarser) losing to `STEP0=4` (even, finer) shows density outranks parity.
+
+> **Law: a mechanism you just found elsewhere is the one you will over-apply
+> next.** Brick 86's stride-aliasing success made the same explanation feel
+> obvious here. The monotonicity break was real evidence; the attribution was
+> not. Before building on a mechanism, find the cheap experiment that SEPARATES
+> it from its neighbour -- here, one env-var sweep against an untouched binary.
+
+### Two constraints for whoever builds it
+
+1. **`pair` also gates the PIPELINE.** "Only the non-`pair` path is pipelined
+   (`step0 == 2`)" -- so enabling pair at step 2 turns OFF the pipelined loop
+   that bricks 46-55 built. That interaction is the whole risk; measure it, do
+   not reason about it.
+2. **`pair` and `step` are coupled.** The existing comment records that growing
+   step without the pair blew `--fast=4` ratio 0.845 -> 1.272. Re-gate `--fast`.
