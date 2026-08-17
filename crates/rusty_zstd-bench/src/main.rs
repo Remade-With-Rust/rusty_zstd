@@ -7,6 +7,7 @@
 static ALLOC: rzstd_alloc::Alloc = rzstd_alloc::Alloc;
 
 mod corpus;
+mod gate1;
 mod ledger;
 mod measure;
 mod oracle;
@@ -109,7 +110,8 @@ fn main() -> ExitCode {
     let m7_harvest = args.iter().any(|a| a == "--m7-harvest");
     let ab_tag = args.iter().any(|a| a == "--ab-tag");
     let gg_matchfind = args.iter().any(|a| a == "--gg-matchfind");
-    if !baseline && !m2_ratio && !m7_speed && !m7_profile && !m7_harvest && !ab_tag && !gg_matchfind
+    let gg_gate1 = args.iter().any(|a| a == "--gg-gate1");
+    if !baseline && !m2_ratio && !m7_speed && !m7_profile && !m7_harvest && !ab_tag && !gg_matchfind && !gg_gate1
     {
         usage();
         return ExitCode::from(2);
@@ -171,6 +173,17 @@ fn main() -> ExitCode {
                 })
             });
         return run_m7_profile(&root, &oracle, &files, &levels, harvest_out.as_deref());
+    }
+    if gg_gate1 {
+        let mut all = files.clone();
+        all.extend(corpus::list_silesia(&root));
+        let out = args
+            .windows(2)
+            .find(|w| w[0] == "--harvest-out")
+            .map(|w| PathBuf::from(&w[1]))
+            .unwrap_or_else(|| root.join("_greatgate").join("harvests").join("gate1.csv"));
+        pin_current_process();
+        return gate1::run(&all, *levels.first().unwrap_or(&1), &only, &out);
     }
     if gg_matchfind {
         let out = args

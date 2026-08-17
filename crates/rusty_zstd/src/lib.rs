@@ -71,7 +71,8 @@ pub use encode::{
 #[cfg(feature = "alloc")]
 pub use encode::{
     set_huff_fast_arm, set_lazy_fill_arm, set_litpush_arm, set_litpush_hoist_arm, set_payload_arm, set_pipe_arm,
-    set_rep1_arm, set_search_log_delta, set_step0_arm, set_tag_arm,
+    set_incomp_skip_arm, set_pair_arm, set_rep1_arm, set_search_log_delta, set_step0_arm,
+    set_tag_arm,
 };
 #[cfg(all(feature = "alloc", feature = "std"))]
 pub use in_bench::{
@@ -86,7 +87,7 @@ pub use mt::{
     JOB_SIZE_MIN, NB_WORKERS_MAX,
 };
 #[cfg(feature = "alloc")]
-pub use params::{compression_params, CompressionParameters, Strategy};
+pub use params::{compression_params, set_strategy_arm, CompressionParameters, Strategy};
 #[cfg(feature = "alloc")]
 pub use prof::{
     dump as prof_dump, encode_counts as prof_encode_counts, note_hash_fill as prof_note_hash_fill,

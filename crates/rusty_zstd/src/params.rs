@@ -340,7 +340,59 @@ pub fn compression_params(
         p.chain_log = 24;
     }
     p.min_match = p.min_match.clamp(3, 7);
+    // GATE 1 (gg-matchfind) arm: override ONLY the strategy, leaving every other
+    // parameter at this level's values.
+    //
+    // This is the only honest way to give Gate 1 a truth table. Comparing L1 to
+    // L3 to L5 does NOT isolate the strategy -- it moves window_log, chain_log,
+    // hash_log, search_log, min_match and target_length at the same time. The
+    // override is applied HERE, at the single derivation point, so
+    // `MatchTables::new` allocates for the strategy that will actually run
+    // (greedy/lazy need `chain`, dfast needs `hash_long`).
+    #[cfg(feature = "std")]
+    if let Some(st) = strategy_override() {
+        p.strategy = st;
+    }
     Ok(p)
+}
+
+/// Gate 1 arm. 0 = no override; else `strategy as u8 + 1`.
+#[cfg(feature = "std")]
+static STRATEGY_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for the Gate 1 truth table. `None` restores the level's strategy.
+#[cfg(feature = "std")]
+pub fn set_strategy_arm(s: Option<Strategy>) {
+    let v = match s {
+        None => 0,
+        Some(Strategy::Fast) => 1,
+        Some(Strategy::DFast) => 2,
+        Some(Strategy::Greedy) => 3,
+        Some(Strategy::Lazy) => 4,
+        Some(Strategy::Lazy2) => 5,
+        Some(Strategy::BtLazy2) => 6,
+        Some(Strategy::BtOpt) => 7,
+        Some(Strategy::BtUltra) => 8,
+        Some(Strategy::BtUltra2) => 9,
+    };
+    STRATEGY_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn strategy_override() -> Option<Strategy> {
+    match STRATEGY_ARM.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => Some(Strategy::Fast),
+        2 => Some(Strategy::DFast),
+        3 => Some(Strategy::Greedy),
+        4 => Some(Strategy::Lazy),
+        5 => Some(Strategy::Lazy2),
+        6 => Some(Strategy::BtLazy2),
+        7 => Some(Strategy::BtOpt),
+        8 => Some(Strategy::BtUltra),
+        9 => Some(Strategy::BtUltra2),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

@@ -854,6 +854,36 @@ thread_local! {
         const { core::cell::Cell::new(None) };
 }
 
+
+/// Gate 6 arm: force the pair search on even at `step0 == 2`.
+static PAIR_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for the Gate 6 truth table.
+pub fn set_pair_arm(on: bool) {
+    PAIR_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn pair_forced() -> bool {
+    PAIR_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
+}
+
+/// Gate 16 arm: the incompressible early-raw skip. Also RETIRES the uncached
+/// `std::env::var` read that `incomp_skip_on` performed on EVERY BLOCK -- the
+/// last uncached env read on a hot path (m7-anatomy section 3 addendum).
+/// 0 = unresolved, 1 = off, 2 = on, 3 = follow the level rule.
+static INCOMP_SKIP_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for the Gate 16 truth table. `None` restores the level rule.
+pub fn set_incomp_skip_arm(on: Option<bool>) {
+    let v = match on {
+        Some(false) => 1,
+        Some(true) => 2,
+        None => 3,
+    };
+    INCOMP_SKIP_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
 fn incomp_skip_on(params: CompressionParameters) -> bool {
     #[cfg(test)]
     {
@@ -863,14 +893,25 @@ fn incomp_skip_on(params: CompressionParameters) -> bool {
     }
     #[cfg(feature = "std")]
     {
-        if let Ok(v) = std::env::var("RZSTD_INCOMP_SKIP") {
-            let t = v.trim();
-            if t == "0" || t.eq_ignore_ascii_case("off") {
-                return false;
-            }
-            if t == "1" || t.eq_ignore_ascii_case("on") {
-                return true;
-            }
+        use core::sync::atomic::Ordering;
+        let mut v = INCOMP_SKIP_ARM.load(Ordering::Relaxed);
+        if v == 0 {
+            // Resolve ONCE, not once per block. This read used to be a raw
+            // `std::env::var` inside `early_raw_skip`, i.e. an allocation and a
+            // process-environment lookup on every block -- the same shape as
+            // bricks 49/64/77.
+            v = match std::env::var("RZSTD_INCOMP_SKIP") {
+                Ok(x) if x.trim() == "0" || x.trim().eq_ignore_ascii_case("off") => 1,
+                Ok(x) if x.trim() == "1" || x.trim().eq_ignore_ascii_case("on") => 2,
+                _ => 3,
+            };
+            INCOMP_SKIP_ARM.store(v, Ordering::Relaxed);
+        }
+        if v == 1 {
+            return false;
+        }
+        if v == 2 {
+            return true;
         }
     }
     // --fast=N (N=1..=7) is strategy Fast with targetLength = N.
@@ -1557,7 +1598,11 @@ fn find_fast_impl<
     // Pair-search ip+1 only when step skips it (`--fast=4`, step 5). At step 2
     // that doubles incomp probes for no ratio. Do not grow step without the pair
     // (that blew --fast=4 ratio 0.845 -> 1.272).
-    let pair = step0 > 2;
+    //
+    // Gate 6 (gg-matchfind): forceable so the pair search can be given its own
+    // truth table INDEPENDENTLY of step0, which is the only way to tell the two
+    // apart -- they are the same physical decision reached by two switches.
+    let pair = step0 > 2 || pair_forced();
     let lowest = block_start.saturating_sub(window).max(tables.frame_start);
     let frame_start = tables.frame_start;
     // Local repeat-offset state, mirroring C's `offset_1`/`offset_2`. A repcode
