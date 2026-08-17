@@ -2741,6 +2741,39 @@ the match-copy path are where the bytes actually move.
 
 Gates: 172 tests; us-decodes-C 36/36.
 
+### THE MATCH-COPY CENSUS: 85.5% is already fast -- no big win remains
+
+Having found DecSeq memory-bound, the next question was where the BYTES move. Censused
+`copy_from_decoded` across the corpus -- **19,905,568 match copies**:
+
+| path                                                     |      count |     share |
+| -------------------------------------------------------- | ---------: | --------: |
+| **FAST 32-byte fixed-width**                             | 17,013,844 | **85.5%** |
+| `len<=32` but `2<=offset<32` (source would overlap dest) |  1,153,839 |      5.8% |
+| `len>32`, non-overlapping -> `extend_from_within`        |  1,603,121 |      8.1% |
+| overlapping (`offset<len`) -> chunk loop                 |    134,764 |      0.7% |
+| `offset==1` byte splat                                   |          0 |      0.0% |
+
+**The memory path is already ~86% optimal by count**, which is the real explanation for
+brick 81: a 35% instruction cut bought 0.4% because the bytes were already moving well and
+there was no stall to recover.
+
+Of the remainder, **8.1% is `len > 32`, where a memcpy IS the right instruction** -- fixed
+-width stores cannot beat it. The only addressable slice is the **5.8%** with short lengths
+and offsets of 2-31, which cannot use a 32-byte read because the source would overlap the
+destination. A 16-byte tier gated on `offset >= 16` would capture part of it (brick 80's
+shape, ~1M memcpy calls), worth an estimated **~0.5%** -- logged, not built.
+
+**Conclusion for DecSeq.** It is confirmed the right target (#1 on 16 of 18, 62-90% of
+decode) and simultaneously near its practical limit. The residual gap to C
+(`C/us` 1.78-2.34) is NOT recoverable through copy-path micro-optimisation; it would take
+a structural change to sequence decoding, and brick 42 measured that class at ~2x SLOWER.
+
+**Three independent measurements now say the same thing:** brick 42 (-2x), brick 78
+(-4-11%), brick 81 (35% fewer instructions -> +0.4%), and this census (85.5% already fast).
+Further DecSeq work should be justified by a NEW mechanism, not another attempt at the
+same one.
+
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 
 Runtime arms added to every brick that had been judged with the broken method, then all
