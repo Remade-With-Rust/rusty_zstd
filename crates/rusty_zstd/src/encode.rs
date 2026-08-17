@@ -2525,7 +2525,7 @@ fn find_greedy(
     let mls = params.min_match.max(3) as usize;
     let hash_log = params.hash_log;
     let chain_mask = tables.chain.len() - 1;
-    let attempts = 1usize << params.search_log.min(12);
+    let attempts = search_attempts(params);
     // P0/gg-matchfind: work counter -- see `chain_find_best`.
     const COUNT: bool = cfg!(feature = "profile");
     let mut probes = 0u64;
@@ -2663,7 +2663,7 @@ fn chain_find_best(
 ) -> (usize, usize) {
     let hash_log = params.hash_log;
     let chain_mask = tables.chain.len() - 1;
-    let attempts = 1usize << params.search_log.min(12);
+    let attempts = search_attempts(params);
     let h = hash_mls(src, ip, mls, hash_log);
     let prev = tables.get_h(h);
     tables.chain[ip & chain_mask] = prev.map(|p| p as u32).unwrap_or(0);
@@ -2859,6 +2859,30 @@ fn find_lazy(
     (seqs, lits)
 }
 
+/// Gate 14 (gg-matchfind) arm: chain-walk depth. `attempts = 1 << search_log`
+/// is a pure LEVEL constant today, and section 6 of m7-anatomy found our ratio
+/// gains LESS per level than C's -- so the marginal return on this exact
+/// constant is the campaign's top open question. Settable at runtime so the
+/// harvest can A/B it in-process. 0 = unset (delta 0); else `delta + 8`.
+static SEARCH_LOG_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Bench hook: shift the chain-walk depth exponent by `delta` (clamped -4..=4).
+pub fn set_search_log_delta(delta: i32) {
+    SEARCH_LOG_ARM.store(
+        (delta.clamp(-4, 4) + 8) as u32,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Candidate examinations the chain walk is allowed, for this level and arm.
+#[inline]
+fn search_attempts(params: CompressionParameters) -> usize {
+    let v = SEARCH_LOG_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    let base = params.search_log.min(12) as i32;
+    let d = if v == 0 { 0 } else { v as i32 - 8 };
+    1usize << base.saturating_add(d).clamp(0, 12)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn bt_find_best(
     src: &[u8],
@@ -2887,7 +2911,7 @@ fn bt_find_best(
     if larger >= tables.chain.len() {
         return (0, 0);
     }
-    let attempts = 1usize << params.search_log.min(12);
+    let attempts = search_attempts(params);
     // P0/gg-matchfind: work counter -- see `chain_find_best`.
     const COUNT: bool = cfg!(feature = "profile");
     let mut probes = 0u64;

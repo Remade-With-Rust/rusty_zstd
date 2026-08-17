@@ -186,7 +186,12 @@ fn main() -> ExitCode {
         // must clear the WORST corpus, so the harvest must contain them all.
         let mut all = files.clone();
         all.extend(corpus::list_silesia(&root));
-        return run_gg_matchfind(&all, &levels, &only, &out);
+        let gate = args
+            .windows(2)
+            .find(|w| w[0] == "--gate")
+            .map(|w| w[1].as_str())
+            .unwrap_or("step0");
+        return run_gg_matchfind(&all, &levels, &only, &out, gate);
     }
     if ab_tag {
         return run_ab_tag(&root, &oracle, &levels, &only);
@@ -1459,13 +1464,58 @@ fn us_arm(
 /// same -- but it means one block's row is not an independent experiment. The
 /// verdict rests on the `clip`/`clip_total` macro aggregation, which is exactly
 /// why the calculator reports micro AND macro and flags sign disagreements.
+/// The gates this harness can A/B. Each names the SHIPPED arm and the ROUTED
+/// arm; `gain`/`work`/`cpu_ms` are always ROUTED measured against SHIPPED, so a
+/// positive number always means "routing this block wins".
+///
+/// Adding a gate here is the whole cost of testing it across all 18 corpora --
+/// the harvest, the per-block deltas, the split, and the calculator contract are
+/// all shared.
+fn apply_gate_arm(gate: &str, routed: bool) -> Result<(), String> {
+    match gate {
+        // Gate 9: probe density. shipped step0 = 2, routed = 1 (C's density).
+        "step0" => rusty_zstd::set_step0_arm(if routed { 1 } else { 2 }),
+        // Gate 3: the lazy chain back-fill. shipped ON; routed OFF.
+        // NOTE the direction -- the shipped arm is the RICH one here, so a
+        // positive gain means turning the back-fill OFF wins.
+        "lazyfill" => rusty_zstd::set_lazy_fill_arm(!routed),
+        // Gate 2: repcode-1 search forced on vs left to the measured yield.
+        "rep1" => rusty_zstd::set_rep1_arm(routed),
+        // Gate 14: chain-walk depth, +1 exponent = twice the candidates.
+        "chaindepth" => rusty_zstd::set_search_log_delta(if routed { 1 } else { 0 }),
+        // Gate 14, the other direction: half the candidates.
+        "chaindepth-down" => rusty_zstd::set_search_log_delta(if routed { -1 } else { 0 }),
+        other => {
+            return Err(format!(
+                "unknown --gate {other}; known: step0, lazyfill, rep1, chaindepth, chaindepth-down"
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// Restore every arm this harness can touch to its SHIPPED value.
+fn reset_gate_arms() {
+    rusty_zstd::set_step0_arm(2);
+    rusty_zstd::set_lazy_fill_arm(true);
+    rusty_zstd::set_rep1_arm(false);
+    rusty_zstd::set_search_log_delta(0);
+}
+
 fn run_gg_matchfind(
     files: &[corpus::GeneratedFile],
     levels: &[i32],
     only: &[String],
     out_path: &Path,
+    gate: &str,
 ) -> ExitCode {
     pin_current_process();
+    if let Err(e) = apply_gate_arm(gate, false) {
+        eprintln!("{e}");
+        return ExitCode::from(2);
+    }
+    reset_gate_arms();
+    println!("gg-matchfind gate={gate}  shipped-arm vs routed-arm, ABBA per file");
     if !cfg!(feature = "profile") {
         eprintln!("--gg-matchfind requires --features rusty_zstd/profile (per-block taps are off)");
         return ExitCode::from(2);
@@ -1511,8 +1561,11 @@ fn run_gg_matchfind(
             let mut taps_ship: Vec<rusty_zstd::ProfBlockTap> = Vec::new();
             let mut taps_rout: Vec<rusty_zstd::ProfBlockTap> = Vec::new();
             for pass in 0..4 {
-                let step = if pass == 0 || pass == 3 { 2 } else { 1 };
-                rusty_zstd::set_step0_arm(step);
+                // ABBA: shipped, routed, routed, shipped.
+                let routed = pass == 1 || pass == 2;
+                if apply_gate_arm(gate, routed).is_err() {
+                    return ExitCode::from(2);
+                }
                 rusty_zstd::prof_reset();
                 if rusty_zstd::compress(&src, lvl).is_err() {
                     eprintln!("{} L{lvl}: compress failed", f.id);
@@ -1525,7 +1578,7 @@ fn run_gg_matchfind(
                     taps_rout = t;
                 }
             }
-            rusty_zstd::set_step0_arm(2);
+            reset_gate_arms();
             if taps_ship.len() != taps_rout.len() {
                 eprintln!(
                     "{} L{lvl}: block count differs between arms ({} vs {}) -- rows would not align, refusing",
@@ -1592,7 +1645,8 @@ fn run_gg_matchfind(
                 rows += 1;
             }
             println!(
-                "gg-matchfind {} L{}: {} blocks  shipped={} routed={} ({:+.3}%)",
+                "gg-matchfind[{}] {} L{}: {} blocks  shipped={} routed={} ({:+.3}%)",
+                gate,
                 f.id,
                 lvl,
                 taps_ship.len(),
