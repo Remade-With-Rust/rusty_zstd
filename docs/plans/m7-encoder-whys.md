@@ -2567,6 +2567,50 @@ to billions -- so ~31M is ~1%. **A large COUNT is not a large COST; count x unit
 Kept: byte-identical, strictly less work, and the arithmetic and the measurement agree.
 **Not claimed as a win** -- it does not clear the bar this campaign holds everything to.
 
+## DECSEQ: bricks 78/79, and a SELF-CAUGHT repeat of the static-vs-executed error
+
+The decode hot loop measures **~109 instructions / 31 stack accesses (28%)** -- roughly
+where `find_fast_impl` began before specialisation took it to 19/1. Two bricks shipped
+against it, and the first one carries a caveat I found by checking my own work.
+
+### Brick 79 (SOUND): `litcopy_on()` was read per SEQUENCE
+
+`copy_literals`' fast-path guard called `litcopy_on()` -- an env/OnceLock read -- once per
+sequence (~15M across the corpus). Hoisted to once per block.
+
+**Fourth instance of this exact shape**: brick 49 (`use_rep`), 64 (`seqcheck_hoisted`),
+77 (`lit_push_enabled`), now 79 (`litcopy_on`). *A frame-constant flag re-read in a hot
+loop is the single most recurring defect in this codebase.* Expect ~1% by brick 77's
+arithmetic (15M x ~2 cycles against a corpus costing billions).
+
+### Brick 78 (CORRECT BUT UNVERIFIED): the premise did not survive checking
+
+`decompress` calls `try_reserve` only `if let Some(n) = header.content_size`, so frames
+without a declared size get none. `grow_one` appeared in the per-sequence loop's call
+list, so a per-block `out.reserve(block_max)` was added.
+
+**Then the asm was re-read after the fix: `grow_one` is STILL in the loop.**
+
+The reserve does guarantee the capacity, but LLVM cannot PROVE the growth path
+unreachable, so it still emits it as a cold branch. **A call site present in a loop body
+is not evidence that it executes** -- exactly the error made earlier with "39 memcpy in
+`find_fast_impl`", which turned out to be ~40 static sites of which one ran ZERO times.
+
+**Twice now, a static call-site count has been read as a work count.** The counter-based
+technique (`lit_try`, `huff_path`, the 15,687,334 `push_literals` figure) exists precisely
+because it cannot make this mistake. It should have been used FIRST.
+
+Brick 78 is kept: it is byte-identical, cannot change output, and genuinely helps frames
+that declare no content size. **But it is not claimed as a win, and its premise is
+unproven.** To settle it: count actual capacity growths during decode (compare
+`out.capacity()` across the block loop) rather than reading the disassembly.
+
+Gates for both: 172 tests; us-decodes-C 45/45; C-decodes-us 8/8; generated round-trip 6/6.
+
+*(Process note: `1f43779` was committed after the RELEASE build passed, while the TEST
+build was broken -- three `copy_literals` call sites needed the new argument. Gate order
+must be tests-then-commit.)*
+
 ## THE SHELF, RE-MEASURED (2026-08-15) -- every cross-process verdict re-run in-process
 
 Runtime arms added to every brick that had been judged with the broken method, then all
