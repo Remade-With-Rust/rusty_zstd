@@ -3240,3 +3240,72 @@ name matching nothing exits 2 instead of silently shrinking the board.
 **`zeros-32m` decompress 2.2x remains OPEN and unexplained.** The run paths are not
 the cause. Next suspects: output-buffer growth policy, and whether C is hitting a
 path that skips the write entirely.
+
+---
+
+## The zeros-32m 2.2x -- it was a WORK-PARITY BREAK, and it was ours
+
+**The trigger.** `zeros-32m` emitted FEWER bytes than C (us/c 0.901) while
+decompressing 2.2x slower. Less data, more time -- the arithmetic did not close.
+
+**Count before time.** A block census (`examples/census.rs`) killed every
+"we decode it differently" theory in one shot: **we emit 256 RLE blocks covering
+all 32 MiB; C emits 240 RLE + 16 compressed.** Identical work. So the gap was not
+in what we decode.
+
+**Root cause.** The oracle runs `zstd -bN -iN -T1` with **no `--check`**, so
+libzstd's default `ZSTD_c_checksumFlag = 0` applies: C's benchmark computes no
+xxh64 on compress and verifies none on decompress. Our `compress` defaults
+`checksum: true` (the CLI default). **We were timing a full extra pass over every
+byte, on BOTH phases, that C never runs.**
+
+Proof by arithmetic, before any A/B: our xxh64 pass over 32 MiB costs **2.6 ms**,
+while C reports the ENTIRE decompress in **1.49 ms**. C cannot be verifying a
+checksum at any plausible hash speed.
+
+| corpus     | C/us c,d BEFORE | C/us c,d AFTER |
+| ---------- | --------------- | -------------- |
+| zeros-32m  | 1.04 / 2.32     | **0.47 / 0.61** |
+| text-32m   | 1.43 / 1.11     | **0.54 / 0.33** |
+| incomp-32m | 1.02 / 1.60     | **0.74 / 0.86** |
+
+The shipped default stays `checksum: true`; this is the BENCH matching the
+oracle's configuration. `encode.rs`/`huffman.rs` verified byte-identical.
+
+> **Law: when a comparison is unflattering, audit the CONFIGURATION of both sides
+> before the code of either.** A defaults mismatch between two implementations is
+> indistinguishable from a performance gap until you read both sets of defaults.
+
+### Refuted along the way (do not retry)
+
+**Allocation is NOT the cost -- under our allocator.** A probe showed
+`decompress` into a fresh `Vec` at 2.24x the cost of a reused buffer, with
+**82%** of the time in page-faults. That was measured under the SYSTEM allocator.
+The bench sets `#[global_allocator] rzstd_alloc`, which recycles the freed 32 MiB
+block so the pages stay faulted -- the board did not move at all.
+*Right measurement, wrong context.*
+
+> **Law: an allocator-sensitive result must name its allocator.** A probe binary
+> and the harness can differ in the one global that decides the answer.
+
+**Brick 85 (fuse the checksum into the block loop): REFUTED.** xxh64 here is
+MEMORY-bound, not compute-bound -- 17.9 / 18.0 / 18.0 GB/s at 32 KiB / 256 KiB /
+4 MiB working sets but only **12.5 GB/s over 32 MiB** (kept as the `#[ignore]`
+`xxh64::locality_probe`). So hashing each <=128 KiB block while still hot in L2
+should have recovered 44%. It did not: normalised against the checksum-OFF null
+arm the fused version measured **~12% WORSE** (ratio 1.53 -> 1.71). Reverted.
+The locality HEADROOM is real; carrying the hasher state across the hot
+block-decode loop apparently costs more than it saves.
+
+**The hash algorithm is not a lever.** RFC 8878 mandates XXH64's low 32 bits.
+XXH64's round needs a full 64x64 multiply, which SSE2/AVX2 lack (only
+`mul_epu32`) -- that is precisely why XXH3 exists. Our 18 GB/s cache-resident
+already beats reference XXH64's typical 13-14 GB/s. The remaining honest levers
+are a `force_ignore_checksum` decode option (C has one) and threading.
+
+### New API: `decompress_into`
+
+Every public decompress entry point returned a fresh `Vec`; we had nothing with
+the `ZSTD_decompress(dst, dstCapacity, ..)` shape, so a caller decoding many
+frames could not reuse an allocation. Added with 4 tests (equivalence, append
+semantics, reuse across frames, error paths) plus a doctest.

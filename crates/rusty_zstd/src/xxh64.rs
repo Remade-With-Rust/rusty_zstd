@@ -300,3 +300,37 @@ mod tests {
         assert_eq!(h2.digest(), xxh64(&long), "long chunked");
     }
 }
+
+#[cfg(test)]
+mod locality_probe {
+    use super::*;
+    use std::time::Instant;
+
+    /// Is our xxh64 COMPUTE-bound or MEMORY-bound? If hashing a cache-resident
+    /// buffer is much faster per byte than hashing a 32 MiB one, the checksum
+    /// is limited by reading cold memory -- and fusing it into the decode loop
+    /// (hashing each block while it is still hot) would be a real win.
+    #[ignore]
+    #[test]
+    fn xxh64_throughput_by_working_set() {
+        for (label, sz) in [
+            ("32 KiB (L1/L2)", 32usize << 10),
+            ("256 KiB (L2)", 256 << 10),
+            ("4 MiB (L3)", 4 << 20),
+            ("32 MiB (DRAM)", 32 << 20),
+        ] {
+            let buf = alloc::vec![0u8; sz];
+            // Equalise total bytes hashed across sizes.
+            let total: usize = 512 << 20;
+            let reps = total / sz;
+            let t = Instant::now();
+            let mut acc = 0u64;
+            for _ in 0..reps {
+                acc ^= u64::from(content_checksum(&buf));
+            }
+            let s = t.elapsed().as_secs_f64();
+            std::hint::black_box(acc);
+            println!("  {label:16} {:7.1} GB/s", (total as f64) / s / 1e9);
+        }
+    }
+}
