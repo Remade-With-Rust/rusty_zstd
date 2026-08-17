@@ -3343,6 +3343,28 @@ fn bt_find_best(
     // through to the runtime arm and got no fold at all -- and the coverage
     // check that "proved" 0 fallbacks used a 2 MiB file, which can only ever hit
     // (22,24) and (24,24). A coverage proof is only as wide as its inputs.
+    // GATE 5 DISPATCH -- the fold pays on the SHALLOW bt ladder only.
+    //
+    // Measured, three independent ABBA runs per corpus, a stable sign in all
+    // three required to count:
+    //
+    //   L13 BtLazy2   stable-spec 3   stable-generic 2   -> specialise
+    //   L19 BtUltra2  stable-spec 0   stable-generic 5   -> generic
+    //                 (nci +3.9..+5.6%, x-ray +5.1..+10.8% when specialised)
+    //
+    // Mechanism, and it is the search depth rather than the content: at L13
+    // `search_log` is 4-6, so a call drives ~16-64 tree probes and the 23
+    // instructions saved per call are a real share of it. At L16+ `search_log`
+    // is 7-9, so a call drives 128-512 probes -- the walk dominates, the fold is
+    // noise against it, and the 12 monomorphizations (2,580 instructions where
+    // the runtime arm is 238) cost I-cache in the loop that matters.
+    //
+    // This is why instruction-count-per-call was the wrong measure on its own:
+    // it is correct about the call and silent about the code it adds.
+    let shallow = matches!(params.strategy, Strategy::BtLazy2);
+    if !bt_spec_enabled() || !shallow {
+        return bt_find_best_runtime(src, ip, block_start, block_end, window, mls, params, tables);
+    }
     match (tables.hash_log, params.chain_log.min(24)) {
         (14, 15) => go!(14, 15),
         (15, 15) => go!(15, 15),
@@ -5514,4 +5536,52 @@ pub fn take_bt_calls() -> (u64, u64) {
         BT_SPEC_CALLS.swap(0, Ordering::Relaxed),
         BT_RUNTIME_CALLS.swap(0, Ordering::Relaxed),
     )
+}
+
+/// GATE 5 arm for the BT path (L13-L22).
+///
+/// **DEFAULT OFF — the specialisation MEASURED WORSE and was reverted here.**
+///
+/// It was shipped in 727e503 on deterministic instruction counts alone: 214
+/// instructions per call against the runtime arm's 237, and 3 of 4 variable
+/// shifts eliminated. Those numbers are correct and they were the wrong
+/// measure. Twelve monomorphizations are 2,580 instructions of code where there
+/// was 238, and at L19 the binary-tree walk is the hot loop, so I-cache
+/// pressure decides rather than per-call instruction count.
+///
+/// Tested properly -- three independent ABBA runs per corpus, 18 corpora, a
+/// stable sign in all three runs required to count:
+///
+/// ```text
+/// L19   stable-generic 5   stable-spec 0   (nci +3.9..+5.6%, x-ray +5.1..+10.8%)
+/// L13   stable-generic 2   stable-spec 3   -- a wash, not a case for a dispatch
+/// ```
+///
+/// Loses on five corpora at L19 and wins on none, so CONSTANT OFF. Same
+/// precedent as `tag_enabled`: the code stays so the arm can be re-tested, the
+/// default ships the arm that measured better.
+///
+/// The `find_dfast` specialisation is NOT affected -- tested the same way it
+/// came out 6 stable-spec / 0 stable-generic and remains on.
+static BT_SPEC_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for in-process ABBA.
+pub fn set_bt_spec_arm(on: bool) {
+    BT_SPEC_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn bt_spec_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match BT_SPEC_ARM.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var("RZSTD_BT_SPEC")
+                .map(|v| v.trim() != "0")
+                .unwrap_or(true);
+            BT_SPEC_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
 }
