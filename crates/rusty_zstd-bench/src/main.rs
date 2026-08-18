@@ -1013,7 +1013,7 @@ fn run_ab_tag(root: &Path, _oracle: &Oracle, levels: &[i32], only: &[String]) ->
         "seqcheck" => rusty_zstd::set_seqcheck_arm,
         "huff" => rusty_zstd::set_huff_fast_arm,
         "lazyfill" => rusty_zstd::set_lazy_fill_arm,
-        "rep1" => rusty_zstd::set_rep1_arm,
+        "rep1" => rep1_arm_shim,
         _ => rusty_zstd::set_tag_arm,
     };
     pin_current_process();
@@ -1493,7 +1493,10 @@ fn apply_gate_arm(gate: &str, routed: bool) -> Result<(), String> {
         // positive gain means turning the back-fill OFF wins.
         "lazyfill" => rusty_zstd::set_lazy_fill_arm(!routed),
         // Gate 2: repcode-1 search forced on vs left to the measured yield.
-        "rep1" => rusty_zstd::set_rep1_arm(routed),
+        // Gate 2: repcode-1 forced on vs left to the measured yield. gg-matchfind
+        // Gate 10 (`set_rep1_arm`) was removed as redundant -- it could only
+        // force ON, which `set_rep1_mode(Some(true))` already does.
+        "rep1" => rusty_zstd::set_rep1_mode(if routed { Some(true) } else { None }),
         // Gate 14: chain-walk depth, +1 exponent = twice the candidates.
         "chaindepth" => rusty_zstd::set_search_log_delta(if routed { 1 } else { 0 }),
         // Gate 14, the other direction: half the candidates.
@@ -1524,10 +1527,17 @@ fn apply_gate_arm(gate: &str, routed: bool) -> Result<(), String> {
 }
 
 /// Restore every arm this harness can touch to its SHIPPED value.
+/// `set_rep1_arm`'s old semantics on top of the surviving mode arm: `true` forced
+/// the repcode search ON, `false` restored the measured dispatch.
+fn rep1_arm_shim(on: bool) {
+    rusty_zstd::set_rep1_mode(if on { Some(true) } else { None });
+}
+
 fn reset_gate_arms() {
     rusty_zstd::set_step0_arm(2);
+    rusty_zstd::set_rep1_mode(None);
     rusty_zstd::set_lazy_fill_arm(true);
-    rusty_zstd::set_rep1_arm(false);
+
     rusty_zstd::set_search_log_delta(0);
     rusty_zstd::set_strategy_arm(None);
 }

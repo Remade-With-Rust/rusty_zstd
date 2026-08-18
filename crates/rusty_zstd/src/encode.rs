@@ -2067,9 +2067,6 @@ fn find_fast_impl<
     let route = tables.pair_route;
     // Frame-constant, so it is decided ONCE here rather than tested per match.
     let maintain_rep1 = pipe_rep1_enabled() && tables.rep_yield <= fast_lazy_threshold();
-    // Measurement arm for the load hoist -- both shapes in ONE binary so the
-    // A/B is in-process rather than cross-binary. Read once per block.
-    let prefetch_pair = pair_pre_enabled();
     // The route is decided in `find_fast` (it also selects the step, which must
     // be known before the specialised body is chosen). `rep_yield` still vetoes:
     // on rep-dominated content the pair search re-finds what the repcode path
@@ -2365,7 +2362,7 @@ fn find_fast_impl<
         // aliasing `h1 == h0` observes the same value it did before), and
         // nothing between here and the pair branch writes the table -- the rep
         // and match paths both `continue`. Only the issue order moves.
-        let pair_pre = if pair && prefetch_pair && ip + 1 <= ilimit {
+        let pair_pre = if pair && ip + 1 <= ilimit {
             let (h1, g1) = hash4_tag::<PACKED>(src, ip + 1, hash_shift);
             Some((h1, g1, tables.load_fast::<PACKED>(h1, ip + 1, g1)))
         } else {
@@ -2692,20 +2689,10 @@ fn lazy_fill_stride() -> usize {
 /// `ZSTD_compressBlock_fast` tests the repeat offset at every position; we only
 /// ever ENCODED a repcode when an offset happened to coincide, never SEARCHED
 /// for one.
-/// Brick 40 arm: repcode-1 search in `find_fast` (shelved, ratio-changing).
-static REP1_ENABLED_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// Bench hook for in-process ABBA; shipping default from `RZSTD_REP1`.
-pub fn set_rep1_arm(on: bool) {
-    REP1_ENABLED_ARM.store(
-        if on { 2 } else { 1 },
-        core::sync::atomic::Ordering::Relaxed,
-    );
-}
-
 /// GATE 2 arm: the repcode-1 search, as a THREE-state choice so both constants
-/// are reachable. `rep1_enabled()` alone can only force ON, which cannot answer
-/// "does any corpus lose under a constant" -- the OFF constant was untestable.
+/// are reachable. The old `rep1_enabled()` arm (Gate 10) could only force ON,
+/// which cannot answer "does any corpus lose under a constant" -- the OFF
+/// constant was untestable. This replaced it and Gate 10 is now deleted.
 /// 0 = unset (measured dispatch), 1 = force OFF, 2 = force ON.
 static REP1_MODE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
@@ -2727,27 +2714,15 @@ fn rep_search_on(rep_yield: f32, strategy: Strategy) -> bool {
     match REP1_MODE_ARM.load(core::sync::atomic::Ordering::Relaxed) {
         1 => false,
         2 => true,
-        _ => rep1_enabled() || rep_yield >= rep_yield_min_for(strategy),
-    }
-}
-
-fn rep1_enabled() -> bool {
-    use core::sync::atomic::Ordering;
-    match REP1_ENABLED_ARM.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            // Was `v == "0"`, which INVERTED the override: `RZSTD_REP1=1`
-            // turned rep1 OFF and `=0` turned it ON. The default (absent =>
-            // false) was correct and the ABBA harness drives `set_rep1_arm`
-            // directly, so no shipped verdict was affected -- but an env-driven
-            // A/B would have measured off-vs-off and read as "no effect".
-            let on = std::env::var("RZSTD_REP1")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-            REP1_ENABLED_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
+        // GATE 10 REMOVED. This was `rep1_enabled() || rep_yield >= min`, where
+        // `rep1_enabled()` was a second arm that could only force ON -- exactly
+        // what `REP1_MODE_ARM::Some(true)` above already does. It was DEAD at
+        // L3/L19/L22 (the DFast threshold is 0.0 and find_opt prices reps
+        // itself) and live only at L1, and its OR shape was a footgun: setting
+        // `RZSTD_REP1=1` silently short-circuited the whole Gate 2 dispatch,
+        // including the `rep_len_ratio` variable. Its default was `false`, so
+        // deleting it is byte-identical at the shipped configuration.
+        _ => rep_yield >= rep_yield_min_for(strategy),
     }
 }
 
@@ -6414,7 +6389,6 @@ pub fn reset_env_arms() {
     use core::sync::atomic::Ordering;
     STEP0_ARM.store(0, Ordering::Relaxed);
     PIPE_ARM.store(0, Ordering::Relaxed);
-    REP1_ENABLED_ARM.store(0, Ordering::Relaxed);
     LAZY_FILL_ENABLED_ARM.store(0, Ordering::Relaxed);
     FAST_LAZY_ARM.store(0, Ordering::Relaxed);
     PAIR_GAIN_ARM.store(u32::MAX, Ordering::Relaxed);
@@ -6830,21 +6804,6 @@ pub fn set_tag_alloc_arm(on: bool) {
 #[inline]
 fn tag_alloc_enabled() -> bool {
     match TAG_ALLOC_ARM.load(core::sync::atomic::Ordering::Relaxed) {
-        1 => false,
-        _ => true,
-    }
-}
-
-static PAIR_PRE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// A/B the Gate 6 load hoist in-process.
-pub fn set_pair_pre_arm(on: bool) {
-    PAIR_PRE_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
-}
-
-#[inline]
-fn pair_pre_enabled() -> bool {
-    match PAIR_PRE_ARM.load(core::sync::atomic::Ordering::Relaxed) {
         1 => false,
         _ => true,
     }

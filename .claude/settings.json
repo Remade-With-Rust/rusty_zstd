@@ -51,10 +51,12 @@
       "Bash(sed -i 's|rl/al.max\\(&0.001\\)|rl/al.max\\(0.001\\)|' crates/rusty_zstd-bench/examples/g2rate.rs)",
       "Bash(sed -i 's|\\(a.4/a.5.max\\(0.001\\)\\)|\\(a.4/a.5.max\\(0.001\\)\\)|' crates/rusty_zstd-bench/examples/g2rate.rs)",
       "Bash(sed -i 's/set_opt_lit_arm, set_opt_floor_arm,/set_opt_lit_arm,/' crates/rusty_zstd/src/lib.rs)",
-      "Bash(rm -f crates/rusty_zstd-bench/examples/optfloor.rs)"
+      "Bash(rm -f crates/rusty_zstd-bench/examples/optfloor.rs)",
+      "Bash(sed -i 's/set_fast_lazy_arm, set_incomp_skip_arm, set_rep1_arm, set_rep1_mode,/set_fast_lazy_arm, set_incomp_skip_arm, set_rep1_mode,/' crates/rusty_zstd/src/lib.rs)"
     ],
     "additionalDirectories": [
-      "c:\\Users\\talmo\\coding\\rusty_zstd\\crates\\rusty_zstd\\src"
+      "c:\\Users\\talmo\\coding\\rusty_zstd\\crates\\rusty_zstd\\src",
+      "C:\\Users\\talmo\\coding\\rusty_zstd\\crates\\rusty_zstd-bench\\examples"
     ]
   }
 }
