@@ -4015,8 +4015,27 @@ fn bt_find_best(
     // `RZSTD_BT_DEEP=1` lifts the depth gate so the arm can be MEASURED at
     // L16+; without it the dispatch forces generic there and any A/B is a null
     // comparison -- which is exactly how the bogus L19 result was produced.
-    let shallow = matches!(params.strategy, Strategy::BtLazy2) || bt_deep_measure();
-    if !bt_spec_enabled() || !shallow {
+    // GATE 8 @ L19/L22 -- DEPTH GATE LIFTED, decided DETERMINISTICALLY.
+    //
+    // The note above kept L16+ on the generic body because "no measurement
+    // supports removing it". That was never going to arrive: the L19/L22 timing
+    // instrument was measured against ITSELF -- same binary, two consecutive
+    // runs -- and disagrees by up to +43.24% (reymont), +13% on several others.
+    // It cannot resolve a per-call instruction delta, so "no signal" was a
+    // property of the stopwatch, not of the arm.
+    //
+    // Decided on the emitted assembly instead, which needs no quiet box:
+    //   specialised   225 instructions,  1 variable shift   (x12, only ONE of
+    //                                                        which ever runs)
+    //   runtime       249 instructions,  4 variable shifts
+    // 24 fewer instructions and 3 fewer variable shifts per call, on a body
+    // called ~15.7M times per level at L16-L22. `hash_log`/`chain_log` are fixed
+    // for a given input, so exactly one monomorphization executes and the other
+    // eleven are cold -- which is why the I-cache objection does not apply.
+    //
+    // Coverage PROVEN before flipping it: with the gate lifted the 12-pair set
+    // takes every call at L13 through L22, runtime 0 at all ten levels.
+    if !bt_spec_enabled() {
         return bt_find_best_runtime(src, ip, block_start, block_end, window, mls, params, tables);
     }
     match (tables.hash_log, params.chain_log.min(24)) {
@@ -4107,6 +4126,22 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
         if COUNT {
             probes += 1;
         }
+        // GATE 8 ON THE Bt LADDER -- the gate is DEAD at L13-L22 (`pipe_enabled`
+        // has no caller there: find_fast 0 calls, find_opt 272), so this BUILDS
+        // the capability rather than tuning it.
+        //
+        // Both children of this node live at `bt_idx` and `bt_idx + 1` -- one
+        // cache line -- and NEITHER depends on `count_match`. In program order
+        // the descent load was issued only after `count_match` had walked `src`,
+        // so the chain miss serialised behind the src misses instead of
+        // overlapping them. `chain` is far larger than LLC at these levels, so
+        // that load misses on essentially every node.
+        //
+        // Applied to BOTH bt bodies -- keeping two hand-written copies in step
+        // is exactly what `find_dfast_runtime` failed to do until Gate 6
+        // silently broke Gate 4's byte-identity.
+        let c_lo = tables.chain[bt_idx];
+        let c_hi = tables.chain[bt_idx + 1];
         let ml = count_match(src, m, ip, block_end);
         #[cfg(feature = "profile")]
         {
@@ -4126,13 +4161,16 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
         let ib = src.get(ip + ml).copied().unwrap_or(0);
         if mb < ib {
             tables.chain[smaller] = m as u32;
+            // BYTE-IDENTICAL: if the store above targeted the slot we
+            // pre-loaded, forward the stored value by hand -- the original read
+            // happened AFTER the write and would have observed it.
+            let v = if smaller == bt_idx + 1 { m as u32 } else { c_hi };
             smaller = bt_idx + 1;
-            let v = tables.chain[bt_idx + 1];
             match_idx = if v == 0 { None } else { Some(v as usize) };
         } else {
             tables.chain[larger] = m as u32;
+            let v = if larger == bt_idx { m as u32 } else { c_lo };
             larger = bt_idx;
-            let v = tables.chain[bt_idx];
             match_idx = if v == 0 { None } else { Some(v as usize) };
         }
         if smaller >= tables.chain.len() || larger >= tables.chain.len() {
@@ -4201,6 +4239,22 @@ fn bt_find_best_runtime(
         if COUNT {
             probes += 1;
         }
+        // GATE 8 ON THE Bt LADDER -- the gate is DEAD at L13-L22 (`pipe_enabled`
+        // has no caller there: find_fast 0 calls, find_opt 272), so this BUILDS
+        // the capability rather than tuning it.
+        //
+        // Both children of this node live at `bt_idx` and `bt_idx + 1` -- one
+        // cache line -- and NEITHER depends on `count_match`. In program order
+        // the descent load was issued only after `count_match` had walked `src`,
+        // so the chain miss serialised behind the src misses instead of
+        // overlapping them. `chain` is far larger than LLC at these levels, so
+        // that load misses on essentially every node.
+        //
+        // Applied to BOTH bt bodies -- keeping two hand-written copies in step
+        // is exactly what `find_dfast_runtime` failed to do until Gate 6
+        // silently broke Gate 4's byte-identity.
+        let c_lo = tables.chain[bt_idx];
+        let c_hi = tables.chain[bt_idx + 1];
         let ml = count_match(src, m, ip, block_end);
         #[cfg(feature = "profile")]
         {
@@ -4220,13 +4274,16 @@ fn bt_find_best_runtime(
         let ib = src.get(ip + ml).copied().unwrap_or(0);
         if mb < ib {
             tables.chain[smaller] = m as u32;
+            // BYTE-IDENTICAL: if the store above targeted the slot we
+            // pre-loaded, forward the stored value by hand -- the original read
+            // happened AFTER the write and would have observed it.
+            let v = if smaller == bt_idx + 1 { m as u32 } else { c_hi };
             smaller = bt_idx + 1;
-            let v = tables.chain[bt_idx + 1];
             match_idx = if v == 0 { None } else { Some(v as usize) };
         } else {
             tables.chain[larger] = m as u32;
+            let v = if larger == bt_idx { m as u32 } else { c_lo };
             larger = bt_idx;
-            let v = tables.chain[bt_idx];
             match_idx = if v == 0 { None } else { Some(v as usize) };
         }
         if smaller >= tables.chain.len() || larger >= tables.chain.len() {
