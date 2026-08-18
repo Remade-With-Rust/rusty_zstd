@@ -207,3 +207,44 @@ fn oversized_hash_log_does_not_panic() {
         }
     }
 }
+
+/// REGRESSION (2026-08-18): compression must depend ONLY on (input, params),
+/// never on what was compressed earlier in the process.
+///
+/// The Gate 19 literal-price feedback first shipped in a process-global static
+/// instead of `MatchTables`, so a frame inherited the previous compression's
+/// measurement. At L19 the same input gave a different result on the first call
+/// than on later ones, on 8 of 12 corpora. Every other feedback signal in the
+/// encoder (`rep_yield`, `tag_yield`, `pair_gain`, `dfast_mean_ml`) lives in
+/// `MatchTables` and resets per frame; this one did not.
+#[test]
+fn compression_is_independent_of_call_history() {
+    let a: Vec<u8> = (0..600_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 15) as u8)
+        .collect();
+    // High-entropy content first, then a repetitive input: the first frame
+    // leaves a HIGH measured literal price, the second a low one.
+    let mut b = Vec::with_capacity(600_000);
+    while b.len() < 600_000 {
+        b.extend_from_slice(b"the quick brown fox jumps over the lazy dog 0123456789 ");
+    }
+    for lvl in [1i32, 3, 9, 13, 16, 19, 22] {
+        let want_a = rusty_zstd::compress(&a, lvl).unwrap();
+        let want_b = rusty_zstd::compress(&b, lvl).unwrap();
+        // Interleave so each frame is preceded by the OTHER content.
+        for _ in 0..3 {
+            let _ = rusty_zstd::compress(&b, lvl).unwrap();
+            assert_eq!(
+                rusty_zstd::compress(&a, lvl).unwrap(),
+                want_a,
+                "L{lvl}: compressing A depended on what preceded it"
+            );
+            let _ = rusty_zstd::compress(&a, lvl).unwrap();
+            assert_eq!(
+                rusty_zstd::compress(&b, lvl).unwrap(),
+                want_b,
+                "L{lvl}: compressing B depended on what preceded it"
+            );
+        }
+    }
+}

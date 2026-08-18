@@ -270,6 +270,15 @@ pub(crate) struct MatchTables {
     /// Countdown to the next forced rep re-probe (the ratio can only be measured
     /// on a block where the search actually ran).
     rep_probe: u32,
+    /// GATE 19: measured literal price in bits, fed to the next block's opt DP.
+    /// 0 = not yet measured this frame.
+    ///
+    /// PER-FRAME, like every other feedback signal here. It first shipped as a
+    /// process-global static, which made compression depend on CALL HISTORY:
+    /// the same input at L19 gave a different result on the first call than on
+    /// later ones (8/12 corpora), because the frame inherited whatever the
+    /// PREVIOUS compression had left behind.
+    opt_lit_price: u32,
     /// GATE 9 @ L3: mean MATCH LENGTH on the previous DFast block, EWMA'd.
     /// Skipping odd positions shifts a LONG match by a byte (free) but loses a
     /// SHORT match outright, and loses nothing where there are no matches.
@@ -392,6 +401,7 @@ impl MatchTables {
             next_long_yield: 1.0,
             rep_len_ratio: 1.0,
             rep_probe: 0,
+            opt_lit_price: 0,
             dfast_mean_ml: 0.0,
             dfast_spec_yield: 1.0,
             dfast_probe: 0,
@@ -870,7 +880,7 @@ pub(crate) fn encode_block(
             // than at a constant that can only suit one content class.
             let _ = lit_reused;
             if !literals.is_empty() {
-                note_lit_bits(lit_end, literals.len());
+                tables.opt_lit_price = measured_lit_bits(lit_end, literals.len());
             }
             crate::prof::note_emit_lit(lit_end as u64);
             write_sequences(&mut payload, &seqs, reps, entropy, params.strategy)?;
@@ -4588,33 +4598,19 @@ fn find_bt_lazy(
 /// a real cost of ~8 bits raw and ~4-7 after Huffman -- so it UNDER-prices
 /// literals on high-entropy content, which makes the "optimal" parse prefer
 /// literals over matches and lose to plain lazy. Swept via `RZSTD_OPT_LIT`.
-/// Record the MEASURED cost of the literals just emitted, for the next block's
-/// DP. One atomic store per BLOCK -- not per probe.
+/// The MEASURED cost of the literals just emitted, for the next block's DP.
 #[inline]
-fn note_lit_bits(section_bytes: usize, literal_count: usize) {
-    use core::sync::atomic::Ordering::Relaxed;
-    // WHOLE-SECTION cost per literal, deliberately. The marginal variant --
-    // header stripped, measured only when the Huffman table is reused -- is
-    // theoretically righter and MEASURED WORSE: L16 -0.404% against -0.674%,
-    // L19 -0.142% against -0.347%, and it turned jsonlog into a +2.86%
-    // regression while losing x-ray's -2.99% entirely.
-    //
-    // The reason is the same one that sank the two-sided variant: the DP's
-    // MATCH price is itself an approximation (12 + off_bits), so making only the
-    // literal side exact unbalances the pair. The section-amortised figure
-    // happens to carry the bias that keeps the two sides commensurable. Recorded
-    // as an empirical calibration, NOT as the true cost of a literal.
+fn measured_lit_bits(section_bytes: usize, literal_count: usize) -> u32 {
+    // WHOLE-SECTION cost per literal, deliberately -- see 4.20: the marginal
+    // variant is theoretically righter and measured worse, because the DP's
+    // MATCH price is itself an approximation and pricing only the literal side
+    // exactly unbalances the pair.
     let bits = (section_bytes as u64 * 8) / literal_count.max(1) as u64;
-    // Clamp to the range the price model is meaningful over: below 3 the DP
-    // stops taking matches at all, above 10 a literal costs more than a raw byte.
-    OPT_LIT_MEASURED.store(bits.clamp(3, 10) as u32, Relaxed);
+    // Clamp to the range the price model is meaningful over.
+    bits.clamp(3, 10) as u32
 }
 
-
-static OPT_LIT_MEASURED: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-
-fn opt_lit_cost() -> u32 {
+fn opt_lit_cost(tables: &MatchTables) -> u32 {
     #[cfg(feature = "std")]
     {
         use core::sync::atomic::Ordering;
@@ -4636,7 +4632,9 @@ fn opt_lit_cost() -> u32 {
         if e != NO_OVERRIDE {
             return e;
         }
-        match OPT_LIT_MEASURED.load(Ordering::Relaxed) {
+        // ONE-SIDED: only ever RAISE the price above the historical constant, so
+        // blocks whose literals are cheap keep exactly today's parse.
+        match tables.opt_lit_price {
             0 => 6,
             m => m.max(6),
         }
@@ -4715,7 +4713,7 @@ fn find_opt(
         (params.target_length as usize).max(OPT_SKIP_FLOOR)
     };
     // Block-constant: read ONCE, never inside the DP loop.
-    let lit_cost = opt_lit_cost();
+    let lit_cost = opt_lit_cost(tables);
     let mut i = 0usize;
     while i < n {
         if price[i] >= inf {
