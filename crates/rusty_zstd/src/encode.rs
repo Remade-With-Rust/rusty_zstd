@@ -846,12 +846,27 @@ pub(crate) fn encode_block(
     {
         let _e = crate::prof::scope(crate::prof::Stage::EncodeEntropy);
         if seqs.is_empty() {
-            write_literals(&mut payload, block, entropy)?;
+            let _ = write_literals(&mut payload, block, entropy)?;
             crate::prof::note_emit_lit(payload.len() as u64);
             payload.push(0);
         } else {
-            write_literals(&mut payload, &literals, entropy)?;
+            let lit_reused = write_literals(&mut payload, &literals, entropy)?;
             let lit_end = payload.len();
+            // GATE 19 -- feed the DP its literal price MEASURED, not guessed.
+            //
+            // `find_opt` priced a literal at a flat 6 bits. Real literals cost
+            // ~8 raw and ~4-7 after Huffman, so 6 UNDER-prices them on
+            // high-entropy content: the DP then prefers literals to matches and
+            // the "optimal" parse LOSES to plain lazy -- x-ray +2.94% against
+            // L15, and every BtOpt/BtUltra level worse than L14 (L16 +38,564).
+            //
+            // This is the real cost of the literals this encoder just emitted,
+            // so the next block prices them at what they actually cost rather
+            // than at a constant that can only suit one content class.
+            let _ = lit_reused;
+            if !literals.is_empty() {
+                note_lit_bits(lit_end, literals.len());
+            }
             crate::prof::note_emit_lit(lit_end as u64);
             write_sequences(&mut payload, &seqs, reps, entropy, params.strategy)?;
             crate::prof::note_emit_seq((payload.len() - lit_end) as u64);
@@ -1164,15 +1179,24 @@ pub(crate) fn write_frame_header(
     out.extend_from_slice(&fcs_bytes);
 }
 
-fn write_literals(dst: &mut Vec<u8>, lits: &[u8], entropy: &mut EntropyState) -> Result<(), Error> {
+/// Returns whether the section REUSED the previous Huffman table. A reused
+/// table costs only the small section header, so the coded stream is then a
+/// clean measure of the MARGINAL bits per literal; a freshly emitted table adds
+/// a large fixed cost that has nothing to do with what one more literal costs.
+fn write_literals(
+    dst: &mut Vec<u8>,
+    lits: &[u8],
+    entropy: &mut EntropyState,
+) -> Result<bool, Error> {
     let _h = crate::prof::scope(crate::prof::Stage::EncodeHuff);
     let (sec, upd) = huffman::encode_literals_section(lits, entropy.huff.as_ref())?;
+    let reused = matches!(upd, HuffUpdate::Unchanged);
     match upd {
         HuffUpdate::New(ct) => entropy.huff = Some(ct),
         HuffUpdate::Unchanged => {}
     }
     dst.extend_from_slice(&sec);
-    Ok(())
+    Ok(reused)
 }
 
 fn write_nseq(dst: &mut Vec<u8>, n: u32) {
@@ -4414,6 +4438,75 @@ fn find_bt_lazy(
     (seqs, lits)
 }
 
+/// The DP's LITERAL price in bits. Flat 6 since the parser was written, against
+/// a real cost of ~8 bits raw and ~4-7 after Huffman -- so it UNDER-prices
+/// literals on high-entropy content, which makes the "optimal" parse prefer
+/// literals over matches and lose to plain lazy. Swept via `RZSTD_OPT_LIT`.
+/// Record the MEASURED cost of the literals just emitted, for the next block's
+/// DP. One atomic store per BLOCK -- not per probe.
+#[inline]
+fn note_lit_bits(section_bytes: usize, literal_count: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    // WHOLE-SECTION cost per literal, deliberately. The marginal variant --
+    // header stripped, measured only when the Huffman table is reused -- is
+    // theoretically righter and MEASURED WORSE: L16 -0.404% against -0.674%,
+    // L19 -0.142% against -0.347%, and it turned jsonlog into a +2.86%
+    // regression while losing x-ray's -2.99% entirely.
+    //
+    // The reason is the same one that sank the two-sided variant: the DP's
+    // MATCH price is itself an approximation (12 + off_bits), so making only the
+    // literal side exact unbalances the pair. The section-amortised figure
+    // happens to carry the bias that keeps the two sides commensurable. Recorded
+    // as an empirical calibration, NOT as the true cost of a literal.
+    let bits = (section_bytes as u64 * 8) / literal_count.max(1) as u64;
+    // Clamp to the range the price model is meaningful over: below 3 the DP
+    // stops taking matches at all, above 10 a literal costs more than a raw byte.
+    OPT_LIT_MEASURED.store(bits.clamp(3, 10) as u32, Relaxed);
+}
+
+
+static OPT_LIT_MEASURED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+fn opt_lit_cost() -> u32 {
+    #[cfg(feature = "std")]
+    {
+        use core::sync::atomic::Ordering;
+        // The env override is resolved ONCE. The first version fell through to
+        // `std::env::var` on every call whenever no override was set -- a string
+        // allocation and environment scan PER DP POSITION, which measured -37%
+        // throughput at L19 across all twelve corpora. Same defect class as the
+        // per-probe atomics in `fast_probe`.
+        const UNCHECKED: u32 = u32::MAX;
+        const NO_OVERRIDE: u32 = u32::MAX - 1;
+        let mut e = OPT_LIT_ARM.load(Ordering::Relaxed);
+        if e == UNCHECKED {
+            e = std::env::var("RZSTD_OPT_LIT")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(NO_OVERRIDE);
+            OPT_LIT_ARM.store(e, Ordering::Relaxed);
+        }
+        if e != NO_OVERRIDE {
+            return e;
+        }
+        match OPT_LIT_MEASURED.load(Ordering::Relaxed) {
+            0 => 6,
+            m => m.max(6),
+        }
+    }
+    #[cfg(not(feature = "std"))]
+    6
+}
+
+static OPT_LIT_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Set the DP literal price in-process.
+pub fn set_opt_lit_arm(v: u32) {
+    OPT_LIT_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
 fn find_opt(
     src: &[u8],
     block_start: usize,
@@ -4475,13 +4568,15 @@ fn find_opt(
     } else {
         (params.target_length as usize).max(OPT_SKIP_FLOOR)
     };
+    // Block-constant: read ONCE, never inside the DP loop.
+    let lit_cost = opt_lit_cost();
     let mut i = 0usize;
     while i < n {
         if price[i] >= inf {
             i += 1;
             continue;
         }
-        let np = price[i].saturating_add(6);
+        let np = price[i].saturating_add(lit_cost);
         if np < price[i + 1] {
             price[i + 1] = np;
             prev[i + 1] = i;
