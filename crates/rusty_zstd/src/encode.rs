@@ -1775,7 +1775,23 @@ fn find_fast_impl<
     // Gate 6 (gg-matchfind): forceable so the pair search can be given its own
     // truth table INDEPENDENTLY of step0, which is the only way to tell the two
     // apart -- they are the same physical decision reached by two switches.
-    let pair = step0 > 2 || pair_forced();
+    // GATE 6 @ L1 -- DISPATCH. The pair search probes `ip+1` as well as `ip`.
+    //
+    // `step0 > 2` never fires at L1: target_length is 0 there, so step0 is 2 and
+    // the preset variable cannot activate. The capability was therefore dead at
+    // the level it helps most. Forced on, all 18 at L1:
+    //
+    //   nci -13.243%  mozilla -9.665%  reymont -9.029%  samba -8.013%
+    //   xml -7.813%   webster -7.747%  dickens -7.440%  ooffice -7.427%
+    //   osdb -5.132%  mr -3.024%   ... TOTAL -4.809%
+    //   versions-16m +10.553%   jsonlog-16m +0.178%
+    //
+    // A sign flip, so it is dispatched rather than constant. `versions-16m` is
+    // the corpus Gate 1 already routes to Lazy for being near-copy content, and
+    // `rep_yield` separates it: the pair search re-finds matches the repcode
+    // path already has, so on rep-dominated content it spends probes to emit a
+    // worse parse.
+    let pair = step0 > 2 || (pair_enabled() && tables.rep_yield <= pair_rep_max());
     let lowest = block_start.saturating_sub(window).max(tables.frame_start);
     let frame_start = tables.frame_start;
     // Local repeat-offset state, mirroring C's `offset_1`/`offset_2`. A repcode
@@ -5712,4 +5728,41 @@ fn next_long_min() -> f32 {
     }
     #[cfg(not(feature = "std"))]
     0.10
+}
+
+/// GATE 6 @ L1: pair-search dispatch. Default ON; `RZSTD_PAIR=0` disables.
+static PAIR_ON_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for in-process ABBA.
+pub fn set_pair_on_arm(on: bool) {
+    PAIR_ON_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn pair_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match PAIR_ON_ARM.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var("RZSTD_PAIR").map(|v| v.trim() != "0").unwrap_or(true);
+            PAIR_ON_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Above this previous-block repcode yield the pair search is switched OFF: the
+/// repcode path already holds those matches, so pairing spends probes to reach a
+/// worse parse. `RZSTD_PAIR_T` sweeps it.
+fn pair_rep_max() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_PAIR_T")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.7)
+    }
+    #[cfg(not(feature = "std"))]
+    0.7
 }
