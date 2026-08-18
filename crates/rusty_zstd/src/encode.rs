@@ -1837,8 +1837,23 @@ fn find_fast_impl<
                         break;
                     }
                     // Brick 52: shift alone bounds the index (see `hash4_tag`).
-                    h0 = (load_u32le(src, ip).wrapping_mul(HASH4_PRIME) >> hash_shift) as usize;
-                    m0 = tables.hash[h0];
+                    //
+                    // GATE 7 DEFECT: this used to recompute `h0` INLINE and read
+                    // `tables.hash[h0]` directly, leaving `g0` holding the tag of
+                    // the PREVIOUS position and bypassing `load_fast`. Harmless
+                    // while no tag exists -- `g0` is always 0 then, so the stale
+                    // value is never compared -- but it silently pairs a fresh
+                    // hash with a stale tag the moment one does, rejecting VALID
+                    // candidates on the repcode path.
+                    //
+                    // That single asymmetry cost versions-16m a CONSTANT 2,475
+                    // bytes and made the tag filter look non-byte-identical,
+                    // which is why the packed representation was blamed and
+                    // removed. The representation was fine; this caller was not.
+                    let (nh, ng) = hash4_tag::<PACKED>(src, ip, hash_shift);
+                    h0 = nh;
+                    g0 = ng;
+                    m0 = tables.load_fast::<PACKED>(h0, ip, g0);
                     continue;
                 }
             }
