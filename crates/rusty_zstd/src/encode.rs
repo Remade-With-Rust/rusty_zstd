@@ -4415,6 +4415,11 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
     if larger >= tables.chain.len() {
         return (0, 0);
     }
+    // Loop-INVARIANT, recomputed on every node of every walk: a saturating_sub,
+    // a max and a field load through `&mut MatchTables`, on a loop that runs
+    // ~30M times per level across the corpus. The `tables.chain[..]` writes in
+    // this same loop are what stop LLVM proving `frame_start` cannot change.
+    let bt_lowest = block_start.saturating_sub(window).max(tables.frame_start);
     let attempts = search_attempts(params);
     // P0/gg-matchfind: work counter -- see `chain_find_best`.
     const COUNT: bool = cfg!(feature = "profile");
@@ -4432,7 +4437,7 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
             tables.chain[larger] = 0;
             break;
         }
-        if m < block_start.saturating_sub(window).max(tables.frame_start) {
+        if m < bt_lowest {
             break;
         }
         let bt_idx = (m & bt_mask) << 1;
@@ -4535,6 +4540,11 @@ fn bt_find_best_runtime(
     if larger >= tables.chain.len() {
         return (0, 0);
     }
+    // Loop-INVARIANT, recomputed on every node of every walk: a saturating_sub,
+    // a max and a field load through `&mut MatchTables`, on a loop that runs
+    // ~30M times per level across the corpus. The `tables.chain[..]` writes in
+    // this same loop are what stop LLVM proving `frame_start` cannot change.
+    let bt_lowest = block_start.saturating_sub(window).max(tables.frame_start);
     let attempts = search_attempts(params);
     // P0/gg-matchfind: work counter -- see `chain_find_best`.
     const COUNT: bool = cfg!(feature = "profile");
@@ -4552,7 +4562,7 @@ fn bt_find_best_runtime(
             tables.chain[larger] = 0;
             break;
         }
-        if m < block_start.saturating_sub(window).max(tables.frame_start) {
+        if m < bt_lowest {
             break;
         }
         let bt_idx = (m & bt_mask) << 1;
