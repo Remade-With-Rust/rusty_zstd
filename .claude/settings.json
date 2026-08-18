@@ -44,7 +44,8 @@
       "Bash(sed -i 's/const PAIR_PROBE_PERIOD: u32 = 16;/const PAIR_PROBE_PERIOD: u32 = 64;/' crates/rusty_zstd/src/encode.rs)",
       "Bash(sed -i 's/rusty_zstd::set_pair_hi_arm\\(6.0\\); }/rusty_zstd::set_pair_hi_arm\\(std::env::args\\(\\).nth\\(1\\).and_then\\(|s| s.parse\\(\\).ok\\(\\)\\).unwrap_or\\(3.0\\)\\); }/' crates/rusty_zstd-bench/examples/g6route.rs)",
       "Bash(sed -i 's/            .unwrap_or\\(6.0\\)/            .unwrap_or\\(1.0\\)/; s/^    6.0$/    1.0/' crates/rusty_zstd/src/encode.rs)",
-      "Bash(grep -n \"unwrap_or\\(1.0\\)\\\\|unwrap_or\\(0.20\\)\\\\|^    1.0$\\\\|^    0.20$\" crates/rusty_zstd/src/encode.rs)"
+      "Bash(grep -n \"unwrap_or\\(1.0\\)\\\\|unwrap_or\\(0.20\\)\\\\|^    1.0$\\\\|^    0.20$\" crates/rusty_zstd/src/encode.rs)",
+      "Bash(git stash *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\talmo\\coding\\rusty_zstd\\crates\\rusty_zstd\\src"

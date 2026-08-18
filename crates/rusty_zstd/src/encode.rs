@@ -1889,6 +1889,8 @@ fn find_fast_impl<
     // x-ray paying 19.8% for 0.02%. The second is what prices the trade.
     let probe = tables.pair_probe == 0;
     let route = tables.pair_route;
+    // Frame-constant, so it is decided ONCE here rather than tested per match.
+    let maintain_rep1 = pipe_rep1_enabled() && tables.rep_yield <= fast_lazy_threshold();
     // Measurement arm for the load hoist -- both shapes in ONE binary so the
     // A/B is in-process rather than cross-binary. Read once per block.
     let prefetch_pair = pair_pre_enabled();
@@ -1997,9 +1999,23 @@ fn find_fast_impl<
             let nip = ip + step0 + ((ip - anchor) >> 8);
             let (h1, g1, m1) = if nip <= ilimit {
                 let (h, g) = hash4_tag::<PACKED>(src, nip, hash_shift);
-                // The store above may have just overwritten this slot.
+                // The store above may have just overwritten this slot, so the
+                // value is forwarded by hand rather than re-read.
+                //
+                // IT MUST MIRROR `load_fast` EXACTLY. `load_fast::<PACKED>`
+                // consults the tag ONLY when PACKED; with PACKED = false -- the
+                // SHIPPING Fast configuration -- it returns the raw slot and the
+                // tag is irrelevant. This forward compared tags unconditionally,
+                // so whenever the next position's hash aliased the current one
+                // (`h == h0`) with a different tag it returned 0 and DISCARDED a
+                // candidate the non-pipelined loop finds. Pure ratio loss, worst
+                // on the highest hash-reuse content: nci -11.93%, xml -0.84%.
+                //
+                // Same defect class as 190ad8b, mirrored: there the STORE was
+                // gated differently from the compare; here the FORWARD applies a
+                // compare the LOAD does not.
                 let v = if h == h0 {
-                    if g == g0 {
+                    if !PACKED || g == g0 {
                         (ip as u32).wrapping_add(1)
                     } else {
                         0
@@ -2032,6 +2048,33 @@ fn find_fast_impl<
                     reserve,
                 );
                 anchor = ip;
+                // The non-pipelined loop does this after EVERY emitted match;
+                // this loop did not, so `rep1` stayed frozen at its block-entry
+                // value and every `try_rep1` tested a STALE offset for the whole
+                // block. The pipeline is documented as byte-identical to the
+                // main loop -- it was not, and the gap was pure ratio: with both
+                // loops doing identical work, nci -11.93%, xml -0.84%,
+                // jsonlog -0.74%, sao -0.14%.
+                // GATE 8 DISPATCH -- `rep1` maintenance in the pipelined loop.
+                //
+                // This loop never maintained `rep1` at all, so it silently ran a
+                // STICKY REPCODE: the block-entry offset held for the whole
+                // block. That broke the loop's documented byte-identity with the
+                // non-pipelined loop (nci -11.93% before the fix), but on
+                // constant-stride content the stale offset is the RIGHT one and
+                // committing to each match's offset breaks the chain.
+                //
+                // Priced across all 18 at L1, maintain vs sticky:
+                //   size  +0.098% total, and ALL of it is versions-16m +20.54%
+                //   time  -0.80% mean (ooffice -9.33%, mr -5.47%)
+                // A sign flip on one axis, so it is dispatched -- on `rep_yield`,
+                // the signal Gate 1 already maintains for exactly this content
+                // class (versions 0.9778 against a real maximum of mr 0.4949).
+                if maintain_rep1 {
+                    if let Some(sq) = seqs.last() {
+                        rep1 = sq.offset as usize;
+                    }
+                }
                 if ip > ilimit {
                     break;
                 }
@@ -2147,8 +2190,13 @@ fn find_fast_impl<
                 reserve,
             );
             anchor = ip;
-            if let Some(sq) = seqs.last() {
-                rep1 = sq.offset as usize;
+            // Same decision as the pipelined loop -- see GATE 8 above. Guarding
+            // only ONE loop would make the heuristic a property of which loop
+            // ran, which is exactly the byte-identity break this gate exposed.
+            if maintain_rep1 {
+                if let Some(sq) = seqs.last() {
+                    rep1 = sq.offset as usize;
+                }
             }
             continue;
         }
@@ -2524,6 +2572,22 @@ fn hash4_tag<const PACKED: bool>(src: &[u8], pos: usize, hash_shift: u32) -> (us
 
 /// Brick 39 arm state: 2-way pipelined probe. Runtime-settable so the
 /// in-process ABBA harness can flip it between adjacent measurements.
+static PIPE_REP1_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// A/B the pipelined loop's `rep1` maintenance. OFF reproduces the pre-fix
+/// "sticky repcode" behaviour, which was an accident but is not obviously worse.
+pub fn set_pipe_rep1_arm(on: bool) {
+    PIPE_REP1_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn pipe_rep1_enabled() -> bool {
+    match PIPE_REP1_ARM.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        _ => true,
+    }
+}
+
 static PIPE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Override the pipeline arm for the rest of the process. Bench hook.
