@@ -2017,10 +2017,27 @@ fn find_fast_impl<
                         probes += 1;
                     }
                 }
+                if COUNT {
+                    PAIR_PROBES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
                 let (h1, g1) = hash4_tag::<PACKED>(src, ip1, hash_shift);
                 let m1 = tables.load_fast::<PACKED>(h1, ip1, g1);
                 tables.store_fast::<PACKED>(h1, ip1, g1);
+                // A THIRD VARIABLE WAS TESTED AND REJECTED: the pair match's
+                // LENGTH. `versions-16m` sits at exactly +10.55% for every
+                // minimum from 0 to 24, while the winners degrade badly (total
+                // -4.809% -> -1.748% at 24). Its pair matches are all LONG, so
+                // they are not marginal candidates taken cheaply -- they are
+                // genuine long matches whose commitment breaks the repcode
+                // chain. A length filter cannot separate a good long match from
+                // a harmful one, because the harm is a property of the CONTENT
+                // (repcode already covers that span) and not of the candidate.
+                // That is why `rep_yield` is the right and sufficient variable.
                 if let Some((m, ml)) = fast_probe(src, m1, ip1, window, lowest, mls, block_end) {
+                    if COUNT {
+                        PAIR_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        PAIR_BYTES.fetch_add(ml as u64, core::sync::atomic::Ordering::Relaxed);
+                    }
                     if COUNT {
                         if COUNT {
                             hits += 1;
@@ -5765,4 +5782,23 @@ fn pair_rep_max() -> f32 {
     }
     #[cfg(not(feature = "std"))]
     0.7
+}
+
+/// Diagnostic counters for Gate 6 candidate variables: how often the pair probe
+/// fires, how often it HITS, and how many bytes those hits cover. Activity vs
+/// outcome -- the campaign's law says the signal must predict the outcome.
+pub static PAIR_PROBES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PAIR_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PAIR_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static MAIN_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear: `(probes, hits, pair_match_bytes, all_match_bytes)`.
+pub fn take_pair_stats() -> (u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        PAIR_PROBES.swap(0, Ordering::Relaxed),
+        PAIR_HITS.swap(0, Ordering::Relaxed),
+        PAIR_BYTES.swap(0, Ordering::Relaxed),
+        MAIN_BYTES.swap(0, Ordering::Relaxed),
+    )
 }
