@@ -270,6 +270,10 @@ pub(crate) struct MatchTables {
     /// Countdown to the next forced rep re-probe (the ratio can only be measured
     /// on a block where the search actually ran).
     rep_probe: u32,
+    /// GATE 9 @ L3: mean MATCH LENGTH on the previous DFast block, EWMA'd.
+    /// Skipping odd positions shifts a LONG match by a byte (free) but loses a
+    /// SHORT match outright, and loses nothing where there are no matches.
+    dfast_mean_ml: f32,
     /// GATE 8 @ L3: share of DFast's speculated loads that the next iteration
     /// actually consumed. Low = the pipeline is prefetching for positions the
     /// match logic then jumps past.
@@ -388,6 +392,7 @@ impl MatchTables {
             next_long_yield: 1.0,
             rep_len_ratio: 1.0,
             rep_probe: 0,
+            dfast_mean_ml: 0.0,
             dfast_spec_yield: 1.0,
             dfast_probe: 0,
             pair_gain: 1.0,
@@ -3278,6 +3283,30 @@ fn find_dfast_impl<const HLOG: u32>(
     // Measured yields split the corpora nearly two to one:
     //   incomp 100.0%  text 98.2%  sao 91.9%  mozilla 87.7%  ooffice 83.7%
     //   ... against nci 32.3%  reymont 23.6%  dickens 38.6%  webster 41.4%
+    // GATE 9 @ L3 -- the gate is DEAD here (step0 in {1,2,4} moves 0/18 sizes at
+    // L3 against 16/18 at L1): DFast's advance was the literal `1`, so the
+    // density knob had no caller. Read ONCE per block, never per position --
+    // see the -37% that an env lookup inside the DP loop cost at L19.
+    // GATE 9 @ L3 DISPATCH. Step 2 halves the hash work; measured across all 18
+    // it is -9.56% time for +1.58% size, but the size cost is entirely content
+    // dependent -- x-ray +12.67% and ooffice +6.09% against jsonlog -0.93% and
+    // osdb -2.04%, which get SMALLER and faster. A sign flip, so it is routed.
+    //
+    // Mean match length is the axis, and it follows from the mechanism rather
+    // than from fitting: skipping odd positions shifts a LONG match by one byte
+    // (negligible), loses a SHORT match entirely, and loses nothing at all where
+    // there are no matches.
+    //   ml == 0   zeros, incomp-32m        step2 size 0.00%
+    //   ml <  8   x-ray 5.05, sao 6.28     +12.67%, +3.26%
+    //   ml >= 14  osdb .. text-32m         -2.04% .. +1.36%
+    let ml = tables.dfast_mean_ml;
+    let dstep = if dfast_step_forced() != 0 {
+        dfast_step_forced()
+    } else if ml == 0.0 || ml >= dfast_ml_min() {
+        2
+    } else {
+        1
+    };
     let dpipe = dfast_pipe_enabled()
         && (tables.dfast_probe == 0 || tables.dfast_spec_yield >= dfast_spec_min());
     let (mut spec_made, mut spec_used) = (0u64, 0u64);
@@ -3340,7 +3369,7 @@ fn find_dfast_impl<const HLOG: u32>(
         // `get_h` on that slot would return `Some(ip)`. The two tables are
         // distinct, so `h4` can only alias `h4` and `h8` only `h8`.
         if dpipe {
-            let nip = ip + 1 + ((ip - anchor) >> 8);
+            let nip = ip + dstep + ((ip - anchor) >> 8);
             if nip <= ilimit {
                 let a = hash_mls(src, nip, 4, hlog);
                 let b = hash8(src, nip, hlog);
@@ -3448,7 +3477,7 @@ fn find_dfast_impl<const HLOG: u32>(
             // them is stale.
             carried = None;
         } else {
-            ip += 1 + ((ip - anchor) >> 8);
+            ip += dstep + ((ip - anchor) >> 8);
         }
     }
     tables.rep_yield = if seqs.is_empty() {
@@ -3484,6 +3513,27 @@ fn find_dfast_impl<const HLOG: u32>(
     } else {
         tables.dfast_probe - 1
     };
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let mb: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
+        DFAST_MATCH_BYTES.fetch_add(mb, Relaxed);
+        DFAST_SEQS.fetch_add(seqs.len() as u64, Relaxed);
+        DFAST_BLOCK_BYTES.fetch_add((block_end - block_start) as u64, Relaxed);
+    }
+    // EWMA so one atypical block cannot flip the route -- the Gate 6 lesson.
+    {
+        let mb: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
+        let now = if seqs.is_empty() {
+            0.0
+        } else {
+            mb as f32 / seqs.len() as f32
+        };
+        tables.dfast_mean_ml = if tables.dfast_mean_ml == 0.0 && now == 0.0 {
+            0.0
+        } else {
+            0.75 * tables.dfast_mean_ml + 0.25 * now
+        };
+    }
     tables.next_long_yield = if nl_probes == 0 {
         1.0
     } else {
@@ -3492,6 +3542,66 @@ fn find_dfast_impl<const HLOG: u32>(
     lits.extend_from_slice(&src[anchor..block_end]);
     note_finder_work(COUNT, probes, hits, &seqs, &lits);
     (seqs, lits)
+}
+
+/// GATE 9: DFast probe density. C's `_doubleFast` probes every position; 2 halves
+/// the hash work at some ratio cost. Swept via `RZSTD_DFAST_STEP`.
+/// Mean match length at or above which DFast may probe every OTHER position.
+fn dfast_ml_min() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_DFAST_ML")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(14.0)
+    }
+    #[cfg(not(feature = "std"))]
+    14.0
+}
+
+/// Non-zero forces a fixed density (measurement arm); 0 = dispatch.
+fn dfast_step_forced() -> usize {
+    #[cfg(feature = "std")]
+    {
+        use core::sync::atomic::Ordering;
+        let c = DFAST_STEP_ARM.load(Ordering::Relaxed);
+        if c != 0 {
+            return c as usize;
+        }
+        let v: usize = std::env::var("RZSTD_DFAST_STEP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or(0);
+        DFAST_STEP_ARM.store(v as u32, Ordering::Relaxed);
+        v
+    }
+    #[cfg(not(feature = "std"))]
+    1
+}
+
+pub static DFAST_MATCH_BYTES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_SEQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_BLOCK_BYTES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// `(match_bytes, seqs, block_bytes)` for the DFast strategy.
+pub fn take_dfast_match_stats() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        DFAST_MATCH_BYTES.swap(0, Relaxed),
+        DFAST_SEQS.swap(0, Relaxed),
+        DFAST_BLOCK_BYTES.swap(0, Relaxed),
+    )
+}
+
+static DFAST_STEP_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Set the DFast probe density in-process.
+pub fn set_dfast_step_arm(v: usize) {
+    DFAST_STEP_ARM.store(v as u32, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Blocks between forced DFast-pipeline re-probes.
