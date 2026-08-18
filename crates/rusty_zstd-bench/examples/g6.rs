@@ -1,11 +1,11 @@
 //! GATE 6 (pair search at ip+1). Step 1: prove the arm is LIVE somewhere.
 //! Step 2: is it reached at L3? Step 3: if dead, validate why.
 fn size(src: &[u8], lvl: i32, pair: bool) -> (usize, u64) {
-    rusty_zstd::set_pair_arm(pair);
+    rusty_zstd::set_pair_on_arm(pair);
     let _ = rusty_zstd::take_finder_calls();
     let z = rusty_zstd::compress(src, lvl).unwrap();
     let (f, _o) = rusty_zstd::take_finder_calls();
-    rusty_zstd::set_pair_arm(false);
+    rusty_zstd::set_pair_on_arm(false);
     (z.len(), f)
 }
 fn main() {

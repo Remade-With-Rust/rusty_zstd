@@ -72,7 +72,7 @@ pub use encode::{
 pub use encode::{
     reset_env_arms, set_bt_spec_arm, set_next_long_arm, set_pair_on_arm, take_pair_stats, set_dfast_spec_arm, set_fast_spec_arm, take_bt_calls, take_dfast_calls, take_finder_calls,
     set_huff_fast_arm, set_lazy_fill_arm, set_litpush_arm, set_litpush_hoist_arm, set_payload_arm, set_pipe_arm,
-    set_fast_lazy_arm, set_incomp_skip_arm, set_pair_arm, set_rep1_arm, set_rep1_mode,
+    set_fast_lazy_arm, set_incomp_skip_arm, set_rep1_arm, set_rep1_mode,
     set_search_log_delta,
     set_step0_arm,
     set_tag_arm,

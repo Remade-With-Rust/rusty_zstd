@@ -9,11 +9,11 @@ fn main() {
     for id in ids {
         let Ok(full) = std::fs::read(format!("corpora/data/generated/{id}"))
             .or_else(|_| std::fs::read(format!("corpora/data/silesia/{id}"))) else { continue };
-        rusty_zstd::set_pair_arm(false);
+        rusty_zstd::set_pair_on_arm(false);
         let a = rusty_zstd::compress(&full, 1).unwrap().len();
-        rusty_zstd::set_pair_arm(true);
+        rusty_zstd::set_pair_on_arm(true);
         let b = rusty_zstd::compress(&full, 1).unwrap().len();
-        rusty_zstd::set_pair_arm(false);
+        rusty_zstd::set_pair_on_arm(false);
         to += a; tn += b;
         let d = 100.0*(b as f64 - a as f64)/a as f64;
         if d < -0.01 { w += 1 } else if d > 0.01 { l += 1 }

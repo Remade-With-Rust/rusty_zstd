@@ -227,8 +227,33 @@ pub(crate) struct MatchTables {
     ///
     /// Positions are reconstructed modulo 2^24 -- unambiguous because any
     /// usable candidate lies within `window` of `ip`, and this is only enabled
-    /// when `window < 2^24`. Not byte-identical: a slot whose residue AND tag
-    /// are both 0 reads as empty (~1 position in 2^32), so it gates on RATIO.
+    /// when `window < 2^24`.
+    ///
+    /// NOT byte-identical, and the size of that effect was UNDERSTATED here for
+    /// most of this codebase's life. The old note said "a slot whose residue AND
+    /// tag are both 0 reads as empty (~1 position in 2^32)", which predicts ~0
+    /// bytes. Measured on `versions-16m` at L1 the effect is a deterministic
+    /// **+2,475 bytes**:
+    ///
+    /// ```text
+    /// prefix   tag OFF   tag ON    delta      absolute
+    /// 2^20       4,534    4,119   -9.153%       -415
+    /// 2^21       7,373    9,848  +33.568%     +2,475
+    /// 2^22      12,959   15,434  +19.099%     +2,475
+    /// 2^23      24,106   26,581  +10.267%     +2,475
+    /// 2^24      46,025   48,500   +5.378%     +2,475
+    /// ```
+    ///
+    /// The absolute cost is CONSTANT from 2^21 up, so it is not the 24-bit
+    /// residue aliasing either -- that would scale with how far the input spans
+    /// past the wrap. It is one early divergence that the rest of the stream
+    /// does not compound, which fits `versions` being almost entirely repcodes
+    /// after its first blocks. And the SIGN FLIPS at 2^20, where the tag WINS by
+    /// 415 bytes.
+    ///
+    /// Across all 18 at L1 the tag costs +0.0049% and changes 9 of 18, so the
+    /// default-off is right; the size-dependent sign flip is a real dispatch
+    /// signal on a gate too marginal to be worth one.
     packed: bool,
     hash_long: Vec<u32>,
     /// BRICK 67: repcode yield of the PREVIOUS block -- the dispatch signal
@@ -887,18 +912,8 @@ thread_local! {
 }
 
 
-/// Gate 6 arm: force the pair search on even at `step0 == 2`.
-static PAIR_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-/// Bench hook for the Gate 6 truth table.
-pub fn set_pair_arm(on: bool) {
-    PAIR_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
-}
 
-#[inline]
-fn pair_forced() -> bool {
-    PAIR_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
-}
 
 /// Gate 16 arm: the incompressible early-raw skip. Also RETIRES the uncached
 /// `std::env::var` read that `incomp_skip_on` performed on EVERY BLOCK -- the
