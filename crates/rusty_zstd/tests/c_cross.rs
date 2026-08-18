@@ -177,3 +177,33 @@ fn c_train_zeros_and_text_32m() {
         assert_roundtrip(&oracle, &text, level);
     }
 }
+
+/// REGRESSION (2026-08-18): `params.hash_log` is user-settable with no upper
+/// bound (`hlog` does only `value.max(6)`), while `MatchTables` allocates at
+/// `params.hash_log.clamp(6, 24)`. The chain-walking finders indexed with the
+/// RAW value, so `hashLog >= 25` ran off the end of a 2^24 table:
+///
+///   index out of bounds: the len is 16777216 but the index is 28488790
+///
+/// Brick 52 fixed `find_fast` and `find_dfast` and left `find_lazy`,
+/// `find_greedy`, `chain_find_best` and the prefill on the raw value. Reachable
+/// from any caller that forwards user configuration.
+#[test]
+fn oversized_hash_log_does_not_panic() {
+    let src: Vec<u8> = (0..2_000_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    for hlog in [24u32, 25, 26, 28, 30, 31] {
+        for lvl in [1i32, 3, 5, 7, 9, 12, 13, 19] {
+            let mut p = rusty_zstd::compression_params(lvl, Some(src.len() as u64)).unwrap();
+            p.hash_log = hlog;
+            let z = rusty_zstd::compress_with_params(&src, p, false)
+                .unwrap_or_else(|e| panic!("hlog {hlog} L{lvl} failed: {e:?}"));
+            assert_eq!(
+                rusty_zstd::decompress(&z).unwrap(),
+                src,
+                "hlog {hlog} L{lvl} round-trip"
+            );
+        }
+    }
+}

@@ -696,7 +696,15 @@ pub(crate) fn prime_tables(
     if from >= ilimit || src.len() < mls {
         return;
     }
-    let hash_log = params.hash_log;
+    // BRICK 52, COMPLETED: the AUTHORITATIVE clamped value, never `params`.
+    // `params.hash_log` is USER-SETTABLE with no upper bound (`hlog` in the
+    // advanced-parameter setter does only `value.max(6)`), while the table is
+    // allocated at `params.hash_log.clamp(6, 24)`. Indexing with the raw value
+    // therefore ran off the end of a 2^24 table: `hlog >= 25` at L9 panicked
+    // with `index out of bounds: the len is 16777216 but the index is
+    // 28488790`. Brick 52 fixed `find_fast` and `find_dfast` and left the
+    // chain-walking finders on the raw value.
+    let hash_log = tables.hash_log;
     let chain_mask = tables.chain.len().saturating_sub(1);
     let mut p = from;
     while p <= ilimit && p + 8 <= src.len() {
@@ -3548,7 +3556,15 @@ fn find_greedy(
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
     let mls = params.min_match.max(3) as usize;
-    let hash_log = params.hash_log;
+    // BRICK 52, COMPLETED: the AUTHORITATIVE clamped value, never `params`.
+    // `params.hash_log` is USER-SETTABLE with no upper bound (`hlog` in the
+    // advanced-parameter setter does only `value.max(6)`), while the table is
+    // allocated at `params.hash_log.clamp(6, 24)`. Indexing with the raw value
+    // therefore ran off the end of a 2^24 table: `hlog >= 25` at L9 panicked
+    // with `index out of bounds: the len is 16777216 but the index is
+    // 28488790`. Brick 52 fixed `find_fast` and `find_dfast` and left the
+    // chain-walking finders on the raw value.
+    let hash_log = tables.hash_log;
     let chain_mask = tables.chain.len() - 1;
     let attempts = search_attempts(params);
     // P0/gg-matchfind: work counter -- see `chain_find_best`.
@@ -3686,7 +3702,15 @@ fn chain_find_best(
     params: CompressionParameters,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
-    let hash_log = params.hash_log;
+    // BRICK 52, COMPLETED: the AUTHORITATIVE clamped value, never `params`.
+    // `params.hash_log` is USER-SETTABLE with no upper bound (`hlog` in the
+    // advanced-parameter setter does only `value.max(6)`), while the table is
+    // allocated at `params.hash_log.clamp(6, 24)`. Indexing with the raw value
+    // therefore ran off the end of a 2^24 table: `hlog >= 25` at L9 panicked
+    // with `index out of bounds: the len is 16777216 but the index is
+    // 28488790`. Brick 52 fixed `find_fast` and `find_dfast` and left the
+    // chain-walking finders on the raw value.
+    let hash_log = tables.hash_log;
     let chain_mask = tables.chain.len() - 1;
     let attempts = search_attempts(params);
     let h = hash_mls(src, ip, mls, hash_log);
@@ -3746,7 +3770,15 @@ fn find_lazy(
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
     let mls = params.min_match.max(3) as usize;
-    let hash_log = params.hash_log;
+    // BRICK 52, COMPLETED: the AUTHORITATIVE clamped value, never `params`.
+    // `params.hash_log` is USER-SETTABLE with no upper bound (`hlog` in the
+    // advanced-parameter setter does only `value.max(6)`), while the table is
+    // allocated at `params.hash_log.clamp(6, 24)`. Indexing with the raw value
+    // therefore ran off the end of a 2^24 table: `hlog >= 25` at L9 panicked
+    // with `index out of bounds: the len is 16777216 but the index is
+    // 28488790`. Brick 52 fixed `find_fast` and `find_dfast` and left the
+    // chain-walking finders on the raw value.
+    let hash_log = tables.hash_log;
     let chain_mask = tables.chain.len() - 1;
     let mut seqs = Vec::new();
     let mut lits = Vec::new();
