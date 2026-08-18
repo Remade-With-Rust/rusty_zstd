@@ -270,6 +270,11 @@ pub(crate) struct MatchTables {
     /// Countdown to the next forced rep re-probe (the ratio can only be measured
     /// on a block where the search actually ran).
     rep_probe: u32,
+    /// Consecutive blocks emitted RAW. Incompressible content otherwise pays the
+    /// full match search before anything discovers it is incompressible.
+    raw_run: u32,
+    /// Countdown to the next forced re-probe of the raw short circuit.
+    raw_probe: u32,
     /// GATE 10 @ L19: bytes the opt DP's repcode candidate covers per probe,
     /// EWMA'd. It runs at EVERY position and is worth keeping on almost nothing:
     /// versions-16m 434 B/probe and text-32m 26,932 need it, everything else is
@@ -414,6 +419,8 @@ impl MatchTables {
             next_long_yield: 1.0,
             rep_len_ratio: 1.0,
             rep_probe: 0,
+            raw_run: 0,
+            raw_probe: 0,
             opt_rep_rate: f32::MAX,
             opt_rep_probe: 0,
             opt_rep_seen: 0,
@@ -798,7 +805,24 @@ pub(crate) fn encode_block(
         return Ok(());
     }
 
-    let (seqs, literals) = {
+    // GATE 16 SCOPE GAP -- incompressible content pays the FULL match search
+    // before anything discovers it is incompressible.
+    //
+    // At L22, incomp-32m issues 2,097,040 binary-tree searches, 100.0% of which
+    // return nothing, and then the block is emitted RAW anyway -- 4,177 bt calls
+    // per emitted sequence. `early_raw_skip` cannot help: it is gated to
+    // `Strategy::Fast` with `--fast=N`, so it never fires on the Bt ladder.
+    //
+    // The outcome of the PREVIOUS block is the signal, and it costs nothing to
+    // read. After `RAW_RUN_MIN` consecutive raw blocks, skip the search and emit
+    // the block as literals -- which is what it was going to become. Re-probed on
+    // a schedule so content that starts compressing is picked up: without that
+    // the gate would suppress its own evidence, the defect this campaign has now
+    // hit in Gates 6, 2 and 10.
+    let skip_search = tables.raw_run >= RAW_RUN_MIN && tables.raw_probe != 0;
+    let (seqs, literals) = if skip_search {
+        (Vec::new(), block.to_vec())
+    } else {
         let _m = crate::prof::scope(crate::prof::Stage::EncodeMatchFind);
         find_sequences(
             src,
@@ -819,6 +843,7 @@ pub(crate) fn encode_block(
         (0, 0)
     };
     if seqs.is_empty() && !huffman::literals_worth_huffman(block) {
+        note_raw_outcome(tables, true);
         crate::prof::note_raw_block();
         tap_block(
             block.len(),
@@ -842,6 +867,7 @@ pub(crate) fn encode_block(
     let mg = min_gain(block.len(), params.strategy);
     let peak = huffman::lit_sample_peak(if seqs.is_empty() { block } else { &literals });
     if early_raw_skip(match_b, block.len(), params) {
+        note_raw_outcome(tables, true);
         crate::prof::note_raw_block();
         crate::prof::note_early_raw();
         tap_block(
@@ -911,6 +937,7 @@ pub(crate) fn encode_block(
     if payload.len() >= raw_limit {
         *reps = saved_reps;
         *entropy = saved_ent;
+        note_raw_outcome(tables, true);
         crate::prof::note_raw_block();
         tap_block(
             block.len(),
@@ -943,6 +970,7 @@ pub(crate) fn encode_block(
         off_coll,
         off_bkt,
     );
+    note_raw_outcome(tables, false);
     write_block_header(out, last, BlockType::Compressed, payload.len() as u32);
     out.extend_from_slice(&payload);
     Ok(())
@@ -1033,6 +1061,26 @@ pub fn set_incomp_skip_arm(on: Option<bool>) {
         None => 3,
     };
     INCOMP_SKIP_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Consecutive raw blocks before the match search is short-circuited.
+const RAW_RUN_MIN: u32 = 2;
+/// Blocks between forced re-probes of the raw short circuit.
+const RAW_PROBE_PERIOD: u32 = 16;
+
+/// Record whether this block ended up RAW, and tick the re-probe countdown.
+/// Called on every exit so the run length is never stale.
+fn note_raw_outcome(tables: &mut MatchTables, raw: bool) {
+    if raw {
+        tables.raw_run = tables.raw_run.saturating_add(1);
+    } else {
+        tables.raw_run = 0;
+    }
+    tables.raw_probe = if tables.raw_probe == 0 {
+        RAW_PROBE_PERIOD
+    } else {
+        tables.raw_probe - 1
+    };
 }
 
 fn incomp_skip_on(params: CompressionParameters) -> bool {
@@ -4782,6 +4830,22 @@ pub static OPT_REP_HITS: core::sync::atomic::AtomicU64 =
 pub static OPT_REP_BYTES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+pub static OPT_BT_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static OPT_BT_DRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static OPT_BT_LEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static OPT_SEQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `(bt_calls, bt_calls_returning_nothing, total_match_len, emitted_seqs)`
+pub fn take_opt_bt() -> (u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        OPT_BT_CALLS.swap(0, Relaxed),
+        OPT_BT_DRY.swap(0, Relaxed),
+        OPT_BT_LEN.swap(0, Relaxed),
+        OPT_SEQS.swap(0, Relaxed),
+    )
+}
+
 /// `(probes, hits, hit_bytes)` for the opt DP's repcode candidate.
 pub fn take_opt_rep() -> (u64, u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
@@ -4866,6 +4930,8 @@ fn find_opt(
     // Block-constant: read ONCE, never inside the DP loop.
     let lit_cost = opt_lit_cost(tables);
     let (mut o_rep_probes, mut o_rep_hits, mut o_rep_bytes) = (0u64, 0u64, 0u64);
+    // GATE 10 @ L22 curiosity: what does the DP's per-position bt search return?
+    let (mut o_bt_calls, mut o_bt_dry, mut o_bt_len) = (0u64, 0u64, 0u64);
     // GATE 10 @ L19 DISPATCH. The candidate costs a `try_rep1` at every position
     // and EARNS almost nowhere: 12 of 18 corpora are SMALLER without it, and
     // only versions-16m (+51.654% if removed) and text-32m (+5.376%) need it.
@@ -4925,6 +4991,13 @@ fn find_opt(
             }
         }
         let (bm, bml) = bt_find_best(src, ip, block_start, block_end, window, mls, params, tables);
+        o_bt_calls += 1;
+        if bml < mls {
+            o_bt_dry += 1;
+        }
+        if bml >= mls {
+            o_bt_len += bml as u64;
+        }
         if bml < mls {
             i += 1;
             continue;
@@ -5032,6 +5105,10 @@ fn find_opt(
         OPT_REP_PROBES.fetch_add(o_rep_probes, Relaxed);
         OPT_REP_HITS.fetch_add(o_rep_hits, Relaxed);
         OPT_REP_BYTES.fetch_add(o_rep_bytes, Relaxed);
+        OPT_BT_CALLS.fetch_add(o_bt_calls, Relaxed);
+        OPT_BT_DRY.fetch_add(o_bt_dry, Relaxed);
+        OPT_BT_LEN.fetch_add(o_bt_len, Relaxed);
+        OPT_SEQS.fetch_add(seqs.len() as u64, Relaxed);
     }
     if opt_rep_on && o_rep_probes > 0 {
         let now = o_rep_bytes as f32 / o_rep_probes as f32;
