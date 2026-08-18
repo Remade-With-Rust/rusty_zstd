@@ -49,7 +49,9 @@
       "Bash(sed -i 's/set_dfast_spec_arm,/set_dfast_spec_arm, set_dfast_pipe_arm,/' crates/rusty_zstd/src/lib.rs)",
       "Bash(cd \"c:/Users/talmo/coding/rusty_zstd\" && sed -i 's/set_dfast_spec_arm, set_dfast_pipe_arm,/set_dfast_spec_arm,/' crates/rusty_zstd/src/lib.rs && grep -n \"while ip <= ilimit {\" crates/rusty_zstd/src/encode.rs && sed -n '2974,2980p' crates/rusty_zstd/src/encode.rs | cat -A | head -8)",
       "Bash(sed -i 's|rl/al.max\\(&0.001\\)|rl/al.max\\(0.001\\)|' crates/rusty_zstd-bench/examples/g2rate.rs)",
-      "Bash(sed -i 's|\\(a.4/a.5.max\\(0.001\\)\\)|\\(a.4/a.5.max\\(0.001\\)\\)|' crates/rusty_zstd-bench/examples/g2rate.rs)"
+      "Bash(sed -i 's|\\(a.4/a.5.max\\(0.001\\)\\)|\\(a.4/a.5.max\\(0.001\\)\\)|' crates/rusty_zstd-bench/examples/g2rate.rs)",
+      "Bash(sed -i 's/set_opt_lit_arm, set_opt_floor_arm,/set_opt_lit_arm,/' crates/rusty_zstd/src/lib.rs)",
+      "Bash(rm -f crates/rusty_zstd-bench/examples/optfloor.rs)"
     ],
     "additionalDirectories": [
       "c:\\Users\\talmo\\coding\\rusty_zstd\\crates\\rusty_zstd\\src"

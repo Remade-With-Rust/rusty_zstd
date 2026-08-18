@@ -4706,6 +4706,16 @@ fn find_opt(
     // The pathology is driven by matches in the tens of THOUSANDS of bytes, so
     // the floor keeps the whole speed win while leaving ordinary matches to the
     // DP. `higher_level_never_larger_osdb` is the gate that caught this.
+    // NOTE (gg-matchfind Gate 9 @ L22): this floor DOMINATES every `target_length`
+    // the level table produces for the opt strategies -- L16 48, L18 64, L19 256,
+    // L21 512, L22 999 all collapse to 1024, so `target_length` is inert across
+    // the whole optimal ladder.
+    //
+    // That sounds like a defect and MEASURED as a non-event: sweeping the floor
+    // 1024 -> 512 -> 256 -> 64 moves nothing on 11 of 14 corpora and makes nci,
+    // samba and xml slightly WORSE. `bml` simply does not reach these lengths
+    // often enough for the skip to fire. The knob was built, measured inert, and
+    // REMOVED rather than left as dead configuration surface.
     const OPT_SKIP_FLOOR: usize = 1024;
     let sufficient_len = if params.target_length == 0 {
         usize::MAX
