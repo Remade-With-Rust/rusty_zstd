@@ -1601,6 +1601,21 @@ fn rep_yield_min_for(strategy: Strategy) -> f32 {
     }
     match strategy {
         Strategy::DFast => 0.0,
+        // GATE 2 RE-VALIDATION (all 18 @ L1, deterministic sizes): the shipped
+        // 0.125 is not the optimum for the Fast ladder. Sweeping the threshold
+        // against 0.125 as baseline:
+        //   0.15/0.20/0.25 all give TOTAL -0.090%
+        //   mr -0.783%  sao -0.152%  dickens -0.151%  ooffice -0.144%
+        //   samba -0.061%  jsonlog -0.015%  xml -0.013%   vs mozilla +0.017%
+        // Seven corpora smaller, one trivially larger. Scoped to Fast because
+        // REP_YIELD_MIN_DEFAULT is shared with Lazy/Lazy2/BtLazy2 at L5-L15,
+        // which this sweep did not cover.
+        //
+        // NOT FIXED by this, and recorded as an open gap: `xml` is 3.72% smaller
+        // with rep1 forced ALWAYS ON, but always-on costs dickens +7.18% and
+        // samba +4.51%. No threshold separates them -- their per-block rep_yield
+        // distributions overlap -- so capturing xml needs a SECOND variable.
+        Strategy::Fast => 0.20,
         _ => REP_YIELD_MIN_DEFAULT,
     }
 }
@@ -2806,7 +2821,7 @@ fn find_dfast(
         };
     }
     if !dfast_spec_enabled() {
-        return find_dfast_runtime(src, block_start, block_end, window, params, tables, reps);
+        return go!(0);
     }
     // GATE 5: the MINIMAL COMPLETE set. Enumerated exhaustively over every
     // input size 0..2^28 plus the unknown-size (streaming) case, DFast reaches
@@ -2819,7 +2834,7 @@ fn find_dfast(
         16 => go!(16),
         17 => go!(17),
         18 => go!(18),
-        _ => find_dfast_runtime(src, block_start, block_end, window, params, tables, reps),
+        _ => go!(0),
     }
 }
 
@@ -2846,7 +2861,21 @@ fn find_dfast_impl<const HLOG: u32>(
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    DFAST_SPEC_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if HLOG != 0 {
+        DFAST_SPEC_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    // HLOG == 0 is the RUNTIME arm, served by THIS body rather than a separate
+    // one. There used to be a hand-written `find_dfast_runtime` here; because it
+    // was a second copy of the algorithm it silently DRIFTED -- Gate 6 added
+    // `_search_next_long` to the specialised body only, so `dfast_spec` stopped
+    // being a codegen A/B and became an A/B between two different algorithms
+    // (15/18 corpora moved, versions-16m by 24.71%). Serving both from one body
+    // makes byte-identity structural instead of a claim that has to be re-checked
+    // every time the algorithm changes.
+    let hlog = if HLOG == 0 { tables.hash_log } else { HLOG };
+    if HLOG == 0 {
+        DFAST_RUNTIME_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     let mls = params.min_match.max(3) as usize;
     let mut seqs = Vec::new();
     let mut lits = Vec::new();
@@ -2894,8 +2923,8 @@ fn find_dfast_impl<const HLOG: u32>(
                 continue;
             }
         }
-        let h4 = hash_mls(src, ip, 4, HLOG);
-        let h8 = hash8(src, ip, HLOG);
+        let h4 = hash_mls(src, ip, 4, hlog);
+        let h8 = hash8(src, ip, hlog);
         let m4 = tables.get_h(h4);
         let m8 = tables.get_hl(h8);
         tables.put_h(h4, ip);
@@ -2938,7 +2967,7 @@ fn find_dfast_impl<const HLOG: u32>(
         let mut best_ip = ip;
         if best_ml < 8 && nl_on && ip + 1 <= ilimit {
             nl_probes += 1;
-            let h8b = hash8(src, ip + 1, HLOG);
+            let h8b = hash8(src, ip + 1, hlog);
             if let Some(m8b) = tables.get_hl(h8b) {
                 if COUNT {
                     probes += 1;
@@ -2991,7 +3020,7 @@ fn find_dfast_impl<const HLOG: u32>(
             let end = best_ip + best_ml;
             // DFast never sets `packed` (it is gated on Strategy::Fast).
             fill_hash_after_match::<false>(tables, src, best_ip, end, mls, ilimit);
-            fill_hash_long_after_match(tables, src, ip, end, HLOG, ilimit);
+            fill_hash_long_after_match(tables, src, ip, end, hlog, ilimit);
             ip = end;
             anchor = ip;
         } else {
@@ -3016,139 +3045,6 @@ fn find_dfast_impl<const HLOG: u32>(
     (seqs, lits)
 }
 
-fn find_dfast_runtime(
-    src: &[u8],
-    block_start: usize,
-    block_end: usize,
-    window: usize,
-    params: CompressionParameters,
-    tables: &mut MatchTables,
-    reps: [u32; 3],
-) -> (Vec<Seq>, Vec<u8>) {
-    DFAST_RUNTIME_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let mls = params.min_match.max(3) as usize;
-    let hash_log = tables.hash_log;
-    let mut seqs = Vec::new();
-    let mut lits = Vec::new();
-    let mut anchor = block_start;
-    let ilimit = block_end.saturating_sub(8);
-    if block_start >= ilimit {
-        lits.extend_from_slice(&src[block_start..block_end]);
-        return (seqs, lits);
-    }
-    // BRICK 70: repcode-1 search in DFast.
-    //
-    // C checks `offset_1` at every position in `_doubleFast` exactly as it does
-    // in `_fast`; we had it ONLY in `find_fast`, so L3 -- the SHIPPING DEFAULT --
-    // had no repcode search at all. That is the whole of the 4.3x versions-16m
-    // hole at L2-L4 (L1/L2 collapse to 0.07x/0.62x with it on, L3/L4 do not move).
-    //
-    // Dispatched on the same measured yield as brick 67, so content without a
-    // constant stride does not pay for a search that cannot hit.
-    // P0/gg-matchfind: work counter -- see `chain_find_best`.
-    const COUNT: bool = cfg!(feature = "profile");
-    let mut probes = 0u64;
-    let mut hits = 0u64;
-    let use_rep = rep_search_on(tables.rep_yield, params.strategy);
-    let mut rep1 = reps[0] as usize;
-    let mut rep_hits = 0u64;
-    let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
-    let mut ip = block_start;
-    while ip <= ilimit {
-        if use_rep {
-            if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
-                rep_hits += 1;
-                let mstart = ip + 1;
-                lits.extend_from_slice(&src[anchor..mstart]);
-                seqs.push(Seq {
-                    litlen: (mstart - anchor) as u32,
-                    matchlen: ml as u32,
-                    offset: rep1 as u32,
-                });
-                ip = mstart + ml;
-                anchor = ip;
-                continue;
-            }
-        }
-        let h4 = hash_mls(src, ip, 4, hash_log);
-        let h8 = hash8(src, ip, hash_log);
-        let m4 = tables.get_h(h4);
-        let m8 = tables.get_hl(h8);
-        tables.put_h(h4, ip);
-        tables.put_hl(h8, ip);
-
-        let mut best_m = 0usize;
-        let mut best_ml = 0usize;
-        if let Some(m8) = m8 {
-            if COUNT {
-                probes += 1;
-            }
-            if match_ok(
-                src,
-                m8,
-                ip,
-                window,
-                block_start,
-                8.min(mls).max(4),
-                tables.frame_start,
-            ) {
-                let ml = count_match(src, m8, ip, block_end);
-                if ml >= mls {
-                    best_m = m8;
-                    best_ml = ml;
-                }
-            }
-        }
-        if best_ml < 8 {
-            if let Some(m4) = m4 {
-                if COUNT {
-                    probes += 1;
-                }
-                if match_ok(src, m4, ip, window, block_start, mls, tables.frame_start) {
-                    let ml = count_match(src, m4, ip, block_end);
-                    if ml >= mls && ml > best_ml {
-                        best_m = m4;
-                        best_ml = ml;
-                    }
-                }
-            }
-        }
-        if best_ml >= mls {
-            lits.extend_from_slice(&src[anchor..ip]);
-            seqs.push(Seq {
-                litlen: (ip - anchor) as u32,
-                matchlen: best_ml as u32,
-                offset: (ip - best_m) as u32,
-            });
-            rep1 = ip - best_m;
-            if COUNT {
-                hits += 1;
-            }
-            let end = ip + best_ml;
-            // DFast never sets `packed` (it is gated on Strategy::Fast).
-            fill_hash_after_match::<false>(tables, src, ip, end, mls, ilimit);
-            fill_hash_long_after_match(tables, src, ip, end, hash_log, ilimit);
-            ip = end;
-            anchor = ip;
-        } else {
-            ip += 1 + ((ip - anchor) >> 8);
-        }
-    }
-    tables.rep_yield = if seqs.is_empty() {
-        1.0
-    } else {
-        (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
-    };
-    lits.extend_from_slice(&src[anchor..block_end]);
-    note_finder_work(COUNT, probes, hits, &seqs, &lits);
-    (seqs, lits)
-}
-
-/// P0/gg-matchfind: one reporting point for every finder, so `work` (candidate
-/// examinations) is defined the SAME way across arms. Finders whose probe loop
-/// lives in `chain_find_best` / `bt_find_best` pass `probes = 0` -- those
-/// helpers already reported their own via `note_probes`.
-#[inline]
 fn note_finder_work(count: bool, probes: u64, hits: u64, seqs: &[Seq], lits: &[u8]) {
     let match_bytes: u64 = if count {
         seqs.iter().map(|s| u64::from(s.matchlen)).sum()
