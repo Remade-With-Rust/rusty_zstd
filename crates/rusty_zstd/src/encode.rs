@@ -4215,7 +4215,14 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
     params: CompressionParameters,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
-    BT_SPEC_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Diagnostic ONLY -- gated. Unguarded this was one atomic read-modify-write
+    // per `bt_find_best` CALL, i.e. per POSITION across the whole L13-L22
+    // ladder (~15.7M per level per corpus set). Same defect class as the two
+    // per-probe atomics removed from `fast_probe`, which were worth +6.97%.
+    // `take_bt_calls` therefore needs `--features rusty_zstd/profile`.
+    if cfg!(feature = "profile") {
+        BT_SPEC_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     const fn btlog(c: u32) -> u32 { let c = if c > 24 { 24 } else { c }; let c = c.saturating_sub(1); if c < 1 { 1 } else { c } }
     let bt_log = btlog(CLOG);
     let bt_mask = (1usize << bt_log) - 1;
@@ -4328,7 +4335,14 @@ fn bt_find_best_runtime(
     params: CompressionParameters,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
-    BT_RUNTIME_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Diagnostic ONLY -- gated. Unguarded this was one atomic read-modify-write
+    // per `bt_find_best` CALL, i.e. per POSITION across the whole L13-L22
+    // ladder (~15.7M per level per corpus set). Same defect class as the two
+    // per-probe atomics removed from `fast_probe`, which were worth +6.97%.
+    // `take_bt_calls` therefore needs `--features rusty_zstd/profile`.
+    if cfg!(feature = "profile") {
+        BT_RUNTIME_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     let hash_log = tables.hash_log;
     let bt_log = params.chain_log.min(24).saturating_sub(1).max(1);
     let bt_mask = (1usize << bt_log) - 1;
