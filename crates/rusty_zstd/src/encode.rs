@@ -3565,6 +3565,16 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
             probes += 1;
         }
         let ml = count_match(src, m, ip, block_end);
+        #[cfg(feature = "profile")]
+        {
+            BT_PROBE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if ml < mls {
+                BT_SHORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            if ml <= best_ml {
+                BT_NOGAIN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
         if ml >= mls && ml > best_ml && offset_ok(ip - m, window) && m >= tables.frame_start {
             best_ml = ml;
             best_m = m;
@@ -3649,6 +3659,16 @@ fn bt_find_best_runtime(
             probes += 1;
         }
         let ml = count_match(src, m, ip, block_end);
+        #[cfg(feature = "profile")]
+        {
+            BT_PROBE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if ml < mls {
+                BT_SHORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            if ml <= best_ml {
+                BT_NOGAIN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
         if ml >= mls && ml > best_ml && offset_ok(ip - m, window) && m >= tables.frame_start {
             best_ml = ml;
             best_m = m;
@@ -5855,4 +5875,20 @@ fn take_tag_yield() -> f32 {
     } else {
         f as f32 / (f + t) as f32
     }
+}
+
+/// L19-native accounting: tree probes, those too SHORT to use, and those that
+/// could not IMPROVE on the best so far.
+pub static BT_PROBE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BT_SHORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BT_NOGAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `(probes, too_short, no_gain)`
+pub fn take_bt_probe_stats() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        BT_PROBE.swap(0, Ordering::Relaxed),
+        BT_SHORT.swap(0, Ordering::Relaxed),
+        BT_NOGAIN.swap(0, Ordering::Relaxed),
+    )
 }
