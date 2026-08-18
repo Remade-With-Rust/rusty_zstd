@@ -11,7 +11,7 @@ fn main(){
         rusty_zstd::set_dfast_step_arm(1);
         let _=rusty_zstd::take_dfast_match_stats();
         let s1=rusty_zstd::compress(src,3).unwrap().len() as f64;
-        let (mb,sq,bb)=rusty_zstd::take_dfast_match_stats();
+        let (mb,sq,bb,_,_)=rusty_zstd::take_dfast_match_stats();
         rusty_zstd::set_dfast_step_arm(2);
         let s2=rusty_zstd::compress(src,3).unwrap().len() as f64;
         let mean_ml = mb as f64/sq.max(1) as f64;

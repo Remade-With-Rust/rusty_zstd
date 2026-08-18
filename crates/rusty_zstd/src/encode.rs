@@ -1703,7 +1703,26 @@ fn rep_yield_min_for(strategy: Strategy) -> f32 {
         return v;
     }
     match strategy {
-        Strategy::DFast => 0.0,
+        // GATE 2 @ L3 -- was a flat 0.0, i.e. the repcode search CONSTANT ON and
+        // never dispatched. It loses that way: forcing it off is smaller on 7 of
+        // 18 (reymont +0.167%, dickens +0.099%, mr +0.083%).
+        //
+        // The size opportunity alone is negligible (-0.0106% at best, and every
+        // threshold >= 0.01 loses because per-block yields straddle it -- xml
+        // +3.089% at 0.03). The WORK is the point: `try_rep1` runs at EVERY
+        // position, and x-ray yields 0.000, smallmsg 0.001, dickens 0.002 -- a
+        // probe per position that essentially never hits.
+        //
+        // At 0.005, deterministically: 27.3% of all repcode probe positions
+        // removed (134,428,522 -> 97,728,362) AND total size -0.0106%. Five
+        // corpora shed 87.5% of their rep probes, which is exactly the decay
+        // schedule: `rep_yield` falls as max(new, prev/2) from 1.0, so it takes
+        // 8 blocks to drop below 0.005 -- 8 of 64 blocks left on.
+        //
+        // The speed of this is NOT claimed from the clock: the L3 null arm on
+        // this box reaches -8.74%, far larger than the effect. The work count is
+        // exact and needs no quiet machine.
+        Strategy::DFast => 0.005,
         // GATE 2 RE-VALIDATION (all 18 @ L1, deterministic sizes): the shipped
         // 0.125 is not the optimum for the Fast ladder. Sweeping the threshold
         // against 0.125 as baseline:
@@ -3268,6 +3287,9 @@ fn find_dfast_impl<const HLOG: u32>(
     let nl_on = next_long_enabled() && tables.next_long_yield >= next_long_min();
     let mut nl_probes = 0u64;
     let mut nl_hits = 0u64;
+    // GATE 2 @ L3: repcode match bytes, for the same length-ratio signal that
+    // dispatches Gate 2 at L1.
+    let mut d_rep_bytes = 0u64;
     let mut ip = block_start;
     // Speculated (short hash, long hash, short slot, long slot) for the NEXT
     // position, produced by the previous iteration -- see GATE 8 below.
@@ -3322,6 +3344,7 @@ fn find_dfast_impl<const HLOG: u32>(
         if use_rep {
             if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
                 rep_hits += 1;
+                d_rep_bytes += ml as u64;
                 let mstart = ip + 1;
                 lits.extend_from_slice(&src[anchor..mstart]);
                 seqs.push(Seq {
@@ -3526,6 +3549,13 @@ fn find_dfast_impl<const HLOG: u32>(
         DFAST_MATCH_BYTES.fetch_add(mb, Relaxed);
         DFAST_SEQS.fetch_add(seqs.len() as u64, Relaxed);
         DFAST_BLOCK_BYTES.fetch_add((block_end - block_start) as u64, Relaxed);
+        DFAST_REP_BYTES.fetch_add(d_rep_bytes, Relaxed);
+        DFAST_REP_HITS.fetch_add(rep_hits, Relaxed);
+        DFAST_BLOCKS.fetch_add(1, Relaxed);
+        if use_rep {
+            DFAST_REP_BLOCKS.fetch_add(1, Relaxed);
+            DFAST_REP_POS.fetch_add((block_end - block_start) as u64, Relaxed);
+        }
     }
     // EWMA so one atypical block cannot flip the route -- the Gate 6 lesson.
     {
@@ -3593,13 +3623,37 @@ pub static DFAST_SEQS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 pub static DFAST_BLOCK_BYTES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-/// `(match_bytes, seqs, block_bytes)` for the DFast strategy.
-pub fn take_dfast_match_stats() -> (u64, u64, u64) {
+pub static DFAST_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_REP_BLOCKS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Positions over which `try_rep1` is live -- the work a rep dispatch removes.
+pub static DFAST_REP_POS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// `(blocks, rep_blocks, rep_positions)`
+pub fn take_dfast_rep_blocks() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        DFAST_BLOCKS.swap(0, Relaxed),
+        DFAST_REP_BLOCKS.swap(0, Relaxed),
+        DFAST_REP_POS.swap(0, Relaxed),
+    )
+}
+
+pub static DFAST_REP_BYTES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_REP_HITS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// `(match_bytes, seqs, block_bytes, rep_bytes, rep_hits)` for DFast.
+pub fn take_dfast_match_stats() -> (u64, u64, u64, u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
     (
         DFAST_MATCH_BYTES.swap(0, Relaxed),
         DFAST_SEQS.swap(0, Relaxed),
         DFAST_BLOCK_BYTES.swap(0, Relaxed),
+        DFAST_REP_BYTES.swap(0, Relaxed),
+        DFAST_REP_HITS.swap(0, Relaxed),
     )
 }
 
