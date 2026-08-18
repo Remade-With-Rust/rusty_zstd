@@ -16,7 +16,7 @@ fn main() {
     print!("{:<8}{:>12}", "REPMIN", "total %");
     for w in watch { print!("{w:>10}"); }
     println!("\n{}", "-".repeat(12+12+10*watch.len()));
-    for t in ["0.15","0.20","0.25"] {
+    for t in ["0.0","0.05","0.10","0.15","0.20","0.30","0.45","0.60"] {
         std::env::set_var("RZSTD_REPMIN", t);
         let mut tot=0usize; let mut per=std::collections::HashMap::new();
         for (i,(id,s)) in srcs.iter().enumerate() {

@@ -262,6 +262,14 @@ pub(crate) struct MatchTables {
     /// losses are downstream parse-cascade effects, and the corpora it hurts are
     /// the ones where it fires often and buys little.
     next_long_yield: f32,
+    /// GATE 2 second variable: mean rep match length divided by mean match
+    /// length on the previous block. Below 1 the repcode search is trading a
+    /// LONGER hash match for a shorter rep match; above 1 its matches are the
+    /// long ones and taking them is free.
+    rep_len_ratio: f32,
+    /// Countdown to the next forced rep re-probe (the ratio can only be measured
+    /// on a block where the search actually ran).
+    rep_probe: u32,
     /// GATE 8 @ L3: share of DFast's speculated loads that the next iteration
     /// actually consumed. Low = the pipeline is prefetching for positions the
     /// match logic then jumps past.
@@ -378,6 +386,8 @@ impl MatchTables {
             blocks_done: 0,
             rep_run: 0,
             next_long_yield: 1.0,
+            rep_len_ratio: 1.0,
+            rep_probe: 0,
             dfast_spec_yield: 1.0,
             dfast_probe: 0,
             pair_gain: 1.0,
@@ -1621,6 +1631,22 @@ const REP_YIELD_MIN_DEFAULT: f32 = 0.125;
 ///
 /// Always-on is also 0.6% FASTER on Silesia at L3, so the dispatch it replaces
 /// was costing ratio and buying no speed.
+/// Blocks between forced rep re-probes, so the ratio can be re-measured.
+const REP_PROBE_PERIOD: u32 = 16;
+
+/// GATE 2 second threshold: minimum rep-to-mean match length ratio.
+fn rep_len_min() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_REPLEN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1.0)
+    }
+    #[cfg(not(feature = "std"))]
+    1.0
+}
+
 fn rep_yield_min_for(strategy: Strategy) -> f32 {
     #[cfg(feature = "std")]
     if let Some(v) = std::env::var("RZSTD_REPMIN")
@@ -1708,6 +1734,19 @@ fn find_fast(
         0
     } else if tables.pair_gain >= pair_rate_hi() {
         2
+    } else if tables.rep_yield > pair_rep_max() {
+        // The STEP-1 route needs the SAME `rep_yield` veto the pair route has,
+        // and for the same reason: on rep-dominated content the extra positions
+        // find matches the repcode path already covers, and committing to them
+        // breaks the chain. Gate 6 documented this for the pair search
+        // (versions-16m +10.55%) but the veto was never applied to step-1.
+        //
+        // It only became visible once `step_rt` was honoured: while the tag and
+        // rep arms were silently downgrading step-1 blocks to step 2, the route
+        // was being ignored on exactly this content, which accidentally shielded
+        // it. Fixing the plumbing exposed the missing veto as versions-16m
+        // +12.75%.
+        0
     } else {
         1
     };
@@ -1742,7 +1781,24 @@ fn find_fast(
     // both, so each block inherits the previous block's measured repcode yield.
     // `rep_yield` starts at 1.0, so the first block of every frame always probes.
     FAST_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let rep_on = rep_search_on(tables.rep_yield, params.strategy);
+    // GATE 2, SECOND VARIABLE. `rep_yield` alone leaves real wins on the table:
+    // always-on is -0.171% overall, with xml -3.708% and mozilla -1.107%, but it
+    // costs jsonlog +0.837%. Bytes-per-probe does NOT separate them (jsonlog
+    // 0.4610 sits between samba 0.4241 and mozilla 0.6540, both winners).
+    //
+    // What does separate them is the rep match LENGTH relative to the block's
+    // mean match length. Below 1 the search is swapping a longer hash match for
+    // a shorter rep match; above 1 its matches ARE the long ones. Every material
+    // loser sits at 0.83-0.87 (jsonlog 0.87, smallmsg 0.83) and every material
+    // winner at >= 1.14 (mozilla 1.14, xml 1.52, samba 1.87).
+    let rep_on = rep_search_on(tables.rep_yield, params.strategy)
+        || tables.rep_probe == 0
+        || tables.rep_len_ratio >= rep_len_min();
+    tables.rep_probe = if tables.rep_probe == 0 {
+        REP_PROBE_PERIOD
+    } else {
+        tables.rep_probe - 1
+    };
     let ut = !tables.tags.is_empty() && tag_enabled() && tables.tag_yield >= tag_min();
     // The GATE 6 re-probe countdown ticks HERE, not in `find_fast_impl`'s tail:
     // the pipelined loop returns early, so a countdown in the tail stops
@@ -1864,6 +1920,12 @@ fn find_fast_impl<
     let mut probes = 0u64;
     let mut hits = 0u64;
     let mut rep_hits = 0u64;
+    // GATE 2 re-denomination: the benefit is rep MATCH BYTES, the cost is one
+    // `try_rep1` per POSITION. `rep_yield` prices hits per SEQUENCE, which has
+    // nothing to do with the cost -- the same error `pair_gain` had before Gate
+    // 6 was re-denominated into bytes-per-probe.
+    let mut rep_probes = 0u64;
+    let mut rep_bytes = 0u64;
     // Probe density. The bit accountant showed our size gap vs C is entirely
     // LITERALS, because C finds more matches -- and we probe only ~0.259
     // positions/byte against C's ~1.0. `step0 = 1` matches C's density.
@@ -1873,13 +1935,20 @@ fn find_fast_impl<
     // pipelined loop only runs when `!pair`, i.e. `step0 <= 2`, so the default
     // (2) is worth specializing -- it folds into the address arithmetic and
     // frees the register it was holding. `STEP == 0` keeps the runtime path.
-    let step0 = if STEP != 0 {
-        STEP
-    } else if params.target_length == 0 {
-        step0_default()
-    } else {
-        params.target_length as usize + 1
-    };
+    // STEP == 0 is the runtime arm, and its value MUST come from the caller.
+    // `find_fast` already derives the step from Gate 6's route (route 1 asks for
+    // step 1) and from `target_length`; recomputing it here from
+    // `step0_default()` threw the route away on every arm that passes STEP = 0
+    // -- which is ALL of Gate 7's tag arms.
+    //
+    // That is the whole of Gate 7's non-byte-identity. The tag COMPARE is exact
+    // (a tag is a function of the same 4 bytes `fast_probe` compares, so a
+    // mismatch implies no 4-byte match -- measured 0 false rejections in
+    // 2,111,991 on sao, 1,428,044 on mozilla). What differed was that switching
+    // the filter on switched the ARM, and the arm silently downgraded a
+    // step-1-routed block to step 2. Pinning the filter on cost dickens +7.3%,
+    // samba +5.7%, mr +2.4% -- exactly the corpora Gate 6 routes to step 1.
+    let step0 = if STEP != 0 { STEP } else { step_rt };
     // Pair-search ip+1 only when step skips it (`--fast=4`, step 5). At step 2
     // that doubles incomp probes for no ratio. Do not grow step without the pair
     // (that blew --fast=4 ratio 0.845 -> 1.272).
@@ -1997,8 +2066,10 @@ fn find_fast_impl<
             }
             tables.store_fast::<PACKED>(h0, ip, g0);
             if REP {
+                rep_probes += 1;
                 if let Some(ml) = try_rep1(src, ip, rep1, lowest, block_end) {
                     rep_hits += 1;
+                    rep_bytes += ml as u64;
                     if COUNT {
                         if COUNT {
                             hits += 1;
@@ -2222,8 +2293,10 @@ fn find_fast_impl<
             None
         };
         if REP {
+            rep_probes += 1;
             if let Some(ml) = try_rep1(src, ip, rep1, lowest, block_end) {
                 rep_hits += 1;
+                rep_bytes += ml as u64;
                 if COUNT {
                     if COUNT {
                         hits += 1;
@@ -2361,6 +2434,24 @@ fn find_fast_impl<
         use core::sync::atomic::Ordering::Relaxed;
         MM_TOTAL.fetch_add(mm_total, Relaxed);
         MM_MISS.fetch_add(mm_miss, Relaxed);
+    }
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        REP_PROBES.fetch_add(rep_probes, Relaxed);
+        REP_BYTES.fetch_add(rep_bytes, Relaxed);
+        REP_HITS_G.fetch_add(rep_hits, Relaxed);
+        // all match bytes emitted this block, for the rep-vs-hash length compare
+        let mb: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
+        ALL_MATCH_BYTES.fetch_add(mb, Relaxed);
+        ALL_SEQS.fetch_add(seqs.len() as u64, Relaxed);
+    }
+    if REP && rep_hits > 0 && !seqs.is_empty() {
+        let all_bytes: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
+        let rl = rep_bytes as f32 / rep_hits as f32;
+        let al = all_bytes as f32 / seqs.len() as f32;
+        if al > 0.0 {
+            tables.rep_len_ratio = 0.75 * tables.rep_len_ratio + 0.25 * (rl / al);
+        }
     }
     // GATE 7: feed this block's measured reject share to the next block's gate.
     tables.tag_yield = take_tag_yield();
@@ -2676,6 +2767,26 @@ pub static TAG_REJECT_TOTAL: core::sync::atomic::AtomicU64 =
 pub fn take_tag_rejects() -> (u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
     (TAG_FALSE_REJECT.swap(0, Relaxed), TAG_REJECT_TOTAL.swap(0, Relaxed))
+}
+
+/// GATE 2 candidate signal: rep match BYTES per rep PROBE.
+pub static REP_PROBES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static REP_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub static REP_HITS_G: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static ALL_MATCH_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static ALL_SEQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `(rep_probes, rep_bytes, rep_hits, all_match_bytes, all_seqs)`
+pub fn take_rep_rate() -> (u64, u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        REP_PROBES.swap(0, Relaxed),
+        REP_BYTES.swap(0, Relaxed),
+        REP_HITS_G.swap(0, Relaxed),
+        ALL_MATCH_BYTES.swap(0, Relaxed),
+        ALL_SEQS.swap(0, Relaxed),
+    )
 }
 
 pub static MM_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
