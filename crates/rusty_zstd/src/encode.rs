@@ -1791,6 +1791,17 @@ fn find_fast_impl<
     // `rep_yield` separates it: the pair search re-finds matches the repcode
     // path already has, so on rep-dominated content it spends probes to emit a
     // worse parse.
+    // A STACKED SECOND VARIABLE WAS TESTED AND REFUTED: `pair_gain`, the share
+    // of the previous block covered by pair matches. On corpus MEANS it looked
+    // separable -- jsonlog 0.3203 above every winner, mozilla highest at 0.3105
+    // -- so a threshold at 0.315 should have excluded only the loser. Per BLOCK
+    // the distributions overlap, and it gated mozilla off across much of its
+    // input: -9.648% collapsed to -0.133% and the total halved from -4.778% to
+    // -2.456% while recovering jsonlog's 0.177%.
+    //
+    // Third occurrence of this error in the campaign (Gate 1's rep_yield
+    // threshold, offset_concentration, and this): A MEAN-LEVEL GAP BETWEEN TWO
+    // CORPORA IS NOT EVIDENCE THAT A PER-BLOCK THRESHOLD SEPARATES THEM.
     let pair = step0 > 2 || (pair_enabled() && tables.rep_yield <= pair_rep_max());
     let lowest = block_start.saturating_sub(window).max(tables.frame_start);
     let frame_start = tables.frame_start;
@@ -5802,3 +5813,4 @@ pub fn take_pair_stats() -> (u64, u64, u64, u64) {
         MAIN_BYTES.swap(0, Ordering::Relaxed),
     )
 }
+
