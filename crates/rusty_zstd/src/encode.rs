@@ -2765,6 +2765,20 @@ fn lazy_fill_threshold() -> f32 {
 }
 
 /// Back-fill stride (1 = every covered position). `RZSTD_LAZY_FILL_S` sweeps.
+/// Stride for the BtLazy2 back-fill. 1 = insert every position a match covers.
+fn bt_fill_stride() -> usize {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_BT_FILL_S")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or(1)
+    }
+    #[cfg(not(feature = "std"))]
+    1
+}
+
 fn lazy_fill_stride() -> usize {
     use std::sync::OnceLock;
     static T: OnceLock<usize> = OnceLock::new();
@@ -4698,12 +4712,21 @@ fn find_bt_lazy(
             // insertion logic.
             let end = best_ip + best_ml;
             if lazy_fill_enabled() {
+                // GATE 11/12 @ L13-L15: this loop inserts EVERY position a match
+                // covers, and it is 61.9% of all binary-tree work at these levels
+                // (28,776,361 calls with it, 10,977,025 without). `find_lazy`'s
+                // equivalent has had a stride knob all along; this one never did.
+                //
+                // It EARNS its place -- removing it entirely costs +2.41% size
+                // (reymont +8.48%, webster +7.83%, nci +7.15%) -- so the question
+                // is not whether to fill but how densely.
+                let stride = bt_fill_stride();
                 // B2: the look-ahead already inserted up to `look_hi`.
                 let mut p = (best_ip + 1).max(look_hi + 1);
                 while p < end && p <= ilimit {
                     let _ =
                         bt_find_best(src, p, block_start, block_end, window, mls, params, tables);
-                    p += 1;
+                    p += stride;
                 }
             }
             ip = end;

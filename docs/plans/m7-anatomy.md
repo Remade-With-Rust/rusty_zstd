@@ -401,7 +401,7 @@ to every profiler:
 
 ---
 
-### Addendum -- gates OUTSIDE the seven stages, and the full knob list
+### Addendum
 
 The seven inventories above cover only the stages in the section 3 table. These gates
 are real, live, and belong to no stage in it.
