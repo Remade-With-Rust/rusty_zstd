@@ -1867,6 +1867,28 @@ fn find_fast(
             16 => go!(false, false, 16, 1, true),
             _ => go!(false, false, 0, 1, true),
         },
+        // Step 3 and 4 get the SAME specialisation as 1 and 2. Without these
+        // arms a step-3 measurement compares a fully generic body (runtime
+        // shift AND runtime step) against a fully specialised step-2 one -- the
+        // work-parity break this file already documents for step-1, and one I
+        // reproduced: it made step 3 read -2.31% when the density's real effect
+        // was masked by the generic arm's own cost.
+        (false, false, true, 3) if fast_spec_enabled() => match tables.hash_log {
+            12 => go!(false, false, 12, 3, true),
+            13 => go!(false, false, 13, 3, true),
+            14 => go!(false, false, 14, 3, true),
+            15 => go!(false, false, 15, 3, true),
+            16 => go!(false, false, 16, 3, true),
+            _ => go!(false, false, 0, 3, true),
+        },
+        (false, false, true, 4) if fast_spec_enabled() => match tables.hash_log {
+            12 => go!(false, false, 12, 4, true),
+            13 => go!(false, false, 13, 4, true),
+            14 => go!(false, false, 14, 4, true),
+            15 => go!(false, false, 15, 4, true),
+            16 => go!(false, false, 16, 4, true),
+            _ => go!(false, false, 0, 4, true),
+        },
         (false, false, true, _) => go!(false, false, 0, 0, true),
         (false, false, false, 2) => go!(false, false, 0, 2, false),
         (false, false, false, 1) => go!(false, false, 0, 1, false),
