@@ -45,7 +45,9 @@
       "Bash(sed -i 's/rusty_zstd::set_pair_hi_arm\\(6.0\\); }/rusty_zstd::set_pair_hi_arm\\(std::env::args\\(\\).nth\\(1\\).and_then\\(|s| s.parse\\(\\).ok\\(\\)\\).unwrap_or\\(3.0\\)\\); }/' crates/rusty_zstd-bench/examples/g6route.rs)",
       "Bash(sed -i 's/            .unwrap_or\\(6.0\\)/            .unwrap_or\\(1.0\\)/; s/^    6.0$/    1.0/' crates/rusty_zstd/src/encode.rs)",
       "Bash(grep -n \"unwrap_or\\(1.0\\)\\\\|unwrap_or\\(0.20\\)\\\\|^    1.0$\\\\|^    0.20$\" crates/rusty_zstd/src/encode.rs)",
-      "Bash(git stash *)"
+      "Bash(git stash *)",
+      "Bash(sed -i 's/set_dfast_spec_arm,/set_dfast_spec_arm, set_dfast_pipe_arm,/' crates/rusty_zstd/src/lib.rs)",
+      "Bash(cd \"c:/Users/talmo/coding/rusty_zstd\" && sed -i 's/set_dfast_spec_arm, set_dfast_pipe_arm,/set_dfast_spec_arm,/' crates/rusty_zstd/src/lib.rs && grep -n \"while ip <= ilimit {\" crates/rusty_zstd/src/encode.rs && sed -n '2974,2980p' crates/rusty_zstd/src/encode.rs | cat -A | head -8)"
     ],
     "additionalDirectories": [
       "c:\\Users\\talmo\\coding\\rusty_zstd\\crates\\rusty_zstd\\src"

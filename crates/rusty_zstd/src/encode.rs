@@ -262,6 +262,12 @@ pub(crate) struct MatchTables {
     /// losses are downstream parse-cascade effects, and the corpora it hurts are
     /// the ones where it fires often and buys little.
     next_long_yield: f32,
+    /// GATE 8 @ L3: share of DFast's speculated loads that the next iteration
+    /// actually consumed. Low = the pipeline is prefetching for positions the
+    /// match logic then jumps past.
+    dfast_spec_yield: f32,
+    /// Countdown to the next forced DFast-pipeline re-probe.
+    dfast_probe: u32,
     /// GATE 6 second variable: MATCH BYTES PER PROBE on the previous block --
     /// the pair search's exchange rate, benefit over cost in the units the cost
     /// is actually paid in. The pair search costs real probe time (+28.9% mean at L1), so it
@@ -367,6 +373,8 @@ impl MatchTables {
             blocks_done: 0,
             rep_run: 0,
             next_long_yield: 1.0,
+            dfast_spec_yield: 1.0,
+            dfast_probe: 0,
             pair_gain: 1.0,
             pair_probe: 0,
             pair_route: 2,
@@ -2971,6 +2979,31 @@ fn find_dfast_impl<const HLOG: u32>(
     let mut nl_probes = 0u64;
     let mut nl_hits = 0u64;
     let mut ip = block_start;
+    // Speculated (short hash, long hash, short slot, long slot) for the NEXT
+    // position, produced by the previous iteration -- see GATE 8 below.
+    // GATE 8 @ L3 DISPATCH -- decided DETERMINISTICALLY, on a work count.
+    //
+    // The pipeline changes issue ORDER, not work, so it is byte-identical and
+    // cannot be priced by probe counts -- and at L3 the timing instrument's own
+    // NULL ARM reads +-3.71% worst / +0.49% mean, which is larger than the whole
+    // effect. Every per-corpus stopwatch verdict here was noise, and two runs
+    // disagreed on the SIGN for versions (+6.89% then -8.48%) and ooffice
+    // (-2.42% then +3.75%).
+    //
+    // The speculation ledger prices it exactly instead. A speculated load that
+    // is CONSUMED replaces one the next iteration would have issued anyway --
+    // pure latency overlap at zero added work. A speculated load that is
+    // DISCARDED (the position ended in a match or a rep hit, so `ip` jumped past
+    // it) is added work, full stop. So `spec_made - spec_used` is an exact count
+    // of wasted loads, and the yield is the deterministic dispatch variable.
+    //
+    // Measured yields split the corpora nearly two to one:
+    //   incomp 100.0%  text 98.2%  sao 91.9%  mozilla 87.7%  ooffice 83.7%
+    //   ... against nci 32.3%  reymont 23.6%  dickens 38.6%  webster 41.4%
+    let dpipe = dfast_pipe_enabled()
+        && (tables.dfast_probe == 0 || tables.dfast_spec_yield >= dfast_spec_min());
+    let (mut spec_made, mut spec_used) = (0u64, 0u64);
+    let mut carried: Option<(usize, usize, Option<usize>, Option<usize>)> = None;
     while ip <= ilimit {
         if use_rep {
             if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
@@ -2984,15 +3017,61 @@ fn find_dfast_impl<const HLOG: u32>(
                 });
                 ip = mstart + ml;
                 anchor = ip;
+                carried = None;
                 continue;
             }
         }
-        let h4 = hash_mls(src, ip, 4, hlog);
-        let h8 = hash8(src, ip, hlog);
-        let m4 = tables.get_h(h4);
-        let m8 = tables.get_hl(h8);
+        // GATE 8 @ L3 -- 2-WAY SOFTWARE PIPELINE FOR DFast.
+        //
+        // Gate 8 was DEAD at L3: `pipe_enabled()` is consumed only by
+        // `find_fast`, and L3 runs `find_dfast` (measured: 0 find_fast calls,
+        // 1027 find_dfast calls). The gate had no caller because the capability
+        // did not exist here. This builds it.
+        //
+        // DFast is a BETTER pipelining candidate than `find_fast`: it issues TWO
+        // independent table loads per position (short `hash` + long `hash_long`)
+        // and consumes neither until after the match logic, so both miss
+        // latencies serialise behind that logic instead of overlapping with it.
+        //
+        // The speculation is carried inside ONE loop body rather than duplicated
+        // into a second pipelined loop. A second body is exactly how
+        // `find_dfast_runtime` drifted until Gate 6 silently broke Gate 4's
+        // byte-identity: an issue-order change must not be able to become an
+        // algorithm change.
+        let (h4, h8, m4, m8) = match carried.take() {
+            Some(v) => {
+                spec_used += 1;
+                v
+            }
+            None => {
+                let a = hash_mls(src, ip, 4, hlog);
+                let b = hash8(src, ip, hlog);
+                (a, b, tables.get_h(a), tables.get_hl(b))
+            }
+        };
         tables.put_h(h4, ip);
         tables.put_hl(h8, ip);
+        // Issue the NEXT position's two loads NOW, so they are in flight while
+        // this position's match logic runs. The miss-advance does not depend on
+        // the match result, so `nip` is knowable here; a match or a rep hit
+        // simply discards the speculation.
+        //
+        // BYTE-IDENTICAL: both stores above have already happened, exactly as
+        // they had before the next iteration's loads in the original order, and
+        // an aliasing slot is forwarded by hand -- `put_h` writes `ip+1`, so
+        // `get_h` on that slot would return `Some(ip)`. The two tables are
+        // distinct, so `h4` can only alias `h4` and `h8` only `h8`.
+        if dpipe {
+            let nip = ip + 1 + ((ip - anchor) >> 8);
+            if nip <= ilimit {
+                let a = hash_mls(src, nip, 4, hlog);
+                let b = hash8(src, nip, hlog);
+                let va = if a == h4 { Some(ip) } else { tables.get_h(a) };
+                let vb = if b == h8 { Some(ip) } else { tables.get_hl(b) };
+                spec_made += 1;
+                carried = Some((a, b, va, vb));
+            }
+        }
 
         let mut best_m = 0usize;
         let mut best_ml = 0usize;
@@ -3087,6 +3166,9 @@ fn find_dfast_impl<const HLOG: u32>(
             fill_hash_long_after_match(tables, src, ip, end, hlog, ilimit);
             ip = end;
             anchor = ip;
+            // The two fills rewrite many entries, so anything speculated before
+            // them is stale.
+            carried = None;
         } else {
             ip += 1 + ((ip - anchor) >> 8);
         }
@@ -3099,6 +3181,31 @@ fn find_dfast_impl<const HLOG: u32>(
     // Optimistic when the probe never fired, so a quiet block cannot latch it
     // off permanently; otherwise the measured hit share, floored at half the
     // previous value so one bad block does not kill it outright.
+    // GATE 8 signal: share of speculated loads that were actually CONSUMED. A
+    // speculation is discarded whenever the position ends in a match or a rep
+    // hit, so match-dense content pays for loads it never uses.
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        DFAST_SPEC_MADE.fetch_add(spec_made, Relaxed);
+        DFAST_SPEC_USED.fetch_add(spec_used, Relaxed);
+    }
+    // Attribute only when the pipeline actually RAN: a block that speculated
+    // nothing measures nothing, and scoring it 1.0 would make the gate
+    // oscillate on/off every block. EWMA for the same reason Gate 6 needs one --
+    // one cold or atypical block must not decide the whole frame.
+    if dpipe && spec_made > 0 {
+        let now = spec_used as f32 / spec_made as f32;
+        tables.dfast_spec_yield = 0.75 * tables.dfast_spec_yield + 0.25 * now;
+    }
+    // Periodic re-probe, so a block that scores low cannot latch the gate shut
+    // for the rest of the frame. This epilogue always runs (the only early
+    // return is the empty-block case), unlike `find_fast`'s, where putting the
+    // tick in the tail is exactly what latched Gate 6.
+    tables.dfast_probe = if tables.dfast_probe == 0 {
+        DFAST_PROBE_PERIOD
+    } else {
+        tables.dfast_probe - 1
+    };
     tables.next_long_yield = if nl_probes == 0 {
         1.0
     } else {
@@ -3107,6 +3214,65 @@ fn find_dfast_impl<const HLOG: u32>(
     lits.extend_from_slice(&src[anchor..block_end]);
     note_finder_work(COUNT, probes, hits, &seqs, &lits);
     (seqs, lits)
+}
+
+/// Blocks between forced DFast-pipeline re-probes.
+const DFAST_PROBE_PERIOD: u32 = 16;
+
+/// Minimum share of speculated loads that must be CONSUMED for the DFast
+/// pipeline to run. Below it the speculation is net added work.
+fn dfast_spec_min() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        use core::sync::atomic::Ordering;
+        let c = DFAST_SPEC_MIN_ARM.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_DFAST_SPECMIN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.70);
+        DFAST_SPEC_MIN_ARM.store(v.to_bits(), Ordering::Relaxed);
+        v
+    }
+    #[cfg(not(feature = "std"))]
+    0.70
+}
+
+static DFAST_SPEC_MIN_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Set the Gate 8 speculation-yield threshold in-process.
+pub fn set_dfast_spec_min_arm(v: f32) {
+    DFAST_SPEC_MIN_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
+}
+
+static DFAST_PIPE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// A/B the DFast 2-way software pipeline in-process -- both shapes, one binary,
+/// so the comparison is immune to cross-binary drift.
+pub static DFAST_SPEC_MADE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_SPEC_USED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear `(speculations_made, speculations_consumed)`.
+pub fn take_dfast_spec() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (DFAST_SPEC_MADE.swap(0, Relaxed), DFAST_SPEC_USED.swap(0, Relaxed))
+}
+
+pub fn set_dfast_pipe_arm(on: bool) {
+    DFAST_PIPE_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn dfast_pipe_enabled() -> bool {
+    match DFAST_PIPE_ARM.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        _ => true,
+    }
 }
 
 fn note_finder_work(count: bool, probes: u64, hits: u64, seqs: &[Seq], lits: &[u8]) {
