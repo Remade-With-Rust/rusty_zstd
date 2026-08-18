@@ -1694,6 +1694,28 @@ fn rep_len_min() -> f32 {
     1.0
 }
 
+/// Decay floor on `rep_yield` for DFast. 0.0 = shut on the first dry block.
+///
+/// It was 0.5, written when the DFast threshold was 0.0 and the gate could never
+/// fire. Once the gate fires at 0.005 that schedule IS a warm-up cost: eight
+/// blocks probing every position for nothing before it shuts.
+///
+/// And 0.5 was not actually protecting anything. With the search off `rep_hits`
+/// is 0, so `rep_yield` keeps halving and never recovers -- it is the SAME
+/// one-way latch as Gate 6's, merely eight blocks slower to engage. What makes
+/// an immediate shut safe is the RE-PROBE (`rep_probe`), not the decay.
+fn rep_decay() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_REP_DECAY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.0)
+    }
+    #[cfg(not(feature = "std"))]
+    0.0
+}
+
 fn rep_yield_min_for(strategy: Strategy) -> f32 {
     #[cfg(feature = "std")]
     if let Some(v) = std::env::var("RZSTD_REPMIN")
@@ -3279,7 +3301,16 @@ fn find_dfast_impl<const HLOG: u32>(
     const COUNT: bool = cfg!(feature = "profile");
     let mut probes = 0u64;
     let mut hits = 0u64;
-    let use_rep = rep_search_on(tables.rep_yield, params.strategy);
+    // GATE 2 @ L3 -- shut IMMEDIATELY on a dry block and re-probe on a schedule,
+    // instead of decaying 0.5 per block. The decay was written when the DFast
+    // threshold was 0.0 and could never fire; with the gate live at 0.005 it
+    // costs an 8-block warm-up in which every position is probed for nothing.
+    //
+    // Decay 0.0 alone would save that (12.5% of the remaining probe work) but is
+    // the one-way LATCH from Gate 6: with the search off, `rep_hits` stays 0, so
+    // `rep_yield` stays 0 and the gate can never reopen. The re-probe is what
+    // makes an immediate shut safe.
+    let use_rep = rep_search_on(tables.rep_yield, params.strategy) || tables.rep_probe == 0;
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
     let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
@@ -3513,7 +3544,12 @@ fn find_dfast_impl<const HLOG: u32>(
     tables.rep_yield = if seqs.is_empty() {
         1.0
     } else {
-        (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
+        (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * rep_decay())
+    };
+    tables.rep_probe = if tables.rep_probe == 0 {
+        REP_PROBE_PERIOD
+    } else {
+        tables.rep_probe - 1
     };
     // Optimistic when the probe never fired, so a quiet block cannot latch it
     // off permanently; otherwise the measured hit share, floored at half the
