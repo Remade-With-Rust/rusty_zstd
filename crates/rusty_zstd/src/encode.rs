@@ -3343,25 +3343,40 @@ fn bt_find_best(
     // through to the runtime arm and got no fold at all -- and the coverage
     // check that "proved" 0 fallbacks used a 2 MiB file, which can only ever hit
     // (22,24) and (24,24). A coverage proof is only as wide as its inputs.
-    // GATE 5 DISPATCH -- the fold pays on the SHALLOW bt ladder only.
+    // GATE 5 DISPATCH -- specialise the SHALLOW bt ladder; generic above it.
     //
-    // Measured, three independent ABBA runs per corpus, a stable sign in all
-    // three required to count:
+    // THE FIRST JUSTIFICATION FOR THIS WAS INSTRUMENT ERROR. It claimed L19 lost
+    // stably on five corpora (nci +3.9..+5.6%, x-ray +5.1..+10.8%). Those
+    // numbers came from an estimator that pooled `min` across both phases of an
+    // A B B A sequence, which lets a monotonically warming box hand the win to
+    // whichever arm ran last. Measured against a TRUE NULL ARM -- the depth gate
+    // forcing identical code on both sides -- that estimator read up to +2.87%
+    // where the answer must be 0.
     //
-    //   L13 BtLazy2   stable-spec 3   stable-generic 2   -> specialise
-    //   L19 BtUltra2  stable-spec 0   stable-generic 5   -> generic
-    //                 (nci +3.9..+5.6%, x-ray +5.1..+10.8% when specialised)
+    // Re-measured with a PAIRED estimator, mean of (B1-A1)/A1 and (B2-A2)/A2,
+    // which cancels monotone drift and reads ~0.1% on the same null arm:
     //
-    // Mechanism, and it is the search depth rather than the content: at L13
-    // `search_log` is 4-6, so a call drives ~16-64 tree probes and the 23
-    // instructions saved per call are a real share of it. At L16+ `search_log`
-    // is 7-9, so a call drives 128-512 probes -- the walk dominates, the fold is
-    // noise against it, and the 12 monomorphizations (2,580 instructions where
-    // the runtime arm is 238) cost I-cache in the loop that matters.
+    //   L13 BtLazy2    spec 3, generic 0   nci -3.66%, xml -3.94%, webster -5.54%
+    //   L19 BtUltra2   spec 0, generic 0   NO SIGNAL, scatter -4.5..+0.6%
+    //
+    // So the dispatch is kept, on evidence rather than the original story: it
+    // specialises where a win is validated and takes the generic arm where
+    // nothing is measurable.
+    //
+    // Deterministically the specialisation is strictly cheaper per call (215
+    // instructions against 238, 1 variable shift against 4) and its extra code
+    // is COLD -- `hash_log` is fixed for a given input, so exactly one
+    // monomorphization ever executes and the other eleven are never entered.
+    // That is why the original I-cache argument for gating L16+ does not hold;
+    // the gate stays because no measurement supports removing it, not because
+    // the specialisation is harmful there.
     //
     // This is why instruction-count-per-call was the wrong measure on its own:
     // it is correct about the call and silent about the code it adds.
-    let shallow = matches!(params.strategy, Strategy::BtLazy2);
+    // `RZSTD_BT_DEEP=1` lifts the depth gate so the arm can be MEASURED at
+    // L16+; without it the dispatch forces generic there and any A/B is a null
+    // comparison -- which is exactly how the bogus L19 result was produced.
+    let shallow = matches!(params.strategy, Strategy::BtLazy2) || bt_deep_measure();
     if !bt_spec_enabled() || !shallow {
         return bt_find_best_runtime(src, ip, block_start, block_end, window, mls, params, tables);
     }
@@ -5581,6 +5596,21 @@ fn bt_spec_enabled() -> bool {
                 .map(|v| v.trim() != "0")
                 .unwrap_or(true);
             BT_SPEC_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+#[inline]
+fn bt_deep_measure() -> bool {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static A: AtomicU8 = AtomicU8::new(0);
+    match A.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var("RZSTD_BT_DEEP").map(|v| v.trim() == "1").unwrap_or(false);
+            A.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }
     }
