@@ -1926,6 +1926,12 @@ fn find_fast_impl<
     // 6 was re-denominated into bytes-per-probe.
     let mut rep_probes = 0u64;
     let mut rep_bytes = 0u64;
+    // GATE 7 feedback, as LOCALS. These were two unconditional atomic fetch_adds
+    // inside `fast_probe`, i.e. two read-modify-writes on shared cache lines in
+    // the hottest loop in the encoder, on EVERY probe -- not gated behind COUNT,
+    // because `tag_yield` is a shipped dispatch input and genuinely needs them.
+    // As locals they cost a register add and are summarised once per block.
+    let mut cand = (0u64, 0u64);
     // Probe density. The bit accountant showed our size gap vs C is entirely
     // LITERALS, because C finds more matches -- and we probe only ~0.259
     // positions/byte against C's ~1.0. `step0 = 1` matches C's density.
@@ -2058,7 +2064,7 @@ fn find_fast_impl<
             if COUNT && PACKED {
                 let raw = tables.raw_fast(h0);
                 if m0 == 0 && raw != 0 {
-                    if fast_probe(src, raw, ip, window, lowest, mls, block_end).is_some() {
+                    if fast_probe(&mut (0, 0), src, raw, ip, window, lowest, mls, block_end).is_some() {
                         TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     }
                     TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2146,7 +2152,7 @@ fn find_fast_impl<
             } else {
                 (0usize, 0u8, 0u32)
             };
-            if let Some((m, ml)) = fast_probe(src, m0, ip, window, lowest, mls, block_end) {
+            if let Some((m, ml)) = fast_probe(&mut cand, src, m0, ip, window, lowest, mls, block_end) {
                 if COUNT {
                     if COUNT {
                         hits += 1;
@@ -2239,6 +2245,10 @@ fn find_fast_impl<
             rep_hits as f32 / seqs.len() as f32
         };
         tables.rep_yield = y.max(tables.rep_yield * 0.5);
+        // The pipelined loop returns HERE, before the main tail -- so before this
+        // it never refreshed `tag_yield` at all and the old global counters just
+        // accumulated across blocks.
+        tables.tag_yield = cand_yield(cand);
         tables.last_nseq = seqs.len();
         if COUNT {
             use core::sync::atomic::Ordering::Relaxed;
@@ -2265,7 +2275,7 @@ fn find_fast_impl<
             // anyway. Count the cases where it would NOT have.
             let raw = tables.raw_fast(h0);
             if m0 == 0 && raw != 0 {
-                if fast_probe(src, raw, ip, window, lowest, mls, block_end).is_some() {
+                if fast_probe(&mut (0, 0), src, raw, ip, window, lowest, mls, block_end).is_some() {
                     TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2316,7 +2326,7 @@ fn find_fast_impl<
                 continue;
             }
         }
-        if let Some((m, ml)) = fast_probe(src, m0, ip, window, lowest, mls, block_end) {
+        if let Some((m, ml)) = fast_probe(&mut cand, src, m0, ip, window, lowest, mls, block_end) {
             if COUNT {
                 hits += 1;
             }
@@ -2373,7 +2383,7 @@ fn find_fast_impl<
                 if COUNT && PACKED {
                     let raw = tables.raw_fast(h1);
                     if m1 == 0 && raw != 0 {
-                        if fast_probe(src, raw, ip1, window, lowest, mls, block_end).is_some() {
+                        if fast_probe(&mut (0, 0), src, raw, ip1, window, lowest, mls, block_end).is_some() {
                             TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         }
                         TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2390,7 +2400,7 @@ fn find_fast_impl<
                 // a harmful one, because the harm is a property of the CONTENT
                 // (repcode already covers that span) and not of the candidate.
                 // That is why `rep_yield` is the right and sufficient variable.
-                if let Some((m, ml)) = fast_probe(src, m1, ip1, window, lowest, mls, block_end) {
+                if let Some((m, ml)) = fast_probe(&mut cand, src, m1, ip1, window, lowest, mls, block_end) {
                     if COUNT {
                         use core::sync::atomic::Ordering::Relaxed;
                         if m0 == 0 { PAIR_HIT_EMPTY.fetch_add(1, Relaxed);
@@ -2454,7 +2464,7 @@ fn find_fast_impl<
         }
     }
     // GATE 7: feed this block's measured reject share to the next block's gate.
-    tables.tag_yield = take_tag_yield();
+    tables.tag_yield = cand_yield(cand);
     // feed this block's pair coverage to the next block's gate
     // Attribute only when the search actually RAN -- a rejected block measures
     // nothing, and zeroing it there is what would latch the gate shut.
@@ -2509,6 +2519,7 @@ fn find_fast_impl<
 /// `match_slot` is the hash-table value (`pos+1`, or 0 = empty).
 #[inline(always)]
 fn fast_probe(
+    cand: &mut (u64, u64),
     src: &[u8],
     match_slot: u32,
     ip: usize,
@@ -2525,10 +2536,10 @@ fn fast_probe(
         return None;
     }
     if load_u32le(src, m) != load_u32le(src, ip) {
-        FALSE_CAND.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        cand.0 += 1;
         return None;
     }
-    TRUE_CAND.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    cand.1 += 1;
     let ml = 4 + count_match(src, m + 4, ip + 4, block_end);
     if ml >= mls {
         Some((m, ml))
@@ -6387,14 +6398,11 @@ fn tag_min() -> f32 {
 }
 
 /// Candidates a tag could reject without loading `src[m]`, and those it cannot.
-static FALSE_CAND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static TRUE_CAND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Consume the counters and return the reject share.
-fn take_tag_yield() -> f32 {
-    use core::sync::atomic::Ordering;
-    let f = FALSE_CAND.swap(0, Ordering::Relaxed);
-    let t = TRUE_CAND.swap(0, Ordering::Relaxed);
+/// Share of candidates rejected by the 4-byte compare -- Gate 7's dispatch input.
+#[inline]
+fn cand_yield((f, t): (u64, u64)) -> f32 {
     if f + t == 0 {
         1.0
     } else {
