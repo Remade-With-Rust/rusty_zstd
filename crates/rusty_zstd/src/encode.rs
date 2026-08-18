@@ -334,7 +334,12 @@ impl MatchTables {
         // longer exist -- an instrument describing the code as it was two
         // bricks ago.
         let use_long = matches!(params.strategy, Strategy::DFast);
-        let use_tags = params.strategy == Strategy::Fast;
+        // A/B: does the tag array EARN its per-probe store? It is a SECOND
+        // array, so every probe writes two cache lines instead of one, and the
+        // write happens even on blocks where Gate 7's filter is off and nothing
+        // reads it. Gate 7 is byte-identical, so this is purely a speed
+        // question.
+        let use_tags = params.strategy == Strategy::Fast && tag_alloc_enabled();
         let use_chain = !matches!(params.strategy, Strategy::Fast | Strategy::DFast);
         let hash_b = (hsz as u64).saturating_mul(4);
         let long_b = if use_long { hash_b } else { 0 };
@@ -466,6 +471,23 @@ impl MatchTables {
         }
     }
 
+    /// Raw slot, bypassing the tag filter -- diagnostic only.
+    #[inline(always)]
+    fn raw_fast(&self, h: usize) -> u32 {
+        self.hash[h]
+    }
+
+    /// HAZARD (recorded 2026-08-18, not yet fixed): this writes `hash[h]` and
+    /// leaves `tags[h]` UNTOUCHED, so on the Fast ladder it installs a new
+    /// position under the PREVIOUS position's tag. Gate 7's filter would then
+    /// reject a valid candidate at that slot -- the 190ad8b defect class again,
+    /// one level up.
+    ///
+    /// It is not reachable today: the only Fast-path caller is the
+    /// dictionary/prefix prefill, which returns early when `payload_off == 0`
+    /// (every benchmark and test here). It also hashes with `hash_mls`, not
+    /// `hash4_tag`, so its slots may not even correspond. Fixing it needs a
+    /// dictionary/prefix test first -- do not "fix" it blind.
     #[inline(always)]
     fn put_h(&mut self, h: usize, pos: usize) {
         self.hash[h] = (pos as u32).saturating_add(1);
@@ -1664,19 +1686,6 @@ fn find_fast(
     // Strategy::Fast rows reach here and they use hash_log {12..16} with step 2;
     // anything else takes the 0/0 runtime path, so correctness never depends on
     // these lists being complete.
-    macro_rules! go {
-        ($p:expr, $r:expr, $h:expr, $s:expr, $pi:expr) => {
-            find_fast_impl::<$p, $r, $h, $s, $pi>(
-                src,
-                block_start,
-                block_end,
-                window,
-                params,
-                tables,
-                reps,
-            )
-        };
-    }
     let pipe_on = pipe_enabled();
     // GATE 6 SPEED DISPATCH. `pair_gain` is MATCH BYTES PER PROBE on the last
     // block the pair search actually ran -- benefit over cost, in the unit the
@@ -1711,6 +1720,20 @@ fn find_fast(
     } else {
         params.target_length as usize + 1
     };
+    macro_rules! go {
+        ($p:expr, $r:expr, $h:expr, $s:expr, $pi:expr) => {
+            find_fast_impl::<$p, $r, $h, $s, $pi>(
+                s0,
+                src,
+                block_start,
+                block_end,
+                window,
+                params,
+                tables,
+                reps,
+            )
+        };
+    }
     // BRICK 67: repcode-1 is DISPATCHED on its own yield, not globally on/off.
     //
     // It is a genuine sign-flip: a LOSS on Silesia (brick 40: 0/6, z=-2.45,
@@ -1788,6 +1811,7 @@ fn find_fast_impl<
     const STEP: usize,
     const PIPE: bool,
 >(
+    step_rt: usize,
     src: &[u8],
     block_start: usize,
     block_end: usize,
@@ -1960,6 +1984,15 @@ fn find_fast_impl<
             if COUNT {
                 if COUNT {
                     probes += 1;
+                }
+            }
+            if COUNT && PACKED {
+                let raw = tables.raw_fast(h0);
+                if m0 == 0 && raw != 0 {
+                    if fast_probe(src, raw, ip, window, lowest, mls, block_end).is_some() {
+                        TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
             tables.store_fast::<PACKED>(h0, ip, g0);
@@ -2155,6 +2188,18 @@ fn find_fast_impl<
         }
         let (h0, g0) = hash4_tag::<PACKED>(src, ip, hash_shift);
         let m0 = tables.load_fast::<PACKED>(h0, ip, g0);
+        if COUNT && PACKED {
+            // Gate 7 is recorded byte-identical: a tag mismatch should imply the
+            // 4 bytes differ, so `fast_probe` would have rejected the candidate
+            // anyway. Count the cases where it would NOT have.
+            let raw = tables.raw_fast(h0);
+            if m0 == 0 && raw != 0 {
+                if fast_probe(src, raw, ip, window, lowest, mls, block_end).is_some() {
+                    TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
         tables.store_fast::<PACKED>(h0, ip, g0);
         // GATE 6 SPEED: issue the PAIR probe's load HERE, next to the main
         // probe's, instead of after `fast_probe` has consumed `m0`.
@@ -2252,6 +2297,15 @@ fn find_fast_impl<
                         (h, g, tables.load_fast::<PACKED>(h, ip1, g))
                     }
                 };
+                if COUNT && PACKED {
+                    let raw = tables.raw_fast(h1);
+                    if m1 == 0 && raw != 0 {
+                        if fast_probe(src, raw, ip1, window, lowest, mls, block_end).is_some() {
+                            TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        }
+                        TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 tables.store_fast::<PACKED>(h1, ip1, g1);
                 // A THIRD VARIABLE WAS TESTED AND REJECTED: the pair match's
                 // LENGTH. `versions-16m` sits at exactly +10.55% for every
@@ -2612,6 +2666,18 @@ fn hash4_tag<const PACKED: bool>(src: &[u8], pos: usize, hash_shift: u32) -> (us
 /// How much of `find_fast`'s NON-pipelined (pair-route) loop would a
 /// speculation serve? `MM_MISS / MM_TOTAL` is the share of positions that reach
 /// the miss-advance, i.e. where a speculated next-position load is CONSUMED.
+/// Gate 7 audit: tag rejections that `fast_probe` would have ACCEPTED.
+pub static TAG_FALSE_REJECT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static TAG_REJECT_TOTAL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear `(false_rejects, total_rejects)`.
+pub fn take_tag_rejects() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (TAG_FALSE_REJECT.swap(0, Relaxed), TAG_REJECT_TOTAL.swap(0, Relaxed))
+}
+
 pub static MM_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static MM_MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -6293,6 +6359,23 @@ fn pair_gain_min() -> f32 {
     }
     #[cfg(not(feature = "std"))]
     0.20
+}
+
+static TAG_ALLOC_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// A/B whether the Fast tag array is ALLOCATED at all (and therefore whether
+/// the per-probe tag store happens). Distinct from `set_tag_arm`, which only
+/// controls whether the filter READS it.
+pub fn set_tag_alloc_arm(on: bool) {
+    TAG_ALLOC_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn tag_alloc_enabled() -> bool {
+    match TAG_ALLOC_ARM.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        _ => true,
+    }
 }
 
 static PAIR_PRE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
