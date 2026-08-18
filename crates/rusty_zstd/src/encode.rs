@@ -217,44 +217,6 @@ struct Seq {
 
 pub(crate) struct MatchTables {
     hash: Vec<u32>,
-    /// Fast-strategy slots carry an 8-bit tag in the TOP byte and a 24-bit
-    /// position residue in the low bits, instead of a bare `pos+1`.
-    ///
-    /// Brick 41 put the tag in a SEPARATE 64 KiB array, which traded one
-    /// random access (`src[m]`) for another (`tag[h]`) -- which is exactly why
-    /// it only won 3-7%. Packing removes the added access outright: the slot
-    /// we must load and store anyway now carries the tag for free.
-    ///
-    /// Positions are reconstructed modulo 2^24 -- unambiguous because any
-    /// usable candidate lies within `window` of `ip`, and this is only enabled
-    /// when `window < 2^24`.
-    ///
-    /// NOT byte-identical, and the size of that effect was UNDERSTATED here for
-    /// most of this codebase's life. The old note said "a slot whose residue AND
-    /// tag are both 0 reads as empty (~1 position in 2^32)", which predicts ~0
-    /// bytes. Measured on `versions-16m` at L1 the effect is a deterministic
-    /// **+2,475 bytes**:
-    ///
-    /// ```text
-    /// prefix   tag OFF   tag ON    delta      absolute
-    /// 2^20       4,534    4,119   -9.153%       -415
-    /// 2^21       7,373    9,848  +33.568%     +2,475
-    /// 2^22      12,959   15,434  +19.099%     +2,475
-    /// 2^23      24,106   26,581  +10.267%     +2,475
-    /// 2^24      46,025   48,500   +5.378%     +2,475
-    /// ```
-    ///
-    /// The absolute cost is CONSTANT from 2^21 up, so it is not the 24-bit
-    /// residue aliasing either -- that would scale with how far the input spans
-    /// past the wrap. It is one early divergence that the rest of the stream
-    /// does not compound, which fits `versions` being almost entirely repcodes
-    /// after its first blocks. And the SIGN FLIPS at 2^20, where the tag WINS by
-    /// 415 bytes.
-    ///
-    /// Across all 18 at L1 the tag costs +0.0049% and changes 9 of 18, so the
-    /// default-off is right; the size-dependent sign flip is a real dispatch
-    /// signal on a gate too marginal to be worth one.
-    packed: bool,
     hash_long: Vec<u32>,
     /// BRICK 67: repcode yield of the PREVIOUS block -- the dispatch signal
     /// for the repcode-1 search. Optimistic start so the first block always
@@ -339,9 +301,7 @@ impl MatchTables {
         // Only the Fast strategy reads these slots through `store_fast` /
         // `load_fast`; the chain strategies keep plain positions. The window
         // guard is what makes the modulo-2^24 reconstruction unambiguous.
-        let packed = params.strategy == Strategy::Fast
-            && tag_enabled()
-            && (1u64 << params.window_log.min(31)) < (1u64 << 24);
+
         // BRICK 47: allocate ONLY the tables this strategy reads.
         //
         // `find_fast` touches neither `hash_long` nor `chain`; `find_dfast`
@@ -355,7 +315,6 @@ impl MatchTables {
         // per-entry CRDT blobs (a table set per small payload) and streaming,
         // where `reset()` memsets the whole set on every window slide.
         Self {
-            packed,
             rep_yield: 1.0,
             hash_log,
             hash: vec![0; hsz],
@@ -646,15 +605,7 @@ pub(crate) fn prime_tables(
         if !tables.chain.is_empty() {
             tables.chain[p & chain_mask] = tables.get_h(h).map(|x| x as u32).unwrap_or(0);
         }
-        if tables.packed {
-            // Fast strategy primes here on dict/prefix frames; the slot must
-            // be written in the SAME format `load_fast` will read.
-            let hs = 32u32.saturating_sub(tables.hash_log);
-            let (th, tg) = hash4_tag::<true>(src, p, hs);
-            tables.store_fast::<true>(th, p, tg);
-        } else {
-            tables.put_h(h, p);
-        }
+        tables.put_h(h, p);
         if p + 8 <= src.len() && !tables.hash_long.is_empty() {
             let hl = hash8(src, p, hash_log);
             tables.put_hl(hl, p);
@@ -1659,10 +1610,10 @@ fn find_fast(
     // `rep_yield` starts at 1.0, so the first block of every frame always probes.
     FAST_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let rep_on = rep_search_on(tables.rep_yield, params.strategy);
-    match (tables.packed, rep_on, pipe_on, s0) {
+    match (rep_on, pipe_on, s0) {
         // The shipping configuration: no tag, no rep1, pipelined, default step.
         // Specialized on hash_log so the shift is an immediate too.
-        (false, false, true, 2) if fast_spec_enabled() => match tables.hash_log {
+        (false, true, 2) if fast_spec_enabled() => match tables.hash_log {
             12 => go!(false, false, 12, 2, true),
             13 => go!(false, false, 13, 2, true),
             14 => go!(false, false, 14, 2, true),
@@ -1675,7 +1626,7 @@ fn find_fast(
         // so any step-1 measurement was comparing a generic loop against a
         // fully specialized one -- a work-parity break in the instrument, not
         // a property of the density.
-        (false, false, true, 1) if fast_spec_enabled() => match tables.hash_log {
+        (false, true, 1) if fast_spec_enabled() => match tables.hash_log {
             12 => go!(false, false, 12, 1, true),
             13 => go!(false, false, 13, 1, true),
             14 => go!(false, false, 14, 1, true),
@@ -1683,16 +1634,12 @@ fn find_fast(
             16 => go!(false, false, 16, 1, true),
             _ => go!(false, false, 0, 1, true),
         },
-        (false, false, true, _) => go!(false, false, 0, 0, true),
-        (false, false, false, 2) => go!(false, false, 0, 2, false),
-        (false, false, false, 1) => go!(false, false, 0, 1, false),
-        (false, false, false, _) => go!(false, false, 0, 0, false),
-        (true, true, true, _) => go!(true, true, 0, 0, true),
-        (true, true, false, _) => go!(true, true, 0, 0, false),
-        (true, false, true, _) => go!(true, false, 0, 0, true),
-        (true, false, false, _) => go!(true, false, 0, 0, false),
-        (false, true, true, _) => go!(false, true, 0, 0, true),
-        (false, true, false, _) => go!(false, true, 0, 0, false),
+        (false, true, _) => go!(false, false, 0, 0, true),
+        (false, false, 2) => go!(false, false, 0, 2, false),
+        (false, false, 1) => go!(false, false, 0, 1, false),
+        (false, false, _) => go!(false, false, 0, 0, false),
+        (true, true, _) => go!(false, true, 0, 0, true),
+        (true, false, _) => go!(false, true, 0, 0, false),
     }
 }
 
@@ -2327,43 +2274,8 @@ fn step0_default() -> usize {
     on
 }
 
-/// Brick 41 arm state: packed tag slots. Settable at RUNTIME so a harness can
-/// interleave both arms inside ONE process.
-///
-/// Why that matters: with each arm as its own process run, the two arms sit
-/// MINUTES apart, and this box drifts ~2x on that timescale -- measured, two
-/// A/B pairs of the same brick came out -36.7% and +2.6%. ABBA only cancels
-/// drift when the arms are SECONDS apart. `set_tag_arm` lets the bench flip
-/// the arm between two adjacent measurements of the same file.
-static TAG_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-/// Override the tag arm for the rest of the process (0 = re-read the env).
-/// Bench/testing hook; the shipping default comes from `RZSTD_TAG`.
-pub fn set_tag_arm(on: bool) {
-    TAG_ARM.store(
-        if on { 2 } else { 1 },
-        core::sync::atomic::Ordering::Relaxed,
-    );
-}
 
-fn tag_enabled() -> bool {
-    use core::sync::atomic::Ordering;
-    match TAG_ARM.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            // DEFAULT OFF: the in-process ABBA A/B measured the tag SLOWER on
-            // 6/6 files (-2.1% to -7.7%, z=-2.45) with same-arm spreads of
-            // 0.3-2.1%. The earlier "+3.6-7.1% win" came from a cross-PROCESS
-            // A/B whose arms sat minutes apart on a drifting box.
-            let on = std::env::var("RZSTD_TAG")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-            TAG_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
 
 /// hash4 index AND its 8-bit tag, from one multiply.
 ///
@@ -5567,7 +5479,6 @@ mod tests {
 pub fn reset_env_arms() {
     use core::sync::atomic::Ordering;
     STEP0_ARM.store(0, Ordering::Relaxed);
-    TAG_ARM.store(0, Ordering::Relaxed);
     PIPE_ARM.store(0, Ordering::Relaxed);
     REP1_ENABLED_ARM.store(0, Ordering::Relaxed);
     LAZY_FILL_ENABLED_ARM.store(0, Ordering::Relaxed);

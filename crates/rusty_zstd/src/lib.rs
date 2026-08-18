@@ -75,7 +75,6 @@ pub use encode::{
     set_fast_lazy_arm, set_incomp_skip_arm, set_rep1_arm, set_rep1_mode,
     set_search_log_delta,
     set_step0_arm,
-    set_tag_arm,
 };
 #[cfg(all(feature = "alloc", feature = "std"))]
 pub use in_bench::{
