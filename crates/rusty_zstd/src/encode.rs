@@ -268,6 +268,13 @@ pub(crate) struct MatchTables {
     /// changing output everywhere. Gating on `blocks_done > 0` makes the
     /// dispatch fire only on measured evidence.
     blocks_done: u32,
+    /// GATE 6 @ L3: share of DFast positions where C's `_search_next_long`
+    /// probe at `ip+1` actually BEAT the short-hash candidate, measured on the
+    /// PREVIOUS block. Same self-calibrating shape as `rep_yield`: the probe
+    /// cannot lose locally (it is taken only when strictly longer), so its
+    /// losses are downstream parse-cascade effects, and the corpora it hurts are
+    /// the ones where it fires often and buys little.
+    next_long_yield: f32,
     /// Consecutive blocks whose `rep_yield` cleared the Gate 1 @ L1 threshold.
     ///
     /// The bare threshold does NOT work, and the per-block data says so: `mr`
@@ -335,6 +342,7 @@ impl MatchTables {
             last_search_per_byte: 1.0,
             blocks_done: 0,
             rep_run: 0,
+            next_long_yield: 1.0,
         }
     }
 
@@ -2690,6 +2698,10 @@ fn find_dfast_impl<const HLOG: u32>(
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
     let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
+    // GATE 6 @ L3 DISPATCH: run C's next-long probe only while it is EARNING.
+    let nl_on = next_long_enabled() && tables.next_long_yield >= next_long_min();
+    let mut nl_probes = 0u64;
+    let mut nl_hits = 0u64;
     let mut ip = block_start;
     while ip <= ilimit {
         if use_rep {
@@ -2736,7 +2748,46 @@ fn find_dfast_impl<const HLOG: u32>(
                 }
             }
         }
-        if best_ml < 8 {
+        // GATE 6 EXTENDED TO DFast -- C's `_search_next_long`.
+        //
+        // Gate 6's pair search at `ip+1` lives in `find_fast` only, so it is
+        // dead at L3 where `find_dfast` runs. But C's doubleFast has an ip+1
+        // probe we lack: when the LONG hash misses and only the short one hit,
+        // it checks `hashLong` at `ip+1` BEFORE settling for the short match and
+        // prefers that long match if it lands.
+        //
+        // Without it `find_dfast` commits to a 4-byte-hash match whenever the
+        // 8-byte hash misses at exactly `ip`, even when a long match starts one
+        // byte later -- the same "capability present in one finder, absent in
+        // its neighbour" shape as the repcode and back-extension defects.
+        let mut best_ip = ip;
+        if best_ml < 8 && nl_on && ip + 1 <= ilimit {
+            nl_probes += 1;
+            let h8b = hash8(src, ip + 1, HLOG);
+            if let Some(m8b) = tables.get_hl(h8b) {
+                if COUNT {
+                    probes += 1;
+                }
+                if match_ok(
+                    src,
+                    m8b,
+                    ip + 1,
+                    window,
+                    block_start,
+                    8.min(mls).max(4),
+                    tables.frame_start,
+                ) {
+                    let ml = count_match(src, m8b, ip + 1, block_end);
+                    if ml >= mls && ml > best_ml {
+                        best_m = m8b;
+                        best_ml = ml;
+                        best_ip = ip + 1;
+                        nl_hits += 1;
+                    }
+                }
+            }
+        }
+        if best_ml < 8 && best_ip == ip {
             if let Some(m4) = m4 {
                 if COUNT {
                     probes += 1;
@@ -2751,19 +2802,20 @@ fn find_dfast_impl<const HLOG: u32>(
             }
         }
         if best_ml >= mls {
-            lits.extend_from_slice(&src[anchor..ip]);
+            // commit at `best_ip`, which is `ip+1` when the next-long probe won
+            lits.extend_from_slice(&src[anchor..best_ip]);
             seqs.push(Seq {
-                litlen: (ip - anchor) as u32,
+                litlen: (best_ip - anchor) as u32,
                 matchlen: best_ml as u32,
-                offset: (ip - best_m) as u32,
+                offset: (best_ip - best_m) as u32,
             });
-            rep1 = ip - best_m;
+            rep1 = best_ip - best_m;
             if COUNT {
                 hits += 1;
             }
-            let end = ip + best_ml;
+            let end = best_ip + best_ml;
             // DFast never sets `packed` (it is gated on Strategy::Fast).
-            fill_hash_after_match::<false>(tables, src, ip, end, mls, ilimit);
+            fill_hash_after_match::<false>(tables, src, best_ip, end, mls, ilimit);
             fill_hash_long_after_match(tables, src, ip, end, HLOG, ilimit);
             ip = end;
             anchor = ip;
@@ -2775,6 +2827,14 @@ fn find_dfast_impl<const HLOG: u32>(
         1.0
     } else {
         (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
+    };
+    // Optimistic when the probe never fired, so a quiet block cannot latch it
+    // off permanently; otherwise the measured hit share, floored at half the
+    // previous value so one bad block does not kill it outright.
+    tables.next_long_yield = if nl_probes == 0 {
+        1.0
+    } else {
+        (nl_hits as f32 / nl_probes as f32).max(tables.next_long_yield * 0.5)
     };
     lits.extend_from_slice(&src[anchor..block_end]);
     note_finder_work(COUNT, probes, hits, &seqs, &lits);
@@ -5614,4 +5674,42 @@ fn bt_deep_measure() -> bool {
             on
         }
     }
+}
+
+/// GATE 6 @ L3 arm: C's `_search_next_long` ip+1 long-hash probe in DFast.
+/// Default OFF until measured, so enabling it differs from the default.
+static NEXT_LONG_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for in-process ABBA.
+pub fn set_next_long_arm(on: bool) {
+    NEXT_LONG_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn next_long_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match NEXT_LONG_ARM.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var("RZSTD_NEXT_LONG").map(|v| v.trim() != "0").unwrap_or(true);
+            NEXT_LONG_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// GATE 6 @ L3 dispatch threshold: minimum share of next-long probes that must
+/// have WON on the previous block for the probe to run on this one.
+/// `RZSTD_NEXT_LONG_T` sweeps it.
+fn next_long_min() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_NEXT_LONG_T")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.10)
+    }
+    #[cfg(not(feature = "std"))]
+    0.10
 }
