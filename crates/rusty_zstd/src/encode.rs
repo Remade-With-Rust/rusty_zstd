@@ -270,6 +270,19 @@ pub(crate) struct MatchTables {
     /// Countdown to the next forced rep re-probe (the ratio can only be measured
     /// on a block where the search actually ran).
     rep_probe: u32,
+    /// GATE 10 @ L19: bytes the opt DP's repcode candidate covers per probe,
+    /// EWMA'd. It runs at EVERY position and is worth keeping on almost nothing:
+    /// versions-16m 434 B/probe and text-32m 26,932 need it, everything else is
+    /// at most 35.6 and is SMALLER without it.
+    opt_rep_rate: f32,
+    /// Countdown to the next forced re-probe, so an off block can be re-measured.
+    opt_rep_probe: u32,
+    /// Blocks in which the candidate has actually RUN. The gate may not shut
+    /// until it has real evidence: block 0 of a frame has no history, so its
+    /// rate is unrepresentative -- and because an OFF block records no hits, a
+    /// gate that shuts on block 0 suppresses its own measurement and can never
+    /// reopen. Same cold-start defect as Gate 6's `pair_gain` (4.17).
+    opt_rep_seen: u32,
     /// GATE 19: measured literal price in bits, fed to the next block's opt DP.
     /// 0 = not yet measured this frame.
     ///
@@ -401,6 +414,9 @@ impl MatchTables {
             next_long_yield: 1.0,
             rep_len_ratio: 1.0,
             rep_probe: 0,
+            opt_rep_rate: f32::MAX,
+            opt_rep_probe: 0,
+            opt_rep_seen: 0,
             opt_lit_price: 0,
             dfast_mean_ml: 0.0,
             dfast_spec_yield: 1.0,
@@ -4716,6 +4732,66 @@ pub fn set_opt_lit_arm(v: u32) {
     OPT_LIT_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Blocks between forced re-probes of the opt repcode candidate.
+const OPT_REP_PERIOD: u32 = 16;
+
+/// Blocks the candidate must RUN before the gate may shut it.
+const OPT_REP_WARMUP: u32 = 4;
+
+/// Minimum bytes-per-probe for the opt DP's repcode candidate to run. A NEGATIVE
+/// value is the escape hatch: constant ON, i.e. the pre-dispatch behaviour, which
+/// is what the ledger's "fallback proven" column requires.
+///
+/// The term is NOT decoration -- disabling it entirely (schedule only) removes
+/// 91.0% of the probes instead of 85.8%, but costs +0.1179% size against
+/// +0.0195%. Those 6M extra probes buy back 0.098 percentage points.
+fn opt_rep_min() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_OPT_REP_MIN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(50.0)
+    }
+    #[cfg(not(feature = "std"))]
+    50.0
+}
+
+/// Measurement arm for the opt DP's repcode candidate.
+static OPT_REP_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// A/B the opt DP's repcode candidate in-process.
+pub fn set_opt_rep_arm(on: bool) {
+    OPT_REP_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn opt_rep_enabled() -> bool {
+    !matches!(
+        OPT_REP_ARM.load(core::sync::atomic::Ordering::Relaxed),
+        1
+    )
+}
+
+/// GATE 10 @ L19: what the DP's repcode candidate earns. `try_rep1` runs at
+/// every position of every opt block, unconditionally.
+pub static OPT_REP_PROBES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static OPT_REP_HITS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static OPT_REP_BYTES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// `(probes, hits, hit_bytes)` for the opt DP's repcode candidate.
+pub fn take_opt_rep() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        OPT_REP_PROBES.swap(0, Relaxed),
+        OPT_REP_HITS.swap(0, Relaxed),
+        OPT_REP_BYTES.swap(0, Relaxed),
+    )
+}
+
 fn find_opt(
     src: &[u8],
     block_start: usize,
@@ -4789,6 +4865,22 @@ fn find_opt(
     };
     // Block-constant: read ONCE, never inside the DP loop.
     let lit_cost = opt_lit_cost(tables);
+    let (mut o_rep_probes, mut o_rep_hits, mut o_rep_bytes) = (0u64, 0u64, 0u64);
+    // GATE 10 @ L19 DISPATCH. The candidate costs a `try_rep1` at every position
+    // and EARNS almost nowhere: 12 of 18 corpora are SMALLER without it, and
+    // only versions-16m (+51.654% if removed) and text-32m (+5.376%) need it.
+    // Bytes-per-probe separates them absolutely -- 434 and 26,932 against a
+    // maximum of 35.6 for everything else.
+    //
+    // Re-probed on a schedule rather than decayed: with the candidate off no
+    // hits are recorded, so any decay converges to zero and latches the gate
+    // shut permanently. That is the Gate 6 defect, and the Gate 2 @ L3 one.
+    let rep_min = opt_rep_min();
+    let opt_rep_on = opt_rep_enabled()
+        && (rep_min < 0.0 // sentinel: constant ON, the pre-dispatch behaviour
+            || tables.opt_rep_seen < OPT_REP_WARMUP
+            || tables.opt_rep_probe == 0
+            || tables.opt_rep_rate >= rep_min);
     let mut i = 0usize;
     while i < n {
         if price[i] >= inf {
@@ -4811,8 +4903,14 @@ fn find_opt(
         // `price[i]` was the first attempt and it emitted every sequence with
         // litlen off by one -- an invalid stream that 36 conformance cases caught.
         // `price[i + 1]` is final here: the literal edge above already set it.
-        if i + 1 <= n && price[i + 1] < inf {
+        // GATE 10 @ L19 -- the L3 question, transferred. `try_rep1` runs at EVERY
+        // position here too, unconditionally. Count what it earns before gating
+        // it: probes issued, hits, and the bytes those hits cover.
+        if opt_rep_on && i + 1 <= n && price[i + 1] < inf {
+            o_rep_probes += 1;
             if let Some(rml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
+                o_rep_hits += 1;
+                o_rep_bytes += rml as u64;
                 let j = i + 1 + rml;
                 if j <= n {
                     let np = price[i + 1].saturating_add(rep_cost);
@@ -4929,6 +5027,31 @@ fn find_opt(
         }
     }
     lits.extend_from_slice(&src[block_start + anchor..block_end]);
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        OPT_REP_PROBES.fetch_add(o_rep_probes, Relaxed);
+        OPT_REP_HITS.fetch_add(o_rep_hits, Relaxed);
+        OPT_REP_BYTES.fetch_add(o_rep_bytes, Relaxed);
+    }
+    if opt_rep_on && o_rep_probes > 0 {
+        let now = o_rep_bytes as f32 / o_rep_probes as f32;
+        tables.opt_rep_seen = tables.opt_rep_seen.saturating_add(1);
+        // Take the MAX over the warm-up rather than an average: the question is
+        // whether this content EVER repays the candidate, and a frame's first
+        // blocks systematically understate it (no history to repeat against).
+        tables.opt_rep_rate = if tables.opt_rep_rate == f32::MAX {
+            now
+        } else if tables.opt_rep_seen <= OPT_REP_WARMUP {
+            tables.opt_rep_rate.max(now)
+        } else {
+            0.75 * tables.opt_rep_rate + 0.25 * now
+        };
+    }
+    tables.opt_rep_probe = if tables.opt_rep_probe == 0 {
+        OPT_REP_PERIOD
+    } else {
+        tables.opt_rep_probe - 1
+    };
     // Probes reported by `bt_find_best`, which the DP calls per position.
     note_finder_work(cfg!(feature = "profile"), 0, seqs.len() as u64, &seqs, &lits);
     (seqs, lits)
