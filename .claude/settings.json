@@ -31,7 +31,20 @@
       "Bash(sed -n '/## 2. Level 3/,/^## /p' docs/plans/m7-anatomy.md)",
       "Bash(git -c user.name=Tim -c user.email=tim.almond@thehouseinc.xyz commit -qam 'decode: brick 81 — inline copy_literals; DecSeq is MEMORY-bound *)",
       "Bash(git -c user.name=Tim -c user.email=tim.almond@thehouseinc.xyz commit -qam 'decode: brick 82 — 16-byte match-copy tier for short offsets *)",
-      "Bash(xargs -I{} echo \"uncommitted: {}\")"
+      "Bash(xargs -I{} echo \"uncommitted: {}\")",
+      "Bash(cd \"c:/Users/talmo/coding/rusty_zstd\" && sed -n '/fn bt_find_best_impl/,/^}/p' crates/rusty_zstd/src/encode.rs | sed -n '30,70p')",
+      "Bash(sed -i 's/rusty_zstd::compress\\(src, 19\\)/rusty_zstd::compress\\(src, LVL\\)/' crates/rusty_zstd-bench/examples/l19waste.rs)",
+      "Bash(sed -i 's/^fn main\\(\\) {/const LVL: i32 = 22;\\\\nfn main\\(\\) {/' crates/rusty_zstd-bench/examples/l19waste.rs)",
+      "Bash(sed -i 's/L19 on its OWN terms/L19-L22 on their OWN terms/' crates/rusty_zstd-bench/examples/l19waste.rs)",
+      "Bash(cp crates/rusty_zstd/src/encode.rs /tmp/encode_hoist.rs)",
+      "Bash(cp /tmp/encode_hoist.rs crates/rusty_zstd/src/encode.rs)",
+      "Read(//tmp/**)",
+      "Bash(sed -i 's/reset_env_arms, set_pair_gain_arm,/reset_env_arms, set_pair_gain_arm, set_pair_pre_arm,/' crates/rusty_zstd/src/lib.rs)",
+      "Bash(sed -i 's/take_pair_stats,/take_pair_stats, take_pair_split,/' crates/rusty_zstd/src/lib.rs)",
+      "Bash(sed -i 's/const PAIR_PROBE_PERIOD: u32 = 16;/const PAIR_PROBE_PERIOD: u32 = 64;/' crates/rusty_zstd/src/encode.rs)",
+      "Bash(sed -i 's/rusty_zstd::set_pair_hi_arm\\(6.0\\); }/rusty_zstd::set_pair_hi_arm\\(std::env::args\\(\\).nth\\(1\\).and_then\\(|s| s.parse\\(\\).ok\\(\\)\\).unwrap_or\\(3.0\\)\\); }/' crates/rusty_zstd-bench/examples/g6route.rs)",
+      "Bash(sed -i 's/            .unwrap_or\\(6.0\\)/            .unwrap_or\\(1.0\\)/; s/^    6.0$/    1.0/' crates/rusty_zstd/src/encode.rs)",
+      "Bash(grep -n \"unwrap_or\\(1.0\\)\\\\|unwrap_or\\(0.20\\)\\\\|^    1.0$\\\\|^    0.20$\" crates/rusty_zstd/src/encode.rs)"
     ],
     "additionalDirectories": [
       "c:\\Users\\talmo\\coding\\rusty_zstd\\crates\\rusty_zstd\\src"

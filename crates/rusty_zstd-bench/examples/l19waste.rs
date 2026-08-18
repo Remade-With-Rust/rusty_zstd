@@ -1,4 +1,5 @@
-//! L19 on its OWN terms: how much of the binary-tree walk is wasted?
+//! L19-L22 on their OWN terms: how much of the binary-tree walk is wasted?
+const LVL: i32 = 22;
 fn main() {
     println!("{:<10}{:>13}{:>13}{:>9}{:>13}{:>9}", "corpus","bt probes","too short","%","no gain","%");
     let (mut tp, mut ts, mut tn) = (0u64,0u64,0u64);
@@ -6,7 +7,7 @@ fn main() {
         let full = std::fs::read(format!("corpora/data/silesia/{id}")).unwrap();
         let src = &full[..full.len().min(1024*1024)];
         let _ = rusty_zstd::take_bt_probe_stats();
-        let _ = rusty_zstd::compress(src, 19).unwrap();
+        let _ = rusty_zstd::compress(src, LVL).unwrap();
         let (p, sh, ng) = rusty_zstd::take_bt_probe_stats();
         tp+=p; ts+=sh; tn+=ng;
         println!("{id:<10}{p:>13}{sh:>13}{:>8.1}%{ng:>13}{:>8.1}%",

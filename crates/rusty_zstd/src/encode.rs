@@ -262,6 +262,27 @@ pub(crate) struct MatchTables {
     /// losses are downstream parse-cascade effects, and the corpora it hurts are
     /// the ones where it fires often and buys little.
     next_long_yield: f32,
+    /// GATE 6 second variable: MATCH BYTES PER PROBE on the previous block --
+    /// the pair search's exchange rate, benefit over cost in the units the cost
+    /// is actually paid in. The pair search costs real probe time (+28.9% mean at L1), so it
+    /// must be shown to be EARNING. Low gain = the extra probes find nothing:
+    /// x-ray 0.0010 pays 19.8% time for 0.02% size; sao 0.0358 pays 61.8% for
+    /// 1.82%. Winners sit an order of magnitude higher (nci 0.1875, mozilla
+    /// 0.3105).
+    pair_gain: f32,
+    /// Countdown to the next forced pair RE-PROBE. Without it the gain term is a
+    /// one-way latch: pair off => 0 bytes attributed => gain 0 => off forever,
+    /// so content that changes phase mid-stream could never recover. On a
+    /// rejected block the gain is RETAINED (not zeroed) and re-measured every
+    /// `PAIR_PROBE_PERIOD` blocks.
+    pair_probe: u32,
+    /// GATE 6 ROUTE for this block: 0 = off, 1 = pipelined step-1, 2 = pair.
+    /// The pair search and the step-1 loop probe the SAME positions, but step-1
+    /// has a pipelined, HLOG-specialised body while the pair path forfeits
+    /// pipelining entirely (`if PIPE && !pair`). On 13 of 16 corpora they tie on
+    /// size and step-1 is ~7 points cheaper; on `nci` pair is twice as good
+    /// (-12.97% vs -6.44%). Same work, opposite verdicts -- so it is routed.
+    pair_route: u8,
     /// GATE 7: one tag byte per hash slot, in a SEPARATE array.
     ///
     /// The tag derives from the same 4 bytes as the hash, so equal words give
@@ -346,6 +367,9 @@ impl MatchTables {
             blocks_done: 0,
             rep_run: 0,
             next_long_yield: 1.0,
+            pair_gain: 1.0,
+            pair_probe: 0,
+            pair_route: 2,
             tags: if use_tags { alloc::vec![0u8; hsz] } else { alloc::vec::Vec::new() },
             tag_yield: 1.0,
         }
@@ -1631,8 +1655,36 @@ fn find_fast(
         };
     }
     let pipe_on = pipe_enabled();
+    // GATE 6 SPEED DISPATCH. `pair_gain` is MATCH BYTES PER PROBE on the last
+    // block the pair search actually ran -- benefit over cost, in the unit the
+    // cost is paid in. Three routes, not two:
+    //   rate <  PAIR_GAIN_MIN  the search finds nothing worth its probes (x-ray
+    //                          0.018, sao 0.081) -- OFF, step 2, pipelined.
+    //   rate <  PAIR_RATE_HI   it earns, but the step-1 loop earns the same size
+    //                          more cheaply because it keeps the pipeline.
+    //   rate >= PAIR_RATE_HI   only the pair path captures it (nci, 8.24).
+    // Every `PAIR_PROBE_PERIOD` blocks the route is forced back to `pair` so the
+    // rate is RE-MEASURED; without that the low routes never run the search and
+    // the gate could never re-open.
+    tables.pair_route = if !pair_enabled() {
+        0
+    } else if params.target_length != 0 {
+        2
+    } else if tables.pair_probe == 0 {
+        2
+    } else if tables.pair_gain < pair_gain_min() {
+        0
+    } else if tables.pair_gain >= pair_rate_hi() {
+        2
+    } else {
+        1
+    };
     let s0 = if params.target_length == 0 {
-        step0_default()
+        if tables.pair_route == 1 {
+            1
+        } else {
+            step0_default()
+        }
     } else {
         params.target_length as usize + 1
     };
@@ -1646,7 +1698,13 @@ fn find_fast(
     FAST_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let rep_on = rep_search_on(tables.rep_yield, params.strategy);
     let ut = !tables.tags.is_empty() && tag_enabled() && tables.tag_yield >= tag_min();
-    match (ut, rep_on, pipe_on, s0) {
+    // The GATE 6 re-probe countdown ticks HERE, not in `find_fast_impl`'s tail:
+    // the pipelined loop returns early, so a countdown in the tail stops
+    // advancing exactly when the gain term has the gate shut -- a one-way latch
+    // that no threshold can open. `mozilla` and `samba` lost their -2.85% and
+    // -6.03% to this, identically at every threshold, which is what gave it
+    // away: a real threshold effect moves when the threshold moves.
+    let r = match (ut, rep_on, pipe_on, s0) {
         // The shipping configuration: no tag, no rep1, pipelined, default step.
         // Specialized on hash_log so the shift is an immediate too.
         (false, false, true, 2) if fast_spec_enabled() => match tables.hash_log {
@@ -1680,7 +1738,12 @@ fn find_fast(
         (true, false, true, _) => go!(true, false, 0, 0, true),
         (true, false, false, _) => go!(true, false, 0, 0, false),
         (false, true, false, _) => go!(false, true, 0, 0, false),
-    }
+    };
+    // AFTER the call: `find_fast_impl` reads `pair_probe == 0` to force a probe,
+    // so ticking beforehand would consume the very first one.
+    tables.pair_probe =
+        if tables.pair_probe == 0 { PAIR_PROBE_PERIOD } else { tables.pair_probe - 1 };
+    r
 }
 
 /// BRICK 48: keep this finder OUT of `find_sequences_strategy`.
@@ -1804,7 +1867,24 @@ fn find_fast_impl<
     // Third occurrence of this error in the campaign (Gate 1's rep_yield
     // threshold, offset_concentration, and this): A MEAN-LEVEL GAP BETWEEN TWO
     // CORPORA IS NOT EVIDENCE THAT A PER-BLOCK THRESHOLD SEPARATES THEM.
-    let pair = step0 > 2 || (pair_enabled() && tables.rep_yield <= pair_rep_max());
+    // GATE 6 DISPATCH, two variables:
+    //   rep_yield <= 0.7   -- repcodes do not already cover this content
+    //   pair_gain >= T     -- the pair search is actually EARNING its probes
+    // The first alone shipped a +28.9% mean time cost for -5.85% size, with
+    // x-ray paying 19.8% for 0.02%. The second is what prices the trade.
+    let probe = tables.pair_probe == 0;
+    let route = tables.pair_route;
+    // Measurement arm for the load hoist -- both shapes in ONE binary so the
+    // A/B is in-process rather than cross-binary. Read once per block.
+    let prefetch_pair = pair_pre_enabled();
+    // The route is decided in `find_fast` (it also selects the step, which must
+    // be known before the specialised body is chosen). `rep_yield` still vetoes:
+    // on rep-dominated content the pair search re-finds what the repcode path
+    // already has and emits a worse parse.
+    let _ = probe;
+    let pair = step0 > 2 || (route == 2 && tables.rep_yield <= pair_rep_max());
+    let mut pair_bytes = 0u64;
+    let mut pair_probes = 0u64;
     let lowest = block_start.saturating_sub(window).max(tables.frame_start);
     let frame_start = tables.frame_start;
     // Local repeat-offset state, mirroring C's `offset_1`/`offset_2`. A repcode
@@ -1991,6 +2071,26 @@ fn find_fast_impl<
         let (h0, g0) = hash4_tag::<PACKED>(src, ip, hash_shift);
         let m0 = tables.load_fast::<PACKED>(h0, ip, g0);
         tables.store_fast::<PACKED>(h0, ip, g0);
+        // GATE 6 SPEED: issue the PAIR probe's load HERE, next to the main
+        // probe's, instead of after `fast_probe` has consumed `m0`.
+        //
+        // The two loads hit different slots and are independent, but in program
+        // order the second was issued only once the first had been consumed, so
+        // the two cache misses SERIALIZED -- the pair search paid two full miss
+        // latencies per position instead of two overlapped ones. That is the
+        // same latency problem the pipelined loop exists to solve; it was just
+        // never applied to this path.
+        //
+        // BYTE-IDENTICAL: `store_fast(h0, ip, g0)` still precedes it (so an
+        // aliasing `h1 == h0` observes the same value it did before), and
+        // nothing between here and the pair branch writes the table -- the rep
+        // and match paths both `continue`. Only the issue order moves.
+        let pair_pre = if pair && prefetch_pair && ip + 1 <= ilimit {
+            let (h1, g1) = hash4_tag::<PACKED>(src, ip + 1, hash_shift);
+            Some((h1, g1, tables.load_fast::<PACKED>(h1, ip + 1, g1)))
+        } else {
+            None
+        };
         if REP {
             if let Some(ml) = try_rep1(src, ip, rep1, lowest, block_end) {
                 rep_hits += 1;
@@ -2045,11 +2145,23 @@ fn find_fast_impl<
                         probes += 1;
                     }
                 }
+                pair_probes += 1;
+                if COUNT {
+                    use core::sync::atomic::Ordering::Relaxed;
+                    if m0 == 0 { PAIR_M0_EMPTY.fetch_add(1, Relaxed); }
+                    else { PAIR_M0_LIVE.fetch_add(1, Relaxed); }
+                }
                 if COUNT {
                     PAIR_PROBES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
-                let (h1, g1) = hash4_tag::<PACKED>(src, ip1, hash_shift);
-                let m1 = tables.load_fast::<PACKED>(h1, ip1, g1);
+                // Already issued above, next to the main probe's load.
+                let (h1, g1, m1) = match pair_pre {
+                    Some(v) => v,
+                    None => {
+                        let (h, g) = hash4_tag::<PACKED>(src, ip1, hash_shift);
+                        (h, g, tables.load_fast::<PACKED>(h, ip1, g))
+                    }
+                };
                 tables.store_fast::<PACKED>(h1, ip1, g1);
                 // A THIRD VARIABLE WAS TESTED AND REJECTED: the pair match's
                 // LENGTH. `versions-16m` sits at exactly +10.55% for every
@@ -2063,6 +2175,11 @@ fn find_fast_impl<
                 // That is why `rep_yield` is the right and sufficient variable.
                 if let Some((m, ml)) = fast_probe(src, m1, ip1, window, lowest, mls, block_end) {
                     if COUNT {
+                        use core::sync::atomic::Ordering::Relaxed;
+                        if m0 == 0 { PAIR_HIT_EMPTY.fetch_add(1, Relaxed);
+                                     PAIR_BYTES_EMPTY.fetch_add(ml as u64, Relaxed); }
+                        else { PAIR_HIT_LIVE.fetch_add(1, Relaxed);
+                               PAIR_BYTES_LIVE.fetch_add(ml as u64, Relaxed); }
                         PAIR_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         PAIR_BYTES.fetch_add(ml as u64, core::sync::atomic::Ordering::Relaxed);
                     }
@@ -2071,6 +2188,7 @@ fn find_fast_impl<
                             hits += 1;
                         }
                     }
+                    pair_bytes += ml as u64;
                     ip = emit_fast_seq::<PACKED>(
                         src,
                         tables,
@@ -2094,6 +2212,27 @@ fn find_fast_impl<
     }
     // GATE 7: feed this block's measured reject share to the next block's gate.
     tables.tag_yield = take_tag_yield();
+    // feed this block's pair coverage to the next block's gate
+    // Attribute only when the search actually RAN -- a rejected block measures
+    // nothing, and zeroing it there is what would latch the gate shut.
+    if pair {
+        // BYTES PER PROBE, not bytes per input byte. The cost of this search is
+        // one probe; the benefit is the match bytes it covers. Denominating the
+        // gain in input bytes prices the benefit against a quantity that has
+        // nothing to do with the cost, which is why a 0.05 threshold in those
+        // units gated off mozilla and samba (real -2.85%/-6.03% wins) while
+        // still admitting content the search does no good on.
+        // EWMA, not last-block. Two things make a single block a bad decider:
+        // the FIRST block of a frame probes against an EMPTY table and always
+        // measures ~0 (a cold reading that would shut the gate for the whole
+        // rest of the file), and per-block rates straddle any threshold set
+        // from a corpus mean -- `nci` aggregates 8.24 B/probe but individual
+        // blocks fall below it, which is the same mean-vs-per-block error this
+        // campaign has now made four times.
+        let now = pair_bytes as f32 / pair_probes.max(1) as f32;
+        tables.pair_gain = 0.75 * tables.pair_gain + 0.25 * now;
+    }
+
     crate::prof::note_huff_path(12);
     lits.extend_from_slice(&src[anchor..block_end]);
     let match_bytes: u64 = if cfg!(feature = "profile") {
@@ -5568,6 +5707,8 @@ pub fn reset_env_arms() {
     REP1_ENABLED_ARM.store(0, Ordering::Relaxed);
     LAZY_FILL_ENABLED_ARM.store(0, Ordering::Relaxed);
     FAST_LAZY_ARM.store(0, Ordering::Relaxed);
+    PAIR_GAIN_ARM.store(u32::MAX, Ordering::Relaxed);
+    PAIR_HI_ARM.store(u32::MAX, Ordering::Relaxed);
 }
 
 /// Arm for the `find_dfast` HLOG specialisation, so it can be A/B'd IN-PROCESS
@@ -5812,6 +5953,29 @@ fn pair_rep_max() -> f32 {
 pub static PAIR_PROBES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static PAIR_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static PAIR_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Split the pair probe by the MAIN probe's slot state -- `m0 == 0` means that
+/// hash bucket has never been written, which is free information already in a
+/// register at the probe site.
+pub static PAIR_M0_EMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PAIR_M0_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PAIR_HIT_EMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PAIR_HIT_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PAIR_BYTES_EMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PAIR_BYTES_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `(probes_empty, probes_live, hits_empty, hits_live, bytes_empty, bytes_live)`
+pub fn take_pair_split() -> (u64, u64, u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        PAIR_M0_EMPTY.swap(0, Relaxed),
+        PAIR_M0_LIVE.swap(0, Relaxed),
+        PAIR_HIT_EMPTY.swap(0, Relaxed),
+        PAIR_HIT_LIVE.swap(0, Relaxed),
+        PAIR_BYTES_EMPTY.swap(0, Relaxed),
+        PAIR_BYTES_LIVE.swap(0, Relaxed),
+    )
+}
+
 pub static MAIN_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Read and clear: `(probes, hits, pair_match_bytes, all_match_bytes)`.
@@ -5891,4 +6055,81 @@ pub fn take_bt_probe_stats() -> (u64, u64, u64) {
         BT_SHORT.swap(0, Ordering::Relaxed),
         BT_NOGAIN.swap(0, Ordering::Relaxed),
     )
+}
+
+/// GATE 6 second threshold: minimum share of the previous block covered by pair
+/// matches for the search to run. `RZSTD_PAIR_G` sweeps; 0 disables the term.
+/// Blocks between forced pair re-probes when the gain term has the gate shut.
+const PAIR_PROBE_PERIOD: u32 = 16;
+
+/// Above this exchange rate the pair path is worth its lost pipelining.
+fn pair_rate_hi() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        use core::sync::atomic::Ordering;
+        let c = PAIR_HI_ARM.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_PAIR_HI")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1.0);
+        PAIR_HI_ARM.store(v.to_bits(), Ordering::Relaxed);
+        v
+    }
+    #[cfg(not(feature = "std"))]
+    1.0
+}
+
+static PAIR_HI_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Set the pair-vs-step1 crossover in-process.
+pub fn set_pair_hi_arm(v: f32) {
+    PAIR_HI_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
+}
+
+fn pair_gain_min() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        use core::sync::atomic::Ordering;
+        // Cached as raw bits: this is read once per BLOCK on the shipped path,
+        // and an `env::var` there allocates a String per block for a constant.
+        let c = PAIR_GAIN_ARM.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_PAIR_G")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.20);
+        PAIR_GAIN_ARM.store(v.to_bits(), Ordering::Relaxed);
+        v
+    }
+    #[cfg(not(feature = "std"))]
+    0.20
+}
+
+static PAIR_PRE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// A/B the Gate 6 load hoist in-process.
+pub fn set_pair_pre_arm(on: bool) {
+    PAIR_PRE_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn pair_pre_enabled() -> bool {
+    match PAIR_PRE_ARM.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        _ => true,
+    }
+}
+
+static PAIR_GAIN_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Set the Gate 6 earning threshold in-process (A/B without a rebuild).
+pub fn set_pair_gain_arm(v: f32) {
+    PAIR_GAIN_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
 }
