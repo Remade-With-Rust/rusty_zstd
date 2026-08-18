@@ -1950,6 +1950,10 @@ fn find_fast_impl<
     // callee-saved registers idle. As a const, the shipping copy contains only
     // the loop it actually runs.
     if PIPE && !pair && ip <= ilimit {
+        if COUNT {
+            FF_PIPE_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        let (mut ff_made, mut ff_used) = (0u64, 0u64);
         let (mut h0, mut g0) = hash4_tag::<PACKED>(src, ip, hash_shift);
         let mut m0 = tables.load_fast::<PACKED>(h0, ip, g0);
         loop {
@@ -2005,6 +2009,9 @@ fn find_fast_impl<
             // Next position, and its table load issued NOW -- this is the whole
             // point of the brick.
             let nip = ip + step0 + ((ip - anchor) >> 8);
+            if COUNT && nip <= ilimit {
+                ff_made += 1;
+            }
             let (h1, g1, m1) = if nip <= ilimit {
                 let (h, g) = hash4_tag::<PACKED>(src, nip, hash_shift);
                 // The store above may have just overwritten this slot, so the
@@ -2095,6 +2102,9 @@ fn find_fast_impl<
             if nip > ilimit {
                 break;
             }
+            if COUNT {
+                ff_used += 1;
+            }
             ip = nip;
             h0 = h1;
             g0 = g1;
@@ -2126,9 +2136,18 @@ fn find_fast_impl<
         };
         tables.rep_yield = y.max(tables.rep_yield * 0.5);
         tables.last_nseq = seqs.len();
+        if COUNT {
+            use core::sync::atomic::Ordering::Relaxed;
+            FF_SPEC_MADE.fetch_add(ff_made, Relaxed);
+            FF_SPEC_USED.fetch_add(ff_used, Relaxed);
+        }
         return (seqs, lits);
     }
+    let (mut mm_total, mut mm_miss) = (0u64, 0u64);
     while ip <= ilimit {
+        if COUNT {
+            mm_total += 1;
+        }
         if COUNT {
             if COUNT {
                 probes += 1;
@@ -2279,7 +2298,15 @@ fn find_fast_impl<
                 }
             }
         }
+        if COUNT {
+            mm_miss += 1;
+        }
         ip += step0 + ((ip - anchor) >> 8);
+    }
+    if COUNT {
+        use core::sync::atomic::Ordering::Relaxed;
+        MM_TOTAL.fetch_add(mm_total, Relaxed);
+        MM_MISS.fetch_add(mm_miss, Relaxed);
     }
     // GATE 7: feed this block's measured reject share to the next block's gate.
     tables.tag_yield = take_tag_yield();
@@ -2580,6 +2607,37 @@ fn hash4_tag<const PACKED: bool>(src: &[u8], pos: usize, hash_shift: u32) -> (us
 
 /// Brick 39 arm state: 2-way pipelined probe. Runtime-settable so the
 /// in-process ABBA harness can flip it between adjacent measurements.
+/// GATE 8 @ L1 reachability + speculation ledger for `find_fast`'s pipelined
+/// loop, the same deterministic instrument that decided Gate 8 at L3.
+/// How much of `find_fast`'s NON-pipelined (pair-route) loop would a
+/// speculation serve? `MM_MISS / MM_TOTAL` is the share of positions that reach
+/// the miss-advance, i.e. where a speculated next-position load is CONSUMED.
+pub static MM_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static MM_MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear `(main_loop_positions, positions_reaching_the_advance)`.
+pub fn take_mm() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (MM_TOTAL.swap(0, Relaxed), MM_MISS.swap(0, Relaxed))
+}
+
+pub static FF_PIPE_BLOCKS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static FF_SPEC_MADE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static FF_SPEC_USED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear `(pipelined_blocks, speculations_made, speculations_used)`.
+pub fn take_ff_pipe() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        FF_PIPE_BLOCKS.swap(0, Relaxed),
+        FF_SPEC_MADE.swap(0, Relaxed),
+        FF_SPEC_USED.swap(0, Relaxed),
+    )
+}
+
 static PIPE_REP1_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// A/B the pipelined loop's `rep1` maintenance. OFF reproduces the pre-fix
