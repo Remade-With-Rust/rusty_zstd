@@ -31,6 +31,8 @@ fn main() {
             .or_else(|_| std::fs::read(format!("corpora/data/silesia/{id}"))) else { continue };
         let s = &f[..f.len().min(cap)];
         let mut sz = Vec::new();
+        // disable the shipped dispatch so this measures the RAW block-size effect
+        rusty_zstd::set_g5_arms(-1.0, 2.0, 2.0);
         for (i, k) in KB.iter().enumerate() {
             std::env::set_var("RZSTD_BLOCK_KB", k.to_string());
             let z = rusty_zstd::compress(s, lvl).unwrap();

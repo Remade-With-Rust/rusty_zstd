@@ -10,9 +10,9 @@ fn main() {
             let Ok(f) = std::fs::read(format!("corpora/data/generated/{id}"))
                 .or_else(|_| std::fs::read(format!("corpora/data/silesia/{id}"))) else { continue };
             let s = &f[..f.len().min(if lvl >= 13 { cap/4 } else { cap })];
-            rusty_zstd::set_g5_arms(-1.0, 2.0, 2.0);
+            rusty_zstd::set_g5_fast_arms(-1.0, 2.0, 2.0);
             let off = rusty_zstd::compress(s, lvl).unwrap();
-            rusty_zstd::set_g5_arms(0.30, 0.70, 1.50);
+            rusty_zstd::set_g5_fast_arms(2.0, 0.70, 2.0);
             let on = rusty_zstd::compress(s, lvl).unwrap();
             assert!(rusty_zstd::decompress(&on).unwrap() == s, "{id} L{lvl}: round-trip");
             let pc = (on.len() as f64/off.len() as f64 - 1.0)*100.0;

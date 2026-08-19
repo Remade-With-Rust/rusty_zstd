@@ -11,9 +11,9 @@ fn main() {
         for cap in [1usize<<20, 2<<20, 4<<20, 8<<20] {
             if f.len() < cap { row += &format!(" {:>10}", "-"); continue }
             let s = &f[..cap];
-            rusty_zstd::set_g5_arms(-1.0, 2.0, 2.0);
+            rusty_zstd::set_g5_fast_arms(-1.0, 2.0, 2.0);
             let off = rusty_zstd::compress(s, lvl).unwrap().len();
-            rusty_zstd::set_g5_arms(0.30, 0.70, 1.50);
+            rusty_zstd::set_g5_fast_arms(2.0, 0.70, 2.0);
             let on = rusty_zstd::compress(s, lvl).unwrap().len();
             let pc = (on as f64/off as f64 - 1.0)*100.0;
             if pc > 0.05 { any = true }
