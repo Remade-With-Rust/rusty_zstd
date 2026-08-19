@@ -344,6 +344,10 @@ pub(crate) struct MatchTables {
     /// Keeping the buffer sidesteps the choice: it reaches its steady-state
     /// capacity once per frame and then neither grows nor is freed.
     payload_scratch: Vec<u8>,
+    /// GATE 6, deeper: `find_opt`'s parse-backtrace buffer, kept for the same
+    /// reason as `payload_scratch` and worth far more -- this one carried the
+    /// bulk of the 340 MB L19 was pushing through `realloc` on a 2 MiB board.
+    opt_ops: Vec<(usize, usize, bool, u32, u32)>,
     /// GATE 6 @ L3: share of DFast positions where C's `_search_next_long`
     /// probe at `ip+1` actually BEAT the short-hash candidate, measured on the
     /// PREVIOUS block. Same self-calibrating shape as `rep_yield`: the probe
@@ -525,6 +529,7 @@ impl MatchTables {
             last_search_per_byte: 1.0,
             blocks_done: 0,
             payload_scratch: Vec::new(),
+            opt_ops: Vec::new(),
             rep_run: 0,
             next_long_yield: 1.0,
             nl_off_worse: 0.0,
@@ -1648,7 +1653,9 @@ pub(crate) fn encode_block(
     let mut payload = std::mem::take(&mut tables.payload_scratch);
     payload.clear();
     if payload_reserve_enabled() && payload.capacity() < block.len() {
-        payload.reserve_exact(block.len() - payload.capacity());
+        // REPLACE, do not grow. `payload` was just cleared, so `realloc` would
+        // memcpy an allocation that holds nothing live. See `opt_ops`.
+        payload = Vec::with_capacity(block.len());
     }
     {
         let _e = crate::prof::scope(crate::prof::Stage::EncodeEntropy);
@@ -7476,7 +7483,69 @@ fn find_opt(
     if price[n] >= inf {
         return find_bt_lazy(src, block_start, block_end, window, params, tables, 2, reps);
     }
-    let mut ops: Vec<(usize, usize, bool, u32, u32)> = Vec::new();
+    // GATE 6, one layer under the payload buffer: `ops` had the SAME defect,
+    // and a much larger one.
+    //
+    // Bucketing every `realloc` by the size it grows TO shows a doubling ladder
+    // repeated once per block -- `sao` at L19 takes 31 reallocs at EVERY rung
+    // from 128 KiB to 2 MiB, one full climb per block, because this vector was
+    // rebuilt from zero each time. A single buffer that doubles hits each rung
+    // ONCE; 31 hits per rung is 31 buffers each climbing from scratch.
+    //
+    // The entry is a 32-byte tuple pushed once per PARSE STEP, and a literal
+    // step advances one byte, so incompressible content pushes one per input
+    // byte -- 4 MiB of tuples for a 128 KiB block. That is why L19 memcpy'd
+    // 340 MB on a 2 MiB board where L3 moved 10 MB.
+    //
+    // Same remedy as the payload: the vector never escapes `find_opt`, so keep
+    // it on the frame and let it converge on its own high-water mark.
+    let mut ops: Vec<(usize, usize, bool, u32, u32)> = std::mem::take(&mut tables.opt_ops);
+    ops.clear();
+    // The reuse above leaves exactly ONE growth ladder per frame: the first
+    // block still climbs from nothing to its high-water mark. It is removable,
+    // and the two obvious constants both lose:
+    //
+    //   * reserve `n + 1` always -- exact upper bound (a literal step advances
+    //     one byte, so the chain cannot be longer than the block), but it asks
+    //     for 4 MiB per 128 KiB block even on content whose parse is 30 steps.
+    //   * reserve nothing -- pays the ladder, which copies ~2x the final size.
+    //
+    // The chain length is COUNTABLE before it is pushed, though: walking `prev`
+    // is a pointer chase with no allocation and no writes. So take the exact
+    // size when the buffer could overflow, and skip the walk entirely when it
+    // provably cannot -- `k <= n`, so a capacity of `n + 1` is proof.
+    // THE COPY WAS COPYING DEAD BYTES.
+    //
+    // Two sizing arms looked like a dispatch -- exact-fit (pre-walk the chain)
+    // versus the `n + 1` upper bound -- and they did split on content: blanket
+    // beat exact on `mr`/`mozilla`/`nci`/`samba`/`xml`, tied on the other 13,
+    // and cost up to +4.19 MB of address space for zero copy benefit on
+    // `text` and `versions`. Escalating between them made it WORSE (6.0 MB of
+    // copying became 21.5 MB), which is what exposed the real defect.
+    //
+    // `Vec::reserve` grows through `realloc`, and `realloc` preserves the old
+    // ALLOCATION -- the allocator has no idea the Vec's `len` is 0. This buffer
+    // is cleared at the top of every block, so every byte `realloc` carried was
+    // already dead. Replacing the buffer instead of growing it copies nothing,
+    // and it does so whatever sizing policy sits on top: the split between the
+    // two arms was never about content, it was both of them paying for a memcpy
+    // neither of them needed.
+    //
+    // Exact-fit is then strictly better than the upper bound -- same zero
+    // copies, and it asks for what the parse actually uses.
+    if opt_ops_exact() {
+        let mut k = 0usize;
+        let mut j = n;
+        while j > 0 {
+            k += 1;
+            j = prev[j];
+        }
+        if ops.capacity() < k {
+            ops = Vec::with_capacity(k);
+        }
+    } else if opt_ops_blanket() && ops.capacity() < n + 1 {
+        ops = Vec::with_capacity(n + 1);
+    }
     let mut i = n;
     while i > 0 {
         let p = prev[i];
@@ -7587,6 +7656,7 @@ fn find_opt(
     };
     // Probes reported by `bt_find_best`, which the DP calls per position.
     note_finder_work(cfg!(feature = "profile"), 0, seqs.len() as u64, &seqs, &lits);
+    tables.opt_ops = ops;
     (seqs, lits)
 }
 
@@ -9555,3 +9625,21 @@ static PAIR_GAIN_ARM: core::sync::atomic::AtomicU32 =
 pub fn set_pair_gain_arm(v: f32) {
     PAIR_GAIN_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
 }
+
+/// GATE 6 deep arm: how `find_opt`'s parse-backtrace buffer is sized.
+/// 0/2 = exact (pre-walk the chain), 1 = neither, 3 = blanket `n + 1`.
+static OPT_OPS_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook. 0 = reuse only, 1 = exact pre-walk, 2 = blanket n+1.
+pub fn set_opt_ops_arm(v: u8) {
+    OPT_OPS_ARM.store(v + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn opt_ops_exact() -> bool {
+    matches!(OPT_OPS_ARM.load(core::sync::atomic::Ordering::Relaxed), 0 | 2)
+}
+
+fn opt_ops_blanket() -> bool {
+    OPT_OPS_ARM.load(core::sync::atomic::Ordering::Relaxed) == 3
+}
+
