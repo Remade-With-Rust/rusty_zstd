@@ -64,7 +64,7 @@ pub use dict::{
 };
 #[cfg(feature = "alloc")]
 pub use encode::{
-    BT_SPEC_PAIRS, set_bt_depth_cached_arm, set_dfast_litpush_arm, take_lit_push,
+    BT_SPEC_PAIRS, set_bt_depth_cached_arm, set_dfast_litpush_arm, take_lit_push, take_lit_hist,
     compress, compress_using_dict, compress_using_dict_with, compress_using_prefix, compress_with,
     compress_with_advanced, compress_with_history, compress_with_params, AdvancedOptions,
     CompressOptions,
