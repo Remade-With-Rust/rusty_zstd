@@ -119,18 +119,33 @@ fn params_with_history(level: i32, src_len: usize, hist_len: usize) -> Result<Co
     compression_params(level, Some(hint))
 }
 
-/// Arm for FINDING 1. **DEFAULT OFF, and coupled to FINDING 2.**
+/// FINDING 1 -- **DEFAULT ON. This is a CONTRACT fix, not a speed trade.**
 ///
-/// On its own a wider window is nearly worthless -- measured -0.389% at L19 with
-/// 6 of 15 corpora LARGER -- because there is no tree over the prefix to search
-/// in it. With FINDING 2 on it becomes -2.047% with 12 smaller / 2 larger. It
-/// also widens the priming range, so it MULTIPLIES Finding 2's cost: together
-/// they are -3.78% size at +246% time.
+/// `compress_using_dict` / `compress_using_prefix` used to size the window from
+/// `src.len()` ALONE, where libzstd's `ZSTD_adjustCParams(cPar, srcSize,
+/// dictSize)` clamps `windowLog` against `srcSize + dictSize`. Because every
+/// finder rejects a candidate at `ip - m > window`, everything in the supplied
+/// dictionary beyond a payload-sized window was UNREACHABLE.
 ///
-/// Turning it on also raises the advertised `windowLog` (20 -> 23 in the measured
-/// shape), obliging every decoder to allocate 8 MiB for that frame instead of
-/// 1 MiB. libzstd makes the same trade via
-/// `ZSTD_adjustCParams(cPar, srcSize, dictSize)`; we do not, by default.
+/// PROVEN, not argued. Compressing one payload against dictionaries built from
+/// the same bytes truncated to 4 MiB / 2 MiB / 1 MiB produced BYTE-IDENTICAL
+/// output on 8 of 8 corpora at L19 -- the caller's dictionary was silently
+/// truncated to the window and three quarters of it did nothing.
+///
+/// That is why the earlier "-0.402% size for +15.4% time, 6 corpora larger"
+/// verdict was the wrong test: it compared two arms that do DIFFERENT AMOUNTS OF
+/// WORK. The fast arm was fast because it ignored most of the input it was given.
+/// The worst-corpus rule governs equivalent arms; it does not license silently
+/// discarding a caller's data to save time.
+///
+/// The real cost is honest and belongs to the caller: the advertised `windowLog`
+/// rises (20 -> 23 in the measured shape), so a decoder allocates 8 MiB for that
+/// frame instead of 1 MiB. libzstd obliges its decoders identically. A caller who
+/// does not want that should pass a smaller dictionary -- which now actually
+/// means what it says.
+///
+/// Only the dict/prefix path is affected. `compress()` has no prefix, so the
+/// 60-cell size table and every speed board are untouched.
 static PREFIX_WINDOW_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Bench hook: `true` sizes the window from payload + prefix, as libzstd does.
@@ -140,9 +155,12 @@ pub fn set_prefix_window_arm(on: bool) {
 
 #[inline]
 fn prefix_window_enabled() -> bool {
-    matches!(
+    // DEFAULT ON: 0 (unresolved) and 2 both mean on; only an explicit
+    // `set_prefix_window_arm(false)` (stored as 1) restores the old behaviour,
+    // which is the byte-identical fallback the ledger requires.
+    !matches!(
         PREFIX_WINDOW_ARM.load(core::sync::atomic::Ordering::Relaxed),
-        2
+        1
     )
 }
 
@@ -3932,14 +3950,29 @@ fn dfast_litpush_enabled() -> bool {
 /// `find_fast_impl` already computes the same value once per block as
 /// `reserve`; it is frame-constant, so it is threaded in instead.
 ///
+/// `arm` is now AUTHORITATIVE: the hoist escape hatch is resolved by the caller,
+/// per block, so this function performs no atomic load at all.
+///
 /// Same disease as brick 49 (`use_rep`) and brick 64 (`seqcheck_hoisted`):
 /// a fixed-for-the-block flag re-read in the hottest loop.
 fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize, arm: bool) {
     let n = to - from;
+    #[cfg(feature = "profile")]
+    {
+        let b = match n {
+            0..=4 => 0,
+            5..=8 => 1,
+            9..=16 => 2,
+            17..=32 => 3,
+            33..=64 => 4,
+            _ => 5,
+        };
+        LP_HIST[b].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     if n <= LIT_PUSH_WIDTH
         && from + LIT_PUSH_WIDTH <= src.len()
         && lits.capacity() - lits.len() >= LIT_PUSH_WIDTH
-        && if litpush_hoist_enabled() { arm } else { lit_push_enabled() }
+        && arm
     {
         #[cfg(feature = "profile")]
         LP_FAST.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -3962,6 +3995,26 @@ fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize, arm: bo
     #[cfg(feature = "profile")]
     LP_SLOW.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     lits.extend_from_slice(&src[from..to]);
+}
+
+/// Literal run-length histogram: 0-4, 5-8, 9-16, 17-32, 33-64, 65+.
+pub static LP_HIST: [core::sync::atomic::AtomicU64; 6] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Read and clear the literal run-length histogram.
+pub fn take_lit_hist() -> [u64; 6] {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut o = [0u64; 6];
+    for (i, v) in LP_HIST.iter().enumerate() {
+        o[i] = v.swap(0, Relaxed);
+    }
+    o
 }
 
 /// Literal appends served by the fixed-width copy, and by the fallback.
@@ -4157,7 +4210,17 @@ fn find_dfast_impl<const HLOG: u32>(
     // GATE 13 @ L3: reserve both outputs, as `find_fast` has since brick 38.
     // Sized from what the PREVIOUS block actually produced, so sparse-match
     // content does not over-reserve.
-    let lp = dfast_litpush_enabled();
+    // The hoist escape hatch is resolved HERE, once per block. It used to sit
+    // inside `push_literals`' guard as an atomic load on EVERY call -- 1.97M
+    // times at L3 and 15.7M at L1 -- selecting between two operands that are
+    // IDENTICAL for `find_fast` (its `arm` is already `lit_push_enabled()`).
+    // Brick 77 hoisted the env read out of that guard and left an atomic in its
+    // place; this finishes the job.
+    let lp = if litpush_hoist_enabled() {
+        dfast_litpush_enabled()
+    } else {
+        lit_push_enabled()
+    };
     let block_len = block_end - block_start;
     let seq_guess = (tables.last_nseq + tables.last_nseq / 4 + 64).min(block_len / mls + 16);
     let mut seqs = if lp {
@@ -4525,6 +4588,15 @@ fn find_dfast_impl<const HLOG: u32>(
         (nl_hits as f32 / nl_probes as f32).max(tables.next_long_yield * 0.5)
     };
     lits.extend_from_slice(&src[anchor..block_end]);
+    // GATE 13 @ L3 FOLLOW-UP: `find_dfast` READ `last_nseq` to size its `seqs`
+    // reservation but never WROTE it -- only `find_fast` did, and L3 never calls
+    // `find_fast`. So the field sat at its initial 0 for the whole frame and the
+    // guess collapsed to the `+ 64` floor, while DFast emits 5,685-13,763
+    // sequences per block: the reservation was ~100x short and `seqs` still grew
+    // by realloc (1,648 growths across the corpus).
+    //
+    // A capacity hint cannot affect output, so this is byte-identical.
+    tables.last_nseq = seqs.len();
     note_finder_work(COUNT, probes, hits, &seqs, &lits);
     (seqs, lits)
 }
