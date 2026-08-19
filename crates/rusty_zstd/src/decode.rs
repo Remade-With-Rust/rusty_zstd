@@ -39,6 +39,42 @@ impl Default for DecompressOptions {
     }
 }
 
+/// GATE 4 @ L19: hash decoded blocks as they land instead of re-reading the whole
+/// output at the end.
+///
+/// **DEFAULT OFF -- it measured FLAT.** The hypothesis was that the final pass
+/// re-reads from DRAM what the decoder just wrote, so hashing each block while it
+/// is cache-hot should be cheaper. Measured both ways:
+///
+///   1 MiB outputs   +1.99%  (incomp -18.1%, samba +17.4%)
+///   16 MiB outputs  -1.70%  (zeros -8.0%, text -8.6%, mozilla +5.0%)
+///
+/// The direction depends on output size and content and never exceeds the
+/// scatter. It wins where the decode is trivially fast and the checksum
+/// dominates, and loses on dense binary -- plausibly because xxh64's 4-lane
+/// stripe loop wants one long contiguous buffer, and per-block updates break the
+/// stripes and add per-call setup that cancels the locality gain.
+///
+/// Kept as an arm rather than deleted because the mechanism is real and would
+/// matter for a streaming decoder, where the final pass is not even available.
+/// `set_ck_stream_arm(true)` enables it; both arms compute the same XXH64 over
+/// the same bytes in the same order, verified good-frame and corrupt-frame on
+/// 18/18 corpora.
+static CK_STREAM_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for the Gate 4 decode-checksum A/B.
+pub fn set_ck_stream_arm(on: bool) {
+    CK_STREAM_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn ck_stream_enabled() -> bool {
+    matches!(
+        CK_STREAM_ARM.load(core::sync::atomic::Ordering::Relaxed),
+        2
+    )
+}
+
 /// One-shot decompress of one or more concatenated frames (skippable frames ignored).
 #[cfg(feature = "alloc")]
 pub fn decompress(src: &[u8]) -> Result<Vec<u8>, Error> {
@@ -322,6 +358,27 @@ fn decode_zstd_frame(
     let start_len = out.len();
     let mut block_state = BlockState::from_dict(dict);
 
+    // GATE 4 @ L19 -- hash each block as it lands, while it is still hot.
+    //
+    // The ENCODER has always done this (`h.update(&workspace[off..end])` per
+    // block). The DECODER did one pass over the WHOLE output after every block
+    // was written, re-reading from memory what it had just produced. On content
+    // the decoder finishes quickly that second traversal dominates: an all-zeros
+    // frame decodes by `resize` (a memset) and then pays a full re-read to hash
+    // it, which measured the checksum at 5x the entire decode.
+    //
+    // Brick 85 fused the checksum into the ENCODE block loop and measured 12%
+    // WORSE, but the two cases are not the same: there the source is already
+    // being streamed by the match finder, so the hash competes for the same
+    // loads. Here the block was just WRITTEN, so it is in L1/L2 and the fused
+    // read is nearly free.
+    let mut running = if header.checksum && !opts.force_ignore_checksum && ck_stream_enabled() {
+        Some(crate::xxh64::Xxh64::new())
+    } else {
+        None
+    };
+    let mut hashed_to = start_len;
+
     {
         let _b = crate::prof::scope(crate::prof::Stage::DecodeBlocks);
         loop {
@@ -359,6 +416,11 @@ fn decode_zstd_frame(
                     )?;
                 }
             }
+            if let Some(h) = running.as_mut() {
+                // hash exactly the bytes this block produced, still cache-hot
+                h.update(&out[hashed_to..]);
+                hashed_to = out.len();
+            }
             if bh.last {
                 break;
             }
@@ -371,8 +433,15 @@ fn decode_zstd_frame(
         // would desync every following frame in a concatenated stream.
         let got = r.u32_le()?;
         if !opts.force_ignore_checksum {
-            let produced = &out[start_len..];
-            if content_checksum(produced) != got {
+            let computed = match running {
+                // streamed per block above -- no second traversal
+                Some(h) => {
+                    debug_assert_eq!(hashed_to, out.len());
+                    h.digest() as u32
+                }
+                None => content_checksum(&out[start_len..]),
+            };
+            if computed != got {
                 return Err(Error::ChecksumMismatch);
             }
         }

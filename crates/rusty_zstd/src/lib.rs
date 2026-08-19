@@ -45,7 +45,7 @@ mod train;
 mod xxh64;
 
 pub use compressed::{set_litcopy_arm, set_lut_arm, set_matchcopy_arm, set_seqcheck_arm};
-pub use decode::{content_size, decompress_with, find_frame_compressed_size, DecompressOptions};
+pub use decode::{content_size, set_ck_stream_arm, decompress_with, find_frame_compressed_size, DecompressOptions};
 pub use error::Error;
 pub use frame::{
     get_frame_header, FrameHeader, FrameKind, BLOCKSIZE_MAX, DEFAULT_WINDOW_MAX, MAGIC,
