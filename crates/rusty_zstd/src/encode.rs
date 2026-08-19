@@ -3411,6 +3411,22 @@ static LAZY_FILL_S_ARM: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 /// Set the lazy back-fill stride in-process.
+/// GATE 6 next-long probe outcomes, for GATE 14's dispatch study.
+pub static NL_PROBES_G: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static NL_HITS_G: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Total match-length GAIN the next-long probe bought, across its hits.
+pub static NL_GAIN_G: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear `(next_long_probes, next_long_hits)`.
+pub fn take_next_long() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        NL_PROBES_G.swap(0, Relaxed),
+        NL_HITS_G.swap(0, Relaxed),
+        NL_GAIN_G.swap(0, Relaxed),
+    )
+}
+
 /// GATE 14 @ L3 -- the DEPTH CUT DFast actually has.
 ///
 /// GATE 14 proper (`bt_depth_apply`) is dead at L3 twice over: L3 makes ZERO
@@ -3438,6 +3454,43 @@ fn dfast_good_ml() -> usize {
     let v = DFAST_GOOD_ML_ARM.load(core::sync::atomic::Ordering::Relaxed);
     if v == 0 {
         8
+    } else {
+        v
+    }
+}
+
+/// The same cut, for the SECOND-CANDIDATE site only. The constant governed two
+/// mechanisms with different characters -- the next-long probe COMMITS at
+/// `ip + 1` (it changes the parse), while the short-hash check only adds a
+/// candidate at `ip` (it cannot make the match shorter). They are swept apart.
+static DFAST_GOOD_ML2_ARM: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Bench hook: the second-candidate cut. 0 follows `dfast_good_ml`.
+pub fn set_dfast_good_ml2_arm(v: usize) {
+    DFAST_GOOD_ML2_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// SHIPPED at 24, against the next-long site's 8.
+///
+/// Splitting the two sites is the whole finding. Raising the NEXT-LONG cut is
+/// the bigger lever (-0.083% size, -0.66% probes) but regresses `mr` by 1.109%,
+/// and FOUR signals fail to separate that: mean match length (webster 10.60
+/// wins, mr 9.58 loses), `rep_yield`, GATE 6's own `next_long_yield` (losers sit
+/// at 0.056-0.074 with winners both above AND below), and the probe's mean
+/// length gain per hit (losers 16.3-17.9, inside the winners' 8.6-26.3). A
+/// non-monotonic split with no separating signal is the doctrine's PRUNE case,
+/// so the next-long cut stays at 8 and the arm stays settable.
+///
+/// The second-candidate site carries no such risk: it only ADDS a candidate at
+/// `ip`, it cannot make the chosen match shorter or move the commit point, so it
+/// cannot restructure the parse. Measured across all 18 at 24: L3 -0.0226%
+/// size, L4 -0.0340%, worst corpus +0.0065% (osdb) -- at the noise floor.
+#[inline(always)]
+fn dfast_good_ml2() -> usize {
+    let v = DFAST_GOOD_ML2_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if v == 0 {
+        24
     } else {
         v
     }
@@ -4559,6 +4612,7 @@ fn find_dfast_impl<const HLOG: u32>(
     // Read ONCE per block -- see the -37% an env lookup inside the DP loop cost
     // at L19, and the 60% the depth gate's four per-call reads cost at L19/L22.
     let good_ml = dfast_good_ml();
+    let good_ml2 = dfast_good_ml2();
     let mls = params.min_match.max(3) as usize;
     // GATE 13 @ L3: reserve both outputs, as `find_fast` has since brick 38.
     // Sized from what the PREVIOUS block actually produced, so sparse-match
@@ -4803,6 +4857,12 @@ fn find_dfast_impl<const HLOG: u32>(
                 ) {
                     let ml = count_match(src, m8b, ip + 1, block_end);
                     if ml >= mls && ml > best_ml {
+                        // GATE 14 study: the probe COMMITS at `ip + 1`, spending
+                        // a literal. What it buys is `ml - best_ml` bytes, so
+                        // that gain -- not the raw hit rate -- is what the cut
+                        // actually stresses.
+                        #[cfg(feature = "profile")]
+                        NL_GAIN_G.fetch_add((ml - best_ml) as u64, core::sync::atomic::Ordering::Relaxed);
                         best_m = m8b;
                         best_ml = ml;
                         best_ip = ip + 1;
@@ -4811,7 +4871,7 @@ fn find_dfast_impl<const HLOG: u32>(
                 }
             }
         }
-        if best_ml < good_ml && best_ip == ip {
+        if best_ml < good_ml2 && best_ip == ip {
             if let Some(m4) = m4 {
                 if COUNT {
                     probes += 1;
@@ -4934,6 +4994,12 @@ fn find_dfast_impl<const HLOG: u32>(
         } else {
             0.75 * tables.dfast_mean_ml + 0.25 * now
         };
+    }
+    #[cfg(feature = "profile")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        NL_PROBES_G.fetch_add(nl_probes, Relaxed);
+        NL_HITS_G.fetch_add(nl_hits, Relaxed);
     }
     tables.next_long_yield = if nl_probes == 0 {
         1.0
@@ -5898,9 +5964,23 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
     // ~30M times per level across the corpus. The `tables.chain[..]` writes in
     // this same loop are what stop LLVM proving `frame_start` cannot change.
     let bt_lowest = block_start.saturating_sub(window).max(tables.frame_start);
-    // GATE 14 DISPATCH -- the chain-walk depth, which 4.33 showed is the BINDING
-    // constraint: 82-84% of walks end by exhausting `attempts` rather than
-    // reaching the end of the tree.
+    // GATE 14 DISPATCH -- the chain-walk depth.
+    //
+    // 4.33's "82-84% of walks end by exhausting `attempts`" is REFUTED and this
+    // comment used to repeat it. That flag was set at the BOTTOM of the loop, so
+    // it measured "did at least one iteration", not "used all attempts".
+    //
+    // The walk is NOT depth-bound. Measured with `take_bt_iters` (walks,
+    // iterations, walks that consumed ALL attempts), 15 corpora at 512 KiB:
+    //
+    //   L13   13.5% full depth, mean  6.8 iterations
+    //   L19    2.9% full depth, mean  8.4
+    //   L22    2.6% full depth, mean  8.6
+    //
+    // 97-98% of walks at L19/L22 end on their own guards, an order of magnitude
+    // under a 128- or 512-attempt budget. That is why raising the depth arm by
+    // +1 or +2 moves output on 0 of 18 corpora at L22: nothing wants more depth,
+    // and the probes live in the TAIL rather than at the cap.
     //
     // Priced at L19 (deterministic probe counts, 18 corpora):
     //   searchLog +1   +8.6% probes   -0.002% size   -- deeper buys nothing
@@ -6046,9 +6126,23 @@ fn bt_find_best_runtime(
     // ~30M times per level across the corpus. The `tables.chain[..]` writes in
     // this same loop are what stop LLVM proving `frame_start` cannot change.
     let bt_lowest = block_start.saturating_sub(window).max(tables.frame_start);
-    // GATE 14 DISPATCH -- the chain-walk depth, which 4.33 showed is the BINDING
-    // constraint: 82-84% of walks end by exhausting `attempts` rather than
-    // reaching the end of the tree.
+    // GATE 14 DISPATCH -- the chain-walk depth.
+    //
+    // 4.33's "82-84% of walks end by exhausting `attempts`" is REFUTED and this
+    // comment used to repeat it. That flag was set at the BOTTOM of the loop, so
+    // it measured "did at least one iteration", not "used all attempts".
+    //
+    // The walk is NOT depth-bound. Measured with `take_bt_iters` (walks,
+    // iterations, walks that consumed ALL attempts), 15 corpora at 512 KiB:
+    //
+    //   L13   13.5% full depth, mean  6.8 iterations
+    //   L19    2.9% full depth, mean  8.4
+    //   L22    2.6% full depth, mean  8.6
+    //
+    // 97-98% of walks at L19/L22 end on their own guards, an order of magnitude
+    // under a 128- or 512-attempt budget. That is why raising the depth arm by
+    // +1 or +2 moves output on 0 of 18 corpora at L22: nothing wants more depth,
+    // and the probes live in the TAIL rather than at the cap.
     //
     // Priced at L19 (deterministic probe counts, 18 corpora):
     //   searchLog +1   +8.6% probes   -0.002% size   -- deeper buys nothing
