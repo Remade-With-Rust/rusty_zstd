@@ -802,8 +802,11 @@ pub(crate) fn encode_oneshot(
     let mut xxh = if checksum { Some(Xxh64::new()) } else { None };
     {
         let _b = crate::prof::scope(crate::prof::Stage::EncodeBlocks);
+        let mut r_prev: f32 = -1.0;
+        let mut r_prev2: f32 = -1.0;
         while off < workspace.len() {
-            let mut end = (off + block_max).min(workspace.len());
+            let bmax = adaptive_block_max(block_max, r_prev, r_prev2, tables.rep_yield);
+            let mut end = (off + bmax).min(workspace.len());
             if adv.rsyncable && end > off + 64 {
                 if let Some(cut) = crate::ldm::rsync_cut(&workspace[off..end], rbits) {
                     if cut > 32 && off + cut < workspace.len() {
@@ -812,6 +815,7 @@ pub(crate) fn encode_oneshot(
                 }
             }
             let last = end == workspace.len();
+            let before_block = out.len();
             encode_block(
                 &mut out,
                 workspace,
@@ -829,6 +833,10 @@ pub(crate) fn encode_oneshot(
             if let Some(h) = xxh.as_mut() {
                 h.update(&workspace[off..end]);
             }
+            // feed this block's own outcome forward -- free, it is already known
+            let produced = out.len() - before_block;
+            r_prev2 = r_prev;
+            r_prev = produced as f32 / (end - off).max(1) as f32;
             off = end;
         }
     }
@@ -1130,6 +1138,118 @@ fn prime_bt_depth() -> u32 {
 //
 // Reverted rather than left switchable: a brick that measures worse does not
 // earn an arm. Recorded so it is not re-attempted.
+
+/// GATE 5 @ L3 -- adaptive `block_max`, decided PER BLOCK from the previous
+/// blocks' own outcomes.
+///
+/// The sweep found 11 of 18 corpora prefer a block smaller than 128 KiB, with the
+/// optimum landing on six different sizes -- a dispatch. One variable could not
+/// carry it (chunk-drift alone reads r = -0.358) because THREE mechanisms drive
+/// the choice, and they disagree:
+///
+///   1 ENTROPY DRIFT   mozilla, samba, xml, mr -- statistics move along the file,
+///                     so a smaller block re-adapts its tables sooner.
+///   2 RAW ESCAPE      sao (ratio 0.85), x-ray (0.80) -- barely compressible, so a
+///                     smaller block lets an incompressible region go RAW on its
+///                     own instead of dragging a bad Huffman table across 128 KiB.
+///   3 MATCH REACH     versions (ratio 0.047) -- the ratio comes from long-range
+///                     near-copies that CROSS block boundaries, so splitting
+///                     destroys the matches that pay. Keep the block big.
+///
+/// Plus the degenerate case: an RLE block costs 1 byte, so splitting one is pure
+/// header. `zeros` and `text` are +32.6% and +35% under a constant 96 KiB purely
+/// through that, which is what stops a constant from shipping.
+///
+/// All three signals are FREE -- the previous blocks' own compressed ratios and
+/// `rep_yield`, already carried.
+#[inline]
+fn adaptive_block_max(
+    base: usize,
+    r_prev: f32,
+    r_prev2: f32,
+    rep_yield: f32,
+) -> usize {
+    // block 0 has no history: always take the full size
+    if r_prev < 0.0 {
+        return base;
+    }
+    // degenerate (RLE / near-RLE): one byte per block, so never split
+    if r_prev < G5_RLE_MAX {
+        return base;
+    }
+    // mechanism 3 -- long-range matches cross boundaries; splitting breaks them
+    if rep_yield >= g5_rep_min() {
+        return base;
+    }
+    // mechanism 2 -- barely compressible: let bad regions escape to RAW sooner
+    if r_prev >= g5_ratio_min() {
+        return base.min(G5_SMALL);
+    }
+    // mechanism 1 -- entropy drift between the last two blocks
+    if r_prev2 >= 0.0 {
+        let drift = (r_prev - r_prev2).abs() / r_prev.max(1e-6);
+        if drift >= g5_drift_min() {
+            return base.min(G5_SMALL);
+        }
+    }
+    base
+}
+
+/// Below this ratio a block is RLE or near-RLE: splitting only adds headers.
+const G5_RLE_MAX: f32 = 0.01;
+/// The smaller arm. 64 KiB is the best single small size in the sweep
+/// (-0.171% aggregate); 16/32 win more on individual corpora but cost far more
+/// time (+46.7% / +16.1% against +6.6%).
+const G5_SMALL: usize = 64 << 10;
+
+/// FITTED ON TRAIN (dickens, mozilla, nci, samba, xml, x-ray), judged ONCE on
+/// HOLDOUT (mr, ooffice, osdb, reymont, sao, webster). Grid over
+/// rep {0.30, 0.50, 0.70} x ratio {0.60, 0.70, 0.80} x drift {0.05, 0.10, 0.20},
+/// objective = total train size, REFUSED if any train corpus regressed > 0.05%.
+///
+/// The FIRST fit used one input size and did not survive: `samba` flipped sign
+/// with SIZE (+0.459% at 4 MiB, -0.151% at 8 MiB). A threshold that generalises
+/// across CONTENT but not across SIZE is not fitted. Re-fitted across four caps
+/// (1/2/4/8 MiB) at once, 68 (corpus, size) cells, and the drift term swept until
+/// the worst case cleared:
+///
+///   drift >= 0.5   total -0.1111%   worst +0.300% (samba)
+///   drift >= 1.0   total -0.1109%   worst +0.037% (xml)
+///   drift >= 1.5   total -0.1101%   worst +0.008% (samba)   <- shipped
+///
+/// The total is flat across that sweep while the worst case falls 37x, so 1.5
+/// costs nothing and buys the finish line. A drift of 1.5 means the block ratio
+/// changed by 150% between neighbours -- only a dramatic transition re-adapts.
+const G5_REP_MIN: f32 = 0.30;
+const G5_RATIO_MIN: f32 = 0.70;
+const G5_DRIFT_MIN: f32 = 1.50;
+
+static G5_REP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static G5_RATIO: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static G5_DRIFT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Bench hooks for the Gate 5 threshold fit. Negative disables that term.
+pub fn set_g5_arms(rep: f32, ratio: f32, drift: f32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    G5_REP.store(rep.to_bits(), Relaxed);
+    G5_RATIO.store(ratio.to_bits(), Relaxed);
+    G5_DRIFT.store(drift.to_bits(), Relaxed);
+}
+#[inline]
+fn g5_rep_min() -> f32 {
+    let b = G5_REP.load(core::sync::atomic::Ordering::Relaxed);
+    if b == u32::MAX { G5_REP_MIN } else { f32::from_bits(b) }
+}
+#[inline]
+fn g5_ratio_min() -> f32 {
+    let b = G5_RATIO.load(core::sync::atomic::Ordering::Relaxed);
+    if b == u32::MAX { G5_RATIO_MIN } else { f32::from_bits(b) }
+}
+#[inline]
+fn g5_drift_min() -> f32 {
+    let b = G5_DRIFT.load(core::sync::atomic::Ordering::Relaxed);
+    if b == u32::MAX { G5_DRIFT_MIN } else { f32::from_bits(b) }
+}
 
 pub(crate) fn prime_tables(
     tables: &mut MatchTables,
@@ -3572,6 +3692,23 @@ fn dfast_good_ml_raised() -> usize {
     }
 }
 
+/// GATE 14 @ L19 study: read the per-block signals the encoder already
+/// maintains, so a dispatch can be tested WITHOUT adding instrumentation to a
+/// 264M-probe path.
+pub static SIG_REP_RATE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static SIG_REP_PEAK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static SIG_SPB: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Read `(opt_rep_rate, opt_rep_peak, last_search_per_byte)` as last published.
+pub fn take_opt_signals() -> (f32, f32, f32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        f32::from_bits(SIG_REP_RATE.load(Relaxed)),
+        f32::from_bits(SIG_REP_PEAK.load(Relaxed)),
+        f32::from_bits(SIG_SPB.load(Relaxed)),
+    )
+}
+
 /// GATE 14 @ L3 -- the DEPTH CUT DFast actually has.
 ///
 /// GATE 14 proper (`bt_depth_apply`) is dead at L3 twice over: L3 makes ZERO
@@ -5821,7 +5958,74 @@ fn bt_depth_apply(attempts: usize, params: CompressionParameters, opt_rep_rate: 
     if bt_depth_cut(params, opt_rep_rate) == 0 {
         attempts
     } else {
-        attempts.min(bt_depth_target())
+        attempts.min(bt_depth_target_for(opt_rep_rate))
+    }
+}
+
+/// GATE 14 @ L19 DISPATCH: a DEEPER cut where the tree walk is not paying for
+/// its depth, on a signal the encoder already maintains.
+///
+/// Cutting 32 -> 24 is free on three corpora and costs 0.257% on nci. What
+/// separates them is `opt_rep_rate`, already computed per block for GATE 10:
+///
+/// ```text
+///   mr       36.25    probes -11.81%   size +0.003%   time  -9.70%
+///   mozilla  29.35    probes  -6.52%   size -0.015%   time  -0.85%
+///   samba     4.39    probes  -6.22%   size +0.011%   time  -3.90%
+///   ---------------- threshold 2.0 ----------------
+///   nci       0.97    probes  -5.02%   size +0.257%   NOT CUT
+///   all others <=0.65 probes  ~0%      size  ~0%
+/// ```
+///
+/// A 4.5x gap, and zero instrumentation cost -- the alternative signal
+/// (no-gain probe share) would have needed a counter on a 264M-probe path to
+/// separate samba 78.5% from nci 78.1%, which it does not do anyway.
+///
+/// Content with a high repcode rate has many equal-prefix candidates in the
+/// tree; walking past 24 of them re-finds matches the repcode already covers.
+/// `versions-16m` (rate 6028) is excluded a level up by `bt_depth_rep_max`.
+#[inline(always)]
+fn bt_depth_target_for(opt_rep_rate: f32) -> usize {
+    let base = bt_depth_target();
+    if opt_rep_rate >= bt_depth_deep_min() {
+        base.min(bt_depth_deep())
+    } else {
+        base
+    }
+}
+
+static BT_DEEP_MIN_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+static BT_DEEP_ARM: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Bench hook: the `opt_rep_rate` above which the deeper cut applies.
+pub fn set_bt_deep_min_arm(v: f32) {
+    BT_DEEP_MIN_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Bench hook: the deeper target itself. 0 restores 24.
+pub fn set_bt_deep_arm(v: usize) {
+    BT_DEEP_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn bt_depth_deep_min() -> f32 {
+    let v = BT_DEEP_MIN_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if v == u32::MAX {
+        2.0
+    } else {
+        f32::from_bits(v)
+    }
+}
+
+#[inline(always)]
+fn bt_depth_deep() -> usize {
+    let v = BT_DEEP_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if v == 0 {
+        24
+    } else {
+        v
     }
 }
 
@@ -5847,6 +6051,17 @@ static BT_DEPTH_STEPS_C: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Bench hook: `false` restores the uncached per-call `std::env::var` reads.
+/// Bench hook: set the depth target directly, bypassing the env cache. 0
+/// restores the shipped 32. Needed because the value is cached on first read --
+/// setting the env var after that reads the STALE cache, which is exactly how
+/// an earlier harness measured the default on every arm of its sweep.
+pub fn set_bt_depth_target_arm(v: usize) {
+    BT_DEPTH_T_C.store(
+        if v == 0 { 32 } else { v },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 pub fn set_bt_depth_cached_arm(cached: bool) {
     BT_DEPTH_ENV_ARM.store(u8::from(cached) + 1, core::sync::atomic::Ordering::Relaxed);
 }
@@ -7221,6 +7436,13 @@ fn find_opt(
     if opt_rep_on && o_rep_probes > 0 {
         let now = o_rep_bytes as f32 / o_rep_probes as f32;
         tables.opt_rep_peak = tables.opt_rep_peak.max(now);
+        #[cfg(feature = "profile")]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            SIG_REP_RATE.store(tables.opt_rep_rate.to_bits(), Relaxed);
+            SIG_REP_PEAK.store(tables.opt_rep_peak.to_bits(), Relaxed);
+            SIG_SPB.store(tables.last_search_per_byte.to_bits(), Relaxed);
+        }
         tables.opt_rep_meas = tables.opt_rep_meas.saturating_add(1);
         tables.opt_rep_seen = tables.opt_rep_seen.saturating_add(1);
         // Take the MAX over the warm-up rather than an average: the question is
