@@ -4079,8 +4079,10 @@ fn lit_shares(seqs: &[Seq]) -> (f32, f32) {
 /// `slow - fast32` on every run in (16, 32] it newly catches. With the measured
 /// slow path at ~47 instructions that breaks even at
 ///
-///     mid_share * (47 - 9)  >  short_share * (9 - 7)
-///     mid_share             >  short_share * 0.0526
+/// ```text
+/// mid_share * (47 - 9)  >  short_share * (9 - 7)
+/// mid_share             >  short_share * 0.0526
+/// ```
 ///
 /// which predicts every corpus in the set, including both marginal ones
 /// (`mozilla` 4.2% vs 4.85% -> stay 16; `samba` 5.2% vs 4.91% -> widen).
@@ -6805,12 +6807,55 @@ fn find_opt(
         i = p;
     }
     ops.reverse();
-    let mut seqs = Vec::new();
-    let mut lits = Vec::new();
+    // GATE 13 @ L22 -- the capability find_fast has had since brick 38 and
+    // find_dfast since 4.46, absent from the whole Bt ladder. `find_opt` grew
+    // both vectors by repeated realloc and appended every literal run through a
+    // runtime-length `extend_from_slice`.
+    //
+    // Unlike the other finders this one can be EXACT rather than estimated:
+    // `ops` is already built, so the sequence count and the literal-run shares
+    // are known before a single byte is appended -- no `last_nseq` guess, no
+    // previous-block signal, and therefore no warm-up block.
+    let nmatched = ops.iter().filter(|o| o.2).count();
+    let block_len = block_end - block_start;
+    let mut seqs = Vec::with_capacity(nmatched + 1);
+    let mut lits = Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX);
+    // Width chosen from THIS block's own runs, by the asm-derived rule:
+    // widen when mid_share > short_share * (fast32 - fast16) / (slow - fast32).
+    let opt_w = {
+        let (mut short, mut mid) = (0usize, 0usize);
+        let mut a = 0usize;
+        for &(start, _, matched, _, ml) in &ops {
+            if matched {
+                let l = start - a;
+                if l <= LIT_PUSH_WIDTH {
+                    short += 1;
+                } else if l <= LIT_PUSH_WIDTH_WIDE {
+                    mid += 1;
+                }
+                a = start + ml as usize;
+            }
+        }
+        let n = nmatched.max(1) as f32;
+        let (sh, md) = (short as f32 / n, mid as f32 / n);
+        if sh < lit_short_min() {
+            0
+        } else if md > sh * WIDEN_RATIO {
+            LIT_PUSH_WIDTH_WIDE
+        } else {
+            LIT_PUSH_WIDTH
+        }
+    };
     let mut anchor = 0usize;
     for &(start, end, matched, off, ml) in &ops {
         if matched {
-            lits.extend_from_slice(&src[block_start + anchor..block_start + start]);
+            push_literals(
+                &mut lits,
+                src,
+                block_start + anchor,
+                block_start + start,
+                opt_w,
+            );
             seqs.push(Seq {
                 litlen: (start - anchor) as u32,
                 matchlen: ml,
