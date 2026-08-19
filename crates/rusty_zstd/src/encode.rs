@@ -119,20 +119,31 @@ fn params_with_history(level: i32, src_len: usize, hist_len: usize) -> Result<Co
     compression_params(level, Some(hint))
 }
 
-/// Fallback arm for FINDING 1. `false` restores payload-only window sizing.
+/// Arm for FINDING 1. **DEFAULT OFF, and coupled to FINDING 2.**
+///
+/// On its own a wider window is nearly worthless -- measured -0.389% at L19 with
+/// 6 of 15 corpora LARGER -- because there is no tree over the prefix to search
+/// in it. With FINDING 2 on it becomes -2.047% with 12 smaller / 2 larger. It
+/// also widens the priming range, so it MULTIPLIES Finding 2's cost: together
+/// they are -3.78% size at +246% time.
+///
+/// Turning it on also raises the advertised `windowLog` (20 -> 23 in the measured
+/// shape), obliging every decoder to allocate 8 MiB for that frame instead of
+/// 1 MiB. libzstd makes the same trade via
+/// `ZSTD_adjustCParams(cPar, srcSize, dictSize)`; we do not, by default.
 static PREFIX_WINDOW_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-/// Bench hook: `false` sizes the window from the payload alone, as before.
+/// Bench hook: `true` sizes the window from payload + prefix, as libzstd does.
 pub fn set_prefix_window_arm(on: bool) {
     PREFIX_WINDOW_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
 }
 
 #[inline]
 fn prefix_window_enabled() -> bool {
-    match PREFIX_WINDOW_ARM.load(core::sync::atomic::Ordering::Relaxed) {
-        1 => false,
-        _ => true,
-    }
+    matches!(
+        PREFIX_WINDOW_ARM.load(core::sync::atomic::Ordering::Relaxed),
+        2
+    )
 }
 
 /// Compress `src` using a dictionary (raw or trained).
@@ -938,7 +949,24 @@ fn prefix_bound_enabled() -> bool {
 /// `bt_find_best` inserts `ip` into the tree as a side effect (and maintains the
 /// hash head itself), so walking the prefix through it is our `ZSTD_updateTree`.
 ///
-/// 0 = unresolved, 1 = heads only (old), 2 = build the tree (shipped).
+/// **DEFAULT OFF.** It is a SIZE capability bought with TIME, and this campaign's
+/// objective is the reverse: we are at size parity and hunting speed. The whole
+/// curve was measured at L19 over a 4 MiB reference (15 corpora), and **no point
+/// on it is both smaller and faster**:
+///
+///   arm         size      time
+///   both OFF    0.000%    0.0%     <- shipped
+///   s1/d5      -3.784%  +246.0%
+///   s2/d5      -2.149%  +172.3%
+///   s4/d5      -1.213%   +86.4%
+///   s8/d5      -0.545%   +68.0%
+///   s8/d3      -0.110%   +46.3%
+///
+/// Enable with `RZSTD_PRIME_BT_TREE=1` / `set_prime_bt_tree_arm(true)` when
+/// dictionary RATIO matters more than dictionary load time -- with FINDING 1 it
+/// is -3.78% on 15 of 15 corpora and moves `us/c` from 1.0880 to 1.0468.
+///
+/// 0 = unresolved, 1 = heads only (shipped), 2 = build the tree.
 static PRIME_BT_TREE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Bench hook: `false` restores heads-only priming.
@@ -955,8 +983,8 @@ fn prime_bt_tree_enabled() -> bool {
             #[cfg(feature = "std")]
             {
                 let on = std::env::var("RZSTD_PRIME_BT_TREE")
-                    .map(|v| v.trim() != "0")
-                    .unwrap_or(true);
+                    .map(|v| v.trim() == "1")
+                    .unwrap_or(false);
                 PRIME_BT_TREE_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
                 on
             }
@@ -2590,6 +2618,9 @@ fn find_fast_impl<
     // the prologue and rematerializes it on every probe even with six
     // callee-saved registers idle. As a const, the shipping copy contains only
     // the loop it actually runs.
+    // Read ONCE per block, never per position -- see the -37% that an env
+    // lookup inside the DP loop cost at L19.
+    let accel = accel_shift_for(params.strategy);
     if PIPE && !pair && ip <= ilimit {
         if COUNT {
             FF_PIPE_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2668,7 +2699,7 @@ fn find_fast_impl<
             }
             // Next position, and its table load issued NOW -- this is the whole
             // point of the brick.
-            let nip = ip + step0 + ((ip - anchor) >> 8);
+            let nip = ip + step0 + ((ip - anchor) >> accel);
             if COUNT && nip <= ilimit {
                 ff_made += 1;
             }
@@ -3004,7 +3035,7 @@ fn find_fast_impl<
         if COUNT {
             mm_miss += 1;
         }
-        ip += step0 + ((ip - anchor) >> 8);
+        ip += step0 + ((ip - anchor) >> accel);
     }
     if COUNT {
         use core::sync::atomic::Ordering::Relaxed;
@@ -3388,6 +3419,68 @@ pub fn set_replen_pipe_arm(fixed: bool) {
 #[inline]
 fn replen_pipe_fixed() -> bool {
     REPLEN_PIPE_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
+}
+
+/// The search-strength shift in `ip += step + ((ip - anchor) >> N)`.
+///
+/// After `2^N` positions without a match resetting `anchor`, the stride grows by
+/// one; the growth is what makes match-poor content cheap. It is the knob that
+/// PRODUCES the positions/byte spread across the corpus -- dickens 0.561 against
+/// x-ray 0.028 and incomp 0.0014 -- and until now it was a hardcoded `8` at all
+/// four sites (both loops of `find_fast`, both of `find_dfast`), never gated.
+///
+/// C `zstd` calls this `kSearchStrength` and also uses 8. Our compressed bytes
+/// are not required to match C's, so it is ours to move. Unlike the back-fill
+/// writes of 4.40, positions are DEPENDENT work on the critical path.
+static ACCEL_SHIFT_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Bench hook: search-strength shift. 8 is the shipped default.
+pub fn set_accel_shift_arm(n: u32) {
+    ACCEL_SHIFT_ARM.store(n, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn accel_shift_base() -> u32 {
+    let v = ACCEL_SHIFT_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if v != u32::MAX {
+        return v;
+    }
+    let n: u32 = std::env::var("RZSTD_ACCEL")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&n| (1..=24).contains(&n))
+        .unwrap_or(0);
+    ACCEL_SHIFT_ARM.store(n, core::sync::atomic::Ordering::Relaxed);
+    n
+}
+
+/// DISPATCHED ON STRATEGY. Fast (L1-L2) accelerates one step harder.
+///
+/// The win is a POSITION count, and positions are dependent, latency-bound work
+/// -- the opposite of 4.40's back-fill writes, where -25% of the count bought
+/// exactly 0. Here -10.15% of positions buys -5.57% of L1 encode time against a
+/// 0.36% null (sao -22.20%, mozilla -10.41%, mr -6.02%), for +0.2206% size,
+/// worst corpus sao +0.796%.
+///
+/// It is dispatched rather than constant because the same shift is WORTH LESS
+/// higher up: DFast removes only 2.41% of positions at shift 7 (against L1's
+/// 10.15%) and times at -0.91% inside a 1.78% null. Fast has no second-chance
+/// long hash, so its main loop is a larger share of total time and its skipped
+/// positions are cheaper to give up.
+///
+/// `RZSTD_ACCEL` pins both arms for A/B.
+#[inline(always)]
+fn accel_shift_for(strategy: Strategy) -> u32 {
+    let pinned = accel_shift_base();
+    if pinned != 0 {
+        return pinned;
+    }
+    if strategy == Strategy::Fast {
+        7
+    } else {
+        8
+    }
 }
 
 /// The Gate 2 decision for this block: forced constant, or the measured yield.
@@ -3971,6 +4064,7 @@ fn find_dfast_impl<const HLOG: u32>(
     let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
     // GATE 6 @ L3 DISPATCH: run C's next-long probe only while it is EARNING.
     let nl_on = next_long_enabled() && tables.next_long_yield >= next_long_min();
+    let accel = accel_shift_for(params.strategy);
     let mut mm_total = 0u64;
     let mut nl_probes = 0u64;
     let mut nl_hits = 0u64;
@@ -4089,7 +4183,7 @@ fn find_dfast_impl<const HLOG: u32>(
         // `get_h` on that slot would return `Some(ip)`. The two tables are
         // distinct, so `h4` can only alias `h4` and `h8` only `h8`.
         if dpipe {
-            let nip = ip + dstep + ((ip - anchor) >> 8);
+            let nip = ip + dstep + ((ip - anchor) >> accel);
             if nip <= ilimit {
                 let a = hash_mls(src, nip, 4, hlog);
                 let b = hash8(src, nip, hlog);
@@ -4215,7 +4309,7 @@ fn find_dfast_impl<const HLOG: u32>(
             // them is stale.
             carried = None;
         } else {
-            ip += dstep + ((ip - anchor) >> 8);
+            ip += dstep + ((ip - anchor) >> accel);
         }
     }
     tables.rep_yield = if seqs.is_empty() {
