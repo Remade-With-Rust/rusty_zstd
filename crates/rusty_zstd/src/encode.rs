@@ -4259,6 +4259,64 @@ pub fn set_search_log_delta(delta: i32) {
 
 /// Candidate examinations the chain walk is allowed, for this level and arm.
 #[inline]
+/// How many halvings to take off the chain-walk depth for this content.
+/// Rep-dominated content keeps the full depth; everything else gives up one step
+/// for -9.2% of all bt probes at +0.001% size.
+///
+/// The signal is `opt_rep_rate`, NOT `rep_yield`: `find_opt` never updates
+/// `rep_yield`, so at L16+ it sits at its initial 1.0 forever and a gate keyed on
+/// it is dead. `opt_rep_rate` is maintained by `find_opt` itself (Gate 10) and
+/// separates the content that needs the depth -- versions-16m 434 bytes/probe and
+/// text-32m 26,932 against a maximum of 35.6 for everything else.
+///
+/// Restricted to the opt strategies: at L13 (BtLazy2) the same cut removes 29.8%
+/// of probes but costs +1.60% size (reymont +7.94%), so it is not applied there.
+#[inline]
+fn bt_depth_cut(params: CompressionParameters, opt_rep_rate: f32) -> u32 {
+    let opt = matches!(
+        params.strategy,
+        Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2
+    );
+    // Applied only in the depth band that MEASURED a win, at both ends:
+    //   searchLog 5-6 (L16-L18, 32-64 attempts)  -0.2928% size for 9.8% probes
+    //                                            (jsonlog +2.348%) -- too costly
+    //   searchLog 7   (L19-L21, 128 attempts)    +0.0010% for 8.6% -- shipped
+    //   searchLog 9   (L22, 512 attempts)        NO probe saving at all: probes
+    //                                            rose 0.26% and size +0.0022%,
+    //                                            because the shallower parse
+    //                                            emits more sequences and the DP
+    //                                            then visits more positions.
+    if !opt || !(7..=8).contains(&params.search_log) || opt_rep_rate > bt_depth_rep_max() {
+        0
+    } else {
+        bt_depth_steps()
+    }
+}
+
+fn bt_depth_rep_max() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_BT_DEPTH_REP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(50.0)
+    }
+    #[cfg(not(feature = "std"))]
+    50.0
+}
+
+fn bt_depth_steps() -> u32 {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_BT_DEPTH")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1)
+    }
+    #[cfg(not(feature = "std"))]
+    1
+}
+
 fn search_attempts(params: CompressionParameters) -> usize {
     let v = SEARCH_LOG_ARM.load(core::sync::atomic::Ordering::Relaxed);
     let base = params.search_log.min(12) as i32;
@@ -4420,7 +4478,20 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
     // ~30M times per level across the corpus. The `tables.chain[..]` writes in
     // this same loop are what stop LLVM proving `frame_start` cannot change.
     let bt_lowest = block_start.saturating_sub(window).max(tables.frame_start);
-    let attempts = search_attempts(params);
+    // GATE 14 DISPATCH -- the chain-walk depth, which 4.33 showed is the BINDING
+    // constraint: 82-84% of walks end by exhausting `attempts` rather than
+    // reaching the end of the tree.
+    //
+    // Priced at L19 (deterministic probe counts, 18 corpora):
+    //   searchLog +1   +8.6% probes   -0.002% size   -- deeper buys nothing
+    //   searchLog -1   -9.2% probes   +0.001% size   -- one step is nearly free
+    //   searchLog -2  -16.9% probes   +0.014% size
+    //
+    // One step shallower is free in aggregate and loses on exactly ONE corpus:
+    // versions-16m, +4.00%. That is the constant-stride content Gates 1, 2 and 6
+    // all veto on `rep_yield`, and the same veto serves here -- a near-copy file
+    // needs the depth to walk past its many equal-prefix candidates.
+    let attempts = search_attempts(params) >> bt_depth_cut(params, tables.opt_rep_rate);
     // P0/gg-matchfind: work counter -- see `chain_find_best`.
     const COUNT: bool = cfg!(feature = "profile");
     let mut probes = 0u64;
@@ -4545,7 +4616,20 @@ fn bt_find_best_runtime(
     // ~30M times per level across the corpus. The `tables.chain[..]` writes in
     // this same loop are what stop LLVM proving `frame_start` cannot change.
     let bt_lowest = block_start.saturating_sub(window).max(tables.frame_start);
-    let attempts = search_attempts(params);
+    // GATE 14 DISPATCH -- the chain-walk depth, which 4.33 showed is the BINDING
+    // constraint: 82-84% of walks end by exhausting `attempts` rather than
+    // reaching the end of the tree.
+    //
+    // Priced at L19 (deterministic probe counts, 18 corpora):
+    //   searchLog +1   +8.6% probes   -0.002% size   -- deeper buys nothing
+    //   searchLog -1   -9.2% probes   +0.001% size   -- one step is nearly free
+    //   searchLog -2  -16.9% probes   +0.014% size
+    //
+    // One step shallower is free in aggregate and loses on exactly ONE corpus:
+    // versions-16m, +4.00%. That is the constant-stride content Gates 1, 2 and 6
+    // all veto on `rep_yield`, and the same veto serves here -- a near-copy file
+    // needs the depth to walk past its many equal-prefix candidates.
+    let attempts = search_attempts(params) >> bt_depth_cut(params, tables.opt_rep_rate);
     // P0/gg-matchfind: work counter -- see `chain_find_best`.
     const COUNT: bool = cfg!(feature = "profile");
     let mut probes = 0u64;
