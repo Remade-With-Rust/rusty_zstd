@@ -65,7 +65,7 @@ pub use dict::{
 };
 #[cfg(feature = "alloc")]
 #[cfg(feature = "profile")]
-pub use simd::{set_eqlen_arm, take_eqlen_stats, take_eq_ops};
+pub use simd::{set_eqlen_arm, take_eqlen_stats, take_eq_ops, bench_eq_avx2, bench_eq_words};
 #[cfg(feature = "profile")]
 pub use compressed::take_dec_copies;
 pub use encode::{
@@ -100,6 +100,7 @@ pub use params::{compression_params, set_cparam_clamp_arm, set_strategy_arm, Com
 #[cfg(feature = "alloc")]
 pub use prof::{
     dump as prof_dump, encode_counts as prof_encode_counts, note_hash_fill as prof_note_hash_fill,
+    stage_ns as prof_stage_ns,
     reset as prof_reset, scope as prof_scope, take_block_taps as prof_take_block_taps,
     BlockTap as ProfBlockTap, EncodeCounts as ProfEncodeCounts, Stage as ProfStage,
 };

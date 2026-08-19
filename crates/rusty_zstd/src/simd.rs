@@ -113,6 +113,28 @@ pub(crate) unsafe fn copy32(src: *const u8, dst: *mut u8) {
     unsafe { core::ptr::copy_nonoverlapping(src, dst, 32) };
 }
 
+/// Bench entry points for the GATE 15 latency study. `count_eq_len` is where
+/// the two implementations differ; whole-encode timing cannot resolve a
+/// four-cycle dependency-chain difference, a tight loop can.
+#[cfg(feature = "profile")]
+pub fn bench_eq_avx2(a: &[u8], b: &[u8]) -> usize {
+    let max = a.len().min(b.len());
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    {
+        if has_avx2() {
+            // SAFETY: `a[..max]` and `b[..max]` are in bounds.
+            return unsafe { count_eq_len_avx2(a.as_ptr(), b.as_ptr(), max) };
+        }
+    }
+    count_eq_len_words(a, b, max)
+}
+
+/// The word-loop twin, for the same study.
+#[cfg(feature = "profile")]
+pub fn bench_eq_words(a: &[u8], b: &[u8]) -> usize {
+    count_eq_len_words(a, b, a.len().min(b.len()))
+}
+
 /// GATE 15 arm. 0 = shipped (AVX2 where available), 1 = force the word loop,
 /// 2 = peek the first 8 bytes before going wide.
 ///
