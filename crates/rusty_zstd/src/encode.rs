@@ -2753,7 +2753,7 @@ fn find_fast_impl<
                     }
                     let mstart = ip + 1;
                     crate::prof::note_huff_path(11);
-                    lits.extend_from_slice(&src[anchor..mstart]);
+                    push_literals(&mut lits, src, anchor, mstart, reserve);
                     crate::prof::note_huff_path(13);
                     seqs.push(Seq {
                         litlen: (mstart - anchor) as u32,
@@ -2938,6 +2938,14 @@ fn find_fast_impl<
             REP_PROBES.fetch_add(rep_probes, Relaxed);
             REP_BYTES.fetch_add(rep_bytes, Relaxed);
             REP_HITS_G.fetch_add(rep_hits, Relaxed);
+            // The DENOMINATORS must be published on the same path as the
+            // numerator. 4.44 added the rep counters here and left these in the
+            // main tail only, so `rep_hits / all_seqs` counted two paths over
+            // one and read as high as 11,516% -- an impossible ratio that
+            // indicted the instrument, not the encoder.
+            let mb: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
+            ALL_MATCH_BYTES.fetch_add(mb, Relaxed);
+            ALL_SEQS.fetch_add(seqs.len() as u64, Relaxed);
             FF_SPEC_MADE.fetch_add(ff_made, Relaxed);
             FF_SPEC_USED.fetch_add(ff_used, Relaxed);
         }
@@ -3000,7 +3008,7 @@ fn find_fast_impl<
                 }
                 let mstart = ip + 1;
                 crate::prof::note_huff_path(11);
-                lits.extend_from_slice(&src[anchor..mstart]);
+                push_literals(&mut lits, src, anchor, mstart, reserve);
                 crate::prof::note_huff_path(13);
                 seqs.push(Seq {
                     litlen: (mstart - anchor) as u32,
@@ -3953,6 +3961,11 @@ fn dfast_litpush_enabled() -> bool {
 /// `arm` is now AUTHORITATIVE: the hoist escape hatch is resolved by the caller,
 /// per block, so this function performs no atomic load at all.
 ///
+/// GATE 13 @ L1: `find_fast`'s two REPCODE sites append here too. They were
+/// raw `extend_from_slice` while the match commit next to them went through
+/// this function -- 8.0% of L1 sequences corpus-wide, but 35.4% on nci, 35.1%
+/// on sao and 33.0% on ooffice and versions.
+///
 /// Same disease as brick 49 (`use_rep`) and brick 64 (`seqcheck_hoisted`):
 /// a fixed-for-the-block flag re-read in the hottest loop.
 fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize, arm: bool) {
@@ -4018,6 +4031,17 @@ pub fn take_lit_hist() -> [u64; 6] {
 }
 
 /// Literal appends served by the fixed-width copy, and by the fallback.
+/// Read and clear the literal-push instruments: the six run-length buckets
+/// (0-4, 5-8, 9-16, 17-32, 33-64, 65+) plus fast/slow path counts.
+pub fn take_lp_stats() -> ([u64; 6], u64, u64) {
+    use core::sync::atomic::Ordering;
+    let mut h = [0u64; 6];
+    for (i, c) in LP_HIST.iter().enumerate() {
+        h[i] = c.swap(0, Ordering::Relaxed);
+    }
+    (h, LP_FAST.swap(0, Ordering::Relaxed), LP_SLOW.swap(0, Ordering::Relaxed))
+}
+
 pub static LP_FAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static LP_SLOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
