@@ -966,6 +966,26 @@ fn prefix_bound_enabled() -> bool {
 /// dictionary RATIO matters more than dictionary load time -- with FINDING 1 it
 /// is -3.78% on 15 of 15 corpora and moves `us/c` from 1.0880 to 1.0468.
 ///
+/// GATE 2 FINDING 2, third cost axis: how MUCH of the prefix gets a tree.
+///
+/// Stride and depth were swept; EXTENT was not. Matches favour recent history,
+/// so the tree's value is not uniform over the window: the bytes nearest the
+/// payload are searched first and matched most. This builds the tree only over
+/// the last `range / extent` bytes and leaves hash heads below it.
+///
+/// 0 or 1 = the whole primed range (what Finding 2 shipped as); N = the last 1/N.
+static PRIME_BT_EXTENT_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+/// Bench hook for the extent sweep. 1 = tree over the whole primed range.
+pub fn set_prime_bt_extent_arm(n: u32) {
+    PRIME_BT_EXTENT_ARM.store(n.max(1), core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn prime_bt_extent() -> usize {
+    PRIME_BT_EXTENT_ARM.load(core::sync::atomic::Ordering::Relaxed).max(1) as usize
+}
+
 /// 0 = unresolved, 1 = heads only (shipped), 2 = build the tree.
 static PRIME_BT_TREE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
@@ -1141,7 +1161,25 @@ pub(crate) fn prime_tables(
         } else {
             CompressionParameters { search_log: d, ..params }
         };
+        // EXTENT: the tree only over the most recent slice; heads below it.
+        let ext = prime_bt_extent();
+        let range = ilimit.saturating_sub(from);
+        let tree_from = if ext <= 1 {
+            from
+        } else {
+            ilimit.saturating_sub(range / ext).max(from)
+        };
         let mut p = from;
+        while p < tree_from && p + 8 <= src.len() {
+            let h = hash_mls(src, p, mls, hash_log);
+            tables.put_h(h, p);
+            if do_long {
+                let hl = hash8(src, p, hash_log);
+                tables.put_hl(hl, p);
+            }
+            iters += 1;
+            p += stride;
+        }
         while p <= ilimit && p + 8 <= src.len() {
             let _ = bt_find_best(src, p, payload_off, payload_off, window, mls, pparams, tables);
             iters += 1;
@@ -3225,14 +3263,28 @@ pub fn set_lazy_fill_threshold_arm(v: f32) {
 
 /// Back-fill stride (1 = every covered position). `RZSTD_LAZY_FILL_S` sweeps.
 /// Stride for the BtLazy2 back-fill. 1 = insert every position a match covers.
+/// Cached: runs once per EMITTED MATCH in `find_btlazy2` (L13-L15) -- the same
+/// per-call `std::env::var` shape that cost 60% of L19 encode. See
+/// `bt_depth_target`.
+static BT_FILL_S_C: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+#[inline(always)]
 fn bt_fill_stride() -> usize {
+    use core::sync::atomic::Ordering::Relaxed;
+    let c = BT_FILL_S_C.load(Relaxed);
+    if c != usize::MAX && bt_depth_cached() {
+        return c;
+    }
     #[cfg(feature = "std")]
     {
-        std::env::var("RZSTD_BT_FILL_S")
+        let v = std::env::var("RZSTD_BT_FILL_S")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .filter(|v| *v >= 1)
-            .unwrap_or(1)
+            .unwrap_or(1);
+        BT_FILL_S_C.store(v, Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     1
@@ -5001,14 +5053,53 @@ fn bt_depth_apply(attempts: usize, params: CompressionParameters, opt_rep_rate: 
     }
 }
 
+/// GATE 12 @ L22 DEFECT. These four knobs feed `bt_depth_apply`, which runs ONCE
+/// PER `bt_find_best` CALL -- 25,094,086 calls over the corpus at 2 MiB. Each was
+/// an uncached `std::env::var`, so the depth gate performed up to FOUR
+/// `GetEnvironmentVariableW` calls plus a `String` allocation per tree walk.
+///
+/// Measured: 4 lookups x 124.8 ns x 25.09M calls = 12,526 ms, against a 21,003 ms
+/// L19 encode and 24,833 ms at L22 -- 60% and 50% of total encode time, spent
+/// reading environment variables that never change.
+///
+/// Cached in atomics, read once. `RZSTD_BT_DEPTH_ENV=1` restores the per-call
+/// lookups so the fix can be A/B'd in one process.
+static BT_DEPTH_ENV_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static BT_DEPTH_T_C: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+static BT_DEPTH_SLOG_C: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+static BT_DEPTH_REP_C: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+static BT_DEPTH_STEPS_C: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Bench hook: `false` restores the uncached per-call `std::env::var` reads.
+pub fn set_bt_depth_cached_arm(cached: bool) {
+    BT_DEPTH_ENV_ARM.store(u8::from(cached) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn bt_depth_cached() -> bool {
+    BT_DEPTH_ENV_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
+}
+
+#[inline(always)]
 fn bt_depth_target() -> usize {
+    use core::sync::atomic::Ordering::Relaxed;
+    let c = BT_DEPTH_T_C.load(Relaxed);
+    if c != usize::MAX && bt_depth_cached() {
+        return c;
+    }
     #[cfg(feature = "std")]
     {
-        std::env::var("RZSTD_BT_DEPTH_TARGET")
+        let v = std::env::var("RZSTD_BT_DEPTH_TARGET")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .filter(|v| *v >= 1)
-            .unwrap_or(32)
+            .unwrap_or(32);
+        BT_DEPTH_T_C.store(v, Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     32
@@ -5039,13 +5130,21 @@ fn bt_depth_cut(params: CompressionParameters, opt_rep_rate: f32) -> u32 {
     }
 }
 
+#[inline(always)]
 fn bt_depth_rep_max() -> f32 {
+    use core::sync::atomic::Ordering::Relaxed;
+    let c = BT_DEPTH_REP_C.load(Relaxed);
+    if c != u32::MAX && bt_depth_cached() {
+        return f32::from_bits(c);
+    }
     #[cfg(feature = "std")]
     {
-        std::env::var("RZSTD_BT_DEPTH_REP")
+        let v: f32 = std::env::var("RZSTD_BT_DEPTH_REP")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(50.0)
+            .unwrap_or(50.0);
+        BT_DEPTH_REP_C.store(v.to_bits(), Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     50.0
@@ -5053,25 +5152,41 @@ fn bt_depth_rep_max() -> f32 {
 
 /// Lowest `search_log` at which the depth cut applies. Swept via
 /// `RZSTD_BT_DEPTH_SLOG`; 10 disables it entirely.
+#[inline(always)]
 fn bt_depth_min_slog() -> u32 {
+    use core::sync::atomic::Ordering::Relaxed;
+    let c = BT_DEPTH_SLOG_C.load(Relaxed);
+    if c != u32::MAX && bt_depth_cached() {
+        return c;
+    }
     #[cfg(feature = "std")]
     {
-        std::env::var("RZSTD_BT_DEPTH_SLOG")
+        let v = std::env::var("RZSTD_BT_DEPTH_SLOG")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(7)
+            .unwrap_or(7);
+        BT_DEPTH_SLOG_C.store(v, Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     7
 }
 
+#[inline(always)]
 fn bt_depth_steps() -> u32 {
+    use core::sync::atomic::Ordering::Relaxed;
+    let c = BT_DEPTH_STEPS_C.load(Relaxed);
+    if c != u32::MAX && bt_depth_cached() {
+        return c;
+    }
     #[cfg(feature = "std")]
     {
-        std::env::var("RZSTD_BT_DEPTH")
+        let v = std::env::var("RZSTD_BT_DEPTH")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(1)
+            .unwrap_or(1);
+        BT_DEPTH_STEPS_C.store(v, Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     1
