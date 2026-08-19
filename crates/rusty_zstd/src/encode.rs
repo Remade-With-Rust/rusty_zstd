@@ -884,6 +884,77 @@ fn prefix_bound_enabled() -> bool {
     }
 }
 
+/// FINDING 2 (Gate 2 @ L19): build the BINARY TREE over the prefix.
+///
+/// `prime_tables` wrote hash HEADS only. From `BtLazy2` up the finder descends a
+/// binary tree held in `chain`, and priming never wrote a node -- so the first
+/// descent from a primed head read an unseeded child and stopped. The prefix
+/// contributed at most one candidate per bucket, with no tree behind it.
+///
+/// libzstd does the opposite: `ZSTD_loadDictionaryContent` calls
+/// `ZSTD_updateTree` for btlazy2/btopt/btultra/btultra2, under the comment
+/// "we want the dictionary table fully sorted".
+///
+/// `bt_find_best` inserts `ip` into the tree as a side effect (and maintains the
+/// hash head itself), so walking the prefix through it is our `ZSTD_updateTree`.
+///
+/// 0 = unresolved, 1 = heads only (old), 2 = build the tree (shipped).
+static PRIME_BT_TREE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: `false` restores heads-only priming.
+pub fn set_prime_bt_tree_arm(build: bool) {
+    PRIME_BT_TREE_ARM.store(u8::from(build) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn prime_bt_tree_enabled() -> bool {
+    match PRIME_BT_TREE_ARM.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            #[cfg(feature = "std")]
+            {
+                let on = std::env::var("RZSTD_PRIME_BT_TREE")
+                    .map(|v| v.trim() != "0")
+                    .unwrap_or(true);
+                PRIME_BT_TREE_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+                on
+            }
+            #[cfg(not(feature = "std"))]
+            true
+        }
+    }
+}
+
+/// FINDING 2 cost dial: how deep the PRIMING tree-insert descends. `0` = use the
+/// level's own `search_log` (full depth, what a real search does).
+static PRIME_BT_DEPTH_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Bench hook for the priming-depth sweep.
+pub fn set_prime_bt_depth_arm(d: u32) {
+    PRIME_BT_DEPTH_ARM.store(d, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn prime_bt_depth() -> u32 {
+    #[cfg(feature = "std")]
+    {
+        use core::sync::atomic::Ordering;
+        let v = PRIME_BT_DEPTH_ARM.load(Ordering::Relaxed);
+        if v != u32::MAX {
+            return v;
+        }
+        let d: u32 = std::env::var("RZSTD_PRIME_BT_DEPTH")
+            .ok()
+            .and_then(|x| x.trim().parse().ok())
+            .unwrap_or(0);
+        PRIME_BT_DEPTH_ARM.store(d, Ordering::Relaxed);
+        d
+    }
+    #[cfg(not(feature = "std"))]
+    0
+}
+
 pub(crate) fn prime_tables(
     tables: &mut MatchTables,
     src: &[u8],
@@ -944,6 +1015,40 @@ pub(crate) fn prime_tables(
     let is_fast = params.strategy == Strategy::Fast && !tables.tags.is_empty();
     let hash_shift = 32u32.saturating_sub(hash_log.min(32));
     let mut iters = 0u64;
+    // FINDING 2: on the Bt ladder, INSERT each position into the tree rather
+    // than only writing its hash head. `bt_find_best` performs the insertion as
+    // a side effect and maintains the head itself, so this is the whole change.
+    // `block_start = block_end = payload_off` keeps the load self-contained: the
+    // descent floor becomes `payload_off - window` (exactly the priming range)
+    // and comparisons stop at the end of the prefix, never running into payload
+    // the caller has not asked us to look at yet.
+    if uses_bt && prime_bt_tree_enabled() && !tables.chain.is_empty() {
+        // COST CONTROL. `bt_find_best` runs a full SEARCH at each position --
+        // it tracks the best match and calls `count_match` -- when priming only
+        // needs the INSERT. libzstd separates the two: `ZSTD_insertBt1` is
+        // insert-only. We cannot cheaply drop the comparison (it decides
+        // left/right), but we CAN bound how deep the insert descends, and depth
+        // is the term the cost is linear in.
+        //
+        // Injected through `params.search_log` rather than new plumbing, so the
+        // real search path keeps its exact code and pays nothing for this.
+        // Striding the insert was measured first and REFUSED: the size win
+        // collapses faster than the cost (stride 4 keeps 0.045% of 1.78%).
+        let d = prime_bt_depth();
+        let pparams = if d == 0 {
+            params
+        } else {
+            CompressionParameters { search_log: d, ..params }
+        };
+        let mut p = from;
+        while p <= ilimit && p + 8 <= src.len() {
+            let _ = bt_find_best(src, p, payload_off, payload_off, window, mls, pparams, tables);
+            iters += 1;
+            p += stride;
+        }
+        PRIME_ITERS.fetch_add(iters, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     let mut p = from;
     while p <= ilimit && p + 8 <= src.len() {
         if is_fast {
@@ -3076,6 +3181,17 @@ fn dfast_fill_stride() -> usize {
     s
 }
 
+/// GATE 12 @ L3 work ledger: table WRITES performed by the two per-match end
+/// fills (short and long counted separately). The sparse arm's saving is paid
+/// in this unit; §4.39 priced only the main-loop positions it costs and so
+/// called the arm "dominated" while ignoring the larger term.
+pub static DF_ENDFILL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear the per-match end-fill write count.
+pub fn take_dfast_endfill() -> u64 {
+    DF_ENDFILL.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
 /// GATE 12 @ L3, the SPARSE direction. DFast writes four table entries per
 /// match -- `match_ip+2` and `match_end-2`, into both the short and the long
 /// hash -- unconditionally, and nothing has ever asked whether both earn it.
@@ -3596,6 +3712,11 @@ fn fill_hash_after_match<const PACKED: bool>(
             n += 1;
         }
     }
+    // Counted only under `--features profile`: this helper runs once per match,
+    // so an unconditional atomic here is ~2M lock-prefixed ops per corpus pass
+    // -- the same per-position atomic tax GATE 9 @ L1 removed from the Bt ladder.
+    #[cfg(feature = "profile")]
+    DF_ENDFILL.fetch_add(n, core::sync::atomic::Ordering::Relaxed);
     crate::prof::note_hash_fill(n);
 }
 
@@ -3609,16 +3730,23 @@ fn fill_hash_long_after_match(
     ilimit: usize,
 ) {
     let (do_a, do_b) = dfast_fill_ends();
+    let mut n = 0u64;
     let a = match_ip.saturating_add(2);
     if do_a && a <= ilimit {
         tables.put_hl(hash8(src, a, hash_log), a);
+        n += 1;
     }
     if do_b && match_end >= 2 {
         let b = match_end - 2;
         if b <= ilimit && b != a {
             tables.put_hl(hash8(src, b, hash_log), b);
+            n += 1;
         }
     }
+    #[cfg(feature = "profile")]
+    DF_ENDFILL.fetch_add(n, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "profile"))]
+    let _ = n;
 }
 
 /// Split out for register allocation -- see brick 48 on `find_fast_impl`.
