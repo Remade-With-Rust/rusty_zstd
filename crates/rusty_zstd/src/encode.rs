@@ -460,6 +460,18 @@ pub(crate) struct MatchTables {
     /// A separate array, NOT packed into the slot. The packed form truncated the
     /// position to 24 bits; it is gone (3a25bc7).
     tags: alloc::vec::Vec<u8>,
+    /// T1: hold DFast's tag in the TOP 8 BITS of the short slot instead of in a
+    /// second array.
+    ///
+    /// The separate-array form works -- byte-identical, and it rejects 29.8% of
+    /// non-empty short slots -- but it does not PAY: it adds one tag store per
+    /// position to avoid ~0.3 candidate loads per position, a second cache line
+    /// touched every time round the loop. Packed, the tag costs nothing at all:
+    /// same word, same load, same store.
+    ///
+    /// Sound only while `pos + 1` fits in 24 bits, so it is enabled per frame
+    /// against the actual buffer length and never guessed.
+    pack_tags: bool,
     /// Share of the PREVIOUS block's candidates the tag would have rejected --
     /// i.e. loads of `src[m]` it saves. Winners sit at 51-100%, the two losers
     /// at 34.3% (mr) and 12.5% (reymont), so the filter is worth its compare
@@ -497,9 +509,11 @@ impl MatchTables {
         // write happens even on blocks where Gate 7's filter is off and nothing
         // reads it. Gate 7 is byte-identical, so this is purely a speed
         // question.
-        let use_tags = (params.strategy == Strategy::Fast
-            || (params.strategy == Strategy::DFast && dfast_tag_enabled()))
-            && tag_alloc_enabled();
+        // T1 note: DFast does NOT want this array. It carries its tag packed in
+        // the slot it already loads, so allocating a second array here would
+        // reintroduce exactly the per-position store that made the unpacked form
+        // fail to pay.
+        let use_tags = params.strategy == Strategy::Fast && tag_alloc_enabled();
         let use_chain = !matches!(params.strategy, Strategy::Fast | Strategy::DFast);
         let hash_b = (hsz as u64).saturating_mul(4);
         let long_b = if use_long { hash_b } else { 0 };
@@ -564,6 +578,7 @@ impl MatchTables {
             pair_probe: 0,
             pair_route: 2,
             tags: if use_tags { alloc::vec![0u8; hsz] } else { alloc::vec::Vec::new() },
+            pack_tags: false,
             tag_yield: 1.0,
         }
     }
@@ -675,10 +690,26 @@ impl MatchTables {
     /// lets tags go stale (190ad8b, and again in `prime_tables`).
     #[inline(always)]
     fn put_h_tag(&mut self, h: usize, pos: usize, tag: u8) {
+        if self.pack_tags {
+            // `pos + 1` is guaranteed < 2^24 by `enable_packed_tags`, so the
+            // mask cannot truncate a live position, and the low bits are never
+            // 0 -- an all-zero word still means "empty".
+            self.hash[h] =
+                (((pos as u32).saturating_add(1)) & 0x00FF_FFFF) | (u32::from(tag) << 24);
+            return;
+        }
         if let Some(t) = self.tags.get_mut(h) {
             *t = tag;
         }
         self.hash[h] = (pos as u32).saturating_add(1);
+    }
+
+    /// Enable packed tags for this frame, but only when every position the
+    /// finder can store fits in the 24 bits the representation leaves.
+    /// `len` must be the length of the buffer the finder indexes into.
+    #[inline]
+    fn enable_packed_tags(&mut self, on: bool, len: usize) {
+        self.pack_tags = on && len < 0x00FF_FFFF;
     }
 
     /// T1: short-table load with the DFast rejection filter.
@@ -692,6 +723,12 @@ impl MatchTables {
         let v = self.hash[h];
         if v == 0 {
             return None;
+        }
+        if self.pack_tags {
+            if (v >> 24) as u8 != tag {
+                return None;
+            }
+            return Some(((v & 0x00FF_FFFF) as usize) - 1);
         }
         if on {
             if let Some(&t) = self.tags.get(h) {
@@ -769,6 +806,13 @@ pub(crate) fn encode_oneshot(
         let _t = crate::prof::scope(crate::prof::Stage::EncodeTables);
         MatchTables::new(params)
     };
+    // T1: DFast's short-table rejection tag, packed into the slot it already
+    // loads. Decided against the real buffer length, so the 24-bit bound is
+    // proven per frame rather than assumed.
+    tables.enable_packed_tags(
+        params.strategy == Strategy::DFast && dfast_tag_enabled(),
+        hist_prefix.len() + src.len(),
+    );
     let mut reps = [1u32, 4, 8];
     let mut entropy = EntropyState::default();
     if let Some(d) = dict {
@@ -1547,7 +1591,7 @@ pub(crate) fn prime_tables(
             // reaches this branch, so it needs the same treatment. `mls` is 5
             // there, so `hash_mls` took its hash4 path and the tag comes from
             // the same 4 bytes as the index.
-            if tables.tags.is_empty() {
+            if tables.tags.is_empty() && !tables.pack_tags {
                 tables.put_h(h, p);
             } else {
                 let hv = load_u32le(src, p).wrapping_mul(HASH4_PRIME);
@@ -1625,7 +1669,7 @@ pub(crate) fn encode_block(
     // the gate would suppress its own evidence, the defect this campaign has now
     // hit in Gates 6, 2 and 10.
     let skip_search =
-        raw_skip_on() && tables.raw_run >= RAW_RUN_MIN && tables.raw_probe != 0;
+        raw_skip_on() && tables.raw_run >= raw_run_min() && tables.raw_probe != 0;
     let (seqs, literals) = if skip_search {
         (Vec::new(), block.to_vec())
     } else {
@@ -1918,6 +1962,48 @@ fn raw_skip_on() -> bool {
     RAW_SKIP_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
 }
 
+/// GATE 16 @ L3: the two constants the short circuit runs on, never swept.
+///
+/// `RAW_RUN_MIN` is how many consecutive raw blocks it takes before the search
+/// is skipped; `RAW_PROBE_PERIOD` is how often it re-probes so content that
+/// starts compressing is picked up. Both were chosen when 4.30 shipped and
+/// neither has been moved since -- the same shape as the search-strength shift
+/// of 4.43, which sat unexamined and turned out to be the biggest L1 lever.
+static RAW_RUN_MIN_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+static RAW_PROBE_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Bench hook: consecutive raw blocks before the search is skipped. 0 = shipped 2.
+pub fn set_raw_run_min_arm(v: u32) {
+    RAW_RUN_MIN_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Bench hook: blocks between forced re-probes. 0 = shipped 16.
+pub fn set_raw_probe_arm(v: u32) {
+    RAW_PROBE_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn raw_run_min() -> u32 {
+    let v = RAW_RUN_MIN_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if v == 0 {
+        RAW_RUN_MIN
+    } else {
+        v
+    }
+}
+
+#[inline(always)]
+fn raw_probe_period() -> u32 {
+    let v = RAW_PROBE_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if v == 0 {
+        RAW_PROBE_PERIOD
+    } else {
+        v
+    }
+}
+
 const RAW_RUN_MIN: u32 = 2;
 /// Blocks between forced re-probes of the raw short circuit.
 const RAW_PROBE_PERIOD: u32 = 16;
@@ -1931,7 +2017,7 @@ fn note_raw_outcome(tables: &mut MatchTables, raw: bool) {
         tables.raw_run = 0;
     }
     tables.raw_probe = if tables.raw_probe == 0 {
-        RAW_PROBE_PERIOD
+        raw_probe_period()
     } else {
         tables.raw_probe - 1
     };
@@ -5002,14 +5088,27 @@ fn fill_hash_after_match<const PACKED: bool>(
     let a = match_ip.saturating_add(2);
     if do_a && a <= ilimit {
         let (h, g) = hash4_tag::<PACKED>(src, a, hash_shift);
-        tables.store_fast::<PACKED>(h, a, g);
+        // T1: this helper runs after EVERY match on the DFast path too, so it
+        // must write the short table in whatever representation the frame is
+        // using. Writing it unpacked while the reader is packed decodes the tag
+        // bits as part of the position -- which is exactly what it did, and it
+        // moved output on 12 of 18 corpora.
+        if tables.pack_tags {
+            tables.put_h_tag(h, a, g);
+        } else {
+            tables.store_fast::<PACKED>(h, a, g);
+        }
         n += 1;
     }
     if do_b && match_end >= 2 {
         let b = match_end - 2;
         if b <= ilimit && b != a {
             let (h, g) = hash4_tag::<PACKED>(src, b, hash_shift);
-            tables.store_fast::<PACKED>(h, b, g);
+            if tables.pack_tags {
+                tables.put_h_tag(h, b, g);
+            } else {
+                tables.store_fast::<PACKED>(h, b, g);
+            }
             n += 1;
         }
     }
@@ -5259,7 +5358,7 @@ fn find_dfast_impl<const HLOG: u32>(
     // Read ONCE per block. `hash4_tag`'s index is `(v * HASH4_PRIME) >> shift`,
     // which is exactly what `hash4` computes, so the tagged path indexes the
     // same slots as `hash_mls(src, ip, 4, hlog)` did.
-    let dtag_on = !tables.tags.is_empty();
+    let dtag_on = tables.pack_tags || !tables.tags.is_empty();
     let dtag_shift = 32u32.saturating_sub(hlog.min(32));
     while ip <= ilimit {
         if COUNT {
@@ -5497,7 +5596,10 @@ fn find_dfast_impl<const HLOG: u32>(
                 let mut p = best_ip + 2 + dfs;
                 while p < stop {
                     let (h, g) = hash4_tag::<false>(src, p, hash_shift);
-                    tables.store_fast::<false>(h, p, g);
+                    // T1: same table, same representation. `store_fast` writes
+                    // the slot unpacked, which a packed reader would decode as a
+                    // bogus position.
+                    tables.put_h_tag(h, p, g);
                     tables.put_hl(hash8(src, p, hlog), p);
                     DF_FILL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     p += dfs;
