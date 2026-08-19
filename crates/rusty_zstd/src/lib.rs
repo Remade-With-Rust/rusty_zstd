@@ -90,7 +90,7 @@ pub use mt::{
     JOB_SIZE_MIN, NB_WORKERS_MAX,
 };
 #[cfg(feature = "alloc")]
-pub use params::{compression_params, set_strategy_arm, CompressionParameters, Strategy};
+pub use params::{compression_params, set_cparam_clamp_arm, set_strategy_arm, CompressionParameters, Strategy};
 #[cfg(feature = "alloc")]
 pub use prof::{
     dump as prof_dump, encode_counts as prof_encode_counts, note_hash_fill as prof_note_hash_fill,

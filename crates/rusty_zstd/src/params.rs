@@ -339,6 +339,32 @@ pub fn compression_params(
     if p.chain_log > 24 {
         p.chain_log = 24;
     }
+    // GATE 2 @ L22: clamp the TABLE logs against the (already source-reduced)
+    // window, as `ZSTD_adjustCParams_internal` does:
+    //
+    //     if (cPar.hashLog > cPar.windowLog+1) cPar.hashLog = cPar.windowLog+1;
+    //     { U32 const cycleLog = ZSTD_cycleLog(cPar.chainLog, cPar.strategy);
+    //       if (cycleLog > cPar.windowLog) cPar.chainLog -= (cycleLog - cPar.windowLog); }
+    //
+    // We clamped `window_log` by source size but never propagated that to the
+    // tables, so a 1 MiB payload at L22 kept `chain_log 24` -- a **64 MiB**
+    // `vec![0; ..]` allocated and ZEROED per frame to hold at most ~1 M
+    // positions. C derives `chain_log 21` (8 MiB) for the same input. Eight
+    // times the memory, eight times the zeroing, and every tree probe a cold
+    // miss in an array that is mostly empty.
+    if cparam_clamp_enabled() {
+        if p.hash_log > p.window_log + 1 {
+            p.hash_log = p.window_log + 1;
+        }
+        // `ZSTD_cycleLog`: bt strategies address two slots per position.
+        let bt_scale = u32::from(p.strategy as u32 >= Strategy::BtLazy2 as u32);
+        let cycle_log = p.chain_log.saturating_sub(bt_scale);
+        if cycle_log > p.window_log {
+            p.chain_log = p.chain_log.saturating_sub(cycle_log - p.window_log);
+        }
+        p.hash_log = p.hash_log.clamp(6, 24);
+        p.chain_log = p.chain_log.max(6);
+    }
     p.min_match = p.min_match.clamp(3, 7);
     // GATE 1 (gg-matchfind) arm: override ONLY the strategy, leaving every other
     // parameter at this level's values.
@@ -358,6 +384,22 @@ pub fn compression_params(
 
 /// Gate 1 arm. 0 = no override; else `strategy as u8 + 1`.
 #[cfg(feature = "std")]
+/// Arm for the `ZSTD_adjustCParams` table clamp. Default ON.
+static CPARAM_CLAMP_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: `false` restores unclamped table logs (the old behaviour).
+pub fn set_cparam_clamp_arm(on: bool) {
+    CPARAM_CLAMP_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn cparam_clamp_enabled() -> bool {
+    !matches!(
+        CPARAM_CLAMP_ARM.load(core::sync::atomic::Ordering::Relaxed),
+        1
+    )
+}
+
 static STRATEGY_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Bench hook for the Gate 1 truth table. `None` restores the level's strategy.
