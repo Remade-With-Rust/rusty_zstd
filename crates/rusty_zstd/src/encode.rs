@@ -686,7 +686,11 @@ pub(crate) fn encode_oneshot(
         // `take_prime_iters()` counter is unchanged across the two arms -- so the
         // win is the `memcpy` alone, not the priming.
         let keep = window.saturating_add(BLOCKSIZE_MAX as usize);
-        let cut = hist_prefix.len().saturating_sub(keep);
+        let cut = if prefix_bound_enabled() {
+            hist_prefix.len().saturating_sub(keep)
+        } else {
+            0
+        };
         let hp = &hist_prefix[cut..];
         owned.reserve(hp.len() + src.len());
         owned.extend_from_slice(hp);
@@ -857,6 +861,29 @@ fn prime_stride() -> usize {
     1
 }
 
+/// GATE 2 fallback arm: the window-bounded prefix copy.
+///
+/// The Great Gate form requires every shipped constant to have a proven
+/// byte-identical OFF. `false` restores the old behaviour -- copy the WHOLE
+/// prefix however large -- so the two can be A/B'd in one process instead of
+/// across two binaries.
+///
+/// 0 = unresolved, 1 = copy everything (old), 2 = bound it (shipped).
+static PREFIX_BOUND_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: `false` copies the entire prefix, as the encoder used to.
+pub fn set_prefix_bound_arm(bound: bool) {
+    PREFIX_BOUND_ARM.store(u8::from(bound) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn prefix_bound_enabled() -> bool {
+    match PREFIX_BOUND_ARM.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        _ => true,
+    }
+}
+
 pub(crate) fn prime_tables(
     tables: &mut MatchTables,
     src: &[u8],
@@ -892,17 +919,48 @@ pub(crate) fn prime_tables(
     // Hoisted: both were re-tested on EVERY primed position.
     let do_long = !tables.hash_long.is_empty();
     let stride = prime_stride();
+    // GATE 2 @ L1 -- prime the TAG as well, or the priming is thrown away.
+    //
+    // `put_h` writes `hash` and nothing else. `store_fast` writes `hash` AND
+    // `tags`, "UNCONDITIONALLY whenever the array exists", because gating the
+    // store on the same flag as the compare is what lets tags go stale -- the
+    // defect class that already cost this gate a day (190ad8b).
+    //
+    // `prime_tables` was the one remaining writer that broke that rule. At L1
+    // the tag array is allocated, `tag_yield` SEEDS TO 1.0 and `tag_min` is
+    // 0.50, so the filter is ON for block 0 -- exactly the block that consumes
+    // the primed prefix. Every primed slot carried `tags[h] == 0`, mismatched,
+    // and `load_fast` returned 0: the candidate was rejected without ever
+    // reading `src[m]`.
+    //
+    // Measured before the fix, prefix-primed at L1 with the filter forced OFF:
+    // smaller on 14 of 18 corpora, -0.4114% overall, `versions-16m` -59.3%
+    // (13,164 -> 5,355 bytes). With NO prefix the same A/B is 0.000% on all 18,
+    // which is the control proving the effect is priming-specific.
+    //
+    // Derived exactly like `hash4_tag` rather than via `hash_mls`: `find_fast`
+    // always hashes 4 bytes whatever `min_match` says, so a `mls >= 8` Fast row
+    // would otherwise prime hash8 slots the finder never reads.
+    let is_fast = params.strategy == Strategy::Fast && !tables.tags.is_empty();
+    let hash_shift = 32u32.saturating_sub(hash_log.min(32));
     let mut iters = 0u64;
     let mut p = from;
     while p <= ilimit && p + 8 <= src.len() {
-        let h = hash_mls(src, p, mls, hash_log);
-        if write_chain {
-            tables.chain[p & chain_mask] = tables.get_h(h).map(|x| x as u32).unwrap_or(0);
-        }
-        tables.put_h(h, p);
-        if do_long {
-            let hl = hash8(src, p, hash_log);
-            tables.put_hl(hl, p);
+        if is_fast {
+            let hv = load_u32le(src, p).wrapping_mul(HASH4_PRIME);
+            let h = (hv >> hash_shift) as usize;
+            let tag = (hv ^ (hv >> 15)) as u8;
+            tables.store_fast::<true>(h, p, tag);
+        } else {
+            let h = hash_mls(src, p, mls, hash_log);
+            if write_chain {
+                tables.chain[p & chain_mask] = tables.get_h(h).map(|x| x as u32).unwrap_or(0);
+            }
+            tables.put_h(h, p);
+            if do_long {
+                let hl = hash8(src, p, hash_log);
+                tables.put_hl(hl, p);
+            }
         }
         iters += 1;
         p += stride;
@@ -2904,15 +2962,32 @@ fn lazy_fill_enabled() -> bool {
 
 /// Dispatch threshold for the lazy back-fill, in search positions per byte.
 /// Calibrated on the deployed estimator (`RZSTD_LAZY_FILL_T` to sweep).
+/// GATE 3's threshold. Was a `OnceLock` -- the same latch that made Gate 12 read
+/// DEAD at every level (see `lazy_fill_stride`). Pinned at 0.0, so
+/// `last_search_per_byte >= 0.0` is always true and the dispatch has never
+/// actually gated anything: the same fossil shape as
+/// `rep_yield_min_for(DFast) = 0.0`, which was worth 26% of the repcode probe
+/// work once unpinned.
 fn lazy_fill_threshold() -> f32 {
-    use std::sync::OnceLock;
-    static T: OnceLock<f32> = OnceLock::new();
-    *T.get_or_init(|| {
-        std::env::var("RZSTD_LAZY_FILL_T")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.0)
-    })
+    use core::sync::atomic::Ordering;
+    let v = LAZY_FILL_T_ARM.load(Ordering::Relaxed);
+    if v != u32::MAX {
+        return f32::from_bits(v);
+    }
+    let t: f32 = std::env::var("RZSTD_LAZY_FILL_T")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+    LAZY_FILL_T_ARM.store(t.to_bits(), Ordering::Relaxed);
+    t
+}
+
+static LAZY_FILL_T_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Set Gate 3's back-fill threshold in-process.
+pub fn set_lazy_fill_threshold_arm(v: f32) {
+    LAZY_FILL_T_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Back-fill stride (1 = every covered position). `RZSTD_LAZY_FILL_S` sweeps.

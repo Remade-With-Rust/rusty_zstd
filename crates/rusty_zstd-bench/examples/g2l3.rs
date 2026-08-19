@@ -31,7 +31,7 @@ const IDS: &[&str] = &[
     "ooffice", "osdb", "reymont", "sao", "webster", "dickens", "mozilla", "nci", "samba", "xml",
     "x-ray",
 ];
-const LVL: i32 = 3;
+
 const PREFIX: usize = 4 << 20;
 const PAYLOAD: usize = 1 << 20;
 const ITERS: usize = 15;
@@ -50,6 +50,8 @@ fn best_of<F: FnMut() -> usize>(mut f: F) -> (f64, usize) {
 }
 
 fn main() {
+    #[allow(non_snake_case)]
+    let LVL: i32 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(3);
     let p = rusty_zstd::compression_params(LVL, Some(PAYLOAD as u64)).unwrap();
     let window = 1usize << p.window_log.min(31);
     let keep = window + rusty_zstd::BLOCKSIZE_MAX as usize;
