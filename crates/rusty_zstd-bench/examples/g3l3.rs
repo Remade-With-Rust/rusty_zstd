@@ -13,7 +13,7 @@ use std::process::Command;
 use std::time::Instant;
 
 const IDS: &[&str] = &["mozilla","webster","nci","samba","osdb","dickens","mr","xml","reymont","sao","ooffice","x-ray","jsonlog-16m","smallmsg-8m","versions-16m","text-32m","zeros-32m","incomp-32m"];
-const LVL: i32 = 3;
+
 const CAP: usize = 1 << 20;
 
 fn with_id(raw: &[u8], id: u32) -> Dictionary {
@@ -23,6 +23,8 @@ fn with_id(raw: &[u8], id: u32) -> Dictionary {
 }
 
 fn main() {
+    #[allow(non_snake_case)]
+    let LVL: i32 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(3);
     let raw = std::fs::read("target/_g3.dict").expect("run `dtrain` first");
     let zstd = "third_party/zstd/extracted/zstd-v1.5.7-win64/zstd.exe";
 
