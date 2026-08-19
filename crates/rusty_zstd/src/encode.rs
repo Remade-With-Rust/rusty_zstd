@@ -3521,8 +3521,36 @@ fn nl_off_worse_max() -> f32 {
 
 /// The next-long cut for THIS block: raised while the trade is paying, and
 /// during warm-up and every re-probe so the signal can be refreshed.
+/// DEFAULT OFF, and the reason is a work ledger I got wrong once already.
+///
+/// Raising this cut is a SIZE win (-0.0940% dispatched) and a SPEED LOSS. The
+/// first ledger counted main-loop POSITIONS only and read -0.38%; but raising
+/// the cut makes the next-long PROBE fire more often, and each firing is a hash
+/// lookup plus `match_ok` plus `count_match` that the position counter never
+/// sees. Both sides:
+///
+/// ```text
+///   positions   -24,683
+///   nl probes  +336,112
+///   NET ops    +311,429      and a timed +3.43% against a 2.20% null
+/// ```
+///
+/// Same half-ledger error as 4.40's back-fill. The brief is speed with minimal
+/// quality cost, so the raise stays OFF; the dispatch, its signal and its arms
+/// are kept because the SIGNAL is sound (it separates cleanly, see 4.51) and the
+/// trade may be worth taking at a level where size dominates.
+static NL_DISPATCH_ON: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: enable the next-long raise + its offset-trade dispatch.
+pub fn set_nl_dispatch_arm(on: bool) {
+    NL_DISPATCH_ON.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
 #[inline(always)]
 fn nl_cut_for(tables: &MatchTables) -> usize {
+    if NL_DISPATCH_ON.load(core::sync::atomic::Ordering::Relaxed) != 2 {
+        return 8;
+    }
     if tables.nl_band_meas < NL_BAND_WARMUP
         || tables.nl_band_probe == 0
         || tables.nl_off_worse <= nl_off_worse_max()
@@ -3607,7 +3635,17 @@ pub fn set_dfast_good_ml2_arm(v: usize) {
 fn dfast_good_ml2() -> usize {
     let v = DFAST_GOOD_ML2_ARM.load(core::sync::atomic::Ordering::Relaxed);
     if v == 0 {
-        24
+        // REVERTED to 8. The size win was real (-0.0266%) but so was the cost:
+        // raising this makes the short-hash candidate check run on every
+        // position with `best_ml` in [8, 24) instead of [0, 8), and that work
+        // was in NEITHER of the ledgers used to justify it. Timed in isolation
+        // with every other arm pinned, the dose-response is monotonic --
+        // cand2=16 +1.30%, cand2=24 +2.49% -- and three independent runs put
+        // the whole gate at +2.47%, +2.49% and +3.43% SLOWER.
+        //
+        // The brief is speed with minimal quality cost. This is size at a speed
+        // cost, which is the opposite trade.
+        8
     } else {
         v
     }
