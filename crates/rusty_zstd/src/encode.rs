@@ -805,7 +805,7 @@ pub(crate) fn encode_oneshot(
         let mut r_prev: f32 = -1.0;
         let mut r_prev2: f32 = -1.0;
         while off < workspace.len() {
-            let bmax = adaptive_block_max(block_max, r_prev, r_prev2, tables.rep_yield);
+            let bmax = adaptive_block_max(block_max, r_prev, r_prev2, tables.rep_yield, params.strategy);
             let mut end = (off + bmax).min(workspace.len());
             if adv.rsyncable && end > off + 64 {
                 if let Some(cut) = crate::ldm::rsync_cut(&workspace[off..end], rbits) {
@@ -1168,7 +1168,22 @@ fn adaptive_block_max(
     r_prev: f32,
     r_prev2: f32,
     rep_yield: f32,
+    strategy: Strategy,
 ) -> usize {
+    // LEVEL-AWARE. The thresholds below were fitted at L3 and they do NOT
+    // transfer to L1: there they regressed `mozilla` +0.208% and `samba` +0.153%
+    // at 8 MiB, while blocking `versions-16m` from a -3.935% win because the
+    // match-reach guard that protects it at L3 is wrong on the Fast ladder.
+    //
+    // The mechanisms are the same; their thresholds are not. `Fast` emits a very
+    // different sequence distribution, so both the repcode yield and the drift
+    // it produces live on different scales.
+    let fast = strategy == Strategy::Fast;
+    let (rep_min, ratio_min, drift_min) = if fast {
+        (g5_rep_min_fast(), g5_ratio_min_fast(), g5_drift_min_fast())
+    } else {
+        (g5_rep_min(), g5_ratio_min(), g5_drift_min())
+    };
     // block 0 has no history: always take the full size
     if r_prev < 0.0 {
         return base;
@@ -1178,17 +1193,17 @@ fn adaptive_block_max(
         return base;
     }
     // mechanism 3 -- long-range matches cross boundaries; splitting breaks them
-    if rep_yield >= g5_rep_min() {
+    if rep_yield >= rep_min {
         return base;
     }
     // mechanism 2 -- barely compressible: let bad regions escape to RAW sooner
-    if r_prev >= g5_ratio_min() {
+    if r_prev >= ratio_min {
         return base.min(G5_SMALL);
     }
     // mechanism 1 -- entropy drift between the last two blocks
     if r_prev2 >= 0.0 {
         let drift = (r_prev - r_prev2).abs() / r_prev.max(1e-6);
-        if drift >= g5_drift_min() {
+        if drift >= drift_min {
             return base.min(G5_SMALL);
         }
     }
@@ -1223,6 +1238,51 @@ const G5_SMALL: usize = 64 << 10;
 const G5_REP_MIN: f32 = 0.30;
 const G5_RATIO_MIN: f32 = 0.70;
 const G5_DRIFT_MIN: f32 = 1.50;
+
+/// FAST-ladder thresholds (L1/L2), fitted separately -- see `adaptive_block_max`.
+/// Fitted on TRAIN at L1 across 1/2/4/8 MiB (68 cells), judged once on HOLDOUT,
+/// with the L3+ thresholds left exactly as shipped:
+///
+///   train    -0.1140%   worst +0.000%   best -0.799% (samba)
+///   HOLDOUT  -0.0766%   worst +0.000%   best -0.408% (sao)
+///
+/// `rep >= 2.0` is not a threshold, it is an OFF switch: `rep_yield` cannot
+/// exceed 1.0, so the match-reach branch never fires on the Fast ladder. That is
+/// the finding. At L3 that guard protects `versions-16m`, whose ratio comes from
+/// long-range near-copies that splitting would break. `Fast` does not find those
+/// matches in the first place, so the guard protects nothing there and merely
+/// blocked `versions` from a **-3.935%** win. A mechanism that is real at one
+/// level can be pure cost at another.
+const G5_REP_MIN_FAST: f32 = 2.00;
+const G5_RATIO_MIN_FAST: f32 = 0.70;
+const G5_DRIFT_MIN_FAST: f32 = 2.00;
+
+static G5_REP_F: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static G5_RATIO_F: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static G5_DRIFT_F: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Bench hook for the Fast-ladder fit. Leaves the L3+ thresholds untouched.
+pub fn set_g5_fast_arms(rep: f32, ratio: f32, drift: f32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    G5_REP_F.store(rep.to_bits(), Relaxed);
+    G5_RATIO_F.store(ratio.to_bits(), Relaxed);
+    G5_DRIFT_F.store(drift.to_bits(), Relaxed);
+}
+#[inline]
+fn g5_rep_min_fast() -> f32 {
+    let b = G5_REP_F.load(core::sync::atomic::Ordering::Relaxed);
+    if b == u32::MAX { G5_REP_MIN_FAST } else { f32::from_bits(b) }
+}
+#[inline]
+fn g5_ratio_min_fast() -> f32 {
+    let b = G5_RATIO_F.load(core::sync::atomic::Ordering::Relaxed);
+    if b == u32::MAX { G5_RATIO_MIN_FAST } else { f32::from_bits(b) }
+}
+#[inline]
+fn g5_drift_min_fast() -> f32 {
+    let b = G5_DRIFT_F.load(core::sync::atomic::Ordering::Relaxed);
+    if b == u32::MAX { G5_DRIFT_MIN_FAST } else { f32::from_bits(b) }
+}
 
 static G5_REP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 static G5_RATIO: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
