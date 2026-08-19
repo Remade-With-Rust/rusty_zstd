@@ -6,6 +6,31 @@ use crate::fse::{self, FseTable};
 use crate::huffman::{self, HuffmanTable};
 use crate::reader::Reader;
 
+/// AVX2 AUDIT: how often do the 32-byte decoder copies actually execute?
+/// Only >=32-byte ops can benefit from AVX2 -- a 16-byte copy is already one
+/// `movups`.
+#[cfg(feature = "profile")]
+pub static DEC_LIT32: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static DEC_MATCH32: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static DEC_LIT16: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static DEC_MATCH16: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear `(lit32, match32, lit16, match16)`.
+#[cfg(feature = "profile")]
+pub fn take_dec_copies() -> (u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        DEC_LIT32.swap(0, Relaxed),
+        DEC_MATCH32.swap(0, Relaxed),
+        DEC_LIT16.swap(0, Relaxed),
+        DEC_MATCH16.swap(0, Relaxed),
+    )
+}
+
+
 #[cfg(feature = "alloc")]
 use alloc::vec;
 #[cfg(feature = "alloc")]
@@ -618,6 +643,8 @@ fn copy_literals(
         // (separate borrows), so the regions cannot overlap. Exactly `n <= 16`
         // bytes are published by `set_len`; the rest stay in spare capacity.
         unsafe {
+            #[cfg(feature = "profile")]
+            DEC_LIT16.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             core::ptr::copy_nonoverlapping(
                 literals.as_ptr().add(*lit_pos),
                 out.as_mut_ptr().add(len),
@@ -642,6 +669,8 @@ fn copy_literals(
         // guaranteed by the two bounds above; `literals` and `out` are distinct
         // buffers. Exactly `n <= 32` bytes are published by `set_len`.
         unsafe {
+            #[cfg(feature = "profile")]
+            DEC_LIT32.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             core::ptr::copy_nonoverlapping(
                 literals.as_ptr().add(*lit_pos),
                 out.as_mut_ptr().add(len),
@@ -971,6 +1000,14 @@ fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize) -> Result<(), Er
         // allocation. Only `len <= 32` bytes are published by `set_len`.
         unsafe {
             let p = out.as_mut_ptr();
+            #[cfg(feature = "profile")]
+            DEC_MATCH32.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // AVX2 AUDIT (4.56): routing this through a runtime-dispatched
+            // `#[target_feature(enable = "avx2")]` copy makes it SLOWER. A
+            // target_feature function cannot be inlined into a baseline caller,
+            // so the 32-byte copy became `2 movs + callq` (3) plus a 4-
+            // instruction callee = 7, against 4 for the two inline SSE `movups`
+            // pairs. Measured, not assumed. Left as the baseline copy.
             core::ptr::copy_nonoverlapping(p.add(src), p.add(dst_at), 32);
             out.set_len(dst_at + len);
         }
@@ -995,6 +1032,8 @@ fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize) -> Result<(), Er
         // bytes are published by `set_len`.
         unsafe {
             let p = out.as_mut_ptr();
+            #[cfg(feature = "profile")]
+            DEC_MATCH16.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             core::ptr::copy_nonoverlapping(p.add(src), p.add(dst_at), 16);
             out.set_len(dst_at + len);
         }

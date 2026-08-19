@@ -74,6 +74,45 @@ pub(crate) fn load_u64_le(src: &[u8], i: usize) -> u64 {
 }
 
 /// Common prefix length of `a` and `b` (min of the two lengths).
+/// AVX2 32-byte copy for the decoder's match/literal fast paths.
+///
+/// At the crate's baseline (plain x86-64 = SSE2) a `copy_nonoverlapping(_, 32)`
+/// emits TWO 16-byte `movups` load/store pairs. With AVX2 it is one `vmovups`
+/// pair -- two instructions instead of four.
+///
+/// # Safety
+/// `src[0..32]` readable, `dst[0..32]` writable, regions non-overlapping.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(crate) unsafe fn copy32_avx2(src: *const u8, dst: *mut u8) {
+    use core::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
+    // SAFETY: caller guarantees 32 readable source and 32 writable destination
+    // bytes in disjoint regions.
+    unsafe {
+        let v = _mm256_loadu_si256(src as *const __m256i);
+        _mm256_storeu_si256(dst as *mut __m256i, v);
+    }
+}
+
+/// Dispatched 32-byte copy: AVX2 where available, else the baseline copy.
+///
+/// # Safety
+/// As `copy32_avx2`.
+#[inline(always)]
+pub(crate) unsafe fn copy32(src: *const u8, dst: *mut u8) {
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    {
+        if has_avx2() {
+            // SAFETY: forwarded from the caller.
+            unsafe { copy32_avx2(src, dst) };
+            return;
+        }
+    }
+    // SAFETY: forwarded from the caller.
+    unsafe { core::ptr::copy_nonoverlapping(src, dst, 32) };
+}
+
 /// GATE 15 arm. 0 = shipped (AVX2 where available), 1 = force the word loop,
 /// 2 = peek the first 8 bytes before going wide.
 ///
