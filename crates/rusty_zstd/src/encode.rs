@@ -725,6 +725,66 @@ pub(crate) fn encode_oneshot(
     Ok(out)
 }
 
+/// GATE 1 @ L19 -- the Bt tree is primed in the WRONG LAYOUT.
+///
+/// `prime_tables` writes `chain[p & chain_mask]`, i.e. the linked-chain form:
+/// one slot per position, "previous position with this hash". That is correct
+/// for `Greedy`/`Lazy`/`Lazy2` (L5-L12), which read it back through
+/// `chain_find_best`.
+///
+/// From `BtLazy2` up (L13-L22) the SAME array is a BINARY TREE. `bt_find_best`
+/// addresses it as `(m & bt_mask) << 1` with `bt_log = chain_log - 1`, i.e. TWO
+/// slots per position holding that node's smaller/larger children. Priming a
+/// prefix at those levels therefore scatters chain-format links across tree
+/// nodes at unrelated indices.
+///
+/// It is not a correctness bug -- a bogus candidate either fails the
+/// `m < bt_lowest` / `ip - m > window` guards or is rejected by `count_match`,
+/// so the output stays valid. It is a QUALITY and SPEED bug: the descent starts
+/// from garbage instead of from an empty tree.
+///
+/// This is reached whenever a prefix or dictionary is present, which for MT is
+/// EVERY job after the first -- and at L19 the overlap is the whole 8 MiB
+/// window, so it is 8 MiB of per-byte work per job, seeding noise.
+///
+/// MEASURED: skipping it is BYTE-IDENTICAL on 18 corpora x L13/L19/L22 (54
+/// cells, 0 changed), so the write is provably DEAD on the Bt ladder -- the
+/// values land at indices the tree never reads as links. It is also strictly
+/// less work: 12 of 18 faster by >1% at L13, 7 of 18 at L22, and up to -28.8%
+/// where the priming loop dominates (`zeros-32m`, `text-32m`).
+///
+/// Default is now SKIP. `RZSTD_PRIME_BT=1` (or `set_prime_bt_arm(true)`) restores
+/// the old write -- that is the byte-identical fallback the ledger requires.
+///
+/// 0 = unresolved, 1 = skip the chain write on Bt strategies, 2 = keep it.
+static PRIME_BT_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for the Gate 1 @ L19 A/B. `true` keeps the current (chain-format)
+/// write on the Bt ladder; `false` skips it.
+pub fn set_prime_bt_arm(keep: bool) {
+    PRIME_BT_ARM.store(u8::from(keep) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn prime_bt_chain_write() -> bool {
+    match PRIME_BT_ARM.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            #[cfg(feature = "std")]
+            {
+                let keep = std::env::var("RZSTD_PRIME_BT")
+                    .map(|v| v.trim() == "1")
+                    .unwrap_or(false);
+                PRIME_BT_ARM.store(u8::from(keep) + 1, core::sync::atomic::Ordering::Relaxed);
+                keep
+            }
+            #[cfg(not(feature = "std"))]
+            false
+        }
+    }
+}
+
 pub(crate) fn prime_tables(
     tables: &mut MatchTables,
     src: &[u8],
@@ -751,10 +811,16 @@ pub(crate) fn prime_tables(
     // chain-walking finders on the raw value.
     let hash_log = tables.hash_log;
     let chain_mask = tables.chain.len().saturating_sub(1);
+    // See `PRIME_BT_ARM`: from BtLazy2 up, `chain` is a binary tree, not a chain.
+    let uses_bt = matches!(
+        params.strategy,
+        Strategy::BtLazy2 | Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2
+    );
+    let write_chain = !uses_bt || prime_bt_chain_write();
     let mut p = from;
     while p <= ilimit && p + 8 <= src.len() {
         let h = hash_mls(src, p, mls, hash_log);
-        if !tables.chain.is_empty() {
+        if write_chain && !tables.chain.is_empty() {
             tables.chain[p & chain_mask] = tables.get_h(h).map(|x| x as u32).unwrap_or(0);
         }
         tables.put_h(h, p);
@@ -4293,7 +4359,7 @@ fn bt_depth_cut(params: CompressionParameters, opt_rep_rate: f32) -> u32 {
     //                                            because the shallower parse
     //                                            emits more sequences and the DP
     //                                            then visits more positions.
-    if !opt || !(7..=8).contains(&params.search_log) || opt_rep_rate > bt_depth_rep_max() {
+    if !opt || params.search_log < bt_depth_min_slog() || opt_rep_rate > bt_depth_rep_max() {
         0
     } else {
         bt_depth_steps()
@@ -4310,6 +4376,20 @@ fn bt_depth_rep_max() -> f32 {
     }
     #[cfg(not(feature = "std"))]
     50.0
+}
+
+/// Lowest `search_log` at which the depth cut applies. Swept via
+/// `RZSTD_BT_DEPTH_SLOG`; 10 disables it entirely.
+fn bt_depth_min_slog() -> u32 {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_BT_DEPTH_SLOG")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(7)
+    }
+    #[cfg(not(feature = "std"))]
+    7
 }
 
 fn bt_depth_steps() -> u32 {
