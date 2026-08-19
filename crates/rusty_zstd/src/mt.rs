@@ -150,30 +150,57 @@ where
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let mut i = 0usize;
-        while i < ranges.len() {
-            let take = (ranges.len() - i).min(workers.max(1));
-            let mut err = None;
-            std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(take);
-                for j in 0..take {
-                    let idx = i + j;
-                    let r = ranges[idx];
-                    let f = &f;
-                    handles.push(s.spawn(move || f(idx, r)));
-                }
-                for (j, h) in handles.into_iter().enumerate() {
-                    match h.join() {
-                        Ok(Ok(bytes)) => parts[i + j] = bytes,
-                        Ok(Err(e)) => err = Some(e),
-                        Err(_) => err = Some(Error::Corruption),
+        // GATE 1 @ L3 -- this used to run in WAVES: spawn `workers` threads, join
+        // ALL of them, then spawn the next `workers`. Every wave therefore cost
+        // its SLOWEST job while the other cores sat idle, and a fresh thread was
+        // spawned per job rather than per worker.
+        //
+        // Jobs are never equal-cost -- they are content, and this codec's own
+        // boards span 3 ms to 600 ms per 32 MiB across the corpus -- so the
+        // barrier is not a theoretical concern. It only bites once `ranges.len()
+        // > workers`, which at L3 needs a source above `workers * 8 MiB`; that
+        // is why it survived to now.
+        //
+        // Persistent workers pulling from a shared cursor instead. Byte-identity
+        // is STRUCTURAL, not measured: `f(idx, ranges[idx])` is a pure function
+        // of its range, and results are placed BY INDEX, so scheduling order
+        // cannot reach the output.
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        let n = ranges.len();
+        let nthreads = workers.max(1).min(n.max(1));
+        let next = AtomicUsize::new(0);
+        let mut err: Option<Error> = None;
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(nthreads);
+            for _ in 0..nthreads {
+                let f = &f;
+                let next = &next;
+                handles.push(s.spawn(move || -> Result<Vec<(usize, Vec<u8>)>, Error> {
+                    let mut done = Vec::new();
+                    loop {
+                        let idx = next.fetch_add(1, Ordering::Relaxed);
+                        if idx >= n {
+                            break;
+                        }
+                        done.push((idx, f(idx, ranges[idx])?));
                     }
-                }
-            });
-            if let Some(e) = err {
-                return Err(e);
+                    Ok(done)
+                }));
             }
-            i += take;
+            for h in handles {
+                match h.join() {
+                    Ok(Ok(done)) => {
+                        for (idx, bytes) in done {
+                            parts[idx] = bytes;
+                        }
+                    }
+                    Ok(Err(e)) => err = Some(e),
+                    Err(_) => err = Some(Error::Corruption),
+                }
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
         }
         Ok(())
     }
