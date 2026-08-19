@@ -282,6 +282,11 @@ pub(crate) struct MatchTables {
     opt_rep_rate: f32,
     /// Countdown to the next forced re-probe, so an off block can be re-measured.
     opt_rep_probe: u32,
+    /// Highest bytes-per-rep-probe seen this frame, and how many real
+    /// measurements it is built from. The PEAK is what characterises the
+    /// content; a single dry block sends the instantaneous rate to 0.
+    opt_rep_peak: f32,
+    opt_rep_meas: u32,
     /// Blocks in which the candidate has actually RUN. The gate may not shut
     /// until it has real evidence: block 0 of a frame has no history, so its
     /// rate is unrepresentative -- and because an OFF block records no hits, a
@@ -423,6 +428,8 @@ impl MatchTables {
             raw_probe: 0,
             opt_rep_rate: f32::MAX,
             opt_rep_probe: 0,
+            opt_rep_peak: 0.0,
+            opt_rep_meas: 0,
             opt_rep_seen: 0,
             opt_lit_price: 0,
             dfast_mean_ml: 0.0,
@@ -4991,13 +4998,32 @@ pub fn take_opt_rep() -> (u64, u64, u64) {
 }
 
 /// GATE 11 @ L19: back-fill the span the `sufficient_len` jump skips.
+///
+/// SHIPPED ON, dispatched on the frame's PEAK bytes-per-rep-probe. Ungated it
+/// cost +27.2% of bt probes for -342 bytes with versions-16m regressing +54;
+/// dispatched it costs +1.11% for -361 bytes with NO corpus regressing -- 115
+/// bytes per million probes against 4.4, a 26x better exchange rate.
 fn opt_fill_enabled() -> bool {
     #[cfg(feature = "std")]
     {
-        std::env::var("RZSTD_OPT_FILL").map(|v| v.trim() != "0").unwrap_or(false)
+        std::env::var("RZSTD_OPT_FILL").map(|v| v.trim() != "0").unwrap_or(true)
     }
     #[cfg(not(feature = "std"))]
     false
+}
+
+/// Above this bytes-per-rep-probe the content is rep-dominated and the jumped
+/// span's interior is not worth inserting.
+fn opt_fill_rep_max() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_OPT_FILL_REP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(50.0)
+    }
+    #[cfg(not(feature = "std"))]
+    50.0
 }
 
 /// Longest span the back-fill will walk. Beyond this the jump is a single huge
@@ -5254,7 +5280,33 @@ fn find_opt(
             // match, which is exactly the hole `find_bt_lazy`'s back-fill exists
             // to close. This is the same capability, at the level where it was
             // dead for want of a caller.
-            if opt_fill_enabled() {
+            // GATE 11 @ L19 DISPATCH. The span-length CAP was the wrong axis:
+            // dickens' jumps average 5,335 positions and GAIN, versions' average
+            // 2,812 and LOSE, so no cap separates them -- and a partial fill is
+            // worse for versions than filling none or all (non-monotonic).
+            //
+            // `opt_rep_rate` does separate them, and it is the same signal Gate
+            // 10 maintains and Gate 14's depth cut uses: versions-16m 434
+            // bytes/probe and text-32m 26,932 against a maximum of 35.6 for
+            // everything else. Those two hold 93% of ALL jumped positions
+            // (3.58M of 3.85M) and contribute -15 and +54 bytes; the other five
+            // hold 5.8% and contribute -381.
+            //
+            // Rep-dominated content does not need the interior of a huge repeat
+            // in the tree -- it is reachable through the repeat itself.
+            // The PEAK, not the last block. A single block in which the rep
+            // candidate probed and never hit drives `opt_rep_rate` to 0 --
+            // measured on versions-16m, whose jumps read the sentinel, then 0,
+            // then 131,041 -- and that one block was enough to fill part of its
+            // spans. A partial fill is worse for versions than filling none or
+            // all, which is the whole +134 bytes.
+            //
+            // Two real measurements are also required: with one, versions has
+            // only seen the 0.
+            if opt_fill_enabled()
+                && tables.opt_rep_meas >= 2
+                && tables.opt_rep_peak < opt_fill_rep_max()
+            {
                 let step = opt_fill_stride();
                 // Cap the span. text-32m and versions-16m hold 93% of ALL jumped
                 // positions (3.58M of 3.85M) and contribute -15 and +54 bytes;
@@ -5323,6 +5375,8 @@ fn find_opt(
     }
     if opt_rep_on && o_rep_probes > 0 {
         let now = o_rep_bytes as f32 / o_rep_probes as f32;
+        tables.opt_rep_peak = tables.opt_rep_peak.max(now);
+        tables.opt_rep_meas = tables.opt_rep_meas.saturating_add(1);
         tables.opt_rep_seen = tables.opt_rep_seen.saturating_add(1);
         // Take the MAX over the warm-up rather than an average: the question is
         // whether this content EVER repays the candidate, and a frame's first

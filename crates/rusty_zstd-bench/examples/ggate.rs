@@ -58,8 +58,17 @@ fn load(cap: usize) -> Vec<(&'static str, Vec<u8>)> {
 
 struct Cell {
     id: &'static str,
+    /// SOURCE bytes — not the compressed size. The first cut printed
+    /// `arms[0].2 / 1024` under a "MiB" heading, i.e. the compressed size in
+    /// KiB mislabelled as source MiB.
+    src: usize,
     arms: Vec<(String, f64, usize)>,
 }
+
+/// Size regression still counted as "parity". We are at size parity and the
+/// objective is speed, so a 4.17x speedup that costs 0.11% is a WIN, not a tie.
+/// The strict (size <= 0) count is printed too, so the guard is never hidden.
+const SIZE_GUARD_PCT: f64 = 0.5;
 
 /// Everything a cell needs to be decided, printed in one shape for all five gates.
 fn decide(gate: u32, lvl: i32, cells: &[Cell], pin: &str, dead: &str, vars: &str) {
@@ -73,6 +82,7 @@ fn decide(gate: u32, lvl: i32, cells: &[Cell], pin: &str, dead: &str, vars: &str
 
     let pi = labels.iter().position(|l| l == pin).expect("pin arm not in set");
     let mut losers: Vec<String> = Vec::new();
+    let mut strict = 0usize;
     let mut anti: Vec<String> = Vec::new();
     for c in cells {
         let p = &c.arms[pi];
@@ -87,23 +97,30 @@ fn decide(gate: u32, lvl: i32, cells: &[Cell], pin: &str, dead: &str, vars: &str
             .unwrap();
         let faster = (p.1 - best.1) / p.1 * 100.0;
         let size_pct = (best.2 as f64 / p.2 as f64 - 1.0) * 100.0;
-        if faster > LOSS_PCT && best.2 <= p.2 {
-            losers.push(format!("{}:{}", c.id, format!("{:.2}x", p.1 / best.1)));
+        if faster > LOSS_PCT && size_pct <= SIZE_GUARD_PCT {
+            losers.push(format!("{}:{:.2}x/{:+.2}%", c.id, p.1 / best.1, size_pct));
+            if best.2 <= p.2 {
+                strict += 1;
+            }
         } else if best.2 < p.2 && faster > -LOSS_PCT {
             losers.push(format!("{}:{}{:+}B", c.id, best.0, best.2 as i64 - p.2 as i64));
+            strict += 1;
         }
         // corpora that would be HURT by pinning the other way
         if faster < -LOSS_PCT || size_pct > 1.0 {
             anti.push(format!("{}:{:+.1}%t/{:+.2}%s", c.id, -faster, size_pct));
         }
-        print!("{:<13} {:>7}", c.id, c.arms[0].2 / 1024);
+        print!("{:<13} {:>7}", c.id, c.src >> 20);
         for a in &c.arms {
             print!(" {:>10.1}", a.1);
         }
         println!("  {:>7.2}x {:>8.2}%", p.1 / best.1, size_pct);
     }
     println!("\n  DEAD CHECK: {dead}");
-    println!("  CONSTANT TEST (pin = {pin}): {} of {} corpora lose", losers.len(), cells.len());
+    println!(
+        "  CONSTANT TEST (pin = {pin}): {} of {} corpora lose at the {SIZE_GUARD_PCT}% size guard ({strict} of {} at a STRICT size<=0 guard)",
+        losers.len(), cells.len(), cells.len()
+    );
     if !losers.is_empty() {
         println!("    {}", losers.join("  "));
     }
@@ -155,7 +172,7 @@ fn gate1(lvl: i32) {
         let adv = AdvancedOptions { nb_workers: 8, job_size: expl, ..Default::default() };
         let z = rusty_zstd::compress_with_advanced(s, p, false, None, &[], true, adv).unwrap();
         assert!(rusty_zstd::decompress(&z).unwrap() == *s, "{id}: MT round-trip FAILED");
-        cells.push(Cell { id, arms });
+        cells.push(Cell { id, src: s.len(), arms });
         print!(".");
         let _ = std::io::stdout().flush();
     }
@@ -196,7 +213,7 @@ fn gate2(lvl: i32) {
             ident += 1;
         }
         assert!(rusty_zstd::decompress_using_prefix(&z1, &pre[cut..]).unwrap() == tail, "{id}: bounded-prefix round-trip FAILED");
-        cells.push(Cell { id, arms: vec![("full-prefix".into(), t0, b0), ("win-bounded".into(), t1, b1)] });
+        cells.push(Cell { id, src: s.len(), arms: vec![("full-prefix".into(), t0, b0), ("win-bounded".into(), t1, b1)] });
         print!(".");
         let _ = std::io::stdout().flush();
     }
@@ -220,7 +237,7 @@ fn gate3(lvl: i32, dict: &Dictionary) {
         let (t1, b1) = best_of(n, go(false));
         let z = rusty_zstd::compress_using_dict_with(s, dict, CompressOptions { level: lvl, checksum: false }, true).unwrap();
         assert!(rusty_zstd::decompress_using_dict(&z, dict).unwrap() == *s, "{id}: dict round-trip FAILED");
-        cells.push(Cell { id, arms: vec![("write-id".into(), t0, b0), ("no-id".into(), t1, b1)] });
+        cells.push(Cell { id, src: s.len(), arms: vec![("write-id".into(), t0, b0), ("no-id".into(), t1, b1)] });
         print!(".");
         let _ = std::io::stdout().flush();
     }
@@ -238,7 +255,7 @@ fn gate4(lvl: i32) {
     for (id, s) in &srcs {
         let (t0, b0) = best_of(n, || rusty_zstd::compress_with(s, CompressOptions { level: lvl, checksum: true }).unwrap().len());
         let (t1, b1) = best_of(n, || rusty_zstd::compress_with(s, CompressOptions { level: lvl, checksum: false }).unwrap().len());
-        cells.push(Cell { id, arms: vec![("checksum-on".into(), t0, b0), ("checksum-off".into(), t1, b1)] });
+        cells.push(Cell { id, src: s.len(), arms: vec![("checksum-on".into(), t0, b0), ("checksum-off".into(), t1, b1)] });
         print!(".");
         let _ = std::io::stdout().flush();
     }
@@ -265,7 +282,7 @@ fn gate5(lvl: i32) {
             arms.push((format!("{k}K"), t, b));
         }
         std::env::remove_var("RZSTD_BLOCK_KB");
-        cells.push(Cell { id, arms });
+        cells.push(Cell { id, src: s.len(), arms });
         print!(".");
         let _ = std::io::stdout().flush();
     }
