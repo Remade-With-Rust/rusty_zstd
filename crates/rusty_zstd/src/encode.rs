@@ -328,6 +328,22 @@ pub(crate) struct MatchTables {
     /// changing output everywhere. Gating on `blocks_done > 0` makes the
     /// dispatch fire only on measured evidence.
     blocks_done: u32,
+    /// GATE 6 @ L3: the block payload buffer, REUSED across every block of the
+    /// frame instead of being built fresh each time.
+    ///
+    /// The gate as written chose between `Vec::new()` (grow by doubling, which
+    /// memcpy'd 40.2 MB across the 18-corpus board) and
+    /// `Vec::with_capacity(block.len())` (one 128 KiB request per block). The
+    /// clock cannot separate them -- a null arm measuring the reserve against
+    /// ITSELF reads up to +-24.15% -- but a counting allocator can, and it shows
+    /// the reserve was trading one cost for another: -77.18% bytes copied, but
+    /// +812 allocations at or above 128 KiB. `block.len()` IS `BLOCKSIZE_MAX`,
+    /// so the reserve landed exactly on the large-allocation threshold and
+    /// bought a fresh VirtualAlloc, and its page-table edit, for every block.
+    ///
+    /// Keeping the buffer sidesteps the choice: it reaches its steady-state
+    /// capacity once per frame and then neither grows nor is freed.
+    payload_scratch: Vec<u8>,
     /// GATE 6 @ L3: share of DFast positions where C's `_search_next_long`
     /// probe at `ip+1` actually BEAT the short-hash candidate, measured on the
     /// PREVIOUS block. Same self-calibrating shape as `rep_yield`: the probe
@@ -508,6 +524,7 @@ impl MatchTables {
             // Start optimistic: the first block back-fills, then measures.
             last_search_per_byte: 1.0,
             blocks_done: 0,
+            payload_scratch: Vec::new(),
             rep_run: 0,
             next_long_yield: 1.0,
             nl_off_worse: 0.0,
@@ -1618,16 +1635,21 @@ pub(crate) fn encode_block(
     let saved_reps = *reps;
     let saved_ent = entropy.clone();
     crate::prof::note_scratch(1);
-    // Brick 44: reserve the block payload. Same shape as brick 38 (which won
-    // 6/6, z=+2.45 by removing per-block Vec growth): this grew from zero by
-    // doubling on EVERY block, re-copying ~2x the compressed block size each
-    // time. `block.len()` is a hard upper bound -- a payload that reaches it
-    // is rejected for Raw by `raw_limit` immediately below.
-    let mut payload = if payload_reserve_enabled() {
-        Vec::with_capacity(block.len())
-    } else {
-        Vec::new()
-    };
+    // GATE 6 @ L3 -- reuse the payload buffer across blocks.
+    //
+    // `payload` is only ever written, measured, and copied out; it is never
+    // moved or handed to a caller, so there is no reason to build a new one per
+    // block. Taking the frame's scratch buffer and putting it back on the way
+    // out makes the reserve a once-per-frame cost instead of a per-block one,
+    // which is what removes BOTH failure modes the allocator counter found (see
+    // `payload_scratch`). `block.len()` is still a hard upper bound -- a payload
+    // that reaches it is rejected for Raw by `raw_limit` below -- so the first
+    // block sizes the buffer correctly and no later block has to grow it.
+    let mut payload = std::mem::take(&mut tables.payload_scratch);
+    payload.clear();
+    if payload_reserve_enabled() && payload.capacity() < block.len() {
+        payload.reserve_exact(block.len() - payload.capacity());
+    }
     {
         let _e = crate::prof::scope(crate::prof::Stage::EncodeEntropy);
         if seqs.is_empty() {
@@ -1682,6 +1704,7 @@ pub(crate) fn encode_block(
         );
         write_block_header(out, last, BlockType::Raw, block.len() as u32);
         out.extend_from_slice(block);
+        tables.payload_scratch = payload;
         return Ok(());
     }
     crate::prof::note_comp_block();
@@ -1701,6 +1724,7 @@ pub(crate) fn encode_block(
     note_raw_outcome(tables, false);
     write_block_header(out, last, BlockType::Compressed, payload.len() as u32);
     out.extend_from_slice(&payload);
+    tables.payload_scratch = payload;
     Ok(())
 }
 
