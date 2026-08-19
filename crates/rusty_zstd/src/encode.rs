@@ -2594,10 +2594,18 @@ fn find_fast_impl<
         if COUNT {
             FF_PIPE_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
+        // INSTRUMENT DEFECT: `mm_total` is declared AFTER this block's
+        // `return`, so MM_TOTAL only ever counted the NON-pipelined loop --
+        // 58% of blocks, and 6.2% of them on the seven corpora that run this
+        // path 93.8% of the time. 4.41's position ledger was an undercount.
+        let mut pipe_pos = 0u64;
         let (mut ff_made, mut ff_used) = (0u64, 0u64);
         let (mut h0, mut g0) = hash4_tag::<PACKED>(src, ip, hash_shift);
         let mut m0 = tables.load_fast::<PACKED>(h0, g0);
         loop {
+            if COUNT {
+                pipe_pos += 1;
+            }
             if COUNT {
                 if COUNT {
                     probes += 1;
@@ -2806,6 +2814,7 @@ fn find_fast_impl<
         }
         if COUNT {
             use core::sync::atomic::Ordering::Relaxed;
+            MM_TOTAL.fetch_add(pipe_pos, Relaxed);
             REP_PROBES.fetch_add(rep_probes, Relaxed);
             REP_BYTES.fetch_add(rep_bytes, Relaxed);
             REP_HITS_G.fetch_add(rep_hits, Relaxed);
