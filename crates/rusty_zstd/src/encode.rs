@@ -1178,11 +1178,17 @@ fn adaptive_block_max(
     // The mechanisms are the same; their thresholds are not. `Fast` emits a very
     // different sequence distribution, so both the repcode yield and the drift
     // it produces live on different scales.
-    let fast = strategy == Strategy::Fast;
-    let (rep_min, ratio_min, drift_min) = if fast {
-        (g5_rep_min_fast(), g5_ratio_min_fast(), g5_drift_min_fast())
-    } else {
-        (g5_rep_min(), g5_ratio_min(), g5_drift_min())
+    // THREE ladders, because the match-reach guard means something different on
+    // each. On `Fast` it protects nothing (Fast never finds the long-range
+    // matches it exists to preserve) and on the OPT ladder it fires on
+    // everything, taking the whole gate to 0.000% on 18 of 18 corpora. Only the
+    // middle ladder needs it.
+    let (rep_min, ratio_min, drift_min) = match strategy {
+        Strategy::Fast => (g5_rep_min_fast(), g5_ratio_min_fast(), g5_drift_min_fast()),
+        Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
+            (g5_rep_min_opt(), g5_ratio_min_opt(), g5_drift_min_opt())
+        }
+        _ => (g5_rep_min(), g5_ratio_min(), g5_drift_min()),
     };
     // block 0 has no history: always take the full size
     if r_prev < 0.0 {
@@ -1256,6 +1262,40 @@ const G5_DRIFT_MIN: f32 = 1.50;
 const G5_REP_MIN_FAST: f32 = 2.00;
 const G5_RATIO_MIN_FAST: f32 = 0.70;
 const G5_DRIFT_MIN_FAST: f32 = 2.00;
+
+/// OPT-ladder thresholds (L16-L22). `rep >= 2.0` is again an OFF switch: at L19
+/// the shipped `rep >= 0.30` fired on every corpus and the gate did nothing at
+/// all -- 0.000% on 18 of 18. Fitted separately below.
+const G5_REP_MIN_OPT: f32 = 2.00;
+const G5_RATIO_MIN_OPT: f32 = 0.50;
+const G5_DRIFT_MIN_OPT: f32 = 1.50;
+
+static G5_REP_O: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static G5_RATIO_O: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static G5_DRIFT_O: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Bench hook for the opt-ladder fit. Leaves Fast and the middle ladder alone.
+pub fn set_g5_opt_arms(rep: f32, ratio: f32, drift: f32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    G5_REP_O.store(rep.to_bits(), Relaxed);
+    G5_RATIO_O.store(ratio.to_bits(), Relaxed);
+    G5_DRIFT_O.store(drift.to_bits(), Relaxed);
+}
+#[inline]
+fn g5_rep_min_opt() -> f32 {
+    let b = G5_REP_O.load(core::sync::atomic::Ordering::Relaxed);
+    if b == u32::MAX { G5_REP_MIN_OPT } else { f32::from_bits(b) }
+}
+#[inline]
+fn g5_ratio_min_opt() -> f32 {
+    let b = G5_RATIO_O.load(core::sync::atomic::Ordering::Relaxed);
+    if b == u32::MAX { G5_RATIO_MIN_OPT } else { f32::from_bits(b) }
+}
+#[inline]
+fn g5_drift_min_opt() -> f32 {
+    let b = G5_DRIFT_O.load(core::sync::atomic::Ordering::Relaxed);
+    if b == u32::MAX { G5_DRIFT_MIN_OPT } else { f32::from_bits(b) }
+}
 
 static G5_REP_F: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 static G5_RATIO_F: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
@@ -7565,7 +7605,10 @@ fn count_match(src: &[u8], m: usize, ip: usize, limit: usize) -> usize {
     // Slice once so the inner loops see a proven length (LLVM drops per-word bounds).
     let a = &src[m..m + max];
     let b = &src[ip..ip + max];
-    crate::simd::count_eq_len(a, b)
+    let n = crate::simd::count_eq_len(a, b);
+    #[cfg(feature = "profile")]
+    crate::simd::note_eqlen(n);
+    n
 }
 
 const HASH4_PRIME: u32 = 2_654_435_761;

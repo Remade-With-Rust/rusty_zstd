@@ -64,6 +64,8 @@ pub use dict::{
     public_dict_id, Dictionary, DICT_ID_PUBLIC_MAX, DICT_ID_PUBLIC_MIN, MAGIC_DICTIONARY,
 };
 #[cfg(feature = "alloc")]
+#[cfg(feature = "profile")]
+pub use simd::{set_eqlen_arm, take_eqlen_stats};
 pub use encode::{
     BT_SPEC_PAIRS, set_bt_depth_cached_arm, set_bt_depth_target_arm, take_opt_signals, set_bt_deep_min_arm, set_bt_deep_arm, set_dfast_litpush_arm, take_lit_push, take_lit_hist, take_lit_tiers, set_lit_push_tiers_arm,
     compress, compress_using_dict, compress_using_dict_with, compress_using_prefix, compress_with,
@@ -77,7 +79,7 @@ pub use encode::{
     set_fast_lazy_arm, set_incomp_skip_arm, set_rep1_mode,
     set_lazy_fill_threshold_arm, set_prefix_bound_arm, set_prefix_window_arm, take_next_long, take_nl_band, take_nl_off, set_nl_off_worse_arm, set_nl_dispatch_arm, set_dfast_good_ml_arm, set_dfast_good_ml2_arm, set_dfast_fill_stride_arm, set_dfast_fill_anchor_arm, set_dfast_fill_n_arm, take_dfast_endfill, set_replen_pipe_arm, set_accel_shift_arm, set_opt_hoist_arm, set_opt_fill_stride_arm, set_opt_fill_max_arm, take_opt_fill_ins, take_dfast_fill, set_prime_bt_arm, set_prime_bt_tree_arm, set_prime_bt_depth_arm, set_prime_bt_extent_arm, set_prime_stride_arm, take_prime_iters,
     set_search_log_delta,
-    set_step0_arm, set_g5_arms, set_g5_fast_arms, set_lit_short_arm, take_lp_guard, set_lit_push_width_arm, take_lp_stats,
+    set_step0_arm, set_g5_arms, set_g5_fast_arms, set_g5_opt_arms, set_lit_short_arm, take_lp_guard, set_lit_push_width_arm, take_lp_stats,
 };
 #[cfg(all(feature = "alloc", feature = "std"))]
 pub use in_bench::{
