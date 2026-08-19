@@ -91,6 +91,50 @@ pub fn compress_with(src: &[u8], opts: CompressOptions) -> Result<Vec<u8>, Error
     )
 }
 
+/// FINDING 1 (Gate 2 @ L19): size the window from payload + prefix, as C does.
+///
+/// libzstd's `ZSTD_adjustCParams(cPar, srcSize, dictSize)` clamps `windowLog`
+/// against `srcSize + dictSize`. We clamped against the PAYLOAD alone, so a
+/// 4 MiB reference behind a 1 MiB payload produced windowLog 20 and three of the
+/// four reference megabytes were unreachable by construction.
+///
+/// Measured at L19 over 15 corpora, once FINDING 2 built the tree over the
+/// prefix: **-2.047%, 12 smaller / 2 larger** (nci -9.87%, reymont -6.95%,
+/// webster -6.89%). The two are COUPLED -- measured alone, before the tree
+/// existed, this same change was only -0.389% with 6 corpora larger, because a
+/// wider window cannot pay when there is no tree to search in it.
+///
+/// L3 is unchanged (+0.009%): DFast has no tree, so the extra window has nothing
+/// to exploit. That asymmetry is the confirmation.
+///
+/// The cost is real and is recorded: the advertised `windowLog` rises 20 -> 23,
+/// so a decoder must allocate 8 MiB for that frame instead of 1 MiB. C makes the
+/// same trade.
+fn params_with_history(level: i32, src_len: usize, hist_len: usize) -> Result<CompressionParameters, Error> {
+    let hint = if prefix_window_enabled() {
+        (src_len as u64).saturating_add(hist_len as u64)
+    } else {
+        src_len as u64
+    };
+    compression_params(level, Some(hint))
+}
+
+/// Fallback arm for FINDING 1. `false` restores payload-only window sizing.
+static PREFIX_WINDOW_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: `false` sizes the window from the payload alone, as before.
+pub fn set_prefix_window_arm(on: bool) {
+    PREFIX_WINDOW_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn prefix_window_enabled() -> bool {
+    match PREFIX_WINDOW_ARM.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        _ => true,
+    }
+}
+
 /// Compress `src` using a dictionary (raw or trained).
 pub fn compress_using_dict(src: &[u8], dict: &Dictionary, level: i32) -> Result<Vec<u8>, Error> {
     compress_using_dict_with(
@@ -111,7 +155,7 @@ pub fn compress_using_dict_with(
     opts: CompressOptions,
     write_dict_id: bool,
 ) -> Result<Vec<u8>, Error> {
-    let params = compression_params(opts.level, Some(src.len() as u64))?;
+    let params = params_with_history(opts.level, src.len(), dict.content().len())?;
     encode_oneshot(
         src,
         params,
@@ -127,7 +171,7 @@ pub fn compress_using_dict_with(
 /// Compress `src` with an external prefix (`--patch-from` / `ZSTD_CCtx_refPrefix`).
 /// No Dictionary_ID is written.
 pub fn compress_using_prefix(src: &[u8], prefix: &[u8], level: i32) -> Result<Vec<u8>, Error> {
-    let params = compression_params(level, Some(src.len() as u64))?;
+    let params = params_with_history(level, src.len(), prefix.len())?;
     encode_oneshot(
         src,
         params,
@@ -490,12 +534,20 @@ impl MatchTables {
 
     /// Load a Fast-strategy candidate as `pos+1` (0 = none / tag mismatch).
     ///
-    /// In packed mode a tag mismatch returns 0 WITHOUT reading `src[m]`, and
-    /// the 24-bit residue is lifted back to an absolute position: the unique
-    /// value congruent to it that does not exceed `ip+1`.
+    /// In packed mode a tag mismatch returns 0 WITHOUT reading `src[m]`.
+    ///
+    /// The 24-bit-residue representation this once carried -- store `pos+1`
+    /// truncated and lift it back against `ip+1` -- was REFUTED: it fails
+    /// byte-identity through GATE 1's mid-frame Fast->Lazy switch, where the two
+    /// strategies share one table and Lazy reads entries Fast truncated. It was
+    /// disabled by an early `return e;` with the lifting code left below it as
+    /// unreachable, which cost the function a dead `ip` parameter and left this
+    /// comment describing behaviour the function no longer had. Removed rather
+    /// than left as a trap for whoever deletes the `return` to "fix" the
+    /// unreachable-code warning.
     #[inline(always)]
     #[allow(unsafe_code)]
-    fn load_fast<const PACKED: bool>(&self, h: usize, ip: usize, tag: u8) -> u32 {
+    fn load_fast<const PACKED: bool>(&self, h: usize, tag: u8) -> u32 {
         // SAFETY: identical invariant to `store_fast` -- `h` is masked by
         // `hash.len() - 1` with a power-of-two length. See brick 50.
         debug_assert!(h < self.hash.len());
@@ -511,19 +563,7 @@ impl MatchTables {
                 return 0;
             }
         }
-        return e;
-        #[allow(unreachable_code)]
-        if (e >> 24) as u8 != tag {
-            return 0;
-        }
-        let ip1 = (ip as u32).wrapping_add(1);
-        let cand = (ip1 & 0xFF00_0000) | (e & 0x00FF_FFFF);
-        if cand > ip1 {
-            // Wrapped into the previous 2^24 window.
-            cand.checked_sub(1 << 24).unwrap_or(0)
-        } else {
-            cand
-        }
+        e
     }
 
     /// Raw slot, bypassing the tag filter -- diagnostic only.
@@ -928,7 +968,24 @@ fn prime_bt_tree_enabled() -> bool {
 
 /// FINDING 2 cost dial: how deep the PRIMING tree-insert descends. `0` = use the
 /// level's own `search_log` (full depth, what a real search does).
+///
+/// DEFAULT 5, measured. The cost is linear in depth; the benefit saturates. At
+/// L19 over a 4 MiB reference, against heads-only priming:
+///
+///   depth   size      time
+///   full   -1.7779%  +60.3%
+///   d5     -1.7732%  +35.9%   <- 99.7% of the win for 60% of the cost
+///   d4     -1.6533%  +44.7%
+///   d3     -1.3535%  +43.8%
+///   d1     -0.5283%  +33.4%
+///
+/// Striding the insert was tried FIRST and refused: it moves along the same
+/// line instead of off it (stride 4 keeps 0.045% of the 1.78%, stride 8 is
+/// WORSE than not building the tree at all).
 static PRIME_BT_DEPTH_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// See the table above. `set_prime_bt_depth_arm(0)` restores full depth.
+const PRIME_BT_DEPTH_DEFAULT: u32 = 5;
 
 /// Bench hook for the priming-depth sweep.
 pub fn set_prime_bt_depth_arm(d: u32) {
@@ -947,12 +1004,12 @@ fn prime_bt_depth() -> u32 {
         let d: u32 = std::env::var("RZSTD_PRIME_BT_DEPTH")
             .ok()
             .and_then(|x| x.trim().parse().ok())
-            .unwrap_or(0);
+            .unwrap_or(PRIME_BT_DEPTH_DEFAULT);
         PRIME_BT_DEPTH_ARM.store(d, Ordering::Relaxed);
         d
     }
     #[cfg(not(feature = "std"))]
-    0
+    PRIME_BT_DEPTH_DEFAULT
 }
 
 pub(crate) fn prime_tables(
@@ -2539,7 +2596,7 @@ fn find_fast_impl<
         }
         let (mut ff_made, mut ff_used) = (0u64, 0u64);
         let (mut h0, mut g0) = hash4_tag::<PACKED>(src, ip, hash_shift);
-        let mut m0 = tables.load_fast::<PACKED>(h0, ip, g0);
+        let mut m0 = tables.load_fast::<PACKED>(h0, g0);
         loop {
             if COUNT {
                 if COUNT {
@@ -2597,7 +2654,7 @@ fn find_fast_impl<
                     let (nh, ng) = hash4_tag::<PACKED>(src, ip, hash_shift);
                     h0 = nh;
                     g0 = ng;
-                    m0 = tables.load_fast::<PACKED>(h0, ip, g0);
+                    m0 = tables.load_fast::<PACKED>(h0, g0);
                     continue;
                 }
             }
@@ -2631,7 +2688,7 @@ fn find_fast_impl<
                         0
                     }
                 } else {
-                    tables.load_fast::<PACKED>(h, nip, g)
+                    tables.load_fast::<PACKED>(h, g)
                 };
                 (h, g, v)
             } else {
@@ -2691,7 +2748,7 @@ fn find_fast_impl<
                 let (nh, ng) = hash4_tag::<PACKED>(src, ip, hash_shift);
                 h0 = nh;
                 g0 = ng;
-                m0 = tables.load_fast::<PACKED>(h0, ip, g0);
+                m0 = tables.load_fast::<PACKED>(h0, g0);
                 continue;
             }
             if nip > ilimit {
@@ -2735,8 +2792,23 @@ fn find_fast_impl<
         // accumulated across blocks.
         tables.tag_yield = cand_yield(cand);
         tables.last_nseq = seqs.len();
+        // DEFECT FIX: the main tail's `rep_len_ratio` update is BELOW this
+        // return, so every pipelined block left Gate 2's second dispatch
+        // variable pinned at its 1.0 initial value -- and the gate is `>= 1.0`.
+        // See `replen_pipe_fixed`.
+        if REP && replen_pipe_fixed() && rep_hits > 0 && !seqs.is_empty() {
+            let all_bytes: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
+            let rl = rep_bytes as f32 / rep_hits as f32;
+            let al = all_bytes as f32 / seqs.len() as f32;
+            if al > 0.0 {
+                tables.rep_len_ratio = 0.75 * tables.rep_len_ratio + 0.25 * (rl / al);
+            }
+        }
         if COUNT {
             use core::sync::atomic::Ordering::Relaxed;
+            REP_PROBES.fetch_add(rep_probes, Relaxed);
+            REP_BYTES.fetch_add(rep_bytes, Relaxed);
+            REP_HITS_G.fetch_add(rep_hits, Relaxed);
             FF_SPEC_MADE.fetch_add(ff_made, Relaxed);
             FF_SPEC_USED.fetch_add(ff_used, Relaxed);
         }
@@ -2753,7 +2825,7 @@ fn find_fast_impl<
             }
         }
         let (h0, g0) = hash4_tag::<PACKED>(src, ip, hash_shift);
-        let m0 = tables.load_fast::<PACKED>(h0, ip, g0);
+        let m0 = tables.load_fast::<PACKED>(h0, g0);
         if COUNT && PACKED {
             // Gate 7 is recorded byte-identical: a tag mismatch should imply the
             // 4 bytes differ, so `fast_probe` would have rejected the candidate
@@ -2783,7 +2855,7 @@ fn find_fast_impl<
         // and match paths both `continue`. Only the issue order moves.
         let pair_pre = if pair && ip + 1 <= ilimit {
             let (h1, g1) = hash4_tag::<PACKED>(src, ip + 1, hash_shift);
-            Some((h1, g1, tables.load_fast::<PACKED>(h1, ip + 1, g1)))
+            Some((h1, g1, tables.load_fast::<PACKED>(h1, g1)))
         } else {
             None
         };
@@ -2862,7 +2934,7 @@ fn find_fast_impl<
                     Some(v) => v,
                     None => {
                         let (h, g) = hash4_tag::<PACKED>(src, ip1, hash_shift);
-                        (h, g, tables.load_fast::<PACKED>(h, ip1, g))
+                        (h, g, tables.load_fast::<PACKED>(h, g))
                     }
                 };
                 if COUNT && PACKED {
@@ -3281,6 +3353,32 @@ pub fn set_rep1_mode(m: Option<bool>) {
         },
         core::sync::atomic::Ordering::Relaxed,
     );
+}
+
+/// DEFECT (GATE 2 @ L1's second variable, found during GATE 12 @ L1).
+///
+/// `rep_len_ratio` starts at 1.0, the gate is `rep_len_ratio >= rep_len_min()`
+/// with `rep_len_min()` == 1.0, and the ONLY code that lowers it sits after the
+/// pipelined loop's early `return`. 42% of blocks take that return -- 93.8% on
+/// eight of the eighteen corpora -- so on those the OR clause is pinned TRUE
+/// from the first block and Gate 2's dispatch can never shut the repcode search
+/// off, however low the measured yield.
+///
+/// Third instance of this exact early-return class in `find_fast`: `tag_yield`
+/// and the GATE 6 re-probe countdown were both fixed here before it.
+///
+/// `false` restores the defect so the two can be A/B'd in one process.
+static REPLEN_PIPE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: `false` restores the pre-fix behaviour (ratio never updated on
+/// the pipelined path).
+pub fn set_replen_pipe_arm(fixed: bool) {
+    REPLEN_PIPE_ARM.store(u8::from(fixed) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn replen_pipe_fixed() -> bool {
+    REPLEN_PIPE_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
 }
 
 /// The Gate 2 decision for this block: forced constant, or the measured yield.
@@ -4756,7 +4854,6 @@ pub fn set_search_log_delta(delta: i32) {
 }
 
 /// Candidate examinations the chain walk is allowed, for this level and arm.
-#[inline]
 /// How many halvings to take off the chain-walk depth for this content.
 /// Rep-dominated content keeps the full depth; everything else gives up one step
 /// for -9.2% of all bt probes at +0.001% size.
@@ -4937,9 +5034,11 @@ fn bt_find_best(
     //
     // This is why instruction-count-per-call was the wrong measure on its own:
     // it is correct about the call and silent about the code it adds.
-    // `RZSTD_BT_DEEP=1` lifts the depth gate so the arm can be MEASURED at
-    // L16+; without it the dispatch forces generic there and any A/B is a null
-    // comparison -- which is exactly how the bogus L19 result was produced.
+    // (An `RZSTD_BT_DEEP=1` escape hatch used to lift the depth gate so the arm
+    // could be MEASURED at L16+, because otherwise the dispatch forced generic
+    // there and any A/B was a null comparison -- which is exactly how the bogus
+    // L19 result was produced. The gate below is now lifted unconditionally, so
+    // the hatch had no caller and has been removed with its function.)
     // GATE 8 @ L19/L22 -- DEPTH GATE LIFTED, decided DETERMINISTICALLY.
     //
     // The note above kept L16+ on the generic body because "no measurement
@@ -7662,21 +7761,6 @@ fn bt_spec_enabled() -> bool {
                 .map(|v| v.trim() != "0")
                 .unwrap_or(true);
             BT_SPEC_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-#[inline]
-fn bt_deep_measure() -> bool {
-    use core::sync::atomic::{AtomicU8, Ordering};
-    static A: AtomicU8 = AtomicU8::new(0);
-    match A.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = std::env::var("RZSTD_BT_DEEP").map(|v| v.trim() == "1").unwrap_or(false);
-            A.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }
     }
