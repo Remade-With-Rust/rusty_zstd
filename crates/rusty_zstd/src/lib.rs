@@ -65,7 +65,7 @@ pub use dict::{
 };
 #[cfg(feature = "alloc")]
 #[cfg(feature = "profile")]
-pub use simd::{set_eqlen_arm, take_eqlen_stats};
+pub use simd::{set_eqlen_arm, take_eqlen_stats, take_eq_ops};
 pub use encode::{
     BT_SPEC_PAIRS, set_bt_depth_cached_arm, set_bt_depth_target_arm, take_opt_signals, set_bt_deep_min_arm, set_bt_deep_arm, set_dfast_litpush_arm, take_lit_push, take_lit_hist, take_lit_tiers, set_lit_push_tiers_arm,
     compress, compress_using_dict, compress_using_dict_with, compress_using_prefix, compress_with,

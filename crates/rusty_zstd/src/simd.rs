@@ -113,6 +113,25 @@ pub static EQ_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 pub static EQ_WIDE_ELIGIBLE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "profile")]
+/// Compare operations executed: wide (32B cmpeq), word (8B), byte.
+#[cfg(feature = "profile")]
+pub static EQ_OPS: [core::sync::atomic::AtomicU64; 3] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Read and clear `(wide_ops, word_ops, byte_ops)`.
+#[cfg(feature = "profile")]
+pub fn take_eq_ops() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        EQ_OPS[0].swap(0, Relaxed),
+        EQ_OPS[1].swap(0, Relaxed),
+        EQ_OPS[2].swap(0, Relaxed),
+    )
+}
+
 pub static EQ_LEN_HIST: [core::sync::atomic::AtomicU64; 5] = [
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
@@ -276,21 +295,29 @@ pub(crate) fn count_eq_len_words(a: &[u8], b: &[u8], max: usize) -> usize {
     let max = max.min(a.len()).min(b.len());
     let mut n = 0usize;
     while n + 32 <= max {
+        #[cfg(feature = "profile")]
+        EQ_OPS[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let a0 = load_u64(a, n);
         let b0 = load_u64(b, n);
         if a0 != b0 {
             return n + ((a0 ^ b0).trailing_zeros() as usize / 8);
         }
+        #[cfg(feature = "profile")]
+        EQ_OPS[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let a1 = load_u64(a, n + 8);
         let b1 = load_u64(b, n + 8);
         if a1 != b1 {
             return n + 8 + ((a1 ^ b1).trailing_zeros() as usize / 8);
         }
+        #[cfg(feature = "profile")]
+        EQ_OPS[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let a2 = load_u64(a, n + 16);
         let b2 = load_u64(b, n + 16);
         if a2 != b2 {
             return n + 16 + ((a2 ^ b2).trailing_zeros() as usize / 8);
         }
+        #[cfg(feature = "profile")]
+        EQ_OPS[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let a3 = load_u64(a, n + 24);
         let b3 = load_u64(b, n + 24);
         if a3 != b3 {
@@ -299,6 +326,8 @@ pub(crate) fn count_eq_len_words(a: &[u8], b: &[u8], max: usize) -> usize {
         n += 32;
     }
     while n + 8 <= max {
+        #[cfg(feature = "profile")]
+        EQ_OPS[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let av = load_u64(a, n);
         let bv = load_u64(b, n);
         if av != bv {
@@ -327,12 +356,16 @@ unsafe fn count_eq_len_avx2(a: *const u8, b: *const u8, max: usize) -> usize {
     // SAFETY: caller promised `a[0..max]` and `b[0..max]` are valid.
     unsafe {
         while n + 64 <= max {
+            #[cfg(feature = "profile")]
+            EQ_OPS[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let a0 = _mm256_loadu_si256(a.add(n) as *const __m256i);
             let b0 = _mm256_loadu_si256(b.add(n) as *const __m256i);
             let m0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a0, b0)) as u32;
             if m0 != 0xFFFF_FFFF {
                 return n + m0.trailing_ones() as usize;
             }
+            #[cfg(feature = "profile")]
+            EQ_OPS[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let a1 = _mm256_loadu_si256(a.add(n + 32) as *const __m256i);
             let b1 = _mm256_loadu_si256(b.add(n + 32) as *const __m256i);
             let m1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a1, b1)) as u32;
@@ -342,6 +375,8 @@ unsafe fn count_eq_len_avx2(a: *const u8, b: *const u8, max: usize) -> usize {
             n += 64;
         }
         while n + 32 <= max {
+            #[cfg(feature = "profile")]
+            EQ_OPS[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let av = _mm256_loadu_si256(a.add(n) as *const __m256i);
             let bv = _mm256_loadu_si256(b.add(n) as *const __m256i);
             let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(av, bv)) as u32;
@@ -351,6 +386,8 @@ unsafe fn count_eq_len_avx2(a: *const u8, b: *const u8, max: usize) -> usize {
             n += 32;
         }
         while n + 8 <= max {
+            #[cfg(feature = "profile")]
+            EQ_OPS[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let av = core::ptr::read_unaligned(a.add(n) as *const u64);
             let bv = core::ptr::read_unaligned(b.add(n) as *const u64);
             if av != bv {
@@ -359,6 +396,8 @@ unsafe fn count_eq_len_avx2(a: *const u8, b: *const u8, max: usize) -> usize {
             n += 8;
         }
         while n < max && *a.add(n) == *b.add(n) {
+            #[cfg(feature = "profile")]
+            EQ_OPS[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             n += 1;
         }
     }
