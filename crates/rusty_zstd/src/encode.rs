@@ -973,8 +973,25 @@ fn prefix_bound_enabled() -> bool {
 /// payload are searched first and matched most. This builds the tree only over
 /// the last `range / extent` bytes and leaves hash heads below it.
 ///
-/// 0 or 1 = the whole primed range (what Finding 2 shipped as); N = the last 1/N.
-static PRIME_BT_EXTENT_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+/// MEASURED at L19, per corpus, best-of-5, against heads-only priming:
+///
+///   extent   size      time     bigger   slower
+///   1/1     -3.78%    +241%       0        15
+///   1/16    -1.53%     +40%       0        14
+///   1/32    -1.13%     +34%       0        15
+///   1/64    -0.83%     +19%       0        15
+///
+/// NO POINT IS FREE -- every extent buys size with time, and an aggregate run
+/// that appeared to show 1/16 both smaller AND faster was an artifact of arm
+/// ordering; per corpus at best-of-5 it is slower on 14 of 15.
+///
+/// Extent is nonetheless the best of the three cost dials: it keeps 40% of the
+/// full win for ~17% of the cost, where stride 4 kept only 0.045% of 1.78%.
+/// So the capability DEFAULTS to 1/16 when it is switched on, and the tree
+/// itself stays off.
+///
+/// 1 = the whole primed range; N = the last 1/N.
+static PRIME_BT_EXTENT_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(16);
 
 /// Bench hook for the extent sweep. 1 = tree over the whole primed range.
 pub fn set_prime_bt_extent_arm(n: u32) {
