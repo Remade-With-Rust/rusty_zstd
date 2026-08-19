@@ -2559,7 +2559,7 @@ fn find_fast_impl<
         Vec::new()
     };
     let mut lits = if reserve {
-        Vec::with_capacity(block_len + LIT_PUSH_WIDTH)
+        Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX)
     } else {
         Vec::new()
     };
@@ -3912,6 +3912,30 @@ fn lit_push_enabled() -> bool {
 /// Width of the fixed-width literal push. Also the slack reserved past a
 /// block's worth of literals so the fast path is always eligible.
 pub(crate) const LIT_PUSH_WIDTH: usize = 16;
+/// Widest value `lit_push_width()` may return. Reservations use THIS so the
+/// capacity guard stays valid whatever the arm selects.
+pub(crate) const LIT_PUSH_WIDTH_MAX: usize = 32;
+
+/// GATE 13 @ L1: the copy width, as a measurement arm.
+///
+/// The width is a CONSTANT 16 today, chosen from L3's run-length histogram. At
+/// L1 the distribution is not the same shape and, more importantly, is not the
+/// same shape ACROSS CORPORA: `smallmsg-8m` puts 95.5% of runs in 5-8 while
+/// `sao` puts 50.4% in 65+ and engages the fast path on only 6.1% of calls.
+/// A constant cannot serve both.
+static LIT_PUSH_WIDTH_ARM: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Bench hook. 0 restores the shipped constant.
+pub fn set_lit_push_width_arm(w: usize) {
+    LIT_PUSH_WIDTH_ARM.store(w, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn lit_push_width() -> usize {
+    let w = LIT_PUSH_WIDTH_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if w == 0 { LIT_PUSH_WIDTH } else { w }
+}
 
 /// GATE 13 @ L3. `push_literals` had exactly ONE call site -- `find_fast`'s
 /// match commit -- so the gate was DEAD everywhere but L1, and dead by SCOPE
@@ -3982,9 +4006,10 @@ fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize, arm: bo
         };
         LP_HIST[b].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
-    if n <= LIT_PUSH_WIDTH
-        && from + LIT_PUSH_WIDTH <= src.len()
-        && lits.capacity() - lits.len() >= LIT_PUSH_WIDTH
+    let w = lit_push_width();
+    if n <= w
+        && from + w <= src.len()
+        && lits.capacity() - lits.len() >= w
         && arm
     {
         #[cfg(feature = "profile")]
@@ -3999,7 +4024,7 @@ fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize, arm: bo
             core::ptr::copy_nonoverlapping(
                 src.as_ptr().add(from),
                 lits.as_mut_ptr().add(len),
-                LIT_PUSH_WIDTH,
+                w,
             );
             lits.set_len(len + n);
         }
@@ -4253,7 +4278,7 @@ fn find_dfast_impl<const HLOG: u32>(
         Vec::new()
     };
     let mut lits = if lp {
-        Vec::with_capacity(block_len + LIT_PUSH_WIDTH)
+        Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX)
     } else {
         Vec::new()
     };
