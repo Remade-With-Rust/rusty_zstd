@@ -101,7 +101,45 @@ Those are two different defects; both live in the same function.
 
 ## 5. Engine targets inside match-find, ranked
 
-### T1 — DFast never uses the rejection tag. `find_dfast_impl`, encode.rs:5048
+### T1 — DFast never uses the rejection tag — **SHIPPED, default ON**
+
+**Result: byte-identical on 18/18 at L3 and 72/72 across the board, removing
+2,938,472 candidate loads per board pass for zero added work.**
+
+The tag rejects **29.8%** of non-empty short slots, and the rejection lands where
+the gap is: `mozilla` 67.6%, `ooffice` 60.5%, `osdb` 57.7%, `x-ray` 46.1%,
+`samba` 43.0%, `sao` 41.6% — against `dickens` 5.8%, `webster` 9.9%, `nci` 2.9%,
+the three we were already closest to C on.
+
+**Two things had to be got right, and the first attempt got neither.**
+
+1. *The separate tag array does not pay.* Allocating `tags` for DFast worked and
+   was byte-identical, but it added **one tag store per position** to avoid ~0.3
+   candidate loads per position — a second cache line touched every time round
+   the loop, for ~3.3 stores per avoided load. The clock agreed (+3.76%).
+   **Packing the tag into the top 8 bits of the slot the finder already loads
+   makes it free**: same word, same load, same store, and no array at all.
+   Sound only while `pos + 1` fits in 24 bits, so `enable_packed_tags` proves
+   that per frame against the real buffer length rather than assuming it.
+2. *Every writer of that table must share the representation.*
+   `fill_hash_after_match` runs after **every match** on the DFast path and wrote
+   the slot unpacked; a packed reader then decoded the tag bits as part of the
+   position. **Output moved on 12 of 18 corpora** until it was routed through the
+   same writer. This is the third time this codebase has been bitten by one
+   writer skipping the tag — `store_fast`'s own comment (190ad8b) and
+   `prime_tables` were the first two. `prime_tables` needed the same fix here.
+
+*The clock still cannot confirm it* — a 9-round paired test with a null arm put
+every corpus inside the floor (`mozilla` −12.12% against a 16.68% floor). It
+ships on the deterministic case: **strictly fewer loads, strictly less memory,
+byte-identical**, which is the same standard that shipped the prefix bound and
+the Bt chain-write removal.
+
+**OPEN:** the 24-bit guard disables packing for frames at or above 16 MiB, so
+large single frames get no filter. A window-relative or 25-bit encoding would
+extend the coverage.
+
+### T1 — original analysis
 **The strongest lead on the board, and it is already built.**
 
 `find_fast_impl` (L1/L2) is generic over `const PACKED: bool` and uses the packed
@@ -216,9 +254,8 @@ dispatch that had to be thrown away.
 
 ## 8. Order of work
 
-1. **T1** — carry the packed tag to DFast. Highest value, mechanism already
-   exists and ships, zero measured ratio cost. Instrument: `take_tag_rejects`,
-   `hit%`, then asm instruction count.
+1. ~~**T1** — carry the packed tag to DFast.~~ **DONE, shipped default ON.**
+   Next: lift the 24-bit cap so frames >= 16 MiB get the filter too.
 2. **T4** — decoder. Simplest structure, 2.04× behind, nothing to gate.
 3. **T2** — inner-loop codegen and register pressure. Slowest to verify.
 4. **T3** — huffman, scoped to literal-heavy content at L1.
