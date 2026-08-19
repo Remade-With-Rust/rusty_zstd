@@ -251,7 +251,7 @@ pub(crate) fn note_eqlen(n: usize) {
 }
 
 #[inline(always)]
-fn has_avx2() -> bool {
+pub(crate) fn has_avx2() -> bool {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
         use core::sync::atomic::{AtomicU8, Ordering};
