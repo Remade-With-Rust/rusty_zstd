@@ -180,7 +180,52 @@ bits free; whether the extra store costs more than the avoided loads; and whethe
 the L1 saving rate transfers to DFast's different hash and step pattern. **The
 32% is what the tag buys on the Fast ladder, not a promise for DFast.**
 
-### T2 — Probe cost and register pressure in the inner loop
+### T2 — Probe cost in the inner loop — **TRANCHE 1 SHIPPED**
+
+Measured from the emitted asm (`--emit asm`, parsed per symbol):
+
+| function | copies | instrs | spill slots | **panic sites** |
+| --- | ---: | ---: | ---: | ---: |
+| `find_fast_impl` (L1/L2) | **34** | 39,424 | 31 | **0** |
+| `find_dfast_impl` (L3/L4) | 1 | 1,713 | 60 | **13 → 0** |
+| `find_greedy` (L5) | 1 | 675 | — | 5 |
+| `find_lazy` (L6–L12) | 1 | 807 | — | 3 |
+| `find_bt_lazy` (L13–L15) | 1 | 677 | — | 2 |
+| **`bt_find_best`** (Bt core) | **23** | **9,058** | — | **132** |
+
+**Shipped:** the Fast finder carries 0 panic sites because brick 50 proved its
+index invariant and moved to `get_unchecked`. DFast never got that treatment, so
+it paid a compare-and-branch on **every** table access — four per position (short
+and long, read and write). The invariant is the *same* one, and this file already
+depends on it: every index is `hash4`/`hash8`/`hash4_tag` shifted down to
+`tables.hash_log` bits, into tables allocated `1 << tables.hash_log`. Verified at
+all six finder bindings before touching it. **13 → 0, byte-identical on 72/72.**
+
+**NOT done, and deliberately — `bt_find_best`'s 132 panic sites are NOT safe to
+remove as written.** The tree indexes `chain[(m & bt_mask) << 1]` and `+1`, so
+the maximum index is `2^(bt_log+1) - 1`. But `bt_log` comes from the **const
+generic `CLOG`**, not from the table's real length — the exact mistake the hash
+tables document and avoid by binding `tables.hash_log` rather than
+`params.hash_log`. Worse, `btlog` floors at `.max(1)`, so `bt_mask >= 1` and the
+tree needs `chain.len() >= 4`, while the only guard present is
+`chain.len() < 2`. With `params.chain_log = 1` (reachable through the advanced
+API) the tree addresses index 3 into a 2-entry table.
+
+**That bounds check is currently load-bearing: it converts a latent
+out-of-bounds into a panic.** Removing it would convert it into UB. The correct
+order is to derive `bt_mask` from `tables.chain.len()` — making the invariant
+provable *and* closing the edge — and only then take the checks out. That is a
+behaviour-affecting change on the Bt ladder and needs its own verification pass.
+
+**Register pressure remains open.** `find_dfast_impl` holds 60 distinct spill
+slots and reloads one of them 20 times against a single store — a loop-invariant
+value LLVM refuses to keep in a register. And `find_fast_impl` has **34
+monomorphisations totalling 39,424 instructions**. Note that dead specialisations
+cost binary size and compile time, *not* execution — do not price them as speed
+without measuring which ones serve calls (GATE 12 found a Bt specialisation
+serving 0%).
+
+### T2 — original note
 Already diagnosed in the code, never resolved. From `find_fast_impl`:
 
 > *"a function this large is why LLVM spills the src base in the prologue and
