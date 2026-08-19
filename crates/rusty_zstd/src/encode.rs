@@ -335,6 +335,10 @@ pub(crate) struct MatchTables {
     /// losses are downstream parse-cascade effects, and the corpora it hurts are
     /// the ones where it fires often and buys little.
     next_long_yield: f32,
+    /// GATE 13 @ L1 -- share of the PREVIOUS block's literal runs short enough
+    /// for the fixed-width copy to catch. Seeded optimistically so block 0
+    /// always takes the fast path.
+    lit_short_share: f32,
     /// GATE 2 second variable: mean rep match length divided by mean match
     /// length on the previous block. Below 1 the repcode search is trading a
     /// LONGER hash match for a shorter rep match; above 1 its matches are the
@@ -495,6 +499,7 @@ impl MatchTables {
             blocks_done: 0,
             rep_run: 0,
             next_long_yield: 1.0,
+            lit_short_share: 1.0,
             rep_len_ratio: 1.0,
             rep_probe: 0,
             raw_run: 0,
@@ -2552,6 +2557,20 @@ fn find_fast_impl<
     // measured in ONE interleaved session (codec-measurement 3); the flag is
     // resolved once per block, never inside the probe loop.
     let reserve = lit_push_enabled();
+    // GATE 13 @ L1 DISPATCH. `reserve` still governs the RESERVATION (a separate
+    // win worth 1,648 reallocations at L3); this governs only whether the
+    // fixed-width copy's guard is worth EVALUATING.
+    //
+    // Below the threshold the four-condition guard runs and fails on nearly
+    // every call: those runs go to `extend_from_slice` either way, so the guard
+    // is pure overhead. Turning it off cannot change output -- both paths append
+    // the same bytes -- and cannot write more, because the calls it declines
+    // were already taking the slow path.
+    //
+    // Seeded optimistic (`lit_short_share` starts at 1.0) so block 0 always
+    // takes the fast path and the gate cannot suppress its own evidence.
+    let lp_copy = reserve
+        && (tables.blocks_done == 0 || tables.lit_short_share >= lit_short_min());
     let seq_guess = (tables.last_nseq + tables.last_nseq / 4 + 64).min(block_len / mls + 16);
     let mut seqs = if reserve {
         Vec::with_capacity(seq_guess)
@@ -2753,7 +2772,7 @@ fn find_fast_impl<
                     }
                     let mstart = ip + 1;
                     crate::prof::note_huff_path(11);
-                    push_literals(&mut lits, src, anchor, mstart, reserve);
+                    push_literals(&mut lits, src, anchor, mstart, lp_copy);
                     crate::prof::note_huff_path(13);
                     seqs.push(Seq {
                         litlen: (mstart - anchor) as u32,
@@ -2919,6 +2938,7 @@ fn find_fast_impl<
         // it never refreshed `tag_yield` at all and the old global counters just
         // accumulated across blocks.
         tables.tag_yield = cand_yield(cand);
+        tables.lit_short_share = lit_short_share(&seqs);
         tables.last_nseq = seqs.len();
         // DEFECT FIX: the main tail's `rep_len_ratio` update is BELOW this
         // return, so every pipelined block left Gate 2's second dispatch
@@ -3008,7 +3028,7 @@ fn find_fast_impl<
                 }
                 let mstart = ip + 1;
                 crate::prof::note_huff_path(11);
-                push_literals(&mut lits, src, anchor, mstart, reserve);
+                push_literals(&mut lits, src, anchor, mstart, lp_copy);
                 crate::prof::note_huff_path(13);
                 seqs.push(Seq {
                     litlen: (mstart - anchor) as u32,
@@ -3159,6 +3179,8 @@ fn find_fast_impl<
     }
     // GATE 7: feed this block's measured reject share to the next block's gate.
     tables.tag_yield = cand_yield(cand);
+    // GATE 13: and this block's share of literal runs the fixed-width copy can catch.
+    tables.lit_short_share = lit_short_share(&seqs);
     // feed this block's pair coverage to the next block's gate
     // Attribute only when the search actually RAN -- a rejected block measures
     // nothing, and zeroing it there is what would latch the gate shut.
@@ -3912,9 +3934,47 @@ fn lit_push_enabled() -> bool {
 /// Width of the fixed-width literal push. Also the slack reserved past a
 /// block's worth of literals so the fast path is always eligible.
 pub(crate) const LIT_PUSH_WIDTH: usize = 16;
-/// Widest value `lit_push_width()` may return. Reservations use THIS so the
-/// capacity guard stays valid whatever the arm selects.
-pub(crate) const LIT_PUSH_WIDTH_MAX: usize = 32;
+/// Widest value any tier may copy. Reservations use THIS so the capacity guard
+/// stays valid for every tier.
+pub(crate) const LIT_PUSH_WIDTH_MAX: usize = 64;
+
+/// GATE 13: the second and third TIERS.
+///
+/// The dispatch here is per-CALL, not per-block. A dispatched WIDTH has to
+/// predict the next block's run-length distribution and then serves every run
+/// with one constant; a tier reads `n` and picks among constants -- no signal,
+/// no threshold, no warm-up, and no misprediction. Both tiers stay compile-time
+/// constants, so both still lower to fixed-width moves.
+///
+/// Priced deterministically as `bytes stored + F x slow calls`, swept over F so
+/// the answer's dependence on the one unknown is visible (totals, 18 corpora):
+///
+/// ```text
+///            w16      w8      w32   tier16/32  tier16/32/64
+///  L1 F=4   1.40M   1.40M    2.14M    1.24M       1.24M
+///  L1 F=32  4.94M   8.49M    3.46M    2.56M       1.81M
+///  L3 F=32  3.98M   7.08M    4.22M    2.32M       2.14M
+/// ```
+///
+/// The tier wins at every realistic F and on 13 of 14 corpora individually, so
+/// no single dispatched width can match it.
+pub(crate) const LIT_PUSH_TIER2: usize = 32;
+pub(crate) const LIT_PUSH_TIER3: usize = 64;
+
+/// Bench arm for the tiers. 0 = all tiers (shipped), 1 = tier 1 only (the
+/// pre-tier behaviour), 2 = tiers 1 and 2.
+static LIT_PUSH_TIERS_ARM: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: 0 all tiers, 1 tier-1 only, 2 tiers 1+2.
+pub fn set_lit_push_tiers_arm(t: u8) {
+    LIT_PUSH_TIERS_ARM.store(t, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn lit_push_tiers() -> u8 {
+    LIT_PUSH_TIERS_ARM.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// GATE 13 @ L1: the copy width, as a measurement arm.
 ///
@@ -3963,6 +4023,71 @@ pub fn set_dfast_litpush_arm(on: bool) {
 fn dfast_litpush_enabled() -> bool {
     DFAST_LITPUSH_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
 }
+
+/// GATE 13 @ L1 signal: share of this block's literal runs short enough for the
+/// fixed-width copy to catch.
+///
+/// Read off the emitted sequences rather than counted in the probe loop -- the
+/// litlens are already there, so the signal costs one pass per BLOCK and nothing
+/// per position. An empty block reports 1.0 so the gate stays open.
+#[inline]
+fn lit_short_share(seqs: &[Seq]) -> f32 {
+    if seqs.is_empty() {
+        return 1.0;
+    }
+    let short = seqs
+        .iter()
+        .filter(|s| s.litlen as usize <= LIT_PUSH_WIDTH)
+        .count();
+    short as f32 / seqs.len() as f32
+}
+
+/// GATE 13 @ L1 threshold: the share of literal runs the fixed-width copy must
+/// CATCH for its guard to be worth evaluating.
+///
+/// Below it the four-condition guard runs and FAILS on nearly every call -- pure
+/// overhead, since those runs go to `extend_from_slice` anyway. The population
+/// separates with nothing in between (share of runs <= 16 bytes, L1):
+///
+///   sao 6.1%   x-ray 7.2%   |   mr 55.9%   dickens 79.5% ... smallmsg 100.0%
+///
+/// A 7.7x gap with no corpus inside it, so this is a single-sided latch on a wide
+/// natural gap (great-gate.md par.4), not a fitted constant. 0.25 sits in the
+/// middle of the empty band.
+const LIT_SHORT_MIN: f32 = 0.25;
+
+/// Bench hook for the Gate 13 dispatch. Negative disables the gate (constant ON,
+/// the pre-dispatch behaviour and the byte-identical fallback).
+static LIT_SHORT_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Set the Gate 13 share threshold. Negative = gate off (always take the guard).
+pub fn set_lit_short_arm(v: f32) {
+    LIT_SHORT_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn lit_short_min() -> f32 {
+    let b = LIT_SHORT_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if b == u32::MAX { LIT_SHORT_MIN } else { f32::from_bits(b) }
+}
+
+/// Deterministic instrument: guard evaluations that FAILED, i.e. wasted work.
+pub static LP_GUARD_FAIL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Guard evaluations SKIPPED by the Gate 13 dispatch.
+pub static LP_GUARD_SKIP: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear the Gate 13 guard instruments.
+pub fn take_lp_guard() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        LP_GUARD_FAIL.swap(0, Ordering::Relaxed),
+        LP_GUARD_SKIP.swap(0, Ordering::Relaxed),
+    )
+}
+
 
 /// Append `src[from..to]` to the literal buffer.
 ///
@@ -4030,8 +4155,62 @@ fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize, arm: bo
         }
         return;
     }
+    // TIER 2 and TIER 3. Reached only when tier 1 missed, so the 87.6% of
+    // appends tier 1 already serves pay nothing for these.
+    let tiers = lit_push_tiers();
+    if tiers != 1 && arm {
+        if n <= LIT_PUSH_TIER2
+            && from + LIT_PUSH_TIER2 <= src.len()
+            && lits.capacity() - lits.len() >= LIT_PUSH_TIER2
+        {
+            #[cfg(feature = "profile")]
+            LP_FAST2.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let len = lits.len();
+            // SAFETY: identical to tier 1 at a wider constant -- `from + 32 <=
+            // src.len()` gives 32 readable source bytes, `capacity - len >= 32`
+            // gives 32 writable destination bytes inside the allocation, and
+            // `src` and `lits` are distinct buffers. Exactly `n <= 32` bytes are
+            // published by `set_len`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src.as_ptr().add(from),
+                    lits.as_mut_ptr().add(len),
+                    LIT_PUSH_TIER2,
+                );
+                lits.set_len(len + n);
+            }
+            return;
+        }
+        if tiers == 0
+            && n <= LIT_PUSH_TIER3
+            && from + LIT_PUSH_TIER3 <= src.len()
+            && lits.capacity() - lits.len() >= LIT_PUSH_TIER3
+        {
+            #[cfg(feature = "profile")]
+            LP_FAST3.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let len = lits.len();
+            // SAFETY: as tier 2, at 64 bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src.as_ptr().add(from),
+                    lits.as_mut_ptr().add(len),
+                    LIT_PUSH_TIER3,
+                );
+                lits.set_len(len + n);
+            }
+            return;
+        }
+    }
     #[cfg(feature = "profile")]
-    LP_SLOW.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    {
+        LP_SLOW.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // The guard was EVALUATED and failed only if the arm let us reach it.
+        if arm {
+            LP_GUARD_FAIL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        } else {
+            LP_GUARD_SKIP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
     lits.extend_from_slice(&src[from..to]);
 }
 
@@ -4053,6 +4232,16 @@ pub fn take_lit_hist() -> [u64; 6] {
         o[i] = v.swap(0, Relaxed);
     }
     o
+}
+
+/// Literal appends served by tier 2 (32 bytes) and tier 3 (64 bytes).
+pub static LP_FAST2: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LP_FAST3: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear the tier-2 and tier-3 counts.
+pub fn take_lit_tiers() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (LP_FAST2.swap(0, Relaxed), LP_FAST3.swap(0, Relaxed))
 }
 
 /// Literal appends served by the fixed-width copy, and by the fallback.
