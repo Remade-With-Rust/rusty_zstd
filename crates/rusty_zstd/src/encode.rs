@@ -339,6 +339,9 @@ pub(crate) struct MatchTables {
     /// for the fixed-width copy to catch. Seeded optimistically so block 0
     /// always takes the fast path.
     lit_short_share: f32,
+    /// GATE 13 WIDTH: share of the previous block's literal runs in (16, 32] --
+    /// the runs a 32-byte copy catches that a 16-byte one does not.
+    lit_mid_share: f32,
     /// GATE 2 second variable: mean rep match length divided by mean match
     /// length on the previous block. Below 1 the repcode search is trading a
     /// LONGER hash match for a shorter rep match; above 1 its matches are the
@@ -500,6 +503,7 @@ impl MatchTables {
             rep_run: 0,
             next_long_yield: 1.0,
             lit_short_share: 1.0,
+            lit_mid_share: 0.0,
             rep_len_ratio: 1.0,
             rep_probe: 0,
             raw_run: 0,
@@ -2569,8 +2573,15 @@ fn find_fast_impl<
     //
     // Seeded optimistic (`lit_short_share` starts at 1.0) so block 0 always
     // takes the fast path and the gate cannot suppress its own evidence.
-    let lp_copy = reserve
-        && (tables.blocks_done == 0 || tables.lit_short_share >= lit_short_min());
+    // GATE 13: resolve BOTH decisions once per block -- whether the guard is
+    // worth evaluating at all, and how wide the copy should be. 0 = slow path.
+    let lp_copy = if reserve
+        && (tables.blocks_done == 0 || tables.lit_short_share >= lit_short_min())
+    {
+        lit_width_for(tables)
+    } else {
+        0
+    };
     let seq_guess = (tables.last_nseq + tables.last_nseq / 4 + 64).min(block_len / mls + 16);
     let mut seqs = if reserve {
         Vec::with_capacity(seq_guess)
@@ -2859,7 +2870,7 @@ fn find_fast_impl<
                     mls,
                     ilimit,
                     frame_start,
-                    reserve,
+                    lp_copy,
                 );
                 anchor = ip;
                 // The non-pipelined loop does this after EVERY emitted match;
@@ -2938,7 +2949,9 @@ fn find_fast_impl<
         // it never refreshed `tag_yield` at all and the old global counters just
         // accumulated across blocks.
         tables.tag_yield = cand_yield(cand);
-        tables.lit_short_share = lit_short_share(&seqs);
+        let (ls, lm) = lit_shares(&seqs);
+        tables.lit_short_share = ls;
+        tables.lit_mid_share = lm;
         tables.last_nseq = seqs.len();
         // DEFECT FIX: the main tail's `rep_len_ratio` update is BELOW this
         // return, so every pipelined block left Gate 2's second dispatch
@@ -3056,7 +3069,7 @@ fn find_fast_impl<
                 mls,
                 ilimit,
                 frame_start,
-                reserve,
+                lp_copy,
             );
             anchor = ip;
             // Same decision as the pipelined loop -- see GATE 8 above. Guarding
@@ -3142,7 +3155,7 @@ fn find_fast_impl<
                         mls,
                         ilimit,
                         frame_start,
-                        reserve,
+                        lp_copy,
                     );
                     anchor = ip;
                     continue;
@@ -3180,7 +3193,9 @@ fn find_fast_impl<
     // GATE 7: feed this block's measured reject share to the next block's gate.
     tables.tag_yield = cand_yield(cand);
     // GATE 13: and this block's share of literal runs the fixed-width copy can catch.
-    tables.lit_short_share = lit_short_share(&seqs);
+    let (ls, lm) = lit_shares(&seqs);
+    tables.lit_short_share = ls;
+    tables.lit_mid_share = lm;
     // feed this block's pair coverage to the next block's gate
     // Attribute only when the search actually RAN -- a rejected block measures
     // nothing, and zeroing it there is what would latch the gate shut.
@@ -3934,6 +3949,11 @@ fn lit_push_enabled() -> bool {
 /// Width of the fixed-width literal push. Also the slack reserved past a
 /// block's worth of literals so the fast path is always eligible.
 pub(crate) const LIT_PUSH_WIDTH: usize = 16;
+/// The widened arm. 32 is the last width that stays inlined as register moves;
+/// 64 lowers to a `memcpy` call (138 instructions vs 9).
+pub(crate) const LIT_PUSH_WIDTH_WIDE: usize = 32;
+/// `(fast32 - fast16) / (slow - fast32)` = 2/38, from the emitted asm.
+const WIDEN_RATIO: f32 = 0.0526;
 /// Widest value any tier may copy. Reservations use THIS so the capacity guard
 /// stays valid for every tier.
 pub(crate) const LIT_PUSH_WIDTH_MAX: usize = 64;
@@ -4031,15 +4051,49 @@ fn dfast_litpush_enabled() -> bool {
 /// litlens are already there, so the signal costs one pass per BLOCK and nothing
 /// per position. An empty block reports 1.0 so the gate stays open.
 #[inline]
-fn lit_short_share(seqs: &[Seq]) -> f32 {
+fn lit_shares(seqs: &[Seq]) -> (f32, f32) {
     if seqs.is_empty() {
-        return 1.0;
+        return (1.0, 0.0);
     }
-    let short = seqs
-        .iter()
-        .filter(|s| s.litlen as usize <= LIT_PUSH_WIDTH)
-        .count();
-    short as f32 / seqs.len() as f32
+    let (mut short, mut mid) = (0usize, 0usize);
+    for q in seqs {
+        let l = q.litlen as usize;
+        if l <= LIT_PUSH_WIDTH {
+            short += 1;
+        } else if l <= LIT_PUSH_WIDTH_WIDE {
+            mid += 1;
+        }
+    }
+    let n = seqs.len() as f32;
+    (short as f32 / n, mid as f32 / n)
+}
+
+/// GATE 13 WIDTH DISPATCH, derived from the emitted asm rather than fitted.
+///
+/// The fast path is SEVEN instructions at width 8 AND at width 16 (one `movq`,
+/// one `movups`) -- so the byte-based model that preferred 8 by 33% was pricing
+/// a quantity the machine does not charge for. Width 32 is NINE (two `movups`).
+/// Width 64 is 138: LLVM stops inlining and emits a `memcpy` CALL, a cliff.
+///
+/// Widening 16 -> 32 therefore costs 2 instructions on every fast call and saves
+/// `slow - fast32` on every run in (16, 32] it newly catches. With the measured
+/// slow path at ~47 instructions that breaks even at
+///
+///     mid_share * (47 - 9)  >  short_share * (9 - 7)
+///     mid_share             >  short_share * 0.0526
+///
+/// which predicts every corpus in the set, including both marginal ones
+/// (`mozilla` 4.2% vs 4.85% -> stay 16; `samba` 5.2% vs 4.91% -> widen).
+#[inline]
+fn lit_width_for(tables: &MatchTables) -> usize {
+    if tables.blocks_done == 0 {
+        return LIT_PUSH_WIDTH;
+    }
+    if tables.lit_mid_share > tables.lit_short_share * WIDEN_RATIO {
+        LIT_PUSH_WIDTH_WIDE
+    } else {
+        LIT_PUSH_WIDTH
+    }
 }
 
 /// GATE 13 @ L1 threshold: the share of literal runs the fixed-width copy must
@@ -4117,8 +4171,9 @@ pub fn take_lp_guard() -> (u64, u64) {
 ///
 /// Same disease as brick 49 (`use_rep`) and brick 64 (`seqcheck_hoisted`):
 /// a fixed-for-the-block flag re-read in the hottest loop.
-fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize, arm: bool) {
+fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize, w: usize) {
     let n = to - from;
+    let arm = w != 0;
     #[cfg(feature = "profile")]
     {
         let b = match n {
@@ -4131,7 +4186,6 @@ fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize, arm: bo
         };
         LP_HIST[b].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
-    let w = lit_push_width();
     if n <= w
         && from + w <= src.len()
         && lits.capacity() - lits.len() >= w
@@ -4155,6 +4209,30 @@ fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize, arm: bo
         }
         return;
     }
+    // The tiers live in an OUTLINED cold helper. Inlining them here pushed
+    // `push_literals` past LLVM's inlining threshold and it stopped being
+    // inlined AT ALL -- it became a standalone symbol with 19 call sites,
+    // turning ~1M literal appends at L1 into real function calls. That is the
+    // linkage trap: making an inlined function bigger can cost more than the
+    // work it adds saves. Tier 1 stays small so it keeps its inlining.
+    push_literals_tiers(lits, src, from, to, n, arm);
+}
+
+/// GATE 13 tiers 2 and 3, plus the fallback. Outlined and cold: reached only
+/// when tier 1 missed -- 12.4% of appends at L1, 3.3% at L3 -- so the call
+/// costs the common path nothing, while INLINING it cost the common path its
+/// own inlining.
+#[allow(unsafe_code)]
+#[inline(never)]
+#[cold]
+fn push_literals_tiers(
+    lits: &mut Vec<u8>,
+    src: &[u8],
+    from: usize,
+    to: usize,
+    n: usize,
+    arm: bool,
+) {
     // TIER 2 and TIER 3. Reached only when tier 1 missed, so the 87.6% of
     // appends tier 1 already serves pay nothing for these.
     let tiers = lit_push_tiers();
@@ -4277,7 +4355,7 @@ fn emit_fast_seq<const PACKED: bool>(
     mls: usize,
     ilimit: usize,
     frame_start: usize,
-    arm: bool,
+    w: usize,
 ) -> usize {
     let mut ip = found_ip;
     let mut mm = m;
@@ -4289,7 +4367,7 @@ fn emit_fast_seq<const PACKED: bool>(
         n += 1;
     }
     crate::prof::note_back_ext((back_from - ip) as u64);
-    push_literals(lits, src, anchor, ip, arm);
+    push_literals(lits, src, anchor, ip, w);
     seqs.push(Seq {
         litlen: (ip - anchor) as u32,
         matchlen: n as u32,
@@ -4571,7 +4649,7 @@ fn find_dfast_impl<const HLOG: u32>(
                 rep_hits += 1;
                 d_rep_bytes += ml as u64;
                 let mstart = ip + 1;
-                push_literals(&mut lits, src, anchor, mstart, lp);
+                push_literals(&mut lits, src, anchor, mstart, if lp { LIT_PUSH_WIDTH } else { 0 });
                 seqs.push(Seq {
                     litlen: (mstart - anchor) as u32,
                     matchlen: ml as u32,
@@ -4712,7 +4790,7 @@ fn find_dfast_impl<const HLOG: u32>(
         }
         if best_ml >= mls {
             // commit at `best_ip`, which is `ip+1` when the next-long probe won
-            push_literals(&mut lits, src, anchor, best_ip, lp);
+            push_literals(&mut lits, src, anchor, best_ip, if lp { LIT_PUSH_WIDTH } else { 0 });
             seqs.push(Seq {
                 litlen: (best_ip - anchor) as u32,
                 matchlen: best_ml as u32,
@@ -7017,13 +7095,18 @@ mod tests {
                 if from + n > src.len() {
                     continue;
                 }
-                for spare in [0usize, 1, 15, 16, 1024] {
-                    let mut fast = Vec::with_capacity(4 + spare);
-                    fast.extend_from_slice(b"HEAD");
-                    let mut want = fast.clone();
-                    want.extend_from_slice(&src[from..from + n]);
-                    super::push_literals(&mut fast, &src, from, from + n, true);
-                    assert_eq!(fast, want, "from={from} n={n} spare={spare}");
+                for spare in [0usize, 1, 15, 16, 31, 32, 1024] {
+                    // GATE 13: every width the dispatch can select, plus the
+                    // gate-off arm (0). All must equal `extend_from_slice` --
+                    // the copy writes `w` bytes but publishes only `n`.
+                    for w in [0usize, super::LIT_PUSH_WIDTH, super::LIT_PUSH_WIDTH_WIDE] {
+                        let mut fast = Vec::with_capacity(4 + spare);
+                        fast.extend_from_slice(b"HEAD");
+                        let mut want = fast.clone();
+                        want.extend_from_slice(&src[from..from + n]);
+                        super::push_literals(&mut fast, &src, from, from + n, w);
+                        assert_eq!(fast, want, "from={from} n={n} spare={spare} w={w}");
+                    }
                 }
             }
         }
