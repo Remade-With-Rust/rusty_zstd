@@ -5000,6 +5000,20 @@ fn opt_fill_enabled() -> bool {
     false
 }
 
+/// Longest span the back-fill will walk. Beyond this the jump is a single huge
+/// repeat and its interior is not worth inserting.
+fn opt_fill_max() -> usize {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_OPT_FILL_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(usize::MAX)
+    }
+    #[cfg(not(feature = "std"))]
+    usize::MAX
+}
+
 /// Stride for that back-fill; 1 inserts every skipped position.
 fn opt_fill_stride() -> usize {
     #[cfg(feature = "std")]
@@ -5242,8 +5256,15 @@ fn find_opt(
             // dead for want of a caller.
             if opt_fill_enabled() {
                 let step = opt_fill_stride();
+                // Cap the span. text-32m and versions-16m hold 93% of ALL jumped
+                // positions (3.58M of 3.85M) and contribute -15 and +54 bytes;
+                // dickens, samba, nci, ooffice and xml hold 6% and contribute
+                // -381. An enormous jump means one huge repeat, and filling its
+                // interior buys nothing -- those positions are reachable through
+                // the repeat itself.
+                let span = bml.min(opt_fill_max());
                 let mut q = i + 1;
-                while q < i + bml {
+                while q < i + span {
                     let qp = block_start + q;
                     if qp + 8 > block_end {
                         break;
