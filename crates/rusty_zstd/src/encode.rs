@@ -1693,6 +1693,8 @@ pub(crate) fn encode_block(
         (0, 0)
     };
     if seqs.is_empty() && !huffman::literals_worth_huffman(block) {
+        #[cfg(feature = "profile")]
+        RAW_EXIT[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         note_raw_outcome(tables, true);
         crate::prof::note_raw_block();
         tap_block(
@@ -1722,6 +1724,8 @@ pub(crate) fn encode_block(
     let mg = min_gain(block.len(), params.strategy);
     let peak = huffman::lit_sample_peak(if seqs.is_empty() { block } else { &literals });
     if early_raw_skip(match_b, block.len(), params) {
+        #[cfg(feature = "profile")]
+        RAW_EXIT[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         note_raw_outcome(tables, true);
         crate::prof::note_raw_block();
         crate::prof::note_early_raw();
@@ -1801,7 +1805,29 @@ pub(crate) fn encode_block(
     } else {
         block.len()
     };
+    // GATE 16 study: the gate's signal is BINARY ("was the last block raw?").
+    // A continuous one is right here -- how badly the block missed. A block that
+    // barely missed may compress next time; one that missed by a mile will not.
+    #[cfg(feature = "profile")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let ratio = (payload.len() as f64 / raw_limit.max(1) as f64 * 1000.0) as u64;
+        if payload.len() >= raw_limit {
+            RAW_MARGIN_SUM.fetch_add(ratio.min(4000), Relaxed);
+            RAW_MARGIN_N.fetch_add(1, Relaxed);
+            // bucket: 1000-1010, 1010-1050, 1050-1200, 1200+
+            let b = match ratio {
+                0..=1010 => 0,
+                1011..=1050 => 1,
+                1051..=1200 => 2,
+                _ => 3,
+            };
+            RAW_MARGIN_HIST[b].fetch_add(1, Relaxed);
+        }
+    }
     if payload.len() >= raw_limit {
+        #[cfg(feature = "profile")]
+        RAW_EXIT[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         *reps = saved_reps;
         *entropy = saved_ent;
         note_raw_outcome(tables, true);
@@ -2002,6 +2028,58 @@ fn raw_probe_period() -> u32 {
     } else {
         v
     }
+}
+
+/// GATE 16 study: WHICH of the three raw exits does each block take?
+/// 0 = no sequences and literals not worth huffman (before any payload exists)
+/// 1 = `early_raw_skip` (needs Fast + tlen 1..7)
+/// 2 = payload did not beat `raw_limit`
+#[cfg(feature = "profile")]
+pub static RAW_EXIT: [core::sync::atomic::AtomicU64; 3] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Read and clear the three raw-exit counts.
+#[cfg(feature = "profile")]
+pub fn take_raw_exits() -> [u64; 3] {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut o = [0u64; 3];
+    for (i, v) in RAW_EXIT.iter().enumerate() {
+        o[i] = v.swap(0, Relaxed);
+    }
+    o
+}
+
+/// GATE 16 study: how far past `raw_limit` did blocks that went RAW land?
+#[cfg(feature = "profile")]
+pub static RAW_MARGIN_SUM: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static RAW_MARGIN_N: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static RAW_MARGIN_HIST: [core::sync::atomic::AtomicU64; 4] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Read and clear `(sum_permille, n, [<=1.01, <=1.05, <=1.20, >1.20])`.
+#[cfg(feature = "profile")]
+pub fn take_raw_margin() -> (u64, u64, [u64; 4]) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut h = [0u64; 4];
+    for (i, v) in RAW_MARGIN_HIST.iter().enumerate() {
+        h[i] = v.swap(0, Relaxed);
+    }
+    (
+        RAW_MARGIN_SUM.swap(0, Relaxed),
+        RAW_MARGIN_N.swap(0, Relaxed),
+        h,
+    )
 }
 
 const RAW_RUN_MIN: u32 = 2;
