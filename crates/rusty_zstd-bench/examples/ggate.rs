@@ -11,8 +11,17 @@
 //!   1. DEAD CHECK — does the default differ from the value set? Reported per
 //!      corpus, because the answer is not the same for all of them.
 //!   2. CONSTANT TEST — pin every corpus to one arm. A corpus LOSES when another
-//!      arm is >3% faster at no size cost, or strictly smaller at no time cost.
+//!      arm is >3% faster at no size cost, or MATERIALLY smaller at no time cost.
 //!      No corpus loses -> CONSTANT. Any corpus loses -> DISPATCH.
+//!
+//!      "Materially" is load-bearing: without a floor this rule scored a 4-byte
+//!      frame header as a loss on 12 of 18 corpora (Gate 3's Dictionary_ID).
+//!
+//!   4. THE RULE CANNOT ADJUDICATE EVERYTHING. It compares two arms on speed and
+//!      size. It cannot tell whether the arms make the SAME PROMISE. Gates 3 and
+//!      4 both scored DISPATCH and were both overruled: `write_dict_id` is a
+//!      decoder contract, and `checksum` is a different GUARANTEE, not a
+//!      different encoding. That judgement stays with a person.
 //!   3. Speed is the objective, size is the guard (we are at size parity).
 use rusty_zstd::{AdvancedOptions, CompressOptions, Dictionary};
 use std::io::Write;
@@ -70,6 +79,16 @@ struct Cell {
 /// The strict (size <= 0) count is printed too, so the guard is never hidden.
 const SIZE_GUARD_PCT: f64 = 0.5;
 
+/// MATERIALITY FLOORS. Without these the loss rule fired on a **4-byte** frame
+/// header (Gate 3's Dictionary_ID) and on sub-2 ms encodes, scoring "12 of 18
+/// lose" for a field that costs nothing and buys dictionary lookup. A size
+/// saving must clear BOTH an absolute byte floor and a relative one to count,
+/// and a timing comparison is refused outright below `MIN_MS` where best-of-3
+/// jitter exceeds the effect being measured.
+const MIN_SIZE_BYTES: i64 = 1024;
+const MIN_SIZE_PCT: f64 = 0.05;
+const MIN_MS: f64 = 2.0;
+
 /// Everything a cell needs to be decided, printed in one shape for all five gates.
 fn decide(gate: u32, lvl: i32, cells: &[Cell], pin: &str, dead: &str, vars: &str) {
     let labels: Vec<String> = cells[0].arms.iter().map(|a| a.0.clone()).collect();
@@ -83,6 +102,7 @@ fn decide(gate: u32, lvl: i32, cells: &[Cell], pin: &str, dead: &str, vars: &str
     let pi = labels.iter().position(|l| l == pin).expect("pin arm not in set");
     let mut losers: Vec<String> = Vec::new();
     let mut strict = 0usize;
+    let mut immaterial = 0usize;
     let mut anti: Vec<String> = Vec::new();
     for c in cells {
         let p = &c.arms[pi];
@@ -97,14 +117,20 @@ fn decide(gate: u32, lvl: i32, cells: &[Cell], pin: &str, dead: &str, vars: &str
             .unwrap();
         let faster = (p.1 - best.1) / p.1 * 100.0;
         let size_pct = (best.2 as f64 / p.2 as f64 - 1.0) * 100.0;
-        if faster > LOSS_PCT && size_pct <= SIZE_GUARD_PCT {
+        let saved = p.2 as i64 - best.2 as i64;
+        let size_material = saved >= MIN_SIZE_BYTES && -size_pct >= MIN_SIZE_PCT;
+        let time_material = p.1 >= MIN_MS && best.1 >= MIN_MS;
+        if time_material && faster > LOSS_PCT && size_pct <= SIZE_GUARD_PCT {
             losers.push(format!("{}:{:.2}x/{:+.2}%", c.id, p.1 / best.1, size_pct));
             if best.2 <= p.2 {
                 strict += 1;
             }
-        } else if best.2 < p.2 && faster > -LOSS_PCT {
-            losers.push(format!("{}:{}{:+}B", c.id, best.0, best.2 as i64 - p.2 as i64));
+        } else if size_material && faster > -LOSS_PCT {
+            losers.push(format!("{}:{}{:+}B", c.id, best.0, -saved));
             strict += 1;
+        }
+        if !time_material {
+            immaterial += 1;
         }
         // corpora that would be HURT by pinning the other way
         if faster < -LOSS_PCT || size_pct > 1.0 {
@@ -123,6 +149,12 @@ fn decide(gate: u32, lvl: i32, cells: &[Cell], pin: &str, dead: &str, vars: &str
     );
     if !losers.is_empty() {
         println!("    {}", losers.join("  "));
+    }
+    if immaterial > 0 {
+        println!(
+            "  TIMING REFUSED on {immaterial} of {} corpora (under {MIN_MS} ms — best-of jitter exceeds the effect)",
+            cells.len()
+        );
     }
     if !anti.is_empty() {
         println!("  PINNING THE OTHER WAY hurts {} corpora: {}", anti.len(), anti.join("  "));
