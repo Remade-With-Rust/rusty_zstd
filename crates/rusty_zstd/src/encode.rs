@@ -1040,6 +1040,22 @@ fn prime_bt_depth() -> u32 {
     PRIME_BT_DEPTH_DEFAULT
 }
 
+// REFUTED AND REVERTED -- priming prefetch.
+//
+// Priming occupies 12.5% of the prefix path at L1, 16.2% at L3 and 3.8% at L19,
+// and the loop runs at ~1.5 ns per primed position (about four cycles) doing a
+// multiply, a shift and a RANDOM store into a 1-4 MiB table. That store misses,
+// so prefetching its slot 16 positions ahead looked free.
+//
+// It is not. Measured byte-identical on 15/15 (as a prefetch must be) and
+// SLOWER: +3.54% at L3 (10 of 15 corpora slower) and +2.20% at L1 (11 of 15).
+// The extra hash needed to compute the future slot costs more than the miss it
+// hides -- at four cycles a position the loop is ALU-bound, not stalled on
+// stores, and the store buffer already covers the latency.
+//
+// Reverted rather than left switchable: a brick that measures worse does not
+// earn an arm. Recorded so it is not re-attempted.
+
 pub(crate) fn prime_tables(
     tables: &mut MatchTables,
     src: &[u8],
