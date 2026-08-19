@@ -74,14 +74,92 @@ pub(crate) fn load_u64_le(src: &[u8], i: usize) -> u64 {
 }
 
 /// Common prefix length of `a` and `b` (min of the two lengths).
+/// GATE 15 arm. 0 = shipped (AVX2 where available), 1 = force the word loop,
+/// 2 = peek the first 8 bytes before going wide.
+///
+/// The question the CPU-capability dispatch does not answer: AVX2's first loop
+/// reads 64 bytes per side before it can return, and at L3 the mean match is
+/// ~9.6 bytes with literal runs of 3.75. Most `count_match` calls die inside the
+/// first word, so the wide load is memory traffic for a result eight bytes of
+/// it already decided.
+#[cfg(feature = "profile")]
+pub static EQLEN_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: select the common-prefix implementation. Present ONLY under
+/// `--features profile` -- `count_eq_len` runs 247M times at L19, so an atomic
+/// load here would be 247M loads in the shipped build to serve a bench knob.
+#[cfg(feature = "profile")]
+pub fn set_eqlen_arm(v: u8) {
+    EQLEN_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "profile")]
+#[inline(always)]
+fn eqlen_arm() -> u8 {
+    EQLEN_ARM.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(feature = "profile"))]
+#[inline(always)]
+fn eqlen_arm() -> u8 {
+    0
+}
+
+/// GATE 15 study: how long ARE the prefixes this returns, and how often is the
+/// wide path even eligible?
+#[cfg(feature = "profile")]
+pub static EQ_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static EQ_WIDE_ELIGIBLE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static EQ_LEN_HIST: [core::sync::atomic::AtomicU64; 5] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Read and clear `(calls, wide_eligible, [<8, 8-31, 32-63, 64-255, 256+])`.
+#[cfg(feature = "profile")]
+pub fn take_eqlen_stats() -> (u64, u64, [u64; 5]) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut h = [0u64; 5];
+    for (i, v) in EQ_LEN_HIST.iter().enumerate() {
+        h[i] = v.swap(0, Relaxed);
+    }
+    (EQ_CALLS.swap(0, Relaxed), EQ_WIDE_ELIGIBLE.swap(0, Relaxed), h)
+}
+
 pub(crate) fn count_eq_len(a: &[u8], b: &[u8]) -> usize {
     let max = a.len().min(b.len());
     if max == 0 {
         return 0;
     }
+    #[cfg(feature = "profile")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        EQ_CALLS.fetch_add(1, Relaxed);
+        if max >= 64 {
+            EQ_WIDE_ELIGIBLE.fetch_add(1, Relaxed);
+        }
+    }
+    let arm = eqlen_arm();
+    if arm == 1 {
+        return count_eq_len_words(a, b, max);
+    }
+    if arm == 2 && max >= 8 {
+        // Peek one word before committing to a 64-byte read.
+        let av = load_u64(a, 0);
+        let bv = load_u64(b, 0);
+        if av != bv {
+            return ((av ^ bv).trailing_zeros() as usize) / 8;
+        }
+    }
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
-        if has_avx2() {
+        if arm != 1 && has_avx2() {
             // SAFETY: `a[..max]` and `b[..max]` are in-bounds.
             return unsafe { count_eq_len_avx2(a.as_ptr(), b.as_ptr(), max) };
         }
@@ -97,6 +175,21 @@ pub(crate) fn count_eq_len(a: &[u8], b: &[u8]) -> usize {
     }
     #[allow(unreachable_code)]
     count_eq_len_words(a, b, max)
+}
+
+/// Bucket a returned prefix length. Called by `count_match` so the histogram
+/// reflects the lengths the ENCODER actually sees.
+#[cfg(feature = "profile")]
+#[inline]
+pub(crate) fn note_eqlen(n: usize) {
+    let b = match n {
+        0..=7 => 0,
+        8..=31 => 1,
+        32..=63 => 2,
+        64..=255 => 3,
+        _ => 4,
+    };
+    EQ_LEN_HIST[b].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 #[inline(always)]
