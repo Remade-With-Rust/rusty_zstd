@@ -5098,6 +5098,32 @@ fn search_attempts(params: CompressionParameters) -> usize {
     1usize << base.saturating_add(d).clamp(0, 12)
 }
 
+/// The `(hash_log, chain_log)` pairs the binary-tree specialisation covers.
+///
+/// ONE list, two consumers: the dispatch arms in `bt_find_best` and the public
+/// `BT_SPEC_PAIRS` the coverage test asserts against. They were previously
+/// independent, so a pair could be dropped from the dispatch while every test
+/// still passed -- which is exactly how 24 of 64 (size, level) cells came to run
+/// the slow runtime body unnoticed.
+macro_rules! bt_spec_list {
+    ($cb:ident) => {
+        $cb! {
+            (11, 11) (12, 12) (13, 13) (14, 14) (14, 15) (15, 15) (16, 16)
+            (17, 17) (17, 18) (18, 18) (19, 18) (19, 19) (20, 20) (21, 21)
+            (22, 22) (22, 23) (22, 24) (23, 22) (23, 23) (23, 24) (24, 24)
+        }
+    };
+}
+
+macro_rules! bt_spec_pairs_const {
+    ($( ($h:literal, $c:literal) )*) => {
+        /// Every `(hash_log, chain_log)` pair served by the specialised body.
+        /// Anything else falls to `bt_find_best_runtime`.
+        pub const BT_SPEC_PAIRS: &[(u32, u32)] = &[$( ($h, $c) ),*];
+    };
+}
+bt_spec_list!(bt_spec_pairs_const);
+
 #[allow(clippy::too_many_arguments)]
 fn bt_find_best(
     src: &[u8],
@@ -5176,26 +5202,32 @@ fn bt_find_best(
     // for a given input, so exactly one monomorphization executes and the other
     // eleven are cold -- which is why the I-cache objection does not apply.
     //
-    // Coverage PROVEN before flipping it: with the gate lifted the 12-pair set
-    // takes every call at L13 through L22, runtime 0 at all ten levels.
+    // Coverage was proven at ONE INPUT SIZE (the 2 MiB corpus prefix), and both
+    // `hash_log` and `chain_log` are derived from the size hint -- so the claim
+    // "runtime 0 at all ten levels" held only for 2 MiB inputs. Measured across
+    // the size axis, 24 of 64 (size, level) cells fell through to the runtime
+    // body: EVERY input at 64 KiB, 512 KiB and 1 MiB, at every bt level, ran the
+    // 249-instruction body with 4 variable shifts. Three absent pairs --
+    // (17,17), (20,20), (21,21) -- were the whole gap; with them the set covers
+    // 16 KiB through 32 MiB at L13-L22 with zero runtime calls.
+    //
+    // The lesson is the coverage PROOF, not the pairs: a dispatch keyed on
+    // derived parameters must be proven across every axis those parameters
+    // depend on, and the size axis was never varied.
     if !bt_spec_enabled() {
         return bt_find_best_runtime(src, ip, block_start, block_end, window, mls, params, tables);
     }
-    match (tables.hash_log, params.chain_log.min(24)) {
-        (14, 15) => go!(14, 15),
-        (15, 15) => go!(15, 15),
-        (17, 18) => go!(17, 18),
-        (19, 18) => go!(19, 18),
-        (19, 19) => go!(19, 19),
-        (22, 22) => go!(22, 22),
-        (22, 23) => go!(22, 23),
-        (22, 24) => go!(22, 24),
-        (23, 22) => go!(23, 22),
-        (23, 23) => go!(23, 23),
-        (23, 24) => go!(23, 24),
-        (24, 24) => go!(24, 24),
-        _ => bt_find_best_runtime(src, ip, block_start, block_end, window, mls, params, tables),
+    macro_rules! bt_spec_dispatch {
+        ($( ($h:literal, $c:literal) )*) => {
+            match (tables.hash_log, params.chain_log.min(24)) {
+                $( ($h, $c) => go!($h, $c), )*
+                _ => bt_find_best_runtime(
+                    src, ip, block_start, block_end, window, mls, params, tables,
+                ),
+            }
+        };
     }
+    bt_spec_list!(bt_spec_dispatch)
 }
 
 /// GATE 4/5 EXTENDED TO THE BT PATH (L13-L22).
@@ -5818,6 +5850,10 @@ fn opt_fill_rep_max() -> f32 {
 /// Longest span the back-fill will walk. Beyond this the jump is a single huge
 /// repeat and its interior is not worth inserting.
 fn opt_fill_max() -> usize {
+    let a = OPT_FILL_MAX_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if a != 0 {
+        return a;
+    }
     #[cfg(feature = "std")]
     {
         std::env::var("RZSTD_OPT_FILL_MAX")
@@ -5830,7 +5866,52 @@ fn opt_fill_max() -> usize {
 }
 
 /// Stride for that back-fill; 1 inserts every skipped position.
+/// GATE 12 @ L19 arms: the opt back-fill's stride and span cap, as atomics so
+/// they can be swept in one process. 0 = unset (use the env/default path).
+static OPT_FILL_S_ARM: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static OPT_FILL_MAX_ARM: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Bench hook: opt back-fill stride (0 restores the default of 1).
+pub fn set_opt_fill_stride_arm(v: usize) {
+    OPT_FILL_S_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Bench hook: opt back-fill span cap (0 restores the uncapped default).
+pub fn set_opt_fill_max_arm(v: usize) {
+    OPT_FILL_MAX_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Positions inserted by the opt back-fill -- the work GATE 12 controls at L19.
+pub static OPT_FILL_INS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear the opt back-fill insert count.
+pub fn take_opt_fill_ins() -> u64 {
+    OPT_FILL_INS.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// GATE 12 @ L19 defect arm: `false` restores the per-jump `std::env::var`
+/// lookups the back-fill guard used to perform inside the DP loop, so the fix
+/// can be A/B'd in one process instead of across two binaries.
+static OPT_HOIST_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: `false` reads the four back-fill knobs per jumped position again.
+pub fn set_opt_hoist_arm(hoisted: bool) {
+    OPT_HOIST_ARM.store(u8::from(hoisted) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn opt_hoisted() -> bool {
+    OPT_HOIST_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
+}
+
 fn opt_fill_stride() -> usize {
+    let a = OPT_FILL_S_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if a != 0 {
+        return a;
+    }
     #[cfg(feature = "std")]
     {
         std::env::var("RZSTD_OPT_FILL_S")
@@ -5939,6 +6020,16 @@ fn find_opt(
             || tables.opt_rep_probe == 0
             || tables.opt_rep_rate >= rep_min);
     let mut i = 0usize;
+    // DEFECT (GATE 12 @ L19). These four were read INSIDE the DP loop, so every
+    // jumped position performed `std::env::var` -- a `GetEnvironmentVariableW`
+    // plus a `String` allocation, up to four per jump, across 3.85M jumped
+    // positions. The file already carried the warning that produced this rule
+    // ("the -37% that an env lookup inside the DP loop cost at L19"); GATE 11's
+    // back-fill reintroduced it. Read ONCE per block.
+    let fill_on = opt_fill_enabled();
+    let fill_rep_max = opt_fill_rep_max();
+    let fill_step = opt_fill_stride();
+    let fill_span_max = opt_fill_max();
     while i < n {
         if price[i] >= inf {
             o_skip_inf += 1;
@@ -6092,18 +6183,23 @@ fn find_opt(
             //
             // Two real measurements are also required: with one, versions has
             // only seen the 0.
-            if opt_fill_enabled()
-                && tables.opt_rep_meas >= 2
-                && tables.opt_rep_peak < opt_fill_rep_max()
-            {
-                let step = opt_fill_stride();
+            // The OFF arm re-reads the environment here, per jumped position,
+            // exactly as the shipped code did before the hoist.
+            let hoisted = opt_hoisted();
+            let (g_on, g_rep) = if hoisted {
+                (fill_on, fill_rep_max)
+            } else {
+                (opt_fill_enabled(), opt_fill_rep_max())
+            };
+            if g_on && tables.opt_rep_meas >= 2 && tables.opt_rep_peak < g_rep {
+                let step = if hoisted { fill_step } else { opt_fill_stride() };
                 // Cap the span. text-32m and versions-16m hold 93% of ALL jumped
                 // positions (3.58M of 3.85M) and contribute -15 and +54 bytes;
                 // dickens, samba, nci, ooffice and xml hold 6% and contribute
                 // -381. An enormous jump means one huge repeat, and filling its
                 // interior buys nothing -- those positions are reachable through
                 // the repeat itself.
-                let span = bml.min(opt_fill_max());
+                let span = bml.min(if hoisted { fill_span_max } else { opt_fill_max() });
                 let mut q = i + 1;
                 while q < i + span {
                     let qp = block_start + q;
@@ -6113,6 +6209,8 @@ fn find_opt(
                     let _ = bt_find_best(
                         src, qp, block_start, block_end, window, mls, params, tables,
                     );
+                    #[cfg(feature = "profile")]
+                    OPT_FILL_INS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     q += step;
                 }
             }

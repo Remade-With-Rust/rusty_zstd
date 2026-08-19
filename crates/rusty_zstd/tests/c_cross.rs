@@ -248,3 +248,53 @@ fn compression_is_independent_of_call_history() {
         }
     }
 }
+
+/// REGRESSION (2026-08-19): the binary-tree finder dispatches to a const-generic
+/// specialisation keyed on `(hash_log, chain_log)`, falling back to a slower
+/// hand-written runtime body (279 instructions / 4 variable shifts against the
+/// specialisation's 260 / 1). Both parameters are DERIVED FROM THE INPUT SIZE,
+/// and the original coverage proof varied only the level -- at one size, the
+/// 2 MiB corpus prefix. Measured across the size axis, 24 of 64 (size, level)
+/// cells fell through: every input at 64 KiB, 512 KiB and 1 MiB, at every bt
+/// level, ran the slow body.
+///
+/// Asserted against `BT_SPEC_PAIRS`, which is generated from the SAME macro list
+/// as the dispatch arms, so this cannot pass while a pair is missing from the
+/// dispatch. It deliberately does NOT use the call counters: those are gated
+/// behind `--features profile`, so a counter-based version of this test passed
+/// vacuously with a pair removed.
+#[test]
+fn bt_specialisation_covers_every_input_size() {
+    let mut uncovered = Vec::new();
+    let mut n: u64 = 1024;
+    while n <= (64 << 20) {
+        for lvl in [13i32, 14, 15, 16, 17, 18, 19, 20, 21, 22] {
+            let p = rusty_zstd::compression_params(lvl, Some(n)).unwrap();
+            let pair = (p.hash_log.min(24), p.chain_log.min(24));
+            if !rusty_zstd::BT_SPEC_PAIRS.contains(&pair) {
+                uncovered.push((n >> 10, lvl, pair));
+            }
+        }
+        n += (n / 4).max(1024);
+    }
+    assert!(
+        uncovered.is_empty(),
+        "bt specialisation misses (KiB, level, (hash_log, chain_log)): {uncovered:?}"
+    );
+
+    // and the bytes must not depend on which body served the call
+    let big: Vec<u8> = (0..(3 << 20) as u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    for &sz in &[64 << 10, 512 << 10, 1 << 20, 3 << 20] {
+        let src = &big[..sz.min(big.len())];
+        for lvl in [13i32, 17, 19, 22] {
+            rusty_zstd::set_bt_spec_arm(false);
+            let a = rusty_zstd::compress(src, lvl).unwrap();
+            rusty_zstd::set_bt_spec_arm(true);
+            let b = rusty_zstd::compress(src, lvl).unwrap();
+            assert_eq!(a, b, "specialised body differs from runtime at {sz} L{lvl}");
+            assert_eq!(rusty_zstd::decompress(&b).unwrap(), src);
+        }
+    }
+}
