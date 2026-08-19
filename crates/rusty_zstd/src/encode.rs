@@ -3411,6 +3411,38 @@ static LAZY_FILL_S_ARM: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 /// Set the lazy back-fill stride in-process.
+/// GATE 14 @ L3 -- the DEPTH CUT DFast actually has.
+///
+/// GATE 14 proper (`bt_depth_apply`) is dead at L3 twice over: L3 makes ZERO
+/// `bt_find_best` calls, and `bt_depth_cut` excludes non-opt strategies anyway.
+/// But "stop searching once the match in hand is good enough" is exactly what a
+/// depth cut IS, and DFast has one -- a bare `8` at two sites:
+///
+///   * gating the GATE 6 next-long probe at `ip + 1`
+///   * gating the second (short-hash) candidate check at `ip`
+///
+/// Both were hardcoded and never gated, the same shape as the search-strength
+/// shift of 4.43 (four sites, never gated, the biggest L1 speed lever found).
+/// Lower = accept a shorter match and stop early; higher = keep looking.
+static DFAST_GOOD_ML_ARM: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Bench hook: the "good enough, stop searching" match length for DFast.
+/// 0 restores the shipped 8.
+pub fn set_dfast_good_ml_arm(v: usize) {
+    DFAST_GOOD_ML_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn dfast_good_ml() -> usize {
+    let v = DFAST_GOOD_ML_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if v == 0 {
+        8
+    } else {
+        v
+    }
+}
+
 /// GATE 12 @ L3. DFast's back-fill is not a span walk -- it inserts exactly two
 /// positions per match (`match_ip+2` and `match_end-2`), mirroring C
 /// `zstd_double_fast.c`. So `lazy_fill_stride` was never wired to it: that knob
@@ -4524,6 +4556,9 @@ fn find_dfast_impl<const HLOG: u32>(
     if HLOG == 0 {
         DFAST_RUNTIME_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
+    // Read ONCE per block -- see the -37% an env lookup inside the DP loop cost
+    // at L19, and the 60% the depth gate's four per-call reads cost at L19/L22.
+    let good_ml = dfast_good_ml();
     let mls = params.min_match.max(3) as usize;
     // GATE 13 @ L3: reserve both outputs, as `find_fast` has since brick 38.
     // Sized from what the PREVIOUS block actually produced, so sparse-match
@@ -4750,7 +4785,7 @@ fn find_dfast_impl<const HLOG: u32>(
         // byte later -- the same "capability present in one finder, absent in
         // its neighbour" shape as the repcode and back-extension defects.
         let mut best_ip = ip;
-        if best_ml < 8 && nl_on && ip + 1 <= ilimit {
+        if best_ml < good_ml && nl_on && ip + 1 <= ilimit {
             nl_probes += 1;
             let h8b = hash8(src, ip + 1, hlog);
             if let Some(m8b) = tables.get_hl(h8b) {
@@ -4776,7 +4811,7 @@ fn find_dfast_impl<const HLOG: u32>(
                 }
             }
         }
-        if best_ml < 8 && best_ip == ip {
+        if best_ml < good_ml && best_ip == ip {
             if let Some(m4) = m4 {
                 if COUNT {
                     probes += 1;
