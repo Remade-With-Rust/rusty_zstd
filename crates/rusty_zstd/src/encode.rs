@@ -3887,6 +3887,33 @@ fn lit_push_enabled() -> bool {
 /// block's worth of literals so the fast path is always eligible.
 pub(crate) const LIT_PUSH_WIDTH: usize = 16;
 
+/// GATE 13 @ L3. `push_literals` had exactly ONE call site -- `find_fast`'s
+/// match commit -- so the gate was DEAD everywhere but L1, and dead by SCOPE
+/// rather than by measurement: `find_dfast` called `lits.extend_from_slice`
+/// directly and allocated both output vectors unreserved.
+///
+/// The gate is two things, and DFast had neither:
+///   1. reserve `lits`/`seqs` up front, so neither grows by repeated realloc
+///   2. a fixed-width 16-byte `copy_nonoverlapping` for short literal runs,
+///      which the compiler CAN lower to a constant-width move where
+///      `extend_from_slice`'s runtime length cannot be
+///
+/// L3 emits 1,973,548 sequences over the corpus at a mean of 3.75 literal bytes
+/// each, and 17 of 18 corpora sit under the 16-byte width -- the same shape that
+/// measured +2-4% at L1. Byte-identical by construction.
+static DFAST_LITPUSH_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: `false` restores DFast's unreserved vectors and runtime-length
+/// literal copies.
+pub fn set_dfast_litpush_arm(on: bool) {
+    DFAST_LITPUSH_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn dfast_litpush_enabled() -> bool {
+    DFAST_LITPUSH_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
+}
+
 /// Append `src[from..to]` to the literal buffer.
 ///
 /// The measured literal run between matches is tiny -- 1.9 bytes/sequence on
@@ -3914,6 +3941,8 @@ fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize, arm: bo
         && lits.capacity() - lits.len() >= LIT_PUSH_WIDTH
         && if litpush_hoist_enabled() { arm } else { lit_push_enabled() }
     {
+        #[cfg(feature = "profile")]
+        LP_FAST.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let len = lits.len();
         // SAFETY: `from + 16 <= src.len()` gives 16 readable source bytes;
         // `capacity - len >= 16` gives 16 writable destination bytes inside
@@ -3930,7 +3959,19 @@ fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize, arm: bo
         }
         return;
     }
+    #[cfg(feature = "profile")]
+    LP_SLOW.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     lits.extend_from_slice(&src[from..to]);
+}
+
+/// Literal appends served by the fixed-width copy, and by the fallback.
+pub static LP_FAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LP_SLOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear `(fixed_width, fallback)` literal-append counts.
+pub fn take_lit_push() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (LP_FAST.swap(0, Relaxed), LP_SLOW.swap(0, Relaxed))
 }
 
 fn emit_fast_seq<const PACKED: bool>(
@@ -4113,8 +4154,22 @@ fn find_dfast_impl<const HLOG: u32>(
         DFAST_RUNTIME_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     let mls = params.min_match.max(3) as usize;
-    let mut seqs = Vec::new();
-    let mut lits = Vec::new();
+    // GATE 13 @ L3: reserve both outputs, as `find_fast` has since brick 38.
+    // Sized from what the PREVIOUS block actually produced, so sparse-match
+    // content does not over-reserve.
+    let lp = dfast_litpush_enabled();
+    let block_len = block_end - block_start;
+    let seq_guess = (tables.last_nseq + tables.last_nseq / 4 + 64).min(block_len / mls + 16);
+    let mut seqs = if lp {
+        Vec::with_capacity(seq_guess)
+    } else {
+        Vec::new()
+    };
+    let mut lits = if lp {
+        Vec::with_capacity(block_len + LIT_PUSH_WIDTH)
+    } else {
+        Vec::new()
+    };
     let mut anchor = block_start;
     let ilimit = block_end.saturating_sub(8);
     if block_start >= ilimit {
@@ -4215,7 +4270,7 @@ fn find_dfast_impl<const HLOG: u32>(
                 rep_hits += 1;
                 d_rep_bytes += ml as u64;
                 let mstart = ip + 1;
-                lits.extend_from_slice(&src[anchor..mstart]);
+                push_literals(&mut lits, src, anchor, mstart, lp);
                 seqs.push(Seq {
                     litlen: (mstart - anchor) as u32,
                     matchlen: ml as u32,
@@ -4356,7 +4411,7 @@ fn find_dfast_impl<const HLOG: u32>(
         }
         if best_ml >= mls {
             // commit at `best_ip`, which is `ip+1` when the next-long probe won
-            lits.extend_from_slice(&src[anchor..best_ip]);
+            push_literals(&mut lits, src, anchor, best_ip, lp);
             seqs.push(Seq {
                 litlen: (best_ip - anchor) as u32,
                 matchlen: best_ml as u32,
