@@ -4947,6 +4947,23 @@ pub static OPT_REP_HITS: core::sync::atomic::AtomicU64 =
 pub static OPT_REP_BYTES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+pub static OPT_POS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static OPT_SKIP_INF: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static OPT_SKIP_JUMP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static OPT_SKIP_JUMPS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// `(positions, skipped_price_inf, bytes_jumped, jumps)`
+pub fn take_opt_skips() -> (u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        OPT_POS.swap(0, Relaxed),
+        OPT_SKIP_INF.swap(0, Relaxed),
+        OPT_SKIP_JUMP.swap(0, Relaxed),
+        OPT_SKIP_JUMPS.swap(0, Relaxed),
+    )
+}
+
 pub static OPT_BT_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static OPT_BT_DRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static OPT_BT_LEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -4971,6 +4988,30 @@ pub fn take_opt_rep() -> (u64, u64, u64) {
         OPT_REP_HITS.swap(0, Relaxed),
         OPT_REP_BYTES.swap(0, Relaxed),
     )
+}
+
+/// GATE 11 @ L19: back-fill the span the `sufficient_len` jump skips.
+fn opt_fill_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_OPT_FILL").map(|v| v.trim() != "0").unwrap_or(false)
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
+/// Stride for that back-fill; 1 inserts every skipped position.
+fn opt_fill_stride() -> usize {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_OPT_FILL_S")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or(1)
+    }
+    #[cfg(not(feature = "std"))]
+    1
 }
 
 fn find_opt(
@@ -5049,6 +5090,10 @@ fn find_opt(
     let (mut o_rep_probes, mut o_rep_hits, mut o_rep_bytes) = (0u64, 0u64, 0u64);
     // GATE 10 @ L22 curiosity: what does the DP's per-position bt search return?
     let (mut o_bt_calls, mut o_bt_dry, mut o_bt_len) = (0u64, 0u64, 0u64);
+    // GATE 11 @ L19: are there positions the DP never inserts? Two paths skip
+    // without calling bt_find_best.
+    let (mut o_skip_inf, mut o_skip_jump, mut o_skip_jumps) = (0u64, 0u64, 0u64);
+    let o_positions = n as u64;
     // GATE 10 @ L19 DISPATCH. The candidate costs a `try_rep1` at every position
     // and EARNS almost nowhere: 12 of 18 corpora are SMALLER without it, and
     // only versions-16m (+51.654% if removed) and text-32m (+5.376%) need it.
@@ -5067,6 +5112,7 @@ fn find_opt(
     let mut i = 0usize;
     while i < n {
         if price[i] >= inf {
+            o_skip_inf += 1;
             i += 1;
             continue;
         }
@@ -5185,6 +5231,29 @@ fn find_opt(
         // every interior position. Positions inside keep `price == inf`, so no
         // path can route through them -- exactly the greedy commitment C makes.
         if bml >= sufficient_len && i + bml <= n {
+            o_skip_jump += bml as u64;
+            o_skip_jumps += 1;
+            // GATE 11 BROUGHT TO LIFE AT L19. The DP inserts a position by
+            // searching it, so the `sufficient_len` jump leaves the whole span
+            // OUT of the tree -- measured, 3,853,451 positions (11.4%) over 675
+            // jumps. Those positions can never afterwards be the START of a
+            // match, which is exactly the hole `find_bt_lazy`'s back-fill exists
+            // to close. This is the same capability, at the level where it was
+            // dead for want of a caller.
+            if opt_fill_enabled() {
+                let step = opt_fill_stride();
+                let mut q = i + 1;
+                while q < i + bml {
+                    let qp = block_start + q;
+                    if qp + 8 > block_end {
+                        break;
+                    }
+                    let _ = bt_find_best(
+                        src, qp, block_start, block_end, window, mls, params, tables,
+                    );
+                    q += step;
+                }
+            }
             i += bml;
             continue;
         }
@@ -5226,6 +5295,10 @@ fn find_opt(
         OPT_BT_DRY.fetch_add(o_bt_dry, Relaxed);
         OPT_BT_LEN.fetch_add(o_bt_len, Relaxed);
         OPT_SEQS.fetch_add(seqs.len() as u64, Relaxed);
+        OPT_POS.fetch_add(o_positions, Relaxed);
+        OPT_SKIP_INF.fetch_add(o_skip_inf, Relaxed);
+        OPT_SKIP_JUMP.fetch_add(o_skip_jump, Relaxed);
+        OPT_SKIP_JUMPS.fetch_add(o_skip_jumps, Relaxed);
     }
     if opt_rep_on && o_rep_probes > 0 {
         let now = o_rep_bytes as f32 / o_rep_probes as f32;

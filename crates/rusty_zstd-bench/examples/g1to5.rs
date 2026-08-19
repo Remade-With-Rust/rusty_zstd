@@ -266,27 +266,54 @@ fn main() {
     println!("  a corpus LOSES under a pin when another arm is >{LOSS_PCT}% faster at no size cost,");
     println!("  or strictly smaller at no time cost");
     let t0 = Instant::now();
-    // one trained dictionary, shared by every Gate 3 cell
-    let seed = load(1 << 20);
-    let samples: Vec<&[u8]> = seed.iter().flat_map(|(_, s)| s.chunks(8192).take(24)).collect();
-    let dbytes = rusty_zstd::train(&samples, rusty_zstd::TrainOptions::fastcover()).expect("train");
+    // ONE trained dictionary, shared by every Gate 3 cell.
+    //
+    // The first cut of this called `train(432 samples of 8 KiB, fastcover())`
+    // with `k = 0`, which makes the trainer sweep `steps = 4` candidate segment
+    // sizes over ~3.5 MB of samples. It ran for 49 MINUTES without reaching L3
+    // and had to be killed. Gate 3 needs exactly one property from this
+    // dictionary -- a NON-ZERO Dictionary_ID, so its two arms differ -- so pin
+    // `k`, force the id, and keep the sample set small.
+    let tt = Instant::now();
+    let seed = load(256 << 10);
+    let samples: Vec<&[u8]> = seed.iter().take(3).flat_map(|(_, s)| s.chunks(4096).take(24)).collect();
+    let topts = rusty_zstd::TrainOptions {
+        max_dict: 16 << 10,
+        dict_id: Some(0x00C0FFEE),
+        k: 200,
+        accel: 10,
+        ..rusty_zstd::TrainOptions::fastcover()
+    };
+    let dbytes = rusty_zstd::train(&samples, topts).expect("train");
     let dict = Dictionary::from_bytes(&dbytes).expect("parse dict");
-    println!("  trained dictionary: {} bytes, id {}", dbytes.len(), dict.id());
+    println!(
+        "  trained dictionary: {} bytes, id {:#x}, {} samples, {:.1}s",
+        dbytes.len(),
+        dict.id(),
+        samples.len(),
+        tt.elapsed().as_secs_f64()
+    );
+    assert!(dict.id() != 0, "Gate 3 needs a non-zero dict id or its arms cannot differ");
+    let _ = std::io::stdout().flush();
 
     for &(lvl, cap) in LEVELS {
         let cap = if lvl >= 13 { 512 << 10 } else { cap };
         let srcs = load(cap);
         println!("\n================ L{lvl} ({} KiB prefix, {} corpora) ================", cap >> 10, srcs.len());
-        print!("  gate 1 ");
-        gate1(&srcs, lvl);
-        print!("  gate 2 ");
-        gate2(&srcs, lvl);
-        print!("  gate 3 ");
-        gate3(&srcs, lvl, &dict);
-        print!("  gate 4 ");
-        gate4(&srcs, lvl);
-        print!("  gate 5 ");
-        gate5(&srcs, lvl);
+        for (n, f) in [(1u32, 0u8), (2, 1), (3, 2), (4, 3), (5, 4)] {
+            let t = Instant::now();
+            print!("  gate {n} ");
+            let _ = std::io::stdout().flush();
+            match f {
+                0 => gate1(&srcs, lvl),
+                1 => gate2(&srcs, lvl),
+                2 => gate3(&srcs, lvl, &dict),
+                3 => gate4(&srcs, lvl),
+                _ => gate5(&srcs, lvl),
+            }
+            println!("    [gate {n} @ L{lvl} took {:.1}s, {:.0}s total]", t.elapsed().as_secs_f64(), t0.elapsed().as_secs_f64());
+            let _ = std::io::stdout().flush();
+        }
     }
     println!("\nDONE in {:.0}s", t0.elapsed().as_secs_f64());
 }
