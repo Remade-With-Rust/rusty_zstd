@@ -497,7 +497,9 @@ impl MatchTables {
         // write happens even on blocks where Gate 7's filter is off and nothing
         // reads it. Gate 7 is byte-identical, so this is purely a speed
         // question.
-        let use_tags = params.strategy == Strategy::Fast && tag_alloc_enabled();
+        let use_tags = (params.strategy == Strategy::Fast
+            || (params.strategy == Strategy::DFast && dfast_tag_enabled()))
+            && tag_alloc_enabled();
         let use_chain = !matches!(params.strategy, Strategy::Fast | Strategy::DFast);
         let hash_b = (hsz as u64).saturating_mul(4);
         let long_b = if use_long { hash_b } else { 0 };
@@ -665,6 +667,40 @@ impl MatchTables {
     #[inline(always)]
     fn put_h(&mut self, h: usize, pos: usize) {
         self.hash[h] = (pos as u32).saturating_add(1);
+    }
+
+    /// T1: `put_h` that also writes the tag, so the short table obeys the same
+    /// rule `store_fast` does -- the tag is written UNCONDITIONALLY whenever the
+    /// array exists. Gating the store on the same flag as the compare is what
+    /// lets tags go stale (190ad8b, and again in `prime_tables`).
+    #[inline(always)]
+    fn put_h_tag(&mut self, h: usize, pos: usize, tag: u8) {
+        if let Some(t) = self.tags.get_mut(h) {
+            *t = tag;
+        }
+        self.hash[h] = (pos as u32).saturating_add(1);
+    }
+
+    /// T1: short-table load with the DFast rejection filter.
+    ///
+    /// The tag derives from the same 4 bytes as the index, and DFast's
+    /// `min_match` is 5, so any match it could accept implies 4 equal bytes and
+    /// therefore an equal tag. A mismatch provably cannot hide a match, which is
+    /// why this is byte-identical rather than a size-for-speed trade.
+    #[inline(always)]
+    fn get_h_tag(&self, h: usize, tag: u8, on: bool) -> Option<usize> {
+        let v = self.hash[h];
+        if v == 0 {
+            return None;
+        }
+        if on {
+            if let Some(&t) = self.tags.get(h) {
+                if t != tag {
+                    return None;
+                }
+            }
+        }
+        Some((v as usize) - 1)
     }
 
     #[inline(always)]
@@ -1505,7 +1541,18 @@ pub(crate) fn prime_tables(
             if write_chain {
                 tables.chain[p & chain_mask] = tables.get_h(h).map(|x| x as u32).unwrap_or(0);
             }
-            tables.put_h(h, p);
+            // T1: the Fast branch above learned this the hard way -- prime the
+            // TAG or the filter rejects every primed slot and the priming is
+            // thrown away (-0.4114% overall at L1, `versions-16m` -59.3%). DFast
+            // reaches this branch, so it needs the same treatment. `mls` is 5
+            // there, so `hash_mls` took its hash4 path and the tag comes from
+            // the same 4 bytes as the index.
+            if tables.tags.is_empty() {
+                tables.put_h(h, p);
+            } else {
+                let hv = load_u32le(src, p).wrapping_mul(HASH4_PRIME);
+                tables.put_h_tag(h, p, (hv ^ (hv >> 15)) as u8);
+            }
             if do_long {
                 let hl = hash8(src, p, hash_log);
                 tables.put_hl(hl, p);
@@ -1577,7 +1624,8 @@ pub(crate) fn encode_block(
     // a schedule so content that starts compressing is picked up: without that
     // the gate would suppress its own evidence, the defect this campaign has now
     // hit in Gates 6, 2 and 10.
-    let skip_search = tables.raw_run >= RAW_RUN_MIN && tables.raw_probe != 0;
+    let skip_search =
+        raw_skip_on() && tables.raw_run >= RAW_RUN_MIN && tables.raw_probe != 0;
     let (seqs, literals) = if skip_search {
         (Vec::new(), block.to_vec())
     } else {
@@ -1850,6 +1898,26 @@ pub fn set_incomp_skip_arm(on: Option<bool>) {
 }
 
 /// Consecutive raw blocks before the match search is short-circuited.
+/// GATE 16 @ L3: the OFF arm the raw short circuit never had.
+///
+/// 4.30 shipped `skip_search` as an unconditional constant. Every other shipped
+/// constant in this campaign carries a proven byte-identical OFF; this one did
+/// not, so it could not be A/B'd at all -- and the arm that LOOKS like its
+/// switch (`set_incomp_skip_arm`) actually gates a different mechanism, the
+/// `raw_limit` tightening. Measuring the wrong one is exactly the mistake that
+/// produced a "zero positions saved" reading for a gate that saves ENTROPY work.
+static RAW_SKIP_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: `false` always searches, restoring the pre-4.30 behaviour.
+pub fn set_raw_skip_arm(on: bool) {
+    RAW_SKIP_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn raw_skip_on() -> bool {
+    RAW_SKIP_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
+}
+
 const RAW_RUN_MIN: u32 = 2;
 /// Blocks between forced re-probes of the raw short circuit.
 const RAW_PROBE_PERIOD: u32 = 16;
@@ -5186,7 +5254,13 @@ fn find_dfast_impl<const HLOG: u32>(
     let dpipe = dfast_pipe_enabled()
         && (tables.dfast_probe == 0 || tables.dfast_spec_yield >= dfast_spec_min());
     let (mut spec_made, mut spec_used) = (0u64, 0u64);
-    let mut carried: Option<(usize, usize, Option<usize>, Option<usize>)> = None;
+    // T1: the speculation now carries the short tag beside the short index.
+    let mut carried: Option<(usize, u8, usize, Option<usize>, Option<usize>)> = None;
+    // Read ONCE per block. `hash4_tag`'s index is `(v * HASH4_PRIME) >> shift`,
+    // which is exactly what `hash4` computes, so the tagged path indexes the
+    // same slots as `hash_mls(src, ip, 4, hlog)` did.
+    let dtag_on = !tables.tags.is_empty();
+    let dtag_shift = 32u32.saturating_sub(hlog.min(32));
     while ip <= ilimit {
         if COUNT {
             mm_total += 1;
@@ -5225,18 +5299,29 @@ fn find_dfast_impl<const HLOG: u32>(
         // `find_dfast_runtime` drifted until Gate 6 silently broke Gate 4's
         // byte-identity: an issue-order change must not be able to become an
         // algorithm change.
-        let (h4, h8, m4, m8) = match carried.take() {
+        let (h4, g4, h8, m4, m8) = match carried.take() {
             Some(v) => {
                 spec_used += 1;
                 v
             }
             None => {
-                let a = hash_mls(src, ip, 4, hlog);
+                let (a, ga) = hash4_tag::<true>(src, ip, dtag_shift);
                 let b = hash8(src, ip, hlog);
-                (a, b, tables.get_h(a), tables.get_hl(b))
+                let m = tables.get_h_tag(a, ga, dtag_on);
+                // T1 ledger: a rejection is a candidate load AVOIDED. Counted
+                // only under `profile`, so the shipping loop is untouched.
+                if COUNT && dtag_on {
+                    if tables.raw_fast(a) != 0 {
+                        TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        if m.is_none() {
+                            TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+                (a, ga, b, m, tables.get_hl(b))
             }
         };
-        tables.put_h(h4, ip);
+        tables.put_h_tag(h4, ip, g4);
         tables.put_hl(h8, ip);
         // Issue the NEXT position's two loads NOW, so they are in flight while
         // this position's match logic runs. The miss-advance does not depend on
@@ -5251,12 +5336,23 @@ fn find_dfast_impl<const HLOG: u32>(
         if dpipe {
             let nip = ip + dstep + ((ip - anchor) >> accel);
             if nip <= ilimit {
-                let a = hash_mls(src, nip, 4, hlog);
+                let (a, ga) = hash4_tag::<true>(src, nip, dtag_shift);
                 let b = hash8(src, nip, hlog);
-                let va = if a == h4 { Some(ip) } else { tables.get_h(a) };
+                // The hand-forward has to respect the filter: `put_h_tag` just
+                // wrote `g4` at slot `h4`, so a speculation landing on that slot
+                // sees `ip` only when its own tag matches what is now stored.
+                let va = if a == h4 {
+                    if !dtag_on || ga == g4 {
+                        Some(ip)
+                    } else {
+                        None
+                    }
+                } else {
+                    tables.get_h_tag(a, ga, dtag_on)
+                };
                 let vb = if b == h8 { Some(ip) } else { tables.get_hl(b) };
                 spec_made += 1;
-                carried = Some((a, b, va, vb));
+                carried = Some((a, ga, b, va, vb));
             }
         }
 
@@ -9684,4 +9780,18 @@ pub fn set_finder_scratch_arm(on: bool) {
 
 fn finder_scratch_enabled() -> bool {
     !matches!(FINDER_SCRATCH_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
+}
+
+
+/// T1 arm: give DFast the packed rejection tag that the Fast ladder already
+/// uses. Default OFF until byte-identity and the counters have spoken.
+static DFAST_TAG_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for T1.
+pub fn set_dfast_tag_arm(on: bool) {
+    DFAST_TAG_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn dfast_tag_enabled() -> bool {
+    matches!(DFAST_TAG_ARM.load(core::sync::atomic::Ordering::Relaxed), 2)
 }
