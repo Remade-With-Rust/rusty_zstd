@@ -680,8 +680,21 @@ impl MatchTables {
     /// `hash4_tag`, so its slots may not even correspond. Fixing it needs a
     /// dictionary/prefix test first -- do not "fix" it blind.
     #[inline(always)]
+    // T2 -- SAFETY, and it is the SAME invariant brick 50 proved for the Fast
+    // path. Every index into `hash`/`hash_long` is produced by `hash4`/`hash8`
+    // /`hash4_tag` shifting down to `tables.hash_log` bits, and the tables are
+    // allocated `1 << tables.hash_log`. That the log is the TABLE's and never
+    // `params.hash_log` is already load-bearing here: `params.hash_log` is
+    // user-settable with no upper bound, which is why `prime_tables` and every
+    // finder bind `let hash_log = tables.hash_log`.
+    //
+    // LLVM cannot see it, so it emitted a bounds check and a branch on EVERY
+    // table access -- twice per position, short table and long. The Fast finder
+    // carries 0 panic sites for this reason; DFast carried 13.
+    #[allow(unsafe_code)]
     fn put_h(&mut self, h: usize, pos: usize) {
-        self.hash[h] = (pos as u32).saturating_add(1);
+        debug_assert!(h < self.hash.len());
+        *unsafe { self.hash.get_unchecked_mut(h) } = (pos as u32).saturating_add(1);
     }
 
     /// T1: `put_h` that also writes the tag, so the short table obeys the same
@@ -689,19 +702,22 @@ impl MatchTables {
     /// array exists. Gating the store on the same flag as the compare is what
     /// lets tags go stale (190ad8b, and again in `prime_tables`).
     #[inline(always)]
+    #[allow(unsafe_code)]
     fn put_h_tag(&mut self, h: usize, pos: usize, tag: u8) {
         if self.pack_tags {
             // `pos + 1` is guaranteed < 2^24 by `enable_packed_tags`, so the
             // mask cannot truncate a live position, and the low bits are never
             // 0 -- an all-zero word still means "empty".
-            self.hash[h] =
+            debug_assert!(h < self.hash.len());
+            *unsafe { self.hash.get_unchecked_mut(h) } =
                 (((pos as u32).saturating_add(1)) & 0x00FF_FFFF) | (u32::from(tag) << 24);
             return;
         }
         if let Some(t) = self.tags.get_mut(h) {
             *t = tag;
         }
-        self.hash[h] = (pos as u32).saturating_add(1);
+        debug_assert!(h < self.hash.len());
+        *unsafe { self.hash.get_unchecked_mut(h) } = (pos as u32).saturating_add(1);
     }
 
     /// Enable packed tags for this frame, but only when every position the
@@ -719,8 +735,10 @@ impl MatchTables {
     /// therefore an equal tag. A mismatch provably cannot hide a match, which is
     /// why this is byte-identical rather than a size-for-speed trade.
     #[inline(always)]
+    #[allow(unsafe_code)]
     fn get_h_tag(&self, h: usize, tag: u8, on: bool) -> Option<usize> {
-        let v = self.hash[h];
+        debug_assert!(h < self.hash.len());
+        let v = *unsafe { self.hash.get_unchecked(h) };
         if v == 0 {
             return None;
         }
@@ -741,8 +759,10 @@ impl MatchTables {
     }
 
     #[inline(always)]
+    #[allow(unsafe_code)]
     fn get_h(&self, h: usize) -> Option<usize> {
-        let v = self.hash[h];
+        debug_assert!(h < self.hash.len());
+        let v = *unsafe { self.hash.get_unchecked(h) };
         if v == 0 {
             None
         } else {
@@ -751,13 +771,17 @@ impl MatchTables {
     }
 
     #[inline(always)]
+    #[allow(unsafe_code)]
     fn put_hl(&mut self, h: usize, pos: usize) {
-        self.hash_long[h] = (pos as u32).saturating_add(1);
+        debug_assert!(h < self.hash_long.len());
+        *unsafe { self.hash_long.get_unchecked_mut(h) } = (pos as u32).saturating_add(1);
     }
 
     #[inline(always)]
+    #[allow(unsafe_code)]
     fn get_hl(&self, h: usize) -> Option<usize> {
-        let v = self.hash_long[h];
+        debug_assert!(h < self.hash_long.len());
+        let v = *unsafe { self.hash_long.get_unchecked(h) };
         if v == 0 {
             None
         } else {
