@@ -2930,16 +2930,49 @@ fn bt_fill_stride() -> usize {
     1
 }
 
+pub static LF_FILLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LF_NONEMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LF_INSERTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `(fill_sites_reached, sites_with_at_least_one_insert, total_inserts)`
+pub fn take_lazy_fill() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        LF_FILLS.swap(0, Relaxed),
+        LF_NONEMPTY.swap(0, Relaxed),
+        LF_INSERTS.swap(0, Relaxed),
+    )
+}
+
+/// GATE 12: the lazy back-fill stride.
+///
+/// This was a `OnceLock`, which latches the environment at the FIRST call and
+/// caches it for the life of the process. Any in-process A/B that sets the
+/// variable after the first compression therefore measures the OLD value on both
+/// arms -- which is why Gate 12 read "0/18 sizes move, DEAD" at every level while
+/// the loop it controls performs 17.4M inserts at L7. The same trap is documented
+/// on `step0` a few hundred lines up. Now an atomic arm, like every other gate.
 fn lazy_fill_stride() -> usize {
-    use std::sync::OnceLock;
-    static T: OnceLock<usize> = OnceLock::new();
-    *T.get_or_init(|| {
-        std::env::var("RZSTD_LAZY_FILL_S")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&v: &usize| v >= 1)
-            .unwrap_or(1)
-    })
+    use core::sync::atomic::Ordering;
+    let v = LAZY_FILL_S_ARM.load(Ordering::Relaxed);
+    if v != 0 {
+        return v;
+    }
+    let s: usize = std::env::var("RZSTD_LAZY_FILL_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v: &usize| v >= 1)
+        .unwrap_or(1);
+    LAZY_FILL_S_ARM.store(s, Ordering::Relaxed);
+    s
+}
+
+static LAZY_FILL_S_ARM: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Set the lazy back-fill stride in-process.
+pub fn set_lazy_fill_stride_arm(v: usize) {
+    LAZY_FILL_S_ARM.store(v.max(1), core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Brick 40 arm selector: repcode-1 search in `find_fast`. **Default OFF --
@@ -4365,7 +4398,12 @@ fn find_lazy(
                 // `nextToUpdate` cursor is monotone, so every position is inserted
                 // exactly once.
                 let mut p = (best_ip + 1).max(look_hi + 1);
+                LF_FILLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if p < end && p <= ilimit {
+                    LF_NONEMPTY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
                 while p < end && p <= ilimit {
+                    LF_INSERTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     let hh = hash_mls(src, p, mls, hash_log);
                     tables.chain[p & chain_mask] = tables.get_h(hh).map(|x| x as u32).unwrap_or(0);
                     tables.put_h(hh, p);
