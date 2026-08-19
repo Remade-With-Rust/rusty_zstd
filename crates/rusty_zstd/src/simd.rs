@@ -74,67 +74,6 @@ pub(crate) fn load_u64_le(src: &[u8], i: usize) -> u64 {
 }
 
 /// Common prefix length of `a` and `b` (min of the two lengths).
-/// AVX2 32-byte copy for the decoder's match/literal fast paths.
-///
-/// At the crate's baseline (plain x86-64 = SSE2) a `copy_nonoverlapping(_, 32)`
-/// emits TWO 16-byte `movups` load/store pairs. With AVX2 it is one `vmovups`
-/// pair -- two instructions instead of four.
-///
-/// # Safety
-/// `src[0..32]` readable, `dst[0..32]` writable, regions non-overlapping.
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "avx2")]
-#[inline]
-pub(crate) unsafe fn copy32_avx2(src: *const u8, dst: *mut u8) {
-    use core::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
-    // SAFETY: caller guarantees 32 readable source and 32 writable destination
-    // bytes in disjoint regions.
-    unsafe {
-        let v = _mm256_loadu_si256(src as *const __m256i);
-        _mm256_storeu_si256(dst as *mut __m256i, v);
-    }
-}
-
-/// Dispatched 32-byte copy: AVX2 where available, else the baseline copy.
-///
-/// # Safety
-/// As `copy32_avx2`.
-#[inline(always)]
-pub(crate) unsafe fn copy32(src: *const u8, dst: *mut u8) {
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    {
-        if has_avx2() {
-            // SAFETY: forwarded from the caller.
-            unsafe { copy32_avx2(src, dst) };
-            return;
-        }
-    }
-    // SAFETY: forwarded from the caller.
-    unsafe { core::ptr::copy_nonoverlapping(src, dst, 32) };
-}
-
-/// Bench entry points for the GATE 15 latency study. `count_eq_len` is where
-/// the two implementations differ; whole-encode timing cannot resolve a
-/// four-cycle dependency-chain difference, a tight loop can.
-#[cfg(feature = "profile")]
-pub fn bench_eq_avx2(a: &[u8], b: &[u8]) -> usize {
-    let max = a.len().min(b.len());
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    {
-        if has_avx2() {
-            // SAFETY: `a[..max]` and `b[..max]` are in bounds.
-            return unsafe { count_eq_len_avx2(a.as_ptr(), b.as_ptr(), max) };
-        }
-    }
-    count_eq_len_words(a, b, max)
-}
-
-/// The word-loop twin, for the same study.
-#[cfg(feature = "profile")]
-pub fn bench_eq_words(a: &[u8], b: &[u8]) -> usize {
-    count_eq_len_words(a, b, a.len().min(b.len()))
-}
-
 /// GATE 15 arm. 0 = shipped (AVX2 where available), 1 = force the word loop,
 /// 2 = peek the first 8 bytes before going wide.
 ///
@@ -193,6 +132,7 @@ pub fn take_eq_ops() -> (u64, u64, u64) {
     )
 }
 
+#[cfg(feature = "profile")]
 pub static EQ_LEN_HIST: [core::sync::atomic::AtomicU64; 5] = [
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),

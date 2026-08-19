@@ -3899,15 +3899,6 @@ pub fn set_dfast_good_ml_arm(v: usize) {
     DFAST_GOOD_ML_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
 }
 
-#[inline(always)]
-fn dfast_good_ml() -> usize {
-    let v = DFAST_GOOD_ML_ARM.load(core::sync::atomic::Ordering::Relaxed);
-    if v == 0 {
-        8
-    } else {
-        v
-    }
-}
 
 /// The same cut, for the SECOND-CANDIDATE site only. The constant governed two
 /// mechanisms with different characters -- the next-long probe COMMITS at
