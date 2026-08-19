@@ -335,6 +335,14 @@ pub(crate) struct MatchTables {
     /// losses are downstream parse-cascade effects, and the corpora it hurts are
     /// the ones where it fires often and buys little.
     next_long_yield: f32,
+    /// GATE 14 @ L3 dispatch: EWMA of the share of raised-band next-long hits
+    /// that take a LARGER offset than the match they replace.
+    nl_off_worse: f32,
+    /// Blocks in which the raised band was actually measured.
+    nl_band_meas: u32,
+    /// Re-probe countdown: the band cannot be measured while the cut is low, so
+    /// the gate must periodically raise it again or it latches shut forever.
+    nl_band_probe: u32,
     /// GATE 13 @ L1 -- share of the PREVIOUS block's literal runs short enough
     /// for the fixed-width copy to catch. Seeded optimistically so block 0
     /// always takes the fast path.
@@ -502,6 +510,9 @@ impl MatchTables {
             blocks_done: 0,
             rep_run: 0,
             next_long_yield: 1.0,
+            nl_off_worse: 0.0,
+            nl_band_meas: 0,
+            nl_band_probe: 0,
             lit_short_share: 1.0,
             lit_mid_share: 0.0,
             rep_len_ratio: 1.0,
@@ -3416,6 +3427,35 @@ pub static NL_PROBES_G: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 pub static NL_HITS_G: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Total match-length GAIN the next-long probe bought, across its hits.
 pub static NL_GAIN_G: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Hits in the RAISED band (`best_ml >= 8`) -- what a higher cut newly enables.
+pub static NL_BAND_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static NL_BAND_GAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static NL_BAND_OLD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Offsets the raised-band hits take, and the offsets they replace.
+pub static NL_OFF_NEW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static NL_OFF_OLD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Raised-band hits whose new offset is LARGER than the one they replaced.
+pub static NL_OFF_WORSE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear `(off_new_sum, off_old_sum, hits_with_worse_offset)`.
+pub fn take_nl_off() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        NL_OFF_NEW.swap(0, Relaxed),
+        NL_OFF_OLD.swap(0, Relaxed),
+        NL_OFF_WORSE.swap(0, Relaxed),
+    )
+}
+
+/// Read and clear `(band_hits, band_gain, band_old_ml)` for the raised band.
+pub fn take_nl_band() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        NL_BAND_HITS.swap(0, Relaxed),
+        NL_BAND_GAIN.swap(0, Relaxed),
+        NL_BAND_OLD.swap(0, Relaxed),
+    )
+}
 
 /// Read and clear `(next_long_probes, next_long_hits)`.
 pub fn take_next_long() -> (u64, u64, u64) {
@@ -3425,6 +3465,83 @@ pub fn take_next_long() -> (u64, u64, u64) {
         NL_HITS_G.swap(0, Relaxed),
         NL_GAIN_G.swap(0, Relaxed),
     )
+}
+
+/// GATE 14 @ L3 DISPATCH -- the signal is what the change TRADES, not what the
+/// content is.
+///
+/// Raising the next-long cut wins on 11 corpora and loses on two (`mr` +1.111%,
+/// `osdb` +0.209%). Four content signals fail to separate them: mean match
+/// length, `rep_yield`, GATE 6's `next_long_yield` (non-monotonic -- winners sit
+/// both above and below the losers) and gain-per-hit (dickens 2.69 wins while
+/// osdb 2.47 loses).
+///
+/// The reason they fail is that they all describe the CONTENT. The raise does
+/// not merely lengthen a match: the probe commits at `ip + 1` to a DIFFERENT
+/// match, at a different OFFSET. Measured over the band the raise actually opens
+/// (`best_ml >= 8`), the share of hits taking a LARGER offset than the one they
+/// replace separates cleanly:
+///
+/// ```text
+///   winners (11)   33.8% .. 64.6%      offset ratio 0.59x .. 1.68x
+///   osdb           76.8%               3.67x
+///   mr             79.0%               2.78x
+/// ```
+///
+/// A far match costs offset bits and resets `offset_1` to a distant value,
+/// breaking the repcode chain the next positions would have used.
+///
+/// WARM-UP + RE-PROBE, for the reason GATES 6, 2 @ L3 and 10 @ L19 all needed
+/// one: with the cut at 8 the raised band never fires, so the signal cannot be
+/// measured and a naive gate latches shut on its first bad block forever.
+const NL_BAND_WARMUP: u32 = 2;
+const NL_BAND_PERIOD: u32 = 16;
+
+static NL_OFF_WORSE_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Bench hook: the worse-offset share above which the cut stays at 8.
+pub fn set_nl_off_worse_arm(v: f32) {
+    NL_OFF_WORSE_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn nl_off_worse_max() -> f32 {
+    let v = NL_OFF_WORSE_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if v == u32::MAX {
+        // Swept: 0.70 gives the best aggregate (-0.1125%) but leaves mr at
+        // +0.465%; 0.60 is the knee where the regression essentially vanishes
+        // (mr +0.047%, worst corpus osdb +0.080%) for -0.0869%. The brief is
+        // speed with MINIMAL quality cost, so the knee wins over the optimum.
+        0.60
+    } else {
+        f32::from_bits(v)
+    }
+}
+
+/// The next-long cut for THIS block: raised while the trade is paying, and
+/// during warm-up and every re-probe so the signal can be refreshed.
+#[inline(always)]
+fn nl_cut_for(tables: &MatchTables) -> usize {
+    if tables.nl_band_meas < NL_BAND_WARMUP
+        || tables.nl_band_probe == 0
+        || tables.nl_off_worse <= nl_off_worse_max()
+    {
+        dfast_good_ml_raised()
+    } else {
+        8
+    }
+}
+
+/// The raised value the dispatch selects when the trade is paying.
+#[inline(always)]
+fn dfast_good_ml_raised() -> usize {
+    let v = DFAST_GOOD_ML_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if v == 0 {
+        24
+    } else {
+        v
+    }
 }
 
 /// GATE 14 @ L3 -- the DEPTH CUT DFast actually has.
@@ -4611,8 +4728,13 @@ fn find_dfast_impl<const HLOG: u32>(
     }
     // Read ONCE per block -- see the -37% an env lookup inside the DP loop cost
     // at L19, and the 60% the depth gate's four per-call reads cost at L19/L22.
-    let good_ml = dfast_good_ml();
+    // GATE 14 @ L3 DISPATCH: raised while the offset trade is paying, held at 8
+    // when it is not. See `nl_cut_for`.
+    let good_ml = nl_cut_for(tables);
     let good_ml2 = dfast_good_ml2();
+    // Block-local band accumulators -- never atomics in the loop.
+    let mut band_hits = 0u64;
+    let mut band_worse = 0u64;
     let mls = params.min_match.max(3) as usize;
     // GATE 13 @ L3: reserve both outputs, as `find_fast` has since brick 38.
     // Sized from what the PREVIOUS block actually produced, so sparse-match
@@ -4857,12 +4979,44 @@ fn find_dfast_impl<const HLOG: u32>(
                 ) {
                     let ml = count_match(src, m8b, ip + 1, block_end);
                     if ml >= mls && ml > best_ml {
+                        // GATE 14 signal, measured only in the band the raise
+                        // opens. Two adds on a path that fires a few thousand
+                        // times per block -- not per position.
+                        if best_ml >= 8 {
+                            band_hits += 1;
+                            if ip + 1 - m8b > ip - best_m {
+                                band_worse += 1;
+                            }
+                        }
                         // GATE 14 study: the probe COMMITS at `ip + 1`, spending
                         // a literal. What it buys is `ml - best_ml` bytes, so
                         // that gain -- not the raw hit rate -- is what the cut
                         // actually stresses.
                         #[cfg(feature = "profile")]
-                        NL_GAIN_G.fetch_add((ml - best_ml) as u64, core::sync::atomic::Ordering::Relaxed);
+                        {
+                            use core::sync::atomic::Ordering::Relaxed;
+                            NL_GAIN_G.fetch_add((ml - best_ml) as u64, Relaxed);
+                            // The RAISED BAND only: hits that a cut above 8
+                            // newly enables. Measuring the gain over ALL hits
+                            // mixes in the baseline band and washes the signal
+                            // out -- which is why the first attempt read flat.
+                            if best_ml >= 8 {
+                                NL_BAND_HITS.fetch_add(1, Relaxed);
+                                NL_BAND_GAIN.fetch_add((ml - best_ml) as u64, Relaxed);
+                                NL_BAND_OLD.fetch_add(best_ml as u64, Relaxed);
+                                // The probe does not only lengthen the match --
+                                // it takes a DIFFERENT one, at a different
+                                // OFFSET. Offset bits are what the gain has to
+                                // pay for, so record both offsets.
+                                let off_new = (ip + 1 - m8b) as u64;
+                                let off_old = (ip - best_m) as u64;
+                                NL_OFF_NEW.fetch_add(off_new, Relaxed);
+                                NL_OFF_OLD.fetch_add(off_old, Relaxed);
+                                if off_new > off_old {
+                                    NL_OFF_WORSE.fetch_add(1, Relaxed);
+                                }
+                            }
+                        }
                         best_m = m8b;
                         best_ml = ml;
                         best_ip = ip + 1;
@@ -5001,6 +5155,23 @@ fn find_dfast_impl<const HLOG: u32>(
         NL_PROBES_G.fetch_add(nl_probes, Relaxed);
         NL_HITS_G.fetch_add(nl_hits, Relaxed);
     }
+    // GATE 14 @ L3: feed this block's measured offset trade to the next block.
+    // Attribute ONLY when the band actually fired -- a block that measured
+    // nothing must not move the EWMA, which is what would latch the gate.
+    if band_hits > 0 {
+        let now = band_worse as f32 / band_hits as f32;
+        tables.nl_off_worse = if tables.nl_band_meas == 0 {
+            now
+        } else {
+            0.75 * tables.nl_off_worse + 0.25 * now
+        };
+        tables.nl_band_meas = tables.nl_band_meas.saturating_add(1);
+    }
+    tables.nl_band_probe = if tables.nl_band_probe == 0 {
+        NL_BAND_PERIOD
+    } else {
+        tables.nl_band_probe - 1
+    };
     tables.next_long_yield = if nl_probes == 0 {
         1.0
     } else {
