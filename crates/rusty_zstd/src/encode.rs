@@ -666,10 +666,32 @@ pub(crate) fn encode_oneshot(
     let (workspace, payload_off): (&[u8], usize) = if hist_prefix.is_empty() {
         (src, 0)
     } else {
-        owned.reserve(hist_prefix.len() + src.len());
-        owned.extend_from_slice(hist_prefix);
+        // GATE 2 @ L3: copy only the reachable tail of the prefix.
+        //
+        // This used to copy the WHOLE prefix, however large. Nothing below
+        // `window + BLOCKSIZE_MAX` can ever be referenced, and the bound is
+        // provable rather than fitted:
+        //   * every finder rejects a candidate at `ip - m > window`, and
+        //     `lowest` is floored at `block_start - window`; and
+        //   * `back_extend` walks down at most `ip - anchor`, and `anchor` never
+        //     precedes `block_start`, so the walk cannot reach further than one
+        //     block below that floor.
+        // So the deepest byte any match can touch is `window + BLOCKSIZE_MAX`
+        // before the payload, and everything under it is copied for nothing.
+        //
+        // `--patch-from` against a large reference is the case that pays: with a
+        // 4 MiB reference and a 1 MiB payload at L3 this is BYTE-IDENTICAL on
+        // 18/18 corpora and measurably faster on 17/18 (up to -21.9%).
+        // `prime_tables` was ALREADY window-bounded -- the deterministic
+        // `take_prime_iters()` counter is unchanged across the two arms -- so the
+        // win is the `memcpy` alone, not the priming.
+        let keep = window.saturating_add(BLOCKSIZE_MAX as usize);
+        let cut = hist_prefix.len().saturating_sub(keep);
+        let hp = &hist_prefix[cut..];
+        owned.reserve(hp.len() + src.len());
+        owned.extend_from_slice(hp);
         owned.extend_from_slice(src);
-        (owned.as_slice(), hist_prefix.len())
+        (owned.as_slice(), hp.len())
     };
     if adv.prime_only {
         tables.frame_start = payload_off;
@@ -785,6 +807,56 @@ fn prime_bt_chain_write() -> bool {
     }
 }
 
+/// GATE 2 @ L3 -- how DENSELY a dictionary/prefix is primed into the tables.
+///
+/// `prime_tables` inserts EVERY position of the last `window` bytes of the
+/// prefix, one at a time, with both the short and (for DFast) the long hash.
+/// libzstd has a sparse counterpart for exactly this: `ZSTD_dtlm_fast` vs
+/// `ZSTD_dtlm_full` in `ZSTD_fillDoubleHashTable`. We only implement the full
+/// walk, so a `--patch-from` against a large reference pays a dense insert over
+/// the whole window before a single byte of payload is searched.
+///
+/// Striding is NOT byte-identical -- it changes which positions are findable --
+/// so it is a size-for-speed dispatch, not a free win. 0 = unresolved, else
+/// stride + 1.
+static PRIME_STRIDE_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Bench hook for the Gate 2 @ L3 stride sweep. 1 = every position (shipped).
+pub fn set_prime_stride_arm(n: usize) {
+    PRIME_STRIDE_ARM.store(n.max(1) as u32 + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Deterministic work counter for the priming loop: positions inserted.
+/// Accumulated LOCALLY and published once per call -- an atomic inside the loop
+/// is the bricks 49/64/77 defect this campaign keeps finding.
+pub static PRIME_ITERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear the priming work counter.
+pub fn take_prime_iters() -> u64 {
+    PRIME_ITERS.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+fn prime_stride() -> usize {
+    #[cfg(feature = "std")]
+    {
+        use core::sync::atomic::Ordering;
+        let v = PRIME_STRIDE_ARM.load(Ordering::Relaxed);
+        if v != 0 {
+            return (v - 1) as usize;
+        }
+        let n: usize = std::env::var("RZSTD_PRIME_STRIDE")
+            .ok()
+            .and_then(|x| x.trim().parse().ok())
+            .filter(|x| *x >= 1)
+            .unwrap_or(1);
+        PRIME_STRIDE_ARM.store(n as u32 + 1, Ordering::Relaxed);
+        n
+    }
+    #[cfg(not(feature = "std"))]
+    1
+}
+
 pub(crate) fn prime_tables(
     tables: &mut MatchTables,
     src: &[u8],
@@ -816,20 +888,26 @@ pub(crate) fn prime_tables(
         params.strategy,
         Strategy::BtLazy2 | Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2
     );
-    let write_chain = !uses_bt || prime_bt_chain_write();
+    let write_chain = (!uses_bt || prime_bt_chain_write()) && !tables.chain.is_empty();
+    // Hoisted: both were re-tested on EVERY primed position.
+    let do_long = !tables.hash_long.is_empty();
+    let stride = prime_stride();
+    let mut iters = 0u64;
     let mut p = from;
     while p <= ilimit && p + 8 <= src.len() {
         let h = hash_mls(src, p, mls, hash_log);
-        if write_chain && !tables.chain.is_empty() {
+        if write_chain {
             tables.chain[p & chain_mask] = tables.get_h(h).map(|x| x as u32).unwrap_or(0);
         }
         tables.put_h(h, p);
-        if p + 8 <= src.len() && !tables.hash_long.is_empty() {
+        if do_long {
             let hl = hash8(src, p, hash_log);
             tables.put_hl(hl, p);
         }
-        p += 1;
+        iters += 1;
+        p += stride;
     }
+    PRIME_ITERS.fetch_add(iters, core::sync::atomic::Ordering::Relaxed);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4344,6 +4422,35 @@ pub fn set_search_log_delta(delta: i32) {
 ///
 /// Restricted to the opt strategies: at L13 (BtLazy2) the same cut removes 29.8%
 /// of probes but costs +1.60% size (reymont +7.94%), so it is not applied there.
+/// Clamp the walk budget to `bt_depth_target()` where the gate allows.
+///
+/// A TARGET, not a shift, because the shift that works is level-dependent while
+/// the target is not: L19 (128 attempts) wants -2 and L22 (512) wants -4, and
+/// both land on 32 with the SAME worst corpus (nci +0.132%). Mean walk depth is
+/// 10.6 at L19 and 12.4 at L22, so 32 is about 3x the mean and still covers the
+/// tail.
+#[inline]
+fn bt_depth_apply(attempts: usize, params: CompressionParameters, opt_rep_rate: f32) -> usize {
+    if bt_depth_cut(params, opt_rep_rate) == 0 {
+        attempts
+    } else {
+        attempts.min(bt_depth_target())
+    }
+}
+
+fn bt_depth_target() -> usize {
+    #[cfg(feature = "std")]
+    {
+        std::env::var("RZSTD_BT_DEPTH_TARGET")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or(32)
+    }
+    #[cfg(not(feature = "std"))]
+    32
+}
+
 #[inline]
 fn bt_depth_cut(params: CompressionParameters, opt_rep_rate: f32) -> u32 {
     let opt = matches!(
@@ -4359,6 +4466,9 @@ fn bt_depth_cut(params: CompressionParameters, opt_rep_rate: f32) -> u32 {
     //                                            because the shallower parse
     //                                            emits more sequences and the DP
     //                                            then visits more positions.
+    // L22 was excluded on a measurement taken before Gate 11's fill shipped AND
+    // through a harness that discarded the depth setting. Re-measured, L22 gives
+    // 22.4% of probes at +0.0120%; the band now has no upper bound.
     if !opt || params.search_log < bt_depth_min_slog() || opt_rep_rate > bt_depth_rep_max() {
         0
     } else {
@@ -4402,6 +4512,20 @@ fn bt_depth_steps() -> u32 {
     }
     #[cfg(not(feature = "std"))]
     1
+}
+
+pub static BT_WALKS2: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BT_ITERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BT_FULL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `(walks, total_iterations, walks_that_used_ALL attempts)`
+pub fn take_bt_iters() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        BT_WALKS2.swap(0, Relaxed),
+        BT_ITERS.swap(0, Relaxed),
+        BT_FULL.swap(0, Relaxed),
+    )
 }
 
 fn search_attempts(params: CompressionParameters) -> usize {
@@ -4578,13 +4702,15 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
     // versions-16m, +4.00%. That is the constant-stride content Gates 1, 2 and 6
     // all veto on `rep_yield`, and the same veto serves here -- a near-copy file
     // needs the depth to walk past its many equal-prefix candidates.
-    let attempts = search_attempts(params) >> bt_depth_cut(params, tables.opt_rep_rate);
+    let attempts = bt_depth_apply(search_attempts(params), params, tables.opt_rep_rate);
     // P0/gg-matchfind: work counter -- see `chain_find_best`.
     const COUNT: bool = cfg!(feature = "profile");
     let mut probes = 0u64;
     let mut best_ml = 0usize;
     let mut best_m = 0usize;
+    let mut iters = 0u32;
     for _ in 0..attempts {
+        iters += 1;
         let Some(m) = match_idx else {
             tables.chain[smaller] = 0;
             tables.chain[larger] = 0;
@@ -4654,6 +4780,14 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
         }
         if smaller >= tables.chain.len() || larger >= tables.chain.len() {
             break;
+        }
+    }
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        BT_WALKS2.fetch_add(1, Relaxed);
+        BT_ITERS.fetch_add(iters as u64, Relaxed);
+        if iters as usize >= attempts {
+            BT_FULL.fetch_add(1, Relaxed);
         }
     }
     if COUNT {
@@ -4716,13 +4850,15 @@ fn bt_find_best_runtime(
     // versions-16m, +4.00%. That is the constant-stride content Gates 1, 2 and 6
     // all veto on `rep_yield`, and the same veto serves here -- a near-copy file
     // needs the depth to walk past its many equal-prefix candidates.
-    let attempts = search_attempts(params) >> bt_depth_cut(params, tables.opt_rep_rate);
+    let attempts = bt_depth_apply(search_attempts(params), params, tables.opt_rep_rate);
     // P0/gg-matchfind: work counter -- see `chain_find_best`.
     const COUNT: bool = cfg!(feature = "profile");
     let mut probes = 0u64;
     let mut best_ml = 0usize;
     let mut best_m = 0usize;
+    let mut iters = 0u32;
     for _ in 0..attempts {
+        iters += 1;
         let Some(m) = match_idx else {
             tables.chain[smaller] = 0;
             tables.chain[larger] = 0;
@@ -4792,6 +4928,14 @@ fn bt_find_best_runtime(
         }
         if smaller >= tables.chain.len() || larger >= tables.chain.len() {
             break;
+        }
+    }
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        BT_WALKS2.fetch_add(1, Relaxed);
+        BT_ITERS.fetch_add(iters as u64, Relaxed);
+        if iters as usize >= attempts {
+            BT_FULL.fetch_add(1, Relaxed);
         }
     }
     if COUNT {

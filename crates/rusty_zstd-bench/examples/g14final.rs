@@ -10,7 +10,7 @@ fn main(){
     for (_,s) in &srcs { let _=rusty_zstd::take_bt_probe_stats();
         let n=rusty_zstd::compress(s,lvl).unwrap().len(); let (p,_,_)=rusty_zstd::take_bt_probe_stats();
         base.push(n); bs+=n; bp+=p; }
-    std::env::remove_var("RZSTD_BT_DEPTH");
+    std::env::set_var("RZSTD_BT_DEPTH","1");
     let (mut sz,mut pr)=(0usize,0u64); let mut worst=0.0f64; let mut wc="";
     for (i,(id,s)) in srcs.iter().enumerate() { let _=rusty_zstd::take_bt_probe_stats();
         let z=rusty_zstd::compress(s,lvl).unwrap(); let (p,_,_)=rusty_zstd::take_bt_probe_stats();
