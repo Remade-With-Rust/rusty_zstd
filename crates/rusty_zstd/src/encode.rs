@@ -771,6 +771,28 @@ impl MatchTables {
     }
 
     #[inline(always)]
+    /// T2: binary-tree slot read.
+    ///
+    /// SAFETY: every caller indexes `(x & bt_mask) << 1` or that `+ 1`, and
+    /// `bt_find_best` returns early unless `(bt_mask << 1) | 1 < chain.len()`,
+    /// which bounds the LARGEST index the tree can form. That worst-case guard
+    /// replaced a per-`ip` one that could not prove the loop's own accesses --
+    /// `bt_idx` is formed from `m`, not `ip`.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn chain_at(&self, i: usize) -> u32 {
+        debug_assert!(i < self.chain.len());
+        *unsafe { self.chain.get_unchecked(i) }
+    }
+
+    /// T2: binary-tree slot write. Same invariant as `chain_at`.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn chain_set(&mut self, i: usize, v: u32) {
+        debug_assert!(i < self.chain.len());
+        *unsafe { self.chain.get_unchecked_mut(i) } = v;
+    }
+
     #[allow(unsafe_code)]
     fn put_hl(&mut self, h: usize, pos: usize) {
         debug_assert!(h < self.hash_long.len());
@@ -6828,7 +6850,19 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
     const fn btlog(c: u32) -> u32 { let c = if c > 24 { 24 } else { c }; let c = c.saturating_sub(1); if c < 1 { 1 } else { c } }
     let bt_log = btlog(CLOG);
     let bt_mask = (1usize << bt_log) - 1;
-    if tables.chain.len() < 2 {
+    // T2: guard the WORST CASE, not this `ip`.
+    //
+    // The tree addresses `(x & bt_mask) << 1` and that `+ 1`, so the largest
+    // index it can ever form is `(bt_mask << 1) | 1` -- and `x` is `m`, a match
+    // position, not `ip`. The old pair of guards (`len < 2`, then `larger >=
+    // len` for this one `ip`) therefore bounded nothing inside the walk, which
+    // is why every `chain[..]` access needed its own bounds check.
+    //
+    // It also closes a real edge. `bt_log` comes from `CLOG`/`params.chain_log`
+    // rather than from the table, and `btlog` floors at 1, so `bt_mask >= 1` and
+    // the tree needs `chain.len() >= 4` -- with `chain_log = 1`, reachable
+    // through the advanced API, it addressed index 3 of a 2-entry table.
+    if (bt_mask << 1) | 1 >= tables.chain.len() {
         return (0, 0);
     }
     let h = hash_mls(src, ip, mls, HLOG);
@@ -6884,13 +6918,13 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
     for _ in 0..attempts {
         iters += 1;
         let Some(m) = match_idx else {
-            tables.chain[smaller] = 0;
-            tables.chain[larger] = 0;
+            tables.chain_set(smaller, 0);
+            tables.chain_set(larger, 0);
             break;
         };
         if m >= ip || ip - m > window {
-            tables.chain[smaller] = 0;
-            tables.chain[larger] = 0;
+            tables.chain_set(smaller, 0);
+            tables.chain_set(larger, 0);
             break;
         }
         if m < bt_lowest {
@@ -6917,8 +6951,8 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
         // Applied to BOTH bt bodies -- keeping two hand-written copies in step
         // is exactly what `find_dfast_runtime` failed to do until Gate 6
         // silently broke Gate 4's byte-identity.
-        let c_lo = tables.chain[bt_idx];
-        let c_hi = tables.chain[bt_idx + 1];
+        let c_lo = tables.chain_at(bt_idx);
+        let c_hi = tables.chain_at(bt_idx + 1);
         let ml = count_match(src, m, ip, block_end);
         #[cfg(feature = "profile")]
         {
@@ -6937,7 +6971,7 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
         let mb = src.get(m + ml).copied().unwrap_or(0);
         let ib = src.get(ip + ml).copied().unwrap_or(0);
         if mb < ib {
-            tables.chain[smaller] = m as u32;
+            tables.chain_set(smaller, m as u32);
             // BYTE-IDENTICAL: if the store above targeted the slot we
             // pre-loaded, forward the stored value by hand -- the original read
             // happened AFTER the write and would have observed it.
@@ -6945,7 +6979,7 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
             smaller = bt_idx + 1;
             match_idx = if v == 0 { None } else { Some(v as usize) };
         } else {
-            tables.chain[larger] = m as u32;
+            tables.chain_set(larger, m as u32);
             let v = if larger == bt_idx { m as u32 } else { c_lo };
             larger = bt_idx;
             match_idx = if v == 0 { None } else { Some(v as usize) };
@@ -6990,7 +7024,19 @@ fn bt_find_best_runtime(
     let hash_log = tables.hash_log;
     let bt_log = params.chain_log.min(24).saturating_sub(1).max(1);
     let bt_mask = (1usize << bt_log) - 1;
-    if tables.chain.len() < 2 {
+    // T2: guard the WORST CASE, not this `ip`.
+    //
+    // The tree addresses `(x & bt_mask) << 1` and that `+ 1`, so the largest
+    // index it can ever form is `(bt_mask << 1) | 1` -- and `x` is `m`, a match
+    // position, not `ip`. The old pair of guards (`len < 2`, then `larger >=
+    // len` for this one `ip`) therefore bounded nothing inside the walk, which
+    // is why every `chain[..]` access needed its own bounds check.
+    //
+    // It also closes a real edge. `bt_log` comes from `CLOG`/`params.chain_log`
+    // rather than from the table, and `btlog` floors at 1, so `bt_mask >= 1` and
+    // the tree needs `chain.len() >= 4` -- with `chain_log = 1`, reachable
+    // through the advanced API, it addressed index 3 of a 2-entry table.
+    if (bt_mask << 1) | 1 >= tables.chain.len() {
         return (0, 0);
     }
     let h = hash_mls(src, ip, mls, hash_log);
@@ -7046,13 +7092,13 @@ fn bt_find_best_runtime(
     for _ in 0..attempts {
         iters += 1;
         let Some(m) = match_idx else {
-            tables.chain[smaller] = 0;
-            tables.chain[larger] = 0;
+            tables.chain_set(smaller, 0);
+            tables.chain_set(larger, 0);
             break;
         };
         if m >= ip || ip - m > window {
-            tables.chain[smaller] = 0;
-            tables.chain[larger] = 0;
+            tables.chain_set(smaller, 0);
+            tables.chain_set(larger, 0);
             break;
         }
         if m < bt_lowest {
@@ -7079,8 +7125,8 @@ fn bt_find_best_runtime(
         // Applied to BOTH bt bodies -- keeping two hand-written copies in step
         // is exactly what `find_dfast_runtime` failed to do until Gate 6
         // silently broke Gate 4's byte-identity.
-        let c_lo = tables.chain[bt_idx];
-        let c_hi = tables.chain[bt_idx + 1];
+        let c_lo = tables.chain_at(bt_idx);
+        let c_hi = tables.chain_at(bt_idx + 1);
         let ml = count_match(src, m, ip, block_end);
         #[cfg(feature = "profile")]
         {
@@ -7099,7 +7145,7 @@ fn bt_find_best_runtime(
         let mb = src.get(m + ml).copied().unwrap_or(0);
         let ib = src.get(ip + ml).copied().unwrap_or(0);
         if mb < ib {
-            tables.chain[smaller] = m as u32;
+            tables.chain_set(smaller, m as u32);
             // BYTE-IDENTICAL: if the store above targeted the slot we
             // pre-loaded, forward the stored value by hand -- the original read
             // happened AFTER the write and would have observed it.
@@ -7107,7 +7153,7 @@ fn bt_find_best_runtime(
             smaller = bt_idx + 1;
             match_idx = if v == 0 { None } else { Some(v as usize) };
         } else {
-            tables.chain[larger] = m as u32;
+            tables.chain_set(larger, m as u32);
             let v = if larger == bt_idx { m as u32 } else { c_lo };
             larger = bt_idx;
             match_idx = if v == 0 { None } else { Some(v as usize) };
