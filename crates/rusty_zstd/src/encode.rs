@@ -3046,6 +3046,87 @@ static LAZY_FILL_S_ARM: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 /// Set the lazy back-fill stride in-process.
+/// GATE 12 @ L3. DFast's back-fill is not a span walk -- it inserts exactly two
+/// positions per match (`match_ip+2` and `match_end-2`), mirroring C
+/// `zstd_double_fast.c`. So `lazy_fill_stride` was never wired to it: that knob
+/// controls `find_lazy`'s loop, which L3 never enters. Reading "DEAD at L3" off
+/// it measured a loop with no caller, exactly as GATE 9 @ L3 did.
+///
+/// This is the density knob DFast actually lacks: `s != 0` also inserts the
+/// interior positions of the match span on a stride. 0 = today (the two ends).
+static DFAST_FILL_S_ARM: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Bench hook: interior back-fill stride for DFast. 0 restores today's two-ends fill.
+pub fn set_dfast_fill_stride_arm(v: usize) {
+    DFAST_FILL_S_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn dfast_fill_stride() -> usize {
+    let v = DFAST_FILL_S_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if v != usize::MAX {
+        return v;
+    }
+    let s: usize = std::env::var("RZSTD_DFAST_FILL_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    DFAST_FILL_S_ARM.store(s, core::sync::atomic::Ordering::Relaxed);
+    s
+}
+
+/// GATE 12 @ L3, the SPARSE direction. DFast writes four table entries per
+/// match -- `match_ip+2` and `match_end-2`, into both the short and the long
+/// hash -- unconditionally, and nothing has ever asked whether both earn it.
+/// This is the only direction at L3 that REMOVES work.
+///
+/// 0 = unresolved, 1 = neither, 2 = start+2 only, 3 = today (both), 4 = end-2 only.
+static DFAST_FILL_N_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: 0 = no end fills, 1 = start+2 only, 2 = both (today), 3 = end-2 only.
+pub fn set_dfast_fill_n_arm(n: u8) {
+    DFAST_FILL_N_ARM.store(n + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(fill_start, fill_end)` for the two per-match positions.
+#[inline]
+fn dfast_fill_ends() -> (bool, bool) {
+    match DFAST_FILL_N_ARM.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => (false, false),
+        2 => (true, false),
+        4 => (false, true),
+        _ => (true, true),
+    }
+}
+
+/// GATE 12 @ L3, sibling finding. The short fill anchors on `best_ip`, the long
+/// fill on `ip`. They differ by one whenever the next-long probe wins, so the two
+/// halves of the DOUBLE hash record DIFFERENT positions for the same match
+/// (short at `ip+3`, long at `ip+2`). C fills both tables at the same two
+/// positions -- `curr+2` and `ip-2` -- so this is a divergence, not a design.
+///
+/// 0 = unresolved, 1 = today (`ip`), 2 = C-consistent (`best_ip`).
+static DFAST_FILL_A_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: `true` anchors BOTH DFast fills on the committed match start.
+pub fn set_dfast_fill_anchor_arm(c: bool) {
+    DFAST_FILL_A_ARM.store(u8::from(c) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn dfast_fill_anchor_c() -> bool {
+    DFAST_FILL_A_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
+}
+
+/// Interior back-fill positions inserted by GATE 12 @ L3's stride arm.
+pub static DF_FILL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Bench hook: interior DFast back-fill inserts since the last call.
+pub fn take_dfast_fill() -> u64 {
+    DF_FILL.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn set_lazy_fill_stride_arm(v: usize) {
     LAZY_FILL_S_ARM.store(v.max(1), core::sync::atomic::Ordering::Relaxed);
 }
@@ -3497,16 +3578,17 @@ fn fill_hash_after_match<const PACKED: bool>(
     _mls: usize,
     ilimit: usize,
 ) {
+    let (do_a, do_b) = dfast_fill_ends();
     // Shift from the table's OWN clamped hash_log -- never from `params`.
     let hash_shift = 32u32.saturating_sub(tables.hash_log);
     let mut n = 0u64;
     let a = match_ip.saturating_add(2);
-    if a <= ilimit {
+    if do_a && a <= ilimit {
         let (h, g) = hash4_tag::<PACKED>(src, a, hash_shift);
         tables.store_fast::<PACKED>(h, a, g);
         n += 1;
     }
-    if match_end >= 2 {
+    if do_b && match_end >= 2 {
         let b = match_end - 2;
         if b <= ilimit && b != a {
             let (h, g) = hash4_tag::<PACKED>(src, b, hash_shift);
@@ -3526,11 +3608,12 @@ fn fill_hash_long_after_match(
     hash_log: u32,
     ilimit: usize,
 ) {
+    let (do_a, do_b) = dfast_fill_ends();
     let a = match_ip.saturating_add(2);
-    if a <= ilimit {
+    if do_a && a <= ilimit {
         tables.put_hl(hash8(src, a, hash_log), a);
     }
-    if match_end >= 2 {
+    if do_b && match_end >= 2 {
         let b = match_end - 2;
         if b <= ilimit && b != a {
             tables.put_hl(hash8(src, b, hash_log), b);
@@ -3653,6 +3736,7 @@ fn find_dfast_impl<const HLOG: u32>(
     let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
     // GATE 6 @ L3 DISPATCH: run C's next-long probe only while it is EARNING.
     let nl_on = next_long_enabled() && tables.next_long_yield >= next_long_min();
+    let mut mm_total = 0u64;
     let mut nl_probes = 0u64;
     let mut nl_hits = 0u64;
     // GATE 2 @ L3: repcode match bytes, for the same length-ratio signal that
@@ -3709,6 +3793,9 @@ fn find_dfast_impl<const HLOG: u32>(
     let (mut spec_made, mut spec_used) = (0u64, 0u64);
     let mut carried: Option<(usize, usize, Option<usize>, Option<usize>)> = None;
     while ip <= ilimit {
+        if COUNT {
+            mm_total += 1;
+        }
         if use_rep {
             if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
                 rep_hits += 1;
@@ -3868,7 +3955,25 @@ fn find_dfast_impl<const HLOG: u32>(
             let end = best_ip + best_ml;
             // DFast never sets `packed` (it is gated on Strategy::Fast).
             fill_hash_after_match::<false>(tables, src, best_ip, end, mls, ilimit);
-            fill_hash_long_after_match(tables, src, ip, end, hlog, ilimit);
+            // GATE 12 @ L3: `ip` here is the PRE-probe position; when the
+            // next-long probe won, `best_ip == ip + 1` and the two tables index
+            // different positions for one match. See `dfast_fill_anchor_c`.
+            let long_anchor = if dfast_fill_anchor_c() { best_ip } else { ip };
+            fill_hash_long_after_match(tables, src, long_anchor, end, hlog, ilimit);
+            // GATE 12 @ L3: the density knob DFast never had. Off by default.
+            let dfs = dfast_fill_stride();
+            if dfs != 0 {
+                let hash_shift = 32u32.saturating_sub(tables.hash_log);
+                let stop = end.saturating_sub(2).min(ilimit + 1);
+                let mut p = best_ip + 2 + dfs;
+                while p < stop {
+                    let (h, g) = hash4_tag::<false>(src, p, hash_shift);
+                    tables.store_fast::<false>(h, p, g);
+                    tables.put_hl(hash8(src, p, hlog), p);
+                    DF_FILL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    p += dfs;
+                }
+            }
             ip = end;
             anchor = ip;
             // The two fills rewrite many entries, so anything speculated before
@@ -3896,6 +4001,7 @@ fn find_dfast_impl<const HLOG: u32>(
     // hit, so match-dense content pays for loads it never uses.
     {
         use core::sync::atomic::Ordering::Relaxed;
+        MM_TOTAL.fetch_add(mm_total, Relaxed);
         DFAST_SPEC_MADE.fetch_add(spec_made, Relaxed);
         DFAST_SPEC_USED.fetch_add(spec_used, Relaxed);
     }

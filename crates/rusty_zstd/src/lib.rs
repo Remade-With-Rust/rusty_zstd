@@ -73,7 +73,7 @@ pub use encode::{
     reset_env_arms, set_opt_lit_arm, set_pair_gain_arm, set_pair_hi_arm, set_tag_arm, set_tag_alloc_arm, set_bt_spec_arm, set_next_long_arm, set_pair_on_arm, take_pair_stats, take_pair_split, set_dfast_spec_arm, set_dfast_pipe_arm, set_dfast_step_arm, set_dfast_spec_min_arm, set_fast_spec_arm, take_bt_calls, take_bt_iters, take_lazy_fill, take_bt_probe_stats, take_dfast_calls, take_dfast_spec, take_dfast_match_stats, take_dfast_rep_blocks, take_opt_rep, take_opt_bt, take_opt_skips, set_opt_rep_arm, take_finder_calls,
     set_huff_fast_arm, set_lazy_fill_arm, set_lazy_fill_stride_arm, set_litpush_arm, set_litpush_hoist_arm, set_payload_arm, set_pipe_arm, set_pipe_rep1_arm, take_ff_pipe, take_mm, take_rep_rate, take_tag_rejects,
     set_fast_lazy_arm, set_incomp_skip_arm, set_rep1_mode,
-    set_lazy_fill_threshold_arm, set_prefix_bound_arm, set_prime_bt_arm, set_prime_stride_arm, take_prime_iters,
+    set_lazy_fill_threshold_arm, set_prefix_bound_arm, set_dfast_fill_stride_arm, set_dfast_fill_anchor_arm, set_dfast_fill_n_arm, take_dfast_fill, set_prime_bt_arm, set_prime_stride_arm, take_prime_iters,
     set_search_log_delta,
     set_step0_arm,
 };
