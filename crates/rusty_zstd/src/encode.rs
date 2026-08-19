@@ -344,6 +344,12 @@ pub(crate) struct MatchTables {
     /// Keeping the buffer sidesteps the choice: it reaches its steady-state
     /// capacity once per frame and then neither grows nor is freed.
     payload_scratch: Vec<u8>,
+    /// GATE 6 @ L1: the finder's sequence and literal buffers, kept on the
+    /// frame for the same reason as `payload_scratch`. `lit_scratch` is the
+    /// expensive one -- sized `block_len + LIT_PUSH_WIDTH_MAX`, it cleared the
+    /// 128 KiB large-allocation threshold on every single block.
+    seq_scratch: Vec<Seq>,
+    lit_scratch: Vec<u8>,
     /// GATE 6, deeper: `find_opt`'s parse-backtrace buffer, kept for the same
     /// reason as `payload_scratch` and worth far more -- this one carried the
     /// bulk of the 340 MB L19 was pushing through `realloc` on a 2 MiB board.
@@ -529,6 +535,8 @@ impl MatchTables {
             last_search_per_byte: 1.0,
             blocks_done: 0,
             payload_scratch: Vec::new(),
+            seq_scratch: Vec::new(),
+            lit_scratch: Vec::new(),
             opt_ops: Vec::new(),
             rep_run: 0,
             next_long_yield: 1.0,
@@ -1610,6 +1618,11 @@ pub(crate) fn encode_block(
         );
         write_block_header(out, last, BlockType::Raw, block.len() as u32);
         out.extend_from_slice(block);
+        // GATE 6 @ L1 -- hand the finder's buffers back to the frame.
+        if finder_scratch_enabled() {
+            tables.seq_scratch = seqs;
+            tables.lit_scratch = literals;
+        }
         return Ok(());
     }
     let match_b: usize = seqs.iter().map(|s| s.matchlen as usize).sum();
@@ -1635,6 +1648,11 @@ pub(crate) fn encode_block(
         );
         write_block_header(out, last, BlockType::Raw, block.len() as u32);
         out.extend_from_slice(block);
+        // GATE 6 @ L1 -- hand the finder's buffers back to the frame.
+        if finder_scratch_enabled() {
+            tables.seq_scratch = seqs;
+            tables.lit_scratch = literals;
+        }
         return Ok(());
     }
     let saved_reps = *reps;
@@ -1712,6 +1730,11 @@ pub(crate) fn encode_block(
         write_block_header(out, last, BlockType::Raw, block.len() as u32);
         out.extend_from_slice(block);
         tables.payload_scratch = payload;
+        // GATE 6 @ L1 -- hand the finder's buffers back to the frame.
+        if finder_scratch_enabled() {
+            tables.seq_scratch = seqs;
+            tables.lit_scratch = literals;
+        }
         return Ok(());
     }
     crate::prof::note_comp_block();
@@ -1732,6 +1755,10 @@ pub(crate) fn encode_block(
     write_block_header(out, last, BlockType::Compressed, payload.len() as u32);
     out.extend_from_slice(&payload);
     tables.payload_scratch = payload;
+    if finder_scratch_enabled() {
+        tables.seq_scratch = seqs;
+        tables.lit_scratch = literals;
+    }
     Ok(())
 }
 
@@ -2845,16 +2872,26 @@ fn find_fast_impl<
         0
     };
     let seq_guess = (tables.last_nseq + tables.last_nseq / 4 + 64).min(block_len / mls + 16);
-    let mut seqs = if reserve {
-        Vec::with_capacity(seq_guess)
-    } else {
-        Vec::new()
-    };
-    let mut lits = if reserve {
-        Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX)
-    } else {
-        Vec::new()
-    };
+    // GATE 6 @ L1. These were built FRESH every block, and `lits` asks for
+    // `block_len + LIT_PUSH_WIDTH_MAX` = 131,136 B -- above the 128 KiB
+    // large-allocation threshold, so it was one VirtualAlloc-class request per
+    // block: 64 of them and 8,392,704 B on an 8 MiB frame, named by backtrace.
+    // Exactly the defect Gate 6 fixed on `payload`, sitting on the L1 path.
+    //
+    // Take them from the frame and hand them back in `encode_block`. Replace
+    // rather than grow when they are too small: they are cleared here, so a
+    // `realloc` would memcpy an allocation that holds nothing live.
+    let keep = finder_scratch_enabled();
+    let mut seqs = if keep { std::mem::take(&mut tables.seq_scratch) } else { Vec::new() };
+    seqs.clear();
+    if reserve && seqs.capacity() < seq_guess {
+        seqs = Vec::with_capacity(seq_guess);
+    }
+    let mut lits = if keep { std::mem::take(&mut tables.lit_scratch) } else { Vec::new() };
+    lits.clear();
+    if reserve && lits.capacity() < block_len + LIT_PUSH_WIDTH_MAX {
+        lits = Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX);
+    }
     let mut anchor = block_start;
     let ilimit = block_end.saturating_sub(8);
     if block_start >= ilimit {
@@ -9643,3 +9680,17 @@ fn opt_ops_blanket() -> bool {
     OPT_OPS_ARM.load(core::sync::atomic::Ordering::Relaxed) == 3
 }
 
+
+
+/// GATE 6 @ L1 arm: keep the finder's sequence/literal buffers on the frame
+/// instead of building them fresh per block. Default ON.
+static FINDER_SCRATCH_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for GATE 6 @ L1.
+pub fn set_finder_scratch_arm(on: bool) {
+    FINDER_SCRATCH_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn finder_scratch_enabled() -> bool {
+    !matches!(FINDER_SCRATCH_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
+}
