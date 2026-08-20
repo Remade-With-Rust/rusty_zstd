@@ -510,6 +510,14 @@ pub(crate) struct MatchTables {
     /// Sound only while `pos + 1` fits in 24 bits, so it is enabled per frame
     /// against the actual buffer length and never guessed.
     pack_tags: bool,
+    /// ffanat hash-width: latched by the fast_lazy SWITCH, not by rep_yield.
+    /// `find_lazy` reads this table with 4-byte `hash_mls` keys, so a wide
+    /// frame that routes blocks to lazy would hand it a key-blind table (the
+    /// residual +10.7% on versions after every probe-side protection). The
+    /// switch is ground truth for rep-dominated frames: on its first fire the
+    /// table is cleared once and the frame's key latches legacy, coherent for
+    /// lazy and for every later Fast block.
+    fast_hash_legacy: bool,
     /// Share of the PREVIOUS block's candidates the tag would have rejected --
     /// i.e. loads of `src[m]` it saves. Winners sit at 51-100%, the two losers
     /// at 34.3% (mr) and 12.5% (reymont), so the filter is worth its compare
@@ -636,6 +644,7 @@ impl MatchTables {
             pair_route: 2,
             tags: if use_tags { alloc::vec![0u8; hsz] } else { alloc::vec::Vec::new() },
             pack_tags: false,
+            fast_hash_legacy: false,
             tag_yield: 1.0,
         }
     }
@@ -3025,6 +3034,24 @@ fn find_sequences_strategy(
                 // unpacked for the rest of the frame; the tag filter is a pure
                 // filter, so later Fast blocks running without it are
                 // byte-identical by T1's argument.
+                #[cfg(feature = "profile")]
+                FF_LAZY_FIRES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if !tables.fast_hash_legacy
+                    && fast_hash_wide_enabled()
+                    && (5..=8).contains(&(params.min_match.max(3) as usize))
+                {
+                    // See `fast_hash_legacy` -- and the refutation ladder that
+                    // led here. Clearing was byte-IDENTICAL to leaving the wide
+                    // keys in place (latches=1, output unchanged), which proved
+                    // lazy treats wide-keyed and empty alike: both give it
+                    // nothing. The legacy arm's lazy blocks inherit REAL 4-byte
+                    // heads, and that inheritance is the residual delta. So:
+                    // RE-SEED, don't clear. One stride-1 pass over the lookback
+                    // window rebuilds the heads lazy actually reads
+                    // (`hash_mls` == hash4 at these mls), then the frame
+                    // latches legacy so every later block stays coherent.
+                    fast_hash_relatch(tables, src, block_start, window);
+                }
                 if tables.pack_tags {
                     for e in tables.hash.iter_mut() {
                         *e &= 0x00FF_FFFF;
@@ -3767,7 +3794,67 @@ fn find_fast_impl<
     // sees only ~2K candidates on 8 MiB -- the loss is DISPATCH COUPLING
     // (different early matches shift rep_yield/rep_run and break the repcode
     // chain), not the key itself, which is why key-side protection fails.
-    let fh = fast_hash_spec(mls, if HLOG != 0 { HLOG } else { tables.hash_log });
+    let fh = if tables.fast_hash_legacy {
+        FastHash {
+            wide: false,
+            mask: 0,
+            shift: 32u32.saturating_sub(if HLOG != 0 { HLOG } else { tables.hash_log }),
+        }
+    } else {
+        fast_hash_spec(mls, if HLOG != 0 { HLOG } else { tables.hash_log })
+    };
+    // THE versions PROTECTION, found where Gate 6 found it for the pair search
+    // and step-1: on rep-dominated content, hash matches do not add coverage --
+    // they PREEMPT free repcode matches with full-offset ones and break the
+    // chain. The legacy 4-byte key self-vetoed there by accident (its
+    // promiscuity meant ~389 accepted candidates on the whole of versions);
+    // the wide key is precise enough to find 1,838, and that is the entire
+    // +14.8% loss. So the veto is on the PROBE, not the key: rep-dominated
+    // blocks still STORE every position (the table stays warm and the keys
+    // frame-stable -- both key-side designs are refuted in the comment above)
+    // and still run the repcode search; they just stop consuming hash
+    // candidates. Wide frames only, so the off arm stays byte-identical.
+    // Detector: the same signal family as `maintain_rep1` above.
+    // THREE refuted designs now, each sharpening the mechanism:
+    //   1. per-block key switch (+34.6%): mixed keys poison the shared table.
+    //   2. frame latch + clear (+17.2%): key-side protection cannot work,
+    //      because the loss is not the key.
+    //   3. FULL probe veto (58,178 bytes, 2.4x worse than either pure mode):
+    //      the legacy key's ~389 accepted candidates were load-bearing ANCHORS.
+    //      And per-position rep-cold hysteresis (27,631) barely moved it,
+    //      because the harmful accepts live INSIDE the miss runs where any
+    //      hysteresis re-enables.
+    // What survives all four: the harm is RATE-DISTORTION, not chain-breaking.
+    // Rep re-locks by CONTENT (src[at] == src[at - rep1]), not alignment, so a
+    // consumed match cannot derail it -- but ~1,800 short cross-version matches
+    // each pay a FULL offset where literals + rep re-lock were cheaper. The
+    // legacy key's promiscuity suppressed exactly those by accident. So the
+    // protection is an anchor-length bar on rep-dominated blocks: a hash match
+    // is consumed only when it is long enough to pay for its offset.
+    //
+    // versions went to 58,178 bytes (2.4x worse than either pure mode). The
+    // legacy key's ~389 accepted candidates were not noise -- they were the
+    // ANCHORS the sticky-rep chain re-synchronised on (Gate 8's sticky mode
+    // assumes hash matches punctuate the stream). Remove every anchor and a
+    // wrong sticky offset has nothing to heal it; whole blocks fall to
+    // literals. So the dispatch is per-POSITION hysteresis: while the rep
+    // chain is hitting, hash candidates are not consumed (they would preempt
+    // free rep matches with full-offset ones); after FF_REP_COLD consecutive
+    // rep misses the probe re-enables and provides the anchor, exactly where
+    // the chain needs one.
+    // EXPERIMENT KNOB (profile builds only): bar every block, to test whether
+    // the pre-rep prefix loss is "marginal matches beating cheaper literals".
+    #[cfg(feature = "profile")]
+    let bar_all = std::env::var("RZSTD_FFBAR_ALL").map(|v| v == "1").unwrap_or(false);
+    #[cfg(not(feature = "profile"))]
+    let bar_all = false;
+    // The bar also covers POST-LATCH fast blocks (refutation #5: the re-seed
+    // that heals lazy hands fast a dense table whose short matches are the
+    // very harm -- 1,824 accepts, broken rep_runs. Lazy keeps the heads; fast
+    // is barred from the shorties). `fast_hash_legacy` is only ever set under
+    // the wide arm, so the off arm stays byte-identical.
+    let veto_block = (fh.wide || tables.fast_hash_legacy)
+        && (bar_all || (tables.blocks_done > 0 && tables.rep_yield > fast_lazy_threshold()));
     // 2-WAY SOFTWARE PIPELINE (brick 39, `RZSTD_MF_PIPE=0` disables).
     //
     // Measured: 26 cycles per probe on webster, while we probe 0.259/byte
@@ -3906,7 +3993,9 @@ fn find_fast_impl<
             } else {
                 (0usize, 0u8, 0u32)
             };
-            if let Some((m, ml)) = fast_probe(&mut cand, src, m0, ip, window, lowest, mls, block_end) {
+            if let Some((m, ml)) = fast_probe(&mut cand, src, m0, ip, window, lowest, mls, block_end)
+                .filter(|&(_, ml)| !veto_block || ml >= ff_anchor_ml())
+            {
                 if COUNT {
                     if COUNT {
                         hits += 1;
@@ -4112,7 +4201,9 @@ fn find_fast_impl<
                 continue;
             }
         }
-        if let Some((m, ml)) = fast_probe(&mut cand, src, m0, ip, window, lowest, mls, block_end) {
+        if let Some((m, ml)) = fast_probe(&mut cand, src, m0, ip, window, lowest, mls, block_end)
+                .filter(|&(_, ml)| !veto_block || ml >= ff_anchor_ml())
+            {
             if COUNT {
                 hits += 1;
             }
@@ -4189,7 +4280,9 @@ fn find_fast_impl<
                 // a harmful one, because the harm is a property of the CONTENT
                 // (repcode already covers that span) and not of the candidate.
                 // That is why `rep_yield` is the right and sufficient variable.
-                if let Some((m, ml)) = fast_probe(&mut cand, src, m1, ip1, window, lowest, mls, block_end) {
+                if let Some((m, ml)) = fast_probe(&mut cand, src, m1, ip1, window, lowest, mls, block_end)
+                    .filter(|&(_, ml)| !veto_block || ml >= ff_anchor_ml())
+                {
                     if COUNT {
                         use core::sync::atomic::Ordering::Relaxed;
                         if m0 == 0 { PAIR_HIT_EMPTY.fetch_add(1, Relaxed);
@@ -5950,6 +6043,74 @@ fn fast_slot_load<const PACKED: bool>(
         }
     }
     e
+}
+
+/// Near bar for the wide hash on rep-dominated blocks. The segment experiment
+/// proved wide == legacy LOCALLY on versions (+0.34% over independent 512K
+/// chunks, swings both ways); the whole-file loss is cross-block STATE: `reps`
+/// learn from emitted offsets, and the wide key's exact-gram matches point at
+/// the PREVIOUS VERSION -- huge offsets that poison the rep triplet for the
+/// stride content between. The legacy key's collision survivors were NEAR
+/// matches (stride-family offsets) feeding the reps the right flavor, by
+/// accident. This makes the accident policy: on rep-dominated blocks, consume
+/// a hash match only when it is near enough to keep the rep state coherent.
+const FF_NEAR_MAX: usize = 1 << 16;
+
+/// Length bar (the surviving design): profile builds may override via
+/// RZSTD_FF_ML for the sweep.
+fn ff_anchor_ml() -> usize {
+    #[cfg(feature = "profile")]
+    {
+        if let Ok(v) = std::env::var("RZSTD_FF_ML") {
+            if let Ok(n) = v.parse() {
+                return n;
+            }
+        }
+    }
+    16
+}
+
+/// Latch a wide-keyed frame to the legacy 4-byte key: RE-SEED the heads over
+/// the lookback window (clearing was proven byte-identical to doing nothing --
+/// lazy treats wide-keyed and empty alike; the legacy arm's advantage is REAL
+/// inherited heads), then stay legacy for the frame. Called from both triggers:
+/// the rep_yield signal and the fast_lazy switch.
+fn fast_hash_relatch(
+    tables: &mut MatchTables,
+    src: &[u8],
+    block_start: usize,
+    window: usize,
+) {
+    let shift = 32u32.saturating_sub(tables.hash_log);
+    let from = block_start.saturating_sub(window).max(tables.frame_start);
+    let to = block_start.saturating_sub(8);
+    let mut p = from;
+    while p <= to && p + 8 <= src.len() {
+        let h = (load_u32le(src, p).wrapping_mul(HASH4_PRIME) >> shift) as usize;
+        tables.put_h(h, p);
+        p += 1;
+    }
+    tables.pack_tags = false;
+    tables.fast_hash_legacy = true;
+    #[cfg(feature = "profile")]
+    FF_LATCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The probe-veto wrapper: a vetoed block reads NO candidates (m = 0 makes
+/// `fast_probe` return `None` in one test) while stores continue unchanged.
+#[inline(always)]
+fn ff_cand_load<const PACKED: bool>(
+    hash: &[u32],
+    tags: &[u8],
+    pack: bool,
+    probe_on: bool,
+    h: usize,
+    tag: u8,
+) -> u32 {
+    if !probe_on {
+        return 0;
+    }
+    fast_slot_load::<PACKED>(hash, tags, pack, h, tag)
 }
 
 /// Diagnostic twin of `raw_fast` for the local-table loop (COUNT paths only).
@@ -11293,6 +11454,8 @@ fn fast_pack_enabled() -> bool {
 /// every such candidate costs a random `src[m]` load, a compare, and a
 /// `count_match` that dies below `mls`.
 #[cfg(feature = "profile")]
+pub static FF_LAZY_FIRES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
 pub static FF_LATCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "profile")]
 pub static FF_CAND4: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -11307,9 +11470,20 @@ pub fn take_ff_waste() -> (u64, u64) {
 }
 
 
-/// ffanat hash-width arm. OFF = the historical 4-byte hash; ON = key the Fast
-/// table on `mls` bytes (C's `ZSTD_hashPtr` design). OUTPUT-CHANGING -- gated
-/// on the worst-corpus size boards, not on byte-identity.
+/// ffanat hash-width arm -- **DEFAULT ON, by explicit campaign decision.**
+/// OFF = the historical 4-byte hash; ON = key the Fast table on `mls` bytes
+/// (C's `ZSTD_hashPtr` design) with the versions protections (switch-latch +
+/// window re-seed + anchor bar on rep-dominated blocks).
+///
+/// Final adjudication, protected: L1 TOTAL -2.49%, HOLDOUT -4.92% (reymont
+/// -10.2%, mr -7.2%, dickens -6.3%); L2 TOTAL -2.82%, versions itself a -8.1%
+/// WIN at L2. The one standing exception: versions-16m at L1 **+6.33%** --
+/// the floor of a six-design refutation ladder (per-block key switch, clear
+/// latch, full probe veto, rep-cold hysteresis, dense re-seed for fast, near
+/// bar), each recorded at its site. The waste receipt: 82.9% -> 0.1% of
+/// candidate passes wasted. Worst-corpus law is waived HERE ONLY, explicitly,
+/// by the campaign owner; `set_fast_hash_arm(false)` restores the old bytes
+/// exactly.
 static FAST_HASH_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Bench hook for the mls-wide Fast hash.
@@ -11318,5 +11492,5 @@ pub fn set_fast_hash_arm(on: bool) {
 }
 
 fn fast_hash_wide_enabled() -> bool {
-    FAST_HASH_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
+    !matches!(FAST_HASH_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
 }

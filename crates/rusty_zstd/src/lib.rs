@@ -81,6 +81,8 @@ pub use encode::take_ff_waste;
 #[cfg(feature = "profile")]
 pub use encode::FF_LATCH;
 #[cfg(feature = "profile")]
+pub use encode::FF_LAZY_FIRES;
+#[cfg(feature = "profile")]
 pub use compressed::take_dec_copies;
 #[cfg(feature = "profile")]
 pub use compressed::take_dec_bands;
