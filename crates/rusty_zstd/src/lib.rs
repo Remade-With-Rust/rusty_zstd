@@ -183,3 +183,5 @@ mod tests {
 
 /// Bench-only re-export of the frame checksum hash (GATE 20 ceiling work).
 pub fn xxh64_pub(d: &[u8]) -> u64 { xxh64::xxh64(d) }
+
+pub use xxh64::set_xxh_avx2_arm;
