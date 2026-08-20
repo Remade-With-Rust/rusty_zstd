@@ -130,6 +130,14 @@ incomp 1.17), **3 pass decompress** (text 0.31, zeros 0.73, incomp 0.89).
 
 ---
 
+> **THE OPTIMIZATION CAMPAIGN HAS ITS OWN ANATOMY.** What shipped, what was refused
+> with numbers beside it, the Prometheus adjudication of the fitted constants, and the
+> measured cost of every instrument used to decide any of it, are in
+> [`m7-optimize-anatomy.md`](m7-optimize-anatomy.md). Read its instrument rule before
+> quoting a speed number from this document: the per-frame clock has a **±24.15%**
+> null-arm floor on encode and **±25%** on decode, which is wider than most of the
+> effects the campaign ships.
+
 ## 3. Stage anatomy — where OUR time goes
 
 **Re-measured 2026-08-16 (third pass), at CHECKSUM PARITY.** Share of encode
