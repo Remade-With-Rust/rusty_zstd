@@ -6983,7 +6983,12 @@ fn find_dfast_impl<const HLOG: u32>(
             // GATE 12 @ L3: the density knob DFast never had. Off by default.
             let dfs = fill_stride;
             if dfs != 0 {
-                let hash_shift = 32u32.saturating_sub(tables.hash_log);
+                // `dtag_shift` IS `32 - tables.hash_log` (hlog mirrors the
+                // struct field in both dispatch arms); recomputing it here
+                // from the field kept a variable CL-shift alive in this arm
+                // while every other hash4 site in the spec copies folded to
+                // an immediate.
+                let hash_shift = dtag_shift;
                 let stop = end.saturating_sub(2).min(ilimit + 1);
                 let mut p = best_ip + 2 + dfs;
                 while p < stop {
