@@ -3217,14 +3217,24 @@ fn rep_decay() -> f32 {
     ENVHIT[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
-        std::env::var("RZSTD_REP_DECAY")
+        use core::sync::atomic::Ordering;
+        let c = REP_DECAY_CACHE.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_REP_DECAY")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0.0)
+            .unwrap_or(0.0);
+        REP_DECAY_CACHE.store(v.to_bits(), Ordering::Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     0.0
 }
+#[cfg(feature = "std")]
+static REP_DECAY_CACHE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 
 fn rep_yield_min_for(strategy: Strategy) -> f32 {
     #[cfg(feature = "profile")]
@@ -6553,6 +6563,10 @@ fn find_dfast_impl<const HLOG: u32>(
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
+    // Counted only under `profile`: one atomic per block is small, but it is
+    // the same class the pair tail shipped until 959e0ae, and it has no
+    // shipping consumer -- `take_dfast_calls` feeds gate harnesses only.
+    #[cfg(feature = "profile")]
     if HLOG != 0 {
         DFAST_SPEC_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
@@ -6565,6 +6579,7 @@ fn find_dfast_impl<const HLOG: u32>(
     // makes byte-identity structural instead of a claim that has to be re-checked
     // every time the algorithm changes.
     let hlog = if HLOG == 0 { tables.hash_log } else { HLOG };
+    #[cfg(feature = "profile")]
     if HLOG == 0 {
         DFAST_RUNTIME_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
@@ -6653,7 +6668,11 @@ fn find_dfast_impl<const HLOG: u32>(
     let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
     // GATE 6 @ L3 DISPATCH: run C's next-long probe only while it is EARNING.
     let nl_on = next_long_enabled() && tables.next_long_yield >= next_long_min();
-    let accel = accel_shift_for(params.strategy);
+    // `accel_shift_for(DFast)` is the constant 8 unless the RZSTD_ACCEL bench
+    // pin is set; the pin stays available under `profile` (same treatment as
+    // `find_fast_impl`'s loop, and `find_dfast` is dispatched for
+    // Strategy::DFast only).
+    let accel = if cfg!(feature = "profile") { accel_shift_for(params.strategy) } else { 8 };
     #[cfg(feature = "profile")]
     let mut mm_total = 0u64;
     let mut nl_probes = 0u64;
@@ -6717,6 +6736,9 @@ fn find_dfast_impl<const HLOG: u32>(
     // same slots as `hash_mls(src, ip, 4, hlog)` did.
     let dtag_on = tables.pack_tags || !tables.tags.is_empty();
     let dtag_shift = 32u32.saturating_sub(hlog.min(32));
+    // Loop-invariant arm reads, hoisted from the MATCH path to once per block.
+    let fill_anchor_c = dfast_fill_anchor_c();
+    let fill_stride = dfast_fill_stride();
     while ip <= ilimit {
         #[cfg(feature = "profile")]
         if COUNT {
@@ -6944,10 +6966,10 @@ fn find_dfast_impl<const HLOG: u32>(
             // GATE 12 @ L3: `ip` here is the PRE-probe position; when the
             // next-long probe won, `best_ip == ip + 1` and the two tables index
             // different positions for one match. See `dfast_fill_anchor_c`.
-            let long_anchor = if dfast_fill_anchor_c() { best_ip } else { ip };
+            let long_anchor = if fill_anchor_c { best_ip } else { ip };
             fill_hash_long_after_match(tables, src, long_anchor, end, hlog, ilimit);
             // GATE 12 @ L3: the density knob DFast never had. Off by default.
-            let dfs = dfast_fill_stride();
+            let dfs = fill_stride;
             if dfs != 0 {
                 let hash_shift = 32u32.saturating_sub(tables.hash_log);
                 let stop = end.saturating_sub(2).min(ilimit + 1);
@@ -6959,6 +6981,7 @@ fn find_dfast_impl<const HLOG: u32>(
                     // bogus position.
                     tables.put_h_tag(h, p, g);
                     tables.put_hl(hash8(src, p, hlog), p);
+                    #[cfg(feature = "profile")]
                     DF_FILL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     p += dfs;
                 }
@@ -7021,9 +7044,14 @@ fn find_dfast_impl<const HLOG: u32>(
     } else {
         tables.dfast_probe - 1
     };
+    // The mean-ml EWMA below is the SHIPPING consumer of this sum; the atomic
+    // publishes are gate-harness diagnostics (`take_dfast_match_stats`,
+    // `take_dfast_rep_blocks`) and shipped as EIGHT lock-prefixed RMWs plus a
+    // SECOND O(nseq) walk per block. Sum once, publish under `profile` only.
+    let mb: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
+    #[cfg(feature = "profile")]
     {
         use core::sync::atomic::Ordering::Relaxed;
-        let mb: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
         DFAST_MATCH_BYTES.fetch_add(mb, Relaxed);
         DFAST_SEQS.fetch_add(seqs.len() as u64, Relaxed);
         DFAST_BLOCK_BYTES.fetch_add((block_end - block_start) as u64, Relaxed);
@@ -7035,9 +7063,10 @@ fn find_dfast_impl<const HLOG: u32>(
             DFAST_REP_POS.fetch_add((block_end - block_start) as u64, Relaxed);
         }
     }
+    #[cfg(not(feature = "profile"))]
+    let _ = d_rep_bytes;
     // EWMA so one atypical block cannot flip the route -- the Gate 6 lesson.
     {
-        let mb: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
         let now = if seqs.is_empty() {
             0.0
         } else {
@@ -7099,14 +7128,25 @@ fn dfast_ml_min() -> f32 {
     ENVHIT[5].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
-        std::env::var("RZSTD_DFAST_ML")
+        // Was a raw env::var per block; cached like `dfast_spec_min`.
+        use core::sync::atomic::Ordering;
+        let c = DFAST_ML_MIN_CACHE.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_DFAST_ML")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(14.0)
+            .unwrap_or(14.0);
+        DFAST_ML_MIN_CACHE.store(v.to_bits(), Ordering::Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     14.0
 }
+#[cfg(feature = "std")]
+static DFAST_ML_MIN_CACHE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Non-zero forces a fixed density (measurement arm); 0 = dispatch.
 fn dfast_step_forced() -> usize {
@@ -11182,14 +11222,24 @@ fn next_long_min() -> f32 {
     ENVHIT[11].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
-        std::env::var("RZSTD_NEXT_LONG_T")
+        use core::sync::atomic::Ordering;
+        let c = NEXT_LONG_MIN_CACHE.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_NEXT_LONG_T")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0.10)
+            .unwrap_or(0.10);
+        NEXT_LONG_MIN_CACHE.store(v.to_bits(), Ordering::Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     0.10
 }
+#[cfg(feature = "std")]
+static NEXT_LONG_MIN_CACHE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// GATE 6 @ L1: pair-search dispatch. Default ON; `RZSTD_PAIR=0` disables.
 static PAIR_ON_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
