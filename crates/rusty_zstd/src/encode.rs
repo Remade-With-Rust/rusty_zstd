@@ -6429,12 +6429,16 @@ fn fill_hash_after_match<const PACKED: bool>(
     src: &[u8],
     match_ip: usize,
     match_end: usize,
-    _mls: usize,
+    // Shift from the table's OWN clamped hash_log -- never from `params`.
+    // Passed IN rather than recomputed from the struct field: the caller's
+    // spec copies hold it as a CONSTANT (dtag_shift from const hlog), and
+    // whether LLVM re-proved the field unchanged here turned out to be
+    // build-to-build unstable -- one emit folded these two shifts to
+    // immediates, the next left them variable.
+    hash_shift: u32,
     ilimit: usize,
 ) {
     let (do_a, do_b) = dfast_fill_ends();
-    // Shift from the table's OWN clamped hash_log -- never from `params`.
-    let hash_shift = 32u32.saturating_sub(tables.hash_log);
     let mut n = 0u64;
     let a = match_ip.saturating_add(2);
     if do_a && a <= ilimit {
@@ -6974,7 +6978,7 @@ fn find_dfast_impl<const HLOG: u32>(
             }
             let end = best_ip + best_ml;
             // DFast never sets `packed` (it is gated on Strategy::Fast).
-            fill_hash_after_match::<false>(tables, src, best_ip, end, mls, ilimit);
+            fill_hash_after_match::<false>(tables, src, best_ip, end, dtag_shift, ilimit);
             // GATE 12 @ L3: `ip` here is the PRE-probe position; when the
             // next-long probe won, `best_ip == ip + 1` and the two tables index
             // different positions for one match. See `dfast_fill_anchor_c`.
