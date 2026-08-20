@@ -345,6 +345,14 @@ pub(crate) struct MatchTables {
     /// hard to find matches, so a richer chain pays; low = matches come easily
     /// (dense repetitive content) and extra chain density is pure walk cost.
     last_search_per_byte: f32,
+    /// WALK-CONTINUE dispatch: EWMA share of walk-continue accepts that were
+    /// FIRST-FINDS past a collision (legacy would have emitted a literal),
+    /// and the Gate-2-style re-probe countdown. First-find-dominated content
+    /// (jsonlog 67%, smallmsg 74%) LOSES under the C-parity walk -- the found
+    /// matches displace cheaper literal+rep economies -- while upgrade-rich
+    /// content (dickens 45%, reymont 41%) wins big.
+    walk_first_share: f32,
+    walk_probe: u32,
     /// Blocks whose finder has actually RUN and written back its signals.
     ///
     /// GATE 1 @ L1 needs this because `rep_yield` starts OPTIMISTIC at 1.0 so
@@ -614,6 +622,8 @@ impl MatchTables {
             step_reprobe: 0,
             // Start optimistic: the first block back-fills, then measures.
             last_search_per_byte: 1.0,
+            walk_first_share: 0.0,
+            walk_probe: 0,
             blocks_done: 0,
             payload_scratch: Vec::new(),
             seq_scratch: Vec::new(),
@@ -7595,6 +7605,16 @@ fn find_greedy(
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
     let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
+    // WALK-CONTINUE dispatch: see `walk_rep_max`.
+    let walk_cont = walk_cont_enabled()
+        && tables.rep_yield <= walk_rep_max()
+        && (tables.walk_first_share <= walk_first_max(attempts) || tables.walk_probe == 0);
+    tables.walk_probe = if tables.walk_probe == 0 {
+        WALK_PROBE_PERIOD
+    } else {
+        tables.walk_probe - 1
+    };
+    let mut wcls = (0u32, 0u32);
     let mut ip = block_start;
     while ip <= ilimit {
         if use_rep {
@@ -7620,33 +7640,59 @@ fn find_greedy(
         let mut best_m = 0usize;
         let mut best_ml = 0usize;
         if let Some(mut m) = prev {
-            for _ in 0..attempts {
-                if !match_ok(src, m, ip, window, block_start, mls, tables.frame_start) {
-                    break;
-                }
-                if COUNT {
-                    probes += 1;
-                }
-                // C's `match[ml] == ip[ml]` prefilter (`ZSTD_HcFindBestMatch`):
-                // a candidate that DIFFERS at the current best length cannot
-                // exceed it, so the full `count_match` is provably wasted. The
-                // same candidate still wins, so this is byte-identical.
-                if best_ml == 0 || pre_eq(src, m, ip, best_ml) {
-                    let ml = count_match(src, m, ip, block_end);
-                    if ml >= mls && ml > best_ml {
-                        best_ml = ml;
-                        best_m = m;
-                        // Reaches the block end -- nothing can be longer.
-                        if ip + best_ml >= block_end {
+            if ip + mls <= src.len() {
+                let mut missed_before = false;
+                for _ in 0..attempts {
+                    // See `chain_find_best`: validity breaks, byte mismatches
+                    // step (walk-continue arm) or break (legacy).
+                    if m >= ip || ip - m > window || m < lowest_rep {
+                        break;
+                    }
+                    if COUNT {
+                        probes += 1;
+                        #[cfg(feature = "profile")]
+                        WALK_EXAM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    if mls_eq(src, m, ip, mls) {
+                        // C's `match[ml] == ip[ml]` prefilter
+                        // (`ZSTD_HcFindBestMatch`): a candidate that DIFFERS at
+                        // the current best length cannot exceed it, so the full
+                        // `count_match` is provably wasted. The same candidate
+                        // still wins, so this is byte-identical.
+                        if best_ml == 0 || pre_eq(src, m, ip, best_ml) {
+                            let ml = count_match(src, m, ip, block_end);
+                            if ml >= mls && ml > best_ml {
+                                if missed_before {
+                                    if best_ml == 0 {
+                                        wcls.0 += 1;
+                                    } else {
+                                        wcls.1 += 1;
+                                    }
+                                }
+                                best_ml = ml;
+                                best_m = m;
+                                // Reaches the block end -- nothing can be longer.
+                                if ip + best_ml >= block_end {
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        missed_before = true;
+                        #[cfg(feature = "profile")]
+                        if COUNT {
+                            WALK_BYTEMISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        }
+                        if !walk_cont {
                             break;
                         }
                     }
+                    let next = tables.chain[m & chain_mask] as usize;
+                    if next >= m {
+                        break;
+                    }
+                    m = next;
                 }
-                let next = tables.chain[m & chain_mask] as usize;
-                if next >= m {
-                    break;
-                }
-                m = next;
             }
         }
         if best_ml >= mls {
@@ -7695,6 +7741,7 @@ fn find_greedy(
     } else {
         (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
     };
+    update_walk_first_share(tables, walk_cont, wcls);
     lits.extend_from_slice(&src[anchor..block_end]);
     note_finder_work(COUNT, probes, hits, &seqs, &lits);
     (seqs, lits)
@@ -7708,6 +7755,14 @@ fn chain_find_best(
     block_end: usize,
     window: usize,
     mls: usize,
+    // Hoisted by the caller once per block: `search_attempts` reads its arm
+    // atomic, and this function runs per position plus per look-ahead step.
+    attempts: usize,
+    // Also caller-hoisted (arm atomic + rep_yield dispatch), once per block.
+    walk_cont: bool,
+    // Block-local (first-find, upgrade) accept counters past a collision --
+    // the walk gate's own dispatch signal. Plain integers, never atomics.
+    cls: &mut (u32, u32),
     params: CompressionParameters,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
@@ -7721,7 +7776,6 @@ fn chain_find_best(
     // chain-walking finders on the raw value.
     let hash_log = tables.hash_log;
     let chain_mask = tables.chain.len() - 1;
-    let attempts = search_attempts(params);
     let h = hash_mls(src, ip, mls, hash_log);
     let prev = tables.get_h(h);
     tables.chain[ip & chain_mask] = prev.map(|p| p as u32).unwrap_or(0);
@@ -7736,29 +7790,70 @@ fn chain_find_best(
     let Some(mut m) = prev else {
         return (0, 0);
     };
-    for _ in 0..attempts {
-        if !match_ok(src, m, ip, window, block_start, mls, tables.frame_start) {
-            break;
-        }
-        if COUNT {
-            probes += 1;
-        }
-        // C's `match[ml] == ip[ml]` prefilter -- see `find_greedy`.
-        if best_ml == 0 || pre_eq(src, m, ip, best_ml) {
-            let ml = count_match(src, m, ip, block_end);
-            if ml >= mls && ml > best_ml && offset_ok(ip - m, window) && m >= tables.frame_start {
-                best_ml = ml;
-                best_m = m;
-                if ip + best_ml >= block_end {
+    let lowest = block_start.saturating_sub(window).max(tables.frame_start);
+    let mut missed_before = false;
+    if ip + mls <= src.len() {
+        for _ in 0..attempts {
+            // Validity is monotone along the chain (m strictly decreases), so
+            // a failure here correctly ends the walk.
+            if m >= ip || ip - m > window || m < lowest {
+                break;
+            }
+            if COUNT {
+                probes += 1;
+                #[cfg(feature = "profile")]
+                WALK_EXAM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            if mls_eq(src, m, ip, mls) {
+                // C's `match[ml] == ip[ml]` prefilter -- see `find_greedy`.
+                if best_ml == 0 || pre_eq(src, m, ip, best_ml) {
+                    let ml = count_match(src, m, ip, block_end);
+                    if ml >= mls
+                        && ml > best_ml
+                        && offset_ok(ip - m, window)
+                        && m >= tables.frame_start
+                    {
+                        if missed_before {
+                            if best_ml == 0 {
+                                cls.0 += 1;
+                            } else {
+                                cls.1 += 1;
+                            }
+                            #[cfg(feature = "profile")]
+                            if COUNT {
+                                use core::sync::atomic::Ordering::Relaxed;
+                                if best_ml == 0 {
+                                    WALK_CONT_FIRST.fetch_add(1, Relaxed);
+                                } else {
+                                    WALK_CONT_UPGRADE.fetch_add(1, Relaxed);
+                                }
+                            }
+                        }
+                        best_ml = ml;
+                        best_m = m;
+                        if ip + best_ml >= block_end {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                missed_before = true;
+                #[cfg(feature = "profile")]
+                if COUNT {
+                    WALK_BYTEMISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                // A byte mismatch is a hash collision, not a wall: C steps to
+                // the next link. Legacy arm preserves the historical break.
+                if !walk_cont {
                     break;
                 }
             }
+            let next = tables.chain[m & chain_mask] as usize;
+            if next >= m {
+                break;
+            }
+            m = next;
         }
-        let next = tables.chain[m & chain_mask] as usize;
-        if next >= m {
-            break;
-        }
-        m = next;
     }
     if COUNT {
         crate::prof::note_probes(probes);
@@ -7789,6 +7884,7 @@ fn find_lazy(
     // chain-walking finders on the raw value.
     let hash_log = tables.hash_log;
     let chain_mask = tables.chain.len() - 1;
+    let attempts = search_attempts(params);
     // GATE 6 family, fourth instance: take the finder buffers from the FRAME.
     //
     // `find_fast_impl` was wired to `MatchTables::seq_scratch`/`lit_scratch`
@@ -7800,14 +7896,15 @@ fn find_lazy(
     //
     // `encode_block` already hands these back at all four of its exits, so the
     // plumbing was in place and only these finders were missing from it.
-    let mut seqs = if finder_scratch_enabled() {
+    let scratch = finder_scratch_enabled();
+    let mut seqs = if scratch {
         let mut v = std::mem::take(&mut tables.seq_scratch);
         v.clear();
         v
     } else {
         Vec::new()
     };
-    let mut lits = if finder_scratch_enabled() {
+    let mut lits = if scratch {
         let mut v = std::mem::take(&mut tables.lit_scratch);
         v.clear();
         v
@@ -7847,6 +7944,23 @@ fn find_lazy(
     let fill = lazy_fill_enabled()
         && params.strategy != Strategy::Fast
         && tables.last_search_per_byte >= lazy_fill_threshold();
+    // Per-match arm read hoisted to once per block.
+    let fill_stride = lazy_fill_stride();
+    // WALK-CONTINUE dispatch: see `walk_rep_max`.
+    let walk_cont = walk_cont_enabled()
+        // GATE 3's rule for the L1-routed case: `find_lazy` reachable with
+        // `strategy == Fast` is the Gate 1 dispatch, and the C-parity walk
+        // must not change the Fast ladder's bytes.
+        && params.strategy != Strategy::Fast
+        && tables.rep_yield <= walk_rep_max()
+        && (tables.walk_first_share <= walk_first_max(attempts) || tables.walk_probe == 0);
+    tables.walk_probe = if tables.walk_probe == 0 {
+        WALK_PROBE_PERIOD
+    } else {
+        tables.walk_probe - 1
+    };
+    let mut wcls = (0u32, 0u32);
+    let gain_cmp = lazy_gain_enabled();
     while ip <= ilimit {
         if use_rep {
             if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
@@ -7864,8 +7978,10 @@ fn find_lazy(
             }
         }
         searches += 1;
-        let (mut best_m, mut best_ml) =
-            chain_find_best(src, ip, block_start, block_end, window, mls, params, tables);
+        let (mut best_m, mut best_ml) = chain_find_best(
+            src, ip, block_start, block_end, window, mls, attempts, walk_cont, &mut wcls, params,
+            tables,
+        );
         let mut best_ip = ip;
         let mut look_hi = ip; // PROBE: highest position the look-ahead inserted
         if best_ml >= mls {
@@ -7882,10 +7998,21 @@ fn find_lazy(
                     block_end,
                     window,
                     mls,
+                    attempts,
+                    walk_cont,
+                    &mut wcls,
                     params,
                     tables,
                 );
-                if ml > best_ml {
+                let take = if gain_cmp {
+                    // C parity: the +4 favors the match already in hand.
+                    ml >= mls
+                        && lazy_gain(ml, ip2 - m)
+                            > lazy_gain(best_ml, best_ip - best_m) + 4
+                } else {
+                    ml > best_ml
+                };
+                if take {
                     best_ml = ml;
                     best_m = m;
                     best_ip = ip2;
@@ -7924,7 +8051,7 @@ fn find_lazy(
                 // Stride the back-fill. `1` = every position (C's behaviour).
                 // Larger strides thin the chain: the cost of the back-fill is
                 // the chain DENSITY it creates, not the inserts themselves.
-                let stride = lazy_fill_stride();
+                let stride = fill_stride;
                 // DEFECT B2 FIX: never insert a position TWICE. The look-ahead
                 // already inserted `ip+1 ..= look_hi` via `chain_find_best`, and
                 // re-inserting `p` stores `chain[p] = get_h(h)` when the head IS
@@ -7937,11 +8064,19 @@ fn find_lazy(
                 // `nextToUpdate` cursor is monotone, so every position is inserted
                 // exactly once.
                 let mut p = (best_ip + 1).max(look_hi + 1);
-                LF_FILLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if p < end && p <= ilimit {
-                    LF_NONEMPTY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                // Consumers are `take_lazy_fill` gate harnesses only; in
+                // shipping LF_INSERTS was one lock-prefixed RMW PER COVERED
+                // POSITION -- the pair-tail class (959e0ae), on the matchiest
+                // content the heaviest.
+                #[cfg(feature = "profile")]
+                {
+                    LF_FILLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if p < end && p <= ilimit {
+                        LF_NONEMPTY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 while p < end && p <= ilimit {
+                    #[cfg(feature = "profile")]
                     LF_INSERTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     let hh = hash_mls(src, p, mls, hash_log);
                     tables.chain[p & chain_mask] = tables.get_h(hh).map(|x| x as u32).unwrap_or(0);
@@ -7960,6 +8095,7 @@ fn find_lazy(
     } else {
         (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
     };
+    update_walk_first_share(tables, walk_cont, wcls);
     lits.extend_from_slice(&src[anchor..block_end]);
     let span = (block_end - block_start).max(1) as f32;
     tables.last_search_per_byte = searches as f32 / span;
@@ -9668,6 +9804,158 @@ fn find_opt(
     tables.opt_off = match_off;
     tables.opt_ml = match_ml;
     (seqs, lits)
+}
+
+/// The BYTE half of `match_ok`, exactly (u32 head + tail slice to `mls`).
+/// Split out for the chain walk: validity is MONOTONE along a chain (positions
+/// strictly decrease), so a validity failure correctly ends the walk -- but a
+/// byte mismatch is just a hash collision, and C's `ZSTD_HcFindBestMatch`
+/// steps past it to the next link. Our walk broke on it, amputating the
+/// remaining chain at the first collision.
+#[inline(always)]
+fn mls_eq(src: &[u8], m: usize, ip: usize, mls: usize) -> bool {
+    if mls >= 4 {
+        if load_u32le(src, m) != load_u32le(src, ip) {
+            return false;
+        }
+        return mls == 4 || src[m + 4..m + mls] == src[ip + 4..ip + mls];
+    }
+    src[m..m + mls] == src[ip..ip + mls]
+}
+
+/// WALK-CONTINUE arm: C-parity chain walk (step past byte mismatches).
+/// Byte-CHANGING (finds matches the amputated walk missed), so it ships on
+/// the adjudication board in `chainwalk`, not on byte-identity.
+static WALK_CONT_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for the walk-continue arm.
+pub fn set_walk_cont_arm(on: bool) {
+    WALK_CONT_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn walk_cont_enabled() -> bool {
+    // DEFAULT ON: adjudicated on the chainwalk board with the first-share
+    // gate at 0.55 -- worst corpus jsonlog +0.54% at L12 against dickens
+    // -8.99%, reymont -7.62%, webster -6.03%.
+    !matches!(WALK_CONT_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
+}
+
+/// WALK-CONTINUE DISPATCH: the C-parity walk wins big on ordinary content
+/// (dickens -9.60%, reymont -8.10%, webster -6.33% at L12) and LOSES on
+/// rep-dominated content (smallmsg +4.30%, jsonlog +3.89%) -- the deeper
+/// walk finds longer matches at offsets that displace the repcode economy.
+/// Identical shape to the wide hash's versions dispatch at L1, and the
+/// signal is the same one these finders already maintain per block:
+/// `rep_yield`. Continue only where reps are NOT carrying the block.
+static WALK_REP_MAX_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Bench hook: the `rep_yield` bar under which the C-parity walk applies.
+pub fn set_walk_rep_max_arm(v: f32) {
+    WALK_REP_MAX_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
+}
+
+fn walk_rep_max() -> f32 {
+    let c = WALK_REP_MAX_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if c != u32::MAX {
+        return f32::from_bits(c);
+    }
+    0.10
+}
+
+/// LAZY GAIN ARM: C's offset-priced look-ahead comparison
+/// (`ZSTD_compressBlock_lazy_generic`): a later match displaces the current
+/// one only when `4*ml2 - log2(off2)` beats `4*ml1 - log2(off1) + 4`. Our
+/// look-ahead compared RAW LENGTHS, which is exactly what lets a deeper
+/// chain walk trade a cheap repeated offset for a long-but-expensive one on
+/// record-periodic content (jsonlog +3.9%, smallmsg +4.3% under
+/// walk-continue). Byte-CHANGING; ships on the `chainwalk` board.
+static LAZY_GAIN_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for the offset-priced look-ahead.
+pub fn set_lazy_gain_arm(on: bool) {
+    LAZY_GAIN_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn lazy_gain_enabled() -> bool {
+    matches!(LAZY_GAIN_ARM.load(core::sync::atomic::Ordering::Relaxed), 2)
+}
+
+/// C's lazy gain: `4*ml - highbit(offset + 1)`.
+#[inline(always)]
+fn lazy_gain(ml: usize, off: usize) -> i64 {
+    (ml as i64) * 4 - (63 - ((off as u64 + 1).leading_zeros() as i64))
+}
+
+/// REFUTED dispatch signals for the walk, so nobody re-tries them:
+/// `rep_yield <= 0.02` left jsonlog at +2.47% (its blocks are not
+/// rep-dominated), and adjacent-offset repetition (`off_rep_ratio`) never
+/// fired on it at any threshold (its seq stream interleaves offsets). The
+/// signal that separates losers from winners is the walk's own accept mix --
+/// see `walk_first_share` on `MatchTables`.
+static WALK_FIRST_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Bench hook: the first-find share above which the C-parity walk latches off.
+pub fn set_walk_first_max_arm(v: f32) {
+    WALK_FIRST_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
+}
+
+fn walk_first_max(attempts: usize) -> f32 {
+    let c = WALK_FIRST_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if c != u32::MAX {
+        return f32::from_bits(c);
+    }
+    // The first-find share of BOTH classes falls as the walk deepens, so the
+    // bar scales with `attempts` (swept: L5 wants 0.80 -- greedy is
+    // first-heavy by construction -- L7/L9 want 0.70, L12 wants 0.55; a
+    // static bar leaks jsonlog at one level or over-shuts dickens at
+    // another).
+    // Actual ladder attempts (clevels.h search_log): L5=8, L7/L9=16, L12=64.
+    if attempts <= 8 {
+        0.80
+    } else if attempts <= 16 {
+        0.70
+    } else {
+        0.55
+    }
+}
+
+/// Re-probe period for the walk gate (the Gate-2 shut-and-re-probe rule: an
+/// immediate shut needs a scheduled reopen, or it is a one-way latch).
+const WALK_PROBE_PERIOD: u32 = 16;
+
+/// Attribute only when the walk RAN and produced enough samples -- a block
+/// that measured nothing must not move the EWMA (the Gate 14 rule).
+fn update_walk_first_share(tables: &mut MatchTables, walked: bool, cls: (u32, u32)) {
+    let n = cls.0 + cls.1;
+    if !walked || n < 64 {
+        return;
+    }
+    let now = cls.0 as f32 / n as f32;
+    tables.walk_first_share = 0.75 * tables.walk_first_share + 0.25 * now;
+}
+
+/// Chain-walk census: (candidates examined, byte-mismatch steps).
+#[cfg(feature = "profile")]
+pub static WALK_EXAM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static WALK_BYTEMISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Walk-continue accept classes: (first-find past a collision -- legacy would
+/// have emitted a literal; upgrade past a collision -- legacy had a match).
+#[cfg(feature = "profile")]
+pub static WALK_CONT_FIRST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static WALK_CONT_UPGRADE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub fn take_walk_classes() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (WALK_CONT_FIRST.swap(0, Relaxed), WALK_CONT_UPGRADE.swap(0, Relaxed))
+}
+#[cfg(feature = "profile")]
+pub fn take_walk_census() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (WALK_EXAM.swap(0, Relaxed), WALK_BYTEMISS.swap(0, Relaxed))
 }
 
 fn match_ok(
