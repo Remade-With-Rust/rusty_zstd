@@ -453,7 +453,11 @@ pub(crate) fn read_table(src: &[u8]) -> Result<(HuffmanTable, usize), Error> {
         }
         let mut w = vec![0u8; nsym];
         for i in 0..nsym {
-            let b = src[1 + i / 2];
+            // SAFETY: guarded directly above -- `nbytes == nsym.div_ceil(2)` and
+            // `i < nsym` give `1 + i / 2 < 1 + nbytes <= src.len()`.
+            debug_assert!(1 + i / 2 < src.len());
+            #[allow(unsafe_code)]
+            let b = *unsafe { src.get_unchecked(1 + i / 2) };
             w[i] = if i % 2 == 0 { b >> 4 } else { b & 0x0F };
         }
         (w, 1 + nbytes)
@@ -479,7 +483,12 @@ fn table_from_weights(weights_wo_last: &[u8]) -> Result<HuffmanTable, Error> {
         if w > MAX_BITS {
             return Err(Error::Corruption);
         }
-        rank[w as usize] += 1;
+        // SAFETY: `w > MAX_BITS` (11) was rejected just above; `rank` is [_; 13].
+        debug_assert!((w as usize) < rank.len());
+        #[allow(unsafe_code)]
+        unsafe {
+            *rank.get_unchecked_mut(w as usize) += 1;
+        }
         if w > 0 {
             weight_total += 1 << (w - 1);
         }
@@ -502,7 +511,12 @@ fn table_from_weights(weights_wo_last: &[u8]) -> Result<HuffmanTable, Error> {
     }
     let mut weights = Vec::from(weights_wo_last);
     weights.push(last_weight);
-    rank[last_weight as usize] += 1;
+    // SAFETY: `last_weight > MAX_BITS` was rejected above; `rank` is [_; 13].
+    debug_assert!((last_weight as usize) < rank.len());
+    #[allow(unsafe_code)]
+    unsafe {
+        *rank.get_unchecked_mut(last_weight as usize) += 1;
+    }
     if rank[1] < 2 || rank[1] % 2 != 0 {
         return Err(Error::Corruption);
     }
@@ -513,37 +527,65 @@ fn table_from_weights(weights_wo_last: &[u8]) -> Result<HuffmanTable, Error> {
     let mut symbols = vec![0u8; weights.len()];
     let mut rank_start = [0usize; 13];
     let mut acc = 0usize;
+    // SAFETY for the weight-indexed arrays here and below: every weight was
+    // rejected above unless `w <= MAX_BITS` (11); `table_log > MAX_BITS` is
+    // rejected; so is `last_weight > MAX_BITS`. All three arrays are `[_; 13]`,
+    // so an index of at most 11 is in range. LLVM cannot carry three separate
+    // validations this far.
+    debug_assert!(table_log as usize <= MAX_BITS as usize);
     for w in 0..=table_log as usize {
-        rank_start[w] = acc;
-        acc += rank[w] as usize;
+        #[allow(unsafe_code)]
+        unsafe {
+            *rank_start.get_unchecked_mut(w) = acc;
+            acc += *rank.get_unchecked(w) as usize;
+        }
     }
     let mut rs = rank_start;
     for (s, &w) in weights.iter().enumerate() {
         if w == 0 {
             continue;
         }
-        let slot = rs[w as usize];
+        debug_assert!((w as usize) < rs.len());
+        #[allow(unsafe_code)]
+        let slot = *unsafe { rs.get_unchecked(w as usize) };
         if slot >= symbols.len() {
             return Err(Error::Corruption);
         }
         symbols[slot] = s as u8;
-        rs[w as usize] += 1;
+        #[allow(unsafe_code)]
+        unsafe {
+            *rs.get_unchecked_mut(w as usize) += 1;
+        }
     }
 
     let mut pos = 0usize;
-    let mut sym_i = rank[0] as usize;
+    // Walk `symbols` with an ITERATOR rather than an index. The counting
+    // argument that keeps `sym_i` in range -- `rank[0] + sum(rank[1..]) ==
+    // weights.len() == symbols.len()` -- is true but spans the whole function,
+    // so LLVM re-checks it on every symbol. An iterator states it structurally
+    // and needs no unsafe; a malformed table now yields Corruption instead of a
+    // panic, which is the better failure anyway.
+    let mut syms = symbols.get(rank[0] as usize..).unwrap_or(&[]).iter();
     for w in 1..=table_log {
-        let count = rank[w as usize] as usize;
+        debug_assert!((w as usize) < rank.len());
+        #[allow(unsafe_code)]
+        let count = *unsafe { rank.get_unchecked(w as usize) } as usize;
         let length = 1usize << (w - 1);
         let nb_bits = table_log + 1 - w;
         for _ in 0..count {
-            let sym = symbols[sym_i];
-            sym_i += 1;
+            let sym = *syms.next().ok_or(Error::Corruption)?;
             if pos + length > table.len() {
                 return Err(Error::Corruption);
             }
+            // SAFETY: `pos + length > table.len()` was rejected immediately
+            // above, and `k < length`, so `pos + k < table.len()`.
             for k in 0..length {
-                table[pos + k] = u16::from(sym) | (u16::from(nb_bits) << 8);
+                debug_assert!(pos + k < table.len());
+                #[allow(unsafe_code)]
+                unsafe {
+                    *table.get_unchecked_mut(pos + k) =
+                        u16::from(sym) | (u16::from(nb_bits) << 8);
+                }
             }
             pos += length;
         }
@@ -570,10 +612,18 @@ fn upsample_dtable(table: Vec<u16>, table_log: u8) -> (Vec<u16>, u8) {
     let scale = FAST_TABLELOG - table_log;
     let factor = 1usize << scale;
     let mut wide = vec![0u16; 1 << FAST_TABLELOG];
+    // SAFETY: `i < table.len() == 1 << table_log` and `scale ==
+    // FAST_TABLELOG - table_log`, so `base = i << scale < 1 << FAST_TABLELOG`;
+    // `k < factor == 1 << scale` keeps `base + k` inside the same bound, and
+    // `wide` is exactly `1 << FAST_TABLELOG` long.
     for (i, &e) in table.iter().enumerate() {
         let base = i << scale;
         for k in 0..factor {
-            wide[base + k] = e;
+            debug_assert!(base + k < wide.len());
+            #[allow(unsafe_code)]
+            unsafe {
+                *wide.get_unchecked_mut(base + k) = e;
+            }
         }
     }
     (wide, FAST_TABLELOG)
@@ -695,7 +745,11 @@ fn x2_from_x1(table: &[u16], table_log: u8) -> Vec<u32> {
     let mask = n.saturating_sub(1);
     let mut out = vec![0u32; n];
     for (val, slot) in out.iter_mut().enumerate() {
-        let e1 = table[val];
+        // SAFETY: `out` is `vec![0u32; n]` with `n == table.len()`, so the
+        // enumeration index is in range for `table` by construction.
+        debug_assert!(val < table.len());
+        #[allow(unsafe_code)]
+        let e1 = *unsafe { table.get_unchecked(val) };
         let s1 = u32::from(e1 as u8);
         let n1 = u32::from(e1 >> 8);
         let leftover = log.saturating_sub(n1);
@@ -949,9 +1003,11 @@ fn huffman_nbits(freq: &[u32; 256]) -> Result<[u8; 256], Error> {
         return Err(Error::Corruption);
     }
     let mut nbits = [0u8; 256];
-    if present.len() == 2 {
-        nbits[present[0] as usize] = 1;
-        nbits[present[1] as usize] = 1;
+    // A slice pattern states `len == 2` structurally, so neither index needs
+    // re-proving; the symbols are `u8` and `nbits` is `[u8; 256]`.
+    if let [a, b] = present[..] {
+        nbits[a as usize] = 1;
+        nbits[b as usize] = 1;
         return Ok(nbits);
     }
 
@@ -971,28 +1027,55 @@ fn huffman_nbits(freq: &[u32; 256]) -> Result<[u8; 256], Error> {
         })
         .collect();
     let mut active: Vec<usize> = (0..nodes.len()).collect();
+    // `active` starts as `0..nodes.len()` and only ever gains `parent`, which
+    // is the index of a node pushed in the same step -- so every element is a
+    // valid arena index. That is true but spans the loop, so the checked
+    // accessors are used instead of asserting it: they cost the same compare and
+    // cannot abort. This runs once per BLOCK, not per literal.
     while active.len() > 1 {
-        active.sort_by_key(|&i| nodes[i].count);
+        active.sort_by_key(|&i| nodes.get(i).map_or(0, |n| n.count));
         let a = active.remove(0);
         let b = active.remove(0);
         let parent = nodes.len();
+        let (ca, cb) = match (nodes.get(a), nodes.get(b)) {
+            (Some(x), Some(y)) => (x.count, y.count),
+            _ => return Err(Error::Corruption),
+        };
         nodes.push(Node {
-            count: nodes[a].count + nodes[b].count,
+            count: ca + cb,
             left: a,
             right: b,
             sym: -1,
         });
         active.push(parent);
     }
+    /// LEFT CHECKED, deliberately. This walks a node ARENA by indices stored in
+    /// the nodes themselves (`left`/`right`), so its invariant lives in the tree
+    /// construction above rather than in any local guard. Proving it means
+    /// auditing every push into `nodes`, and the function runs once per BLOCK on
+    /// the table-build path -- not per literal. The two checks stay until the
+    /// arena invariant is written down and tested, not before.
     fn walk(nodes: &[Node], i: usize, depth: u8, nbits: &mut [u8; 256]) {
-        if nodes[i].sym >= 0 {
-            nbits[nodes[i].sym as usize] = depth.max(1);
+        // This walks a node ARENA by indices stored in the nodes themselves, so
+        // its invariant lives in the construction above rather than in any local
+        // guard. Rather than assert an arena invariant I have not proven, take
+        // the checked accessors: `get`/`get_mut` cost the same compare the panic
+        // path did but cannot abort, so a malformed arena degrades to a
+        // truncated walk instead of a crash. Safe, and no `unsafe`.
+        let Some(node) = nodes.get(i) else { return };
+        if node.sym >= 0 {
+            if let Some(slot) = nbits.get_mut(node.sym as usize) {
+                *slot = depth.max(1);
+            }
             return;
         }
-        walk(nodes, nodes[i].left, depth.saturating_add(1), nbits);
-        walk(nodes, nodes[i].right, depth.saturating_add(1), nbits);
+        walk(nodes, node.left, depth.saturating_add(1), nbits);
+        walk(nodes, node.right, depth.saturating_add(1), nbits);
     }
-    walk(&nodes, active[0], 0, &mut nbits);
+    // The loop above exits only at `len <= 1`, and `present.len() > 2` got us
+    // here, so exactly one root remains -- taken through `first()` regardless.
+    let root = *active.first().ok_or(Error::Corruption)?;
+    walk(&nodes, root, 0, &mut nbits);
     limit_nbits(&mut nbits, &present, MAX_BITS);
     Ok(nbits)
 }
@@ -1057,7 +1140,11 @@ fn ctable_from_nbits(nbits: &[u8; 256], freq: Option<&[u32; 256]>) -> Result<Huf
     }
     let mut weights = vec![0u8; max_symbol];
     for (s, slot) in weights.iter_mut().enumerate() {
-        let nb = nbits[s];
+        // SAFETY: `max_symbol` is an `rposition` INDEX into a `[u8; 256]`, so it
+        // is at most 255, and `s < weights.len() == max_symbol`.
+        debug_assert!(s < nbits.len());
+        #[allow(unsafe_code)]
+        let nb = *unsafe { nbits.get_unchecked(s) };
         *slot = if nb == 0 { 0 } else { huff_log + 1 - nb };
     }
     let table = table_from_weights(&weights)?;
@@ -1070,10 +1157,15 @@ fn ctable_from_nbits(nbits: &[u8; 256], freq: Option<&[u32; 256]>) -> Result<Huf
         if nb == 0 {
             continue;
         }
-        if out_nbits[sym as usize] == 0 {
-            out_nbits[sym as usize] = nb;
-            let shift = u32::from(max.saturating_sub(nb));
-            code[sym as usize] = (idx >> shift) as u16;
+        // SAFETY: `sym` is a `u8` and `out_nbits`/`code` are `[_; 256]` --
+        // in range BY TYPE, for every possible value.
+        #[allow(unsafe_code)]
+        unsafe {
+            if *out_nbits.get_unchecked(sym as usize) == 0 {
+                *out_nbits.get_unchecked_mut(sym as usize) = nb;
+                let shift = u32::from(max.saturating_sub(nb));
+                *code.get_unchecked_mut(sym as usize) = (idx >> shift) as u16;
+            }
         }
     }
     Ok(finish_ctable(
@@ -1097,10 +1189,15 @@ pub(crate) fn ctable_from_weights(weights: &[u8]) -> Result<HuffCTable, Error> {
         if nb == 0 {
             continue;
         }
-        if out_nbits[sym as usize] == 0 {
-            out_nbits[sym as usize] = nb;
-            let shift = u32::from(max.saturating_sub(nb));
-            code[sym as usize] = (idx >> shift) as u16;
+        // SAFETY: `sym` is a `u8` and `out_nbits`/`code` are `[_; 256]` --
+        // in range BY TYPE, for every possible value.
+        #[allow(unsafe_code)]
+        unsafe {
+            if *out_nbits.get_unchecked(sym as usize) == 0 {
+                *out_nbits.get_unchecked_mut(sym as usize) = nb;
+                let shift = u32::from(max.saturating_sub(nb));
+                *code.get_unchecked_mut(sym as usize) = (idx >> shift) as u16;
+            }
         }
     }
     Ok(finish_ctable(
@@ -1120,10 +1217,19 @@ pub(crate) fn read_ctable(src: &[u8]) -> Result<(HuffCTable, usize), Error> {
     let header = src[0];
     let weights = if header >= 128 {
         let nsym = header as usize - 127;
-        let _nbytes = nsym.div_ceil(2);
+        let nbytes = nsym.div_ceil(2);
+        // This site had NO bound of its own: `_nbytes` was computed and thrown
+        // away, and it was safe only because `read_table(src)` above validated
+        // the same bound for the same header and would have returned `Err`.
+        // That is an indirect argument across a call boundary; state it here.
+        if 1 + nbytes > src.len() {
+            return Err(Error::Corruption);
+        }
         let mut w = vec![0u8; nsym];
         for i in 0..nsym {
-            let b = src[1 + i / 2];
+            debug_assert!(1 + i / 2 < src.len());
+            #[allow(unsafe_code)]
+            let b = *unsafe { src.get_unchecked(1 + i / 2) };
             w[i] = if i % 2 == 0 { b >> 4 } else { b & 0x0F };
         }
         w
@@ -1394,7 +1500,12 @@ fn body_bytes_exact(ct: &HuffCTable, seg: &[[u32; 256]], n_streams: u32) -> Opti
                 continue;
             }
             any = true;
-            let nb = ct.entry[sym] >> 16;
+            // SAFETY: `h` is a `[u32; 256]` (from `seg: &[[u32; 256]]`) and
+            // `ct.entry` is `[u32; 256]`, so the enumeration index is in range
+            // for both by type.
+            debug_assert!(sym < ct.entry.len());
+            #[allow(unsafe_code)]
+            let nb = *unsafe { ct.entry.get_unchecked(sym) } >> 16;
             if nb == 0 {
                 return None;
             }
@@ -1464,9 +1575,15 @@ fn encode_4_streams(ct: &HuffCTable, src: &[u8]) -> Result<Vec<u8>, Error> {
     }
     let body: usize = streams.iter().map(|s| s.len()).sum();
     let mut out = Vec::with_capacity(6 + body);
-    out.extend_from_slice(&(streams[0].len() as u16).to_le_bytes());
-    out.extend_from_slice(&(streams[1].len() as u16).to_le_bytes());
-    out.extend_from_slice(&(streams[2].len() as u16).to_le_bytes());
+    // The loop above pushes exactly four streams or returns `Err`, so a slice
+    // pattern states the length structurally instead of re-proving it three
+    // times. These were the last three panic sites in the file.
+    let [s0, s1, s2, _s3] = &streams[..] else {
+        return Err(Error::Corruption);
+    };
+    out.extend_from_slice(&(s0.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(s1.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(s2.len() as u16).to_le_bytes());
     for s in &streams {
         out.extend_from_slice(s);
     }
@@ -1879,7 +1996,13 @@ fn write_raw_or_rle(lits: &[u8], rle: bool) -> Vec<u8> {
         dst.push((n >> 12) as u8);
     }
     if rle {
-        dst.push(lits[0]);
+        // `rle` promising a non-empty `lits` is a CALLER contract with no local
+        // witness, so this must not become `unsafe`. `first()` keeps it safe and
+        // still drops the panic path.
+        debug_assert!(!lits.is_empty());
+        if let Some(&b) = lits.first() {
+            dst.push(b);
+        }
     } else {
         dst.extend_from_slice(lits);
     }
