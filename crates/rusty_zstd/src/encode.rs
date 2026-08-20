@@ -326,16 +326,12 @@ pub(crate) struct MatchTables {
     /// Step used by the block currently being encoded, so the outcome can be
     /// attributed to the arm that produced it.
     step_used: u8,
-    /// Forces the step during a probe run. 0 = normal dispatch.
-    step_force: u8,
     /// Forces the GATE 6 pair route during a probe run. 0 = normal dispatch.
     route_force: u8,
     /// Blocks probed, and accumulated (compressed / input) per arm.
     step_probed: u32,
     step_sum1: f64,
     step_sum2: f64,
-    step_n1: u32,
-    step_n2: u32,
     /// Countdown to a forced re-probe, so content that changes character is
     /// picked up -- the warm-up + re-probe shape GATES 2, 6, 10 and 14 all need.
     step_reprobe: u32,
@@ -591,13 +587,10 @@ impl MatchTables {
             last_nseq: 0,
             step_pick: 0,
             step_used: 0,
-            step_force: 0,
             route_force: 0,
             step_probed: 0,
             step_sum1: 0.0,
             step_sum2: 0.0,
-            step_n1: 0,
-            step_n2: 0,
             step_reprobe: 0,
             // Start optimistic: the first block back-fills, then measures.
             last_search_per_byte: 1.0,
@@ -827,7 +820,6 @@ impl MatchTables {
         }
     }
 
-    #[inline(always)]
     /// T2: binary-tree slot read.
     ///
     /// SAFETY: every caller indexes `(x & bt_mask) << 1` or that `+ 1`, and
@@ -4670,24 +4662,6 @@ fn step_probe_on() -> bool {
     STEP_PROBE_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
 }
 
-/// Which step this block should use on the contested route.
-///
-/// Probing runs at step 1 -- the SAFE arm -- and measures what step 2 would have
-/// cost, so a probe block is never worse than the pinned behaviour. Alternating
-/// the two arms across blocks was tried first and fails: adjacent blocks differ
-/// in compressibility, so the comparison measures CONTENT rather than the step,
-/// and it latched mozilla and samba onto step 2 at +2.3% and +3.2%.
-#[inline]
-fn step_probe_pick(tables: &mut MatchTables) -> u8 {
-    if !step_probe_on() {
-        return 1;
-    }
-    if tables.step_pick != 0 && tables.step_reprobe > 0 {
-        return tables.step_pick;
-    }
-    1
-}
-
 /// GATE 18 study: the measured step-2 forfeit, per mille x10.
 #[cfg(feature = "profile")]
 pub static STEP_FORFEIT_SUM: core::sync::atomic::AtomicU64 =
@@ -4811,16 +4785,6 @@ static STEP_SEQ_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 /// refused.
 pub fn set_step_seq_arm(v: f32) {
     STEP_SEQ_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
-}
-
-#[inline(always)]
-fn step_seq_max() -> f64 {
-    let v = STEP_SEQ_ARM.load(core::sync::atomic::Ordering::Relaxed);
-    if v == u32::MAX {
-        0.85
-    } else {
-        f64::from(f32::from_bits(v))
-    }
 }
 
 fn step0_default() -> usize {
@@ -5148,20 +5112,6 @@ fn lit_push_tiers() -> u8 {
 /// same shape ACROSS CORPORA: `smallmsg-8m` puts 95.5% of runs in 5-8 while
 /// `sao` puts 50.4% in 65+ and engages the fast path on only 6.1% of calls.
 /// A constant cannot serve both.
-static LIT_PUSH_WIDTH_ARM: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
-/// Bench hook. 0 restores the shipped constant.
-pub fn set_lit_push_width_arm(w: usize) {
-    LIT_PUSH_WIDTH_ARM.store(w, core::sync::atomic::Ordering::Relaxed);
-}
-
-#[inline(always)]
-fn lit_push_width() -> usize {
-    let w = LIT_PUSH_WIDTH_ARM.load(core::sync::atomic::Ordering::Relaxed);
-    if w == 0 { LIT_PUSH_WIDTH } else { w }
-}
-
 /// GATE 13 @ L3. `push_literals` had exactly ONE call site -- `find_fast`'s
 /// match commit -- so the gate was DEAD everywhere but L1, and dead by SCOPE
 /// rather than by measurement: `find_dfast` called `lits.extend_from_slice`
@@ -5753,6 +5703,7 @@ fn find_dfast_impl<const HLOG: u32>(
     // GATE 6 @ L3 DISPATCH: run C's next-long probe only while it is EARNING.
     let nl_on = next_long_enabled() && tables.next_long_yield >= next_long_min();
     let accel = accel_shift_for(params.strategy);
+    #[cfg(feature = "profile")]
     let mut mm_total = 0u64;
     let mut nl_probes = 0u64;
     let mut nl_hits = 0u64;
@@ -5816,6 +5767,7 @@ fn find_dfast_impl<const HLOG: u32>(
     let dtag_on = tables.pack_tags || !tables.tags.is_empty();
     let dtag_shift = 32u32.saturating_sub(hlog.min(32));
     while ip <= ilimit {
+        #[cfg(feature = "profile")]
         if COUNT {
             mm_total += 1;
         }
@@ -8449,14 +8401,13 @@ fn load_u64le(src: &[u8], i: usize) -> u64 {
     crate::simd::load_u64_le(src, i)
 }
 
-#[inline(always)]
 /// T2/GATE 6: reset a kept scratch vector to `n` copies of `val` without a
 /// growth `realloc`.
 ///
 /// The contents are dead at this point, so growing through `reserve` would
 /// memcpy a buffer holding nothing live -- the defect that made the first
 /// `opt_ops` attempt cost more than it saved. Replacing instead copies nothing.
-#[inline]
+#[inline(always)]
 fn reset_to<T: Clone>(v: &mut Vec<T>, n: usize, val: T) {
     if v.capacity() < n {
         *v = Vec::with_capacity(n);

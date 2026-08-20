@@ -7,7 +7,7 @@ fn main() {
         let Ok(f)=std::fs::read(format!("corpora/data/generated/{id}"))
             .or_else(|_|std::fs::read(format!("corpora/data/silesia/{id}"))) else { continue };
         let s=&f[..f.len().min(cap)];
-        for lvl in [5,6,7,8,9,10,11,12] {
+        for lvl in [13,14,15,16,17,18] {
             let z=rusty_zstd::compress(s,lvl).unwrap();
             assert!(rusty_zstd::decompress(&z).unwrap()==s,"{id} L{lvl} ROUND-TRIP");
             println!("{id:<10} L{lvl:<2} {:>9} {:016x}", z.len(), h(&z));

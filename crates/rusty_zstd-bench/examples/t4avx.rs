@@ -39,8 +39,23 @@ fn main() {
                 }
             }
         }
+        // NULL ARM at the identical protocol: avx2-on measured against ITSELF.
+        let (mut na, mut nb) = (f64::MAX, f64::MAX);
+        for pass in 0..3 {
+            for first in [pass % 2 == 0, pass % 2 != 0] {
+                rusty_zstd::set_seqloop_avx2_arm(true);
+                for _ in 0..n {
+                    let t = Instant::now();
+                    let d = rusty_zstd::decompress(&z).unwrap();
+                    let e = t.elapsed().as_secs_f64() * 1000.0;
+                    std::hint::black_box(&d);
+                    if first { if e < na { na = e } } else if e < nb { nb = e }
+                }
+            }
+        }
+        let null = (nb / na - 1.0) * 100.0;
         t_off += bo; t_on += bn;
-        println!("{:<13} off {:>8.2} ms   avx2 {:>8.2} ms   {:>+6.2}%", id, bo, bn, (bn/bo - 1.0)*100.0);
+        println!("{:<13} off {:>8.2}   avx2 {:>8.2}   real {:>+6.2}%   null {:>+6.2}%", id, bo, bn, (bn/bo - 1.0)*100.0, null);
     }
     println!("\n  IDENTICAL OUTPUT: {same}/{tot}  (REQUIRED)");
     println!("  totals: off {t_off:.1} ms -> avx2 {t_on:.1} ms  ({:+.2}%)", (t_on/t_off - 1.0)*100.0);
