@@ -199,7 +199,12 @@ early. Byte-identical 54/54 + 36/36; rejects equal to the unit.
   worst-corpus gates. Census: `ffwaste.rs`, counters inside `fast_probe`.
 
 ### 5d4. The mls-wide hash — **SHIPPED DEFAULT ON** (owner's call, protections found)
-Six-design refutation ladder recorded in-code; survivors: switch-latch + window
+**Seven**-design refutation ladder recorded in-code (#7, rep-substitution: the probe's
+new gram knowledge swaps a far match for the same gram at rep1 — census found ALL 80
+veto-block accepts had **no gram at rep1** at any slack; inert on every corpus, removed
+per the OPT_SKIP_FLOOR precedent). 311/391 accepts land *before* rep dominance: the
+divergence is seeded early, amplified by cross-block state — frame-level foresight no
+block-local dispatch can have. Survivors: switch-latch + window
 **re-seed** (lazy inherits real heads) + ML≥16 anchor bar on rep-dominated blocks.
 Final: L1 TOTAL −2.49%, **HOLDOUT −4.92%**, worst versions **+6.33%** (from +14.8%;
 segment experiment proves the residue is cross-block state-path divergence — the
