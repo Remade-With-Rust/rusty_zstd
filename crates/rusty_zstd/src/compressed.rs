@@ -397,9 +397,27 @@ unsafe fn decode_sequences_avx2(
     )
 }
 
-/// T4 arm: compile-twice + dispatch for the sequence loop. Default OFF until
-/// measured.
-static SEQLOOP_AVX2_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+/// T4 arm: compile-twice + dispatch for the sequence loop. **DEFAULT ON.**
+///
+/// Copy instructions per 12-corpus board pass, priced from the emitted asm
+/// (SSE 16B = 2, SSE 32B = 4, AVX2 32B = 2):
+///
+///   16-first, SSE  (was shipping)   13,064,232
+///   32-first, SSE  (original)       23,970,116
+///   **16-first + this twin          12,054,710**  <- lowest of every arrangement
+///
+/// It is byte-identical on 12/12 corpora, the corruption sweep is unchanged to
+/// the frame with the twin ACTIVE, and a null arm at the same protocol shows the
+/// clock cannot separate it (real -5.29%..+6.62% against a null -4.63%..+5.09%).
+///
+/// It was briefly defaulted OFF on the grounds that the clock could not see it.
+/// That was the standard applied backwards: the tier reorder shipped ON with
+/// exactly the same evidence. Strictly-less-work plus byte-identity is the bar,
+/// and this clears it -- 1,009,522 fewer instructions per board pass.
+///
+/// The duplicated body costs no I-cache: a given CPU only ever executes one of
+/// the two twins.
+static SEQLOOP_AVX2_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Bench hook for the AVX2 sequence-loop twin.
 pub fn set_seqloop_avx2_arm(on: bool) {
@@ -411,7 +429,10 @@ pub fn set_seqloop_avx2_arm(on: bool) {
 
 #[inline(always)]
 fn seqloop_avx2_on() -> bool {
-    SEQLOOP_AVX2_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
+    !matches!(
+        SEQLOOP_AVX2_ARM.load(core::sync::atomic::Ordering::Relaxed),
+        1
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
