@@ -127,14 +127,51 @@ XOR+TZCNT before any wide load). *Instrument:* `EQ_LEN_HIST` (length histogram,
 already present) decides how much traffic dies at ≤8; asm confirms the head is 3–4
 instructions. Byte-identical by definition (it returns a length).
 
-## 5. `find_fast_impl` — mostly done; two residues
+## 5. `find_fast_impl` — BROKEN OPEN 2026-08-20 (rusty-curiosity pass)
 
-The most-worked function in the codebase (tag, pipeline, const-specialisation,
-scratch, step dispatch). Remaining: **(a)** the 34-copy census — which serve calls at
-default settings? Suspect: hash_log × step × arm combinations that no shipping
-configuration reaches; **(b)** the 13 panic sites in the one inlined instantiation
-that emits no symbol — needs the CodeView inline-site chain to attribute (OPEN since
-the keyword sweep). *Instrument:* `FAST_CALLS` per-copy census; PDB inline records.
+**The finding: the specialised copies served ZERO blocks.** A dispatch-arm census
+(`FF_ARM`, profile-gated) at default configuration:
+
+```
+spec=0   TAG-GENERIC=58..640   rep-generic=6..596     on all 8 probe corpora
+```
+
+`ut` (the tag filter) defaults ON and `rep_on` covers most remaining blocks, so 100%
+of L1 traffic ran the **HLOG=0/STEP=0 generic bodies** — the exact runtime-shift/
+runtime-step cost the file documents as a work-parity break. The five-hlog × four-step
+family the dispatch comment calls "the shipping configuration" was dead weight; GATE
+12's finding inverted. **FIXED** (`1e0a45e`): the three live combinations —
+`(tag,¬rep)`, `(¬tag,rep)`, `(tag,rep)` × s0∈{1,2} × hlog 12–16 — now specialise;
+census reads spec=100%; byte-identical 36/36 via `set_fast_spec_arm` A/B.
+
+**How it was found (the method matters):** stage share (81.5% matchfind on dickens) →
+per-position closure: ~10 ns ≈ **45 cycles/position** against a ~20-instruction miss
+path → implied IPC ≈ 0.5, arithmetic does not close → before blaming memory, prove
+which code runs → census said *none of the specialised code runs at all*.
+
+### 5a. The remaining memory signature — tags as a SECOND array *(top open L1 lever)*
+The 45-cycle closure still is not fully explained by the generic body. On the live tag
+path every probe touches **two arrays**: `load_fast::<true>` reads `hash[h]` then
+`tags[h]` (two random cache lines), and `store_fast::<true>` writes both, every
+position. C's fast loop touches ONE array. The packed-in-slot form (tag in the slot's
+top 8 bits — T1's mechanism, which came FROM this ladder) exists disabled in
+`store_fast` behind `if false`, refuted historically for exactly one reason: **the
+mid-frame Fast→Lazy switch shares one table, and Lazy reads entries Fast truncated.**
+DFast's T1 solved the same problem with `pack_tags` + a per-frame guard. The path here:
+pack on Fast, and **unpack the table once on the (rare) Fast→Lazy switch** — a 16K-entry
+walk per switch. *Instrument:* allocator/asm parity + 72-cell identity; the tags-array
+allocation disappearing is the deterministic receipt.
+
+### 5b. Sibling finding: x-ray's L1 loss is NOT this function
+Stage anatomy at L1: `x-ray` is **84.9% EncodeHuff, 7.0% matchfind** (min_match=7
+finds nothing in 12-bit greyscale). Its C/us 2.83 belongs to the **Huffman encoder**
+— a separate engine target (`encode_stream`/`emit_fill`), not listed in this file's
+priority order until now. `sao` decode similarly flipped to DecLits 78.3%.
+
+### 5c. Residue
+The 13 panic sites in one inlined instantiation still need the CodeView inline-site
+chain (OPEN). The dead-copy census question is now answered for the OLD family (0%);
+the new family's per-copy split is measurable with the same `FF_ARM` counter.
 
 ## 6. `find_sequences_strategy` — the dispatch hub, 4,391 instrs
 
