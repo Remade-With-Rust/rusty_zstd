@@ -177,27 +177,17 @@ pub(crate) fn rsync_bits(window_log: u32) -> u32 {
 }
 
 fn ldm_hash(src: &[u8], ip: usize, hash_log: u32) -> usize {
-    let mut v = u64::from_le_bytes([
-        src[ip],
-        src[ip + 1],
-        src[ip + 2],
-        src[ip + 3],
-        src[ip + 4],
-        src[ip + 5],
-        src[ip + 6],
-        src[ip + 7],
-    ]);
+    // Sixteen individual byte loads assembled into two u64s -- and eight bounds
+    // checks with them. Both callers already guard `ip + 8 <= src.len()`
+    // explicitly in their loop conditions, and the second word is guarded here,
+    // so `load_u64_le` reads each word in ONE unaligned load instead of eight.
+    //
+    // This is worth doing for the loads, not for the panic count: LDM is
+    // `enable_ldm: false` by default, so it is off the shipping path entirely.
+    debug_assert!(ip + 8 <= src.len());
+    let mut v = crate::simd::load_u64_le(src, ip);
     if ip + 16 <= src.len() {
-        let w = u64::from_le_bytes([
-            src[ip + 8],
-            src[ip + 9],
-            src[ip + 10],
-            src[ip + 11],
-            src[ip + 12],
-            src[ip + 13],
-            src[ip + 14],
-            src[ip + 15],
-        ]);
+        let w = crate::simd::load_u64_le(src, ip + 8);
         v ^= w.rotate_left(13);
     }
     let shift = 64u32.saturating_sub(hash_log.min(32));
