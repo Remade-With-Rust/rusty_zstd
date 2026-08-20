@@ -60,14 +60,33 @@ impl FseTable {
                 if high_threshold == 0 && s > 0 {
                     return Err(Error::Corruption);
                 }
-                decode[high_threshold].symbol = sym;
+                // T4: `high_threshold` starts at `table_size - 1` and only
+                // decreases, and the `== 0` tests below/above stop it wrapping,
+                // so it indexes `decode` (len `table_size`) in range.
+                debug_assert!(high_threshold < decode.len());
+                #[allow(unsafe_code)]
+                unsafe {
+                    decode.get_unchecked_mut(high_threshold).symbol = sym;
+                }
                 if high_threshold == 0 {
                     return Err(Error::Corruption);
                 }
                 high_threshold -= 1;
-                symbol_next[s] = 1;
+                // T4: `s` indexes `norm`, and `symbol_next` is
+                // `norm.len().max(1)` long -- the `.max(1)` is what hides the
+                // relation from LLVM, since an empty `norm` never enters this
+                // loop at all.
+                debug_assert!(s < symbol_next.len());
+                #[allow(unsafe_code)]
+                unsafe {
+                    *symbol_next.get_unchecked_mut(s) = 1;
+                }
             } else if p > 0 {
-                symbol_next[s] = p as u16;
+                debug_assert!(s < symbol_next.len());
+                #[allow(unsafe_code)]
+                unsafe {
+                    *symbol_next.get_unchecked_mut(s) = p as u16;
+                }
             }
         }
 
@@ -77,7 +96,14 @@ impl FseTable {
         for (s, &p) in norm.iter().enumerate() {
             let sym = s as u8;
             for _ in 0..p.max(0) {
-                decode[position].symbol = sym;
+                // `position` is always `& mask` with `mask == table_size - 1`
+                // and `table_size` a power of two, so it is in range for
+                // `decode`.
+                debug_assert!(position < decode.len());
+                #[allow(unsafe_code)]
+                unsafe {
+                    decode.get_unchecked_mut(position).symbol = sym;
+                }
                 position = (position + step) & mask;
                 while position > high_threshold {
                     position = (position + step) & mask;
@@ -650,40 +676,49 @@ pub(crate) fn compress_using_ctable(src: &[u8], table: &FseCTable) -> Result<Vec
     if src.len() <= 2 {
         return Err(Error::Corruption);
     }
+    // T4: `i` starts at `src.len()` and EVERY access below decrements first, so
+    // `i < src.len()` holds at every read. LLVM cannot follow that through the
+    // unrolled 2/4-way tail, so it bounds-checked a per-SYMBOL access.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn at(src: &[u8], i: usize) -> usize {
+        debug_assert!(i < src.len());
+        (*unsafe { src.get_unchecked(i) }) as usize
+    }
     let mut bits = crate::bit::BitCStream::new();
     let mut i = src.len();
     let mut state1: u32;
     let mut state2: u32;
     if src.len() & 1 != 0 {
         i -= 1;
-        state1 = table.init_state2(src[i] as usize);
+        state1 = table.init_state2(at(src, i));
         i -= 1;
-        state2 = table.init_state2(src[i] as usize);
+        state2 = table.init_state2(at(src, i));
         i -= 1;
-        table.encode(&mut state1, &mut bits, src[i] as usize);
+        table.encode(&mut state1, &mut bits, at(src, i));
         bits.flush();
     } else {
         i -= 1;
-        state2 = table.init_state2(src[i] as usize);
+        state2 = table.init_state2(at(src, i));
         i -= 1;
-        state1 = table.init_state2(src[i] as usize);
+        state1 = table.init_state2(at(src, i));
     }
     if ((src.len() - 2) & 2) != 0 {
         i -= 1;
-        table.encode(&mut state2, &mut bits, src[i] as usize);
+        table.encode(&mut state2, &mut bits, at(src, i));
         i -= 1;
-        table.encode(&mut state1, &mut bits, src[i] as usize);
+        table.encode(&mut state1, &mut bits, at(src, i));
         bits.flush();
     }
     while i >= 4 {
         i -= 1;
-        table.encode(&mut state2, &mut bits, src[i] as usize);
+        table.encode(&mut state2, &mut bits, at(src, i));
         i -= 1;
-        table.encode(&mut state1, &mut bits, src[i] as usize);
+        table.encode(&mut state1, &mut bits, at(src, i));
         i -= 1;
-        table.encode(&mut state2, &mut bits, src[i] as usize);
+        table.encode(&mut state2, &mut bits, at(src, i));
         i -= 1;
-        table.encode(&mut state1, &mut bits, src[i] as usize);
+        table.encode(&mut state1, &mut bits, at(src, i));
         bits.flush();
     }
     table.flush(state2, &mut bits);
