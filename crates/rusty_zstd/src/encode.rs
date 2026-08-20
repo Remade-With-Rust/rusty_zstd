@@ -292,6 +292,10 @@ struct Seq {
 pub(crate) struct MatchTables {
     hash: Vec<u32>,
     hash_long: Vec<u32>,
+    /// 1a array route: the long table's tag byte array, for frames where the
+    /// packed form is refused (>= 16 MiB, streaming). Mirrors `tags` exactly:
+    /// empty on packed frames, allocated at frame init when the arms say so.
+    ltags: Vec<u8>,
     /// BRICK 67: repcode yield of the PREVIOUS block -- the dispatch signal
     /// for the repcode-1 search. Optimistic start so the first block always
     /// probes; a block finding no repcodes turns it off for the next.
@@ -597,6 +601,7 @@ impl MatchTables {
             hash_log,
             hash: vec![0; hsz],
             hash_long: if use_long { vec![0; hsz] } else { Vec::new() },
+            ltags: Vec::new(),
             chain: if use_chain { vec![0; csz] } else { Vec::new() },
             frame_start: 0,
             last_nseq: 0,
@@ -653,6 +658,7 @@ impl MatchTables {
         self.tags.fill(0);
         self.hash.fill(0);
         self.hash_long.fill(0);
+        self.ltags.fill(0);
         self.chain.fill(0);
     }
 
@@ -784,6 +790,15 @@ impl MatchTables {
         {
             self.tags = alloc::vec![0u8; self.hash.len()];
         }
+        // 1a array route, streaming leg.
+        if params.strategy == Strategy::DFast
+            && dfast_tag_enabled()
+            && long_tag_enabled()
+            && !self.hash_long.is_empty()
+            && self.ltags.is_empty()
+        {
+            self.ltags = alloc::vec![0u8; self.hash_long.len()];
+        }
     }
 
     /// Enable packed tags for this frame, but only when every position the
@@ -893,6 +908,12 @@ impl MatchTables {
                 (((pos as u32).saturating_add(1)) & 0x00FF_FFFF) | (u32::from(tag) << 24);
             return;
         }
+        // Array route (>= 16 MiB / streaming): written UNCONDITIONALLY
+        // whenever the array exists -- gating the store on the compare's flag
+        // is what lets tags go stale (190ad8b).
+        if let Some(t) = self.ltags.get_mut(h) {
+            *t = tag;
+        }
         *unsafe { self.hash_long.get_unchecked_mut(h) } = (pos as u32).saturating_add(1);
     }
 
@@ -912,6 +933,13 @@ impl MatchTables {
                 return None;
             }
             return Some(((v & 0x00FF_FFFF) as usize) - 1);
+        }
+        if on {
+            if let Some(&t) = self.ltags.get(h) {
+                if t != tag {
+                    return None;
+                }
+            }
         }
         Some((v as usize) - 1)
     }
@@ -994,6 +1022,17 @@ pub(crate) fn encode_oneshot(
         // real match implies an equal tag). Priced on the T1 instrument by
         // `tagbig`: see the commit.
         tables.tags = alloc::vec![0u8; tables.hash.len()];
+    }
+    // 1a array route: the LONG table's filter for the same frames. Priced by
+    // `ltagbig` on the same instrument.
+    if params.strategy == Strategy::DFast
+        && dfast_tag_enabled()
+        && long_tag_enabled()
+        && !tables.pack_tags
+        && !tables.hash_long.is_empty()
+        && tables.ltags.is_empty()
+    {
+        tables.ltags = alloc::vec![0u8; tables.hash_long.len()];
     }
     let mut reps = [1u32, 4, 8];
     let mut entropy = EntropyState::default();
@@ -6533,15 +6572,16 @@ fn fill_hash_long_after_match(
     let (do_a, do_b) = dfast_fill_ends();
     let mut n = 0u64;
     let a = match_ip.saturating_add(2);
+    let ltag_live = tables.pack_tags || !tables.ltags.is_empty();
     if do_a && a <= ilimit {
-        let g = if tables.pack_tags { hash4_tag(src, a, hash_shift).1 } else { 0 };
+        let g = if ltag_live { hash4_tag(src, a, hash_shift).1 } else { 0 };
         tables.put_hl_tag(hash8(src, a, hash_log), a, g);
         n += 1;
     }
     if do_b && match_end >= 2 {
         let b = match_end - 2;
         if b <= ilimit && b != a {
-            let g = if tables.pack_tags { hash4_tag(src, b, hash_shift).1 } else { 0 };
+            let g = if ltag_live { hash4_tag(src, b, hash_shift).1 } else { 0 };
             tables.put_hl_tag(hash8(src, b, hash_log), b, g);
             n += 1;
         }
@@ -6806,7 +6846,7 @@ fn find_dfast_impl<const HLOG: u32>(
     // Instrument lesson that found this (the "32M" false lead): the residual
     // statics ran during the arm-OFF pass too -- read counters out between
     // arms or the baseline contaminates the treatment 4:1.
-    let lt_on = long_tag_enabled() && tables.pack_tags;
+    let lt_on = long_tag_enabled() && (tables.pack_tags || !tables.ltags.is_empty());
     // Loop-invariant arm reads, hoisted from the MATCH path to once per block.
     let fill_anchor_c = dfast_fill_anchor_c();
     let fill_stride = dfast_fill_stride();
