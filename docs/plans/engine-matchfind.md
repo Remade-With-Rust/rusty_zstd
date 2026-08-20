@@ -330,6 +330,15 @@ per nonempty probe, a tag write per store, and a `1 << hash_log` (<= 256 KiB)
 allocation per frame. The Fast array precedent accepted this same trade at a
 22.7% rejection rate; the DFast big-frame board clears it at 33.0%.
 
+**Long-table array route — CLOSED 2026-08-21 (`ltagbig`):** the last unfiltered
+tag surface. `ltags` byte array beside `hash_long`, same g4 tag, engaged only
+where pack is refused. Full-length board: **28,187,616 of 36,885,171 long
+probes rejected (76.4%)** — `mozilla` 91.2%/90.6% — and the consume-site
+ledger lands at the collision floor again (28,897,386 unfiltered wasted loads
+→ 125,441, 0.43%). 18/18 byte-identical, FALSE 0. Every tag surface in the
+encoder (short packed, short array, long packed, long array) now runs at the
+8-bit collision floor at every frame size.
+
 ---
 
 ## Priority order
