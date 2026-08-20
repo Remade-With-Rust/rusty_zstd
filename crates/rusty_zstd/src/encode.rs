@@ -3615,6 +3615,14 @@ fn find_fast_impl<
         return (seqs, lits);
     }
     let mut ip = block_start;
+    // ffanat: take the table out of `MatchTables` so its data pointer is a
+    // LOCAL for the whole loop. The asm showed it spilled and reloaded from the
+    // stack three times per iteration; `src` was already register-resident
+    // (brick 48) and the table never got the same fix. Handed back at every
+    // exit below.
+    let mut hash_v = core::mem::take(&mut tables.hash);
+    let mut tags_v = core::mem::take(&mut tables.tags);
+    let pack = tables.pack_tags;
     // BRICK 51: `probes`/`hits` feed ONLY `note_search`, which is a no-op
     // without the `profile` feature (their other consumers, `last_hit_rate` and
     // `tag_latch`, were write-only dead state left by the brick-41 revert).
@@ -3763,7 +3771,7 @@ fn find_fast_impl<
         let mut pipe_pos = 0u64;
         let (mut ff_made, mut ff_used) = (0u64, 0u64);
         let (mut h0, mut g0) = hash4_tag::<PACKED>(src, ip, hash_shift);
-        let mut m0 = tables.load_fast::<PACKED>(h0, g0);
+        let mut m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h0, g0);
         loop {
             if COUNT {
                 pipe_pos += 1;
@@ -3774,7 +3782,7 @@ fn find_fast_impl<
                 }
             }
             if COUNT && PACKED {
-                let raw = tables.raw_fast(h0);
+                let raw = fast_slot_raw(&hash_v, pack, h0);
                 if m0 == 0 && raw != 0 {
                     if fast_probe(&mut (0, 0), src, raw, ip, window, lowest, mls, block_end).is_some() {
                         TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -3782,7 +3790,7 @@ fn find_fast_impl<
                     TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
-            tables.store_fast::<PACKED>(h0, ip, g0);
+            fast_slot_store(&mut hash_v, &mut tags_v, pack, h0, ip, g0);
             if REP {
                 rep_probes += 1;
                 if let Some(ml) = try_rep1(src, ip, rep1, lowest, block_end) {
@@ -3824,7 +3832,7 @@ fn find_fast_impl<
                     let (nh, ng) = hash4_tag::<PACKED>(src, ip, hash_shift);
                     h0 = nh;
                     g0 = ng;
-                    m0 = tables.load_fast::<PACKED>(h0, g0);
+                    m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h0, g0);
                     continue;
                 }
             }
@@ -3858,7 +3866,7 @@ fn find_fast_impl<
                         0
                     }
                 } else {
-                    tables.load_fast::<PACKED>(h, g)
+                    fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h, g)
                 };
                 (h, g, v)
             } else {
@@ -3872,7 +3880,10 @@ fn find_fast_impl<
                 }
                 ip = emit_fast_seq::<PACKED>(
                     src,
-                    tables,
+                    &mut hash_v,
+                    &mut tags_v,
+                    pack,
+                    hash_shift,
                     &mut seqs,
                     &mut lits,
                     anchor,
@@ -3918,7 +3929,7 @@ fn find_fast_impl<
                 let (nh, ng) = hash4_tag::<PACKED>(src, ip, hash_shift);
                 h0 = nh;
                 g0 = ng;
-                m0 = tables.load_fast::<PACKED>(h0, g0);
+                m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h0, g0);
                 continue;
             }
             if nip > ilimit {
@@ -3994,6 +4005,8 @@ fn find_fast_impl<
             FF_SPEC_MADE.fetch_add(ff_made, Relaxed);
             FF_SPEC_USED.fetch_add(ff_used, Relaxed);
         }
+        tables.hash = hash_v;
+        tables.tags = tags_v;
         return (seqs, lits);
     }
     let (mut mm_total, mut mm_miss) = (0u64, 0u64);
@@ -4007,12 +4020,12 @@ fn find_fast_impl<
             }
         }
         let (h0, g0) = hash4_tag::<PACKED>(src, ip, hash_shift);
-        let m0 = tables.load_fast::<PACKED>(h0, g0);
+        let m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h0, g0);
         if COUNT && PACKED {
             // Gate 7 is recorded byte-identical: a tag mismatch should imply the
             // 4 bytes differ, so `fast_probe` would have rejected the candidate
             // anyway. Count the cases where it would NOT have.
-            let raw = tables.raw_fast(h0);
+            let raw = fast_slot_raw(&hash_v, pack, h0);
             if m0 == 0 && raw != 0 {
                 if fast_probe(&mut (0, 0), src, raw, ip, window, lowest, mls, block_end).is_some() {
                     TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -4020,7 +4033,7 @@ fn find_fast_impl<
                 TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
-        tables.store_fast::<PACKED>(h0, ip, g0);
+        fast_slot_store(&mut hash_v, &mut tags_v, pack, h0, ip, g0);
         // GATE 6 SPEED: issue the PAIR probe's load HERE, next to the main
         // probe's, instead of after `fast_probe` has consumed `m0`.
         //
@@ -4037,7 +4050,7 @@ fn find_fast_impl<
         // and match paths both `continue`. Only the issue order moves.
         let pair_pre = if pair && ip + 1 <= ilimit {
             let (h1, g1) = hash4_tag::<PACKED>(src, ip + 1, hash_shift);
-            Some((h1, g1, tables.load_fast::<PACKED>(h1, g1)))
+            Some((h1, g1, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h1, g1)))
         } else {
             None
         };
@@ -4071,7 +4084,10 @@ fn find_fast_impl<
             }
             ip = emit_fast_seq::<PACKED>(
                 src,
-                tables,
+                &mut hash_v,
+                &mut tags_v,
+                pack,
+                hash_shift,
                 &mut seqs,
                 &mut lits,
                 anchor,
@@ -4116,11 +4132,11 @@ fn find_fast_impl<
                     Some(v) => v,
                     None => {
                         let (h, g) = hash4_tag::<PACKED>(src, ip1, hash_shift);
-                        (h, g, tables.load_fast::<PACKED>(h, g))
+                        (h, g, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h, g))
                     }
                 };
                 if COUNT && PACKED {
-                    let raw = tables.raw_fast(h1);
+                    let raw = fast_slot_raw(&hash_v, pack, h1);
                     if m1 == 0 && raw != 0 {
                         if fast_probe(&mut (0, 0), src, raw, ip1, window, lowest, mls, block_end).is_some() {
                             TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -4128,7 +4144,7 @@ fn find_fast_impl<
                         TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                tables.store_fast::<PACKED>(h1, ip1, g1);
+                fast_slot_store(&mut hash_v, &mut tags_v, pack, h1, ip1, g1);
                 // A THIRD VARIABLE WAS TESTED AND REJECTED: the pair match's
                 // LENGTH. `versions-16m` sits at exactly +10.55% for every
                 // minimum from 0 to 24, while the winners degrade badly (total
@@ -4157,7 +4173,10 @@ fn find_fast_impl<
                     pair_bytes += ml as u64;
                     ip = emit_fast_seq::<PACKED>(
                         src,
-                        tables,
+                        &mut hash_v,
+                        &mut tags_v,
+                        pack,
+                        hash_shift,
                         &mut seqs,
                         &mut lits,
                         anchor,
@@ -4255,6 +4274,8 @@ fn find_fast_impl<
     };
     tables.rep_yield = y.max(tables.rep_yield * 0.5);
     tables.last_nseq = seqs.len();
+    tables.hash = hash_v;
+    tables.tags = tags_v;
     (seqs, lits)
 }
 
@@ -5769,10 +5790,118 @@ pub fn take_lit_push() -> (u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
     (LP_FAST.swap(0, Relaxed), LP_SLOW.swap(0, Relaxed))
 }
+/// ffanat: the Fast loop's slot primitives, operating on LOCALS taken out of
+/// `MatchTables` so the table base pointer lives in a REGISTER for the whole
+/// loop. The asm receipt that motivated this: the specialised copy reloaded the
+/// hash base from the stack (`movq 96(%rbp), ..`) THREE times per iteration --
+/// before the probe load, the store, and the speculation load -- while `src`
+/// sat in a register, because brick 48's fix was never given to the table
+/// itself. `fast_slot_store` is the ONE write-rule site (190ad8b) shared by the
+/// loop and `fill_fast_after_match`; the bodies mirror
+/// `store_fast`/`load_fast`/`raw_fast` exactly, receipt counters included.
+#[inline(always)]
+#[allow(unsafe_code)]
+fn fast_slot_store(hash: &mut [u32], tags: &mut [u8], pack: bool, h: usize, pos: usize, tag: u8) {
+    debug_assert!(h < hash.len());
+    if pack {
+        *unsafe { hash.get_unchecked_mut(h) } =
+            (((pos as u32).wrapping_add(1)) & 0x00FF_FFFF) | (u32::from(tag) << 24);
+        return;
+    }
+    if let Some(t) = tags.get_mut(h) {
+        *t = tag;
+    }
+    *unsafe { hash.get_unchecked_mut(h) } = (pos as u32).wrapping_add(1);
+}
+
+#[inline(always)]
+#[allow(unsafe_code)]
+fn fast_slot_load<const PACKED: bool>(
+    hash: &[u32],
+    tags: &[u8],
+    pack: bool,
+    h: usize,
+    tag: u8,
+) -> u32 {
+    debug_assert!(h < hash.len());
+    let e = *unsafe { hash.get_unchecked(h) };
+    if e == 0 {
+        return 0;
+    }
+    if pack {
+        #[cfg(feature = "profile")]
+        PACKED_TAG_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if PACKED && (e >> 24) as u8 != tag {
+            return 0;
+        }
+        return e & 0x00FF_FFFF;
+    }
+    if !PACKED {
+        return e;
+    }
+    if let Some(&t) = tags.get(h) {
+        #[cfg(feature = "profile")]
+        TAGARR_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if t != tag {
+            return 0;
+        }
+    }
+    e
+}
+
+/// Diagnostic twin of `raw_fast` for the local-table loop (COUNT paths only).
+#[inline(always)]
+fn fast_slot_raw(hash: &[u32], pack: bool, h: usize) -> u32 {
+    let e = hash[h];
+    if pack {
+        e & 0x00FF_FFFF
+    } else {
+        e
+    }
+}
+
+/// The Fast ladder's after-match end-fill on the LOCAL table -- same semantics
+/// and same instruments as `fill_hash_after_match`, writing through the shared
+/// `fast_slot_store` rule.
+#[inline]
+fn fill_fast_after_match<const PACKED: bool>(
+    hash: &mut [u32],
+    tags: &mut [u8],
+    pack: bool,
+    hash_shift: u32,
+    src: &[u8],
+    match_ip: usize,
+    match_end: usize,
+    ilimit: usize,
+) {
+    let (do_a, do_b) = dfast_fill_ends();
+    let mut n = 0u64;
+    let a = match_ip.saturating_add(2);
+    if do_a && a <= ilimit {
+        let (h, g) = hash4_tag::<PACKED>(src, a, hash_shift);
+        fast_slot_store(hash, tags, pack, h, a, g);
+        n += 1;
+    }
+    if do_b && match_end >= 2 {
+        let b = match_end - 2;
+        if b <= ilimit && b != a {
+            let (h, g) = hash4_tag::<PACKED>(src, b, hash_shift);
+            fast_slot_store(hash, tags, pack, h, b, g);
+            n += 1;
+        }
+    }
+    #[cfg(feature = "profile")]
+    DF_ENDFILL.fetch_add(n, core::sync::atomic::Ordering::Relaxed);
+    crate::prof::note_hash_fill(n);
+}
+
 
 fn emit_fast_seq<const PACKED: bool>(
     src: &[u8],
-    tables: &mut MatchTables,
+    hash: &mut [u32],
+    tags: &mut [u8],
+    pack: bool,
+    hash_shift: u32,
     seqs: &mut Vec<Seq>,
     lits: &mut Vec<u8>,
     anchor: usize,
@@ -5784,6 +5913,7 @@ fn emit_fast_seq<const PACKED: bool>(
     frame_start: usize,
     w: usize,
 ) -> usize {
+    let _ = mls;
     let mut ip = found_ip;
     let mut mm = m;
     let mut n = ml;
@@ -5808,7 +5938,7 @@ fn emit_fast_seq<const PACKED: bool>(
         offset: (ip - mm) as u32,
     });
     let end = ip + n;
-    fill_hash_after_match::<PACKED>(tables, src, found_ip, end, mls, ilimit);
+    fill_fast_after_match::<PACKED>(hash, tags, pack, hash_shift, src, found_ip, end, ilimit);
     end
 }
 
