@@ -7102,16 +7102,10 @@ fn find_dfast_impl<const HLOG: u32>(
             if COUNT {
                 probes += 1;
             }
-            if match_ok(
-                src,
-                m8,
-                ip,
-                window,
-                block_start,
-                8.min(mls).max(4),
-                tables.frame_start,
-            ) {
-                let ml = count_match(src, m8, ip, block_end);
+            let mlx = 8.min(mls).max(4);
+            if match_ok(src, m8, ip, window, block_start, mlx, tables.frame_start) {
+                // Count past match_ok's verified prefix (fast_probe_wide rule).
+                let ml = mlx + count_match(src, m8 + mlx, ip + mlx, block_end);
                 if ml >= mls {
                     best_m = m8;
                     best_ml = ml;
@@ -7170,16 +7164,10 @@ fn find_dfast_impl<const HLOG: u32>(
                 if COUNT {
                     probes += 1;
                 }
-                if match_ok(
-                    src,
-                    m8b,
-                    ip + 1,
-                    window,
-                    block_start,
-                    8.min(mls).max(4),
-                    tables.frame_start,
-                ) {
-                    let ml = count_match(src, m8b, ip + 1, block_end);
+                let mlx = 8.min(mls).max(4);
+                if match_ok(src, m8b, ip + 1, window, block_start, mlx, tables.frame_start) {
+                    // Count past match_ok's verified prefix.
+                    let ml = mlx + count_match(src, m8b + mlx, ip + 1 + mlx, block_end);
                     if ml >= mls && ml > best_ml {
                         // GATE 14 signal, measured only in the band the raise
                         // opens. Two adds on a path that fires a few thousand
@@ -7234,7 +7222,8 @@ fn find_dfast_impl<const HLOG: u32>(
                 }
                 let mut _acc = false;
                 if match_ok(src, m4, ip, window, block_start, mls, tables.frame_start) {
-                    let ml = count_match(src, m4, ip, block_end);
+                    // Count past match_ok's verified prefix.
+                    let ml = mls + count_match(src, m4 + mls, ip + mls, block_end);
                     _acc = ml >= mls;
                     if ml >= mls && ml > best_ml {
                         best_m = m4;
@@ -7776,7 +7765,9 @@ fn find_greedy(
                         // `count_match` is provably wasted. The same candidate
                         // still wins, so this is byte-identical.
                         if best_ml == 0 || pre_eq(src, m, ip, best_ml) {
-                            let ml = count_match(src, m, ip, block_end);
+                            // Count past mls_eq's verified prefix (see
+                            // `chain_find_best`).
+                            let ml = mls + count_match(src, m + mls, ip + mls, block_end);
                             if ml >= mls && ml > best_ml {
                                 if missed_before {
                                     if best_ml == 0 {
@@ -7965,7 +7956,10 @@ fn chain_find_best(
             if mls_eq(src, m, ip, mls) {
                 // C's `match[ml] == ip[ml]` prefilter -- see `find_greedy`.
                 if best_ml == 0 || pre_eq(src, m, ip, best_ml) {
-                    let ml = count_match(src, m, ip, block_end);
+                    // Count from the byte AFTER what mls_eq just verified --
+                    // restarting at 0 re-compared the first word of every
+                    // candidate (the fast_probe_wide rule, applied here).
+                    let ml = mls + count_match(src, m + mls, ip + mls, block_end);
                     if ml >= mls
                         && ml > best_ml
                         && offset_ok(ip - m, window)
