@@ -3315,6 +3315,31 @@ fn find_fast(
     // that no threshold can open. `mozilla` and `samba` lost their -2.85% and
     // -6.03% to this, identically at every threshold, which is what gave it
     // away: a real threshold effect moves when the threshold moves.
+    // ffanat census: WHICH monomorphisation class serves the traffic? The
+    // comment on the (false,..) arms calls them "the shipping configuration",
+    // but `ut` is tag_enabled() && tag_yield >= tag_min, which defaults ON --
+    // if that is what usually runs, the shipped path is the GENERIC body.
+    #[cfg(feature = "profile")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        // MIRRORS THE DISPATCH BELOW exactly -- classify by which arm will
+        // match, not by the inputs alone (the first version of this census
+        // kept its labels when the dispatch gained arms, and read stale).
+        let spec = fast_spec_enabled()
+            && pipe_on
+            && ((!ut && !rep_on && (1..=4).contains(&s0))
+                || ((ut || rep_on) && (1..=2).contains(&s0)));
+        let idx = if spec {
+            0usize
+        } else {
+            match (ut, rep_on, pipe_on) {
+                (true, false, true) => 1,
+                (_, true, true) => 2,
+                _ => 3,
+            }
+        };
+        FF_ARM[idx].fetch_add(1, Relaxed);
+    }
     let r = match (ut, rep_on, pipe_on, s0) {
         // The shipping configuration: no tag, no rep1, pipelined, default step.
         // Specialized on hash_log so the shift is an immediate too.
@@ -3360,6 +3385,64 @@ fn find_fast(
             15 => go!(false, false, 15, 4, true),
             16 => go!(false, false, 16, 4, true),
             _ => go!(false, false, 0, 4, true),
+        },
+        // ffanat 2026-08-20: the census that added FF_ARM found the arms above
+        // serve ZERO blocks in the shipped configuration. `ut` defaults ON
+        // (tag_enabled() && tag_yield >= tag_min, and tag_min ships 0.0) and
+        // rep_on fires on most of the rest, so 100% of L1 traffic was running
+        // the HLOG=0/STEP=0 GENERIC bodies -- the exact work-parity cost this
+        // file documents for the step arms ("a fully generic body (runtime
+        // shift AND runtime step)"). The live combinations get the same
+        // specialisation the dead ones always had. Byte-identical by the same
+        // argument as `find_dfast_impl`: the consts take the values the runtime
+        // variables already held.
+        (true, false, true, 2) if fast_spec_enabled() => match tables.hash_log {
+            12 => go!(true, false, 12, 2, true),
+            13 => go!(true, false, 13, 2, true),
+            14 => go!(true, false, 14, 2, true),
+            15 => go!(true, false, 15, 2, true),
+            16 => go!(true, false, 16, 2, true),
+            _ => go!(true, false, 0, 2, true),
+        },
+        (true, false, true, 1) if fast_spec_enabled() => match tables.hash_log {
+            12 => go!(true, false, 12, 1, true),
+            13 => go!(true, false, 13, 1, true),
+            14 => go!(true, false, 14, 1, true),
+            15 => go!(true, false, 15, 1, true),
+            16 => go!(true, false, 16, 1, true),
+            _ => go!(true, false, 0, 1, true),
+        },
+        (false, true, true, 2) if fast_spec_enabled() => match tables.hash_log {
+            12 => go!(false, true, 12, 2, true),
+            13 => go!(false, true, 13, 2, true),
+            14 => go!(false, true, 14, 2, true),
+            15 => go!(false, true, 15, 2, true),
+            16 => go!(false, true, 16, 2, true),
+            _ => go!(false, true, 0, 2, true),
+        },
+        (false, true, true, 1) if fast_spec_enabled() => match tables.hash_log {
+            12 => go!(false, true, 12, 1, true),
+            13 => go!(false, true, 13, 1, true),
+            14 => go!(false, true, 14, 1, true),
+            15 => go!(false, true, 15, 1, true),
+            16 => go!(false, true, 16, 1, true),
+            _ => go!(false, true, 0, 1, true),
+        },
+        (true, true, true, 2) if fast_spec_enabled() => match tables.hash_log {
+            12 => go!(true, true, 12, 2, true),
+            13 => go!(true, true, 13, 2, true),
+            14 => go!(true, true, 14, 2, true),
+            15 => go!(true, true, 15, 2, true),
+            16 => go!(true, true, 16, 2, true),
+            _ => go!(true, true, 0, 2, true),
+        },
+        (true, true, true, 1) if fast_spec_enabled() => match tables.hash_log {
+            12 => go!(true, true, 12, 1, true),
+            13 => go!(true, true, 13, 1, true),
+            14 => go!(true, true, 14, 1, true),
+            15 => go!(true, true, 15, 1, true),
+            16 => go!(true, true, 16, 1, true),
+            _ => go!(true, true, 0, 1, true),
         },
         (false, false, true, _) => go!(false, false, 0, 0, true),
         (false, false, false, 2) => go!(false, false, 0, 2, false),
@@ -5053,6 +5136,24 @@ pub static MM_MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 pub fn take_mm() -> (u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
     (MM_TOTAL.swap(0, Relaxed), MM_MISS.swap(0, Relaxed))
+}
+
+/// ffanat: dispatch-arm census. 0 = specialised (false,false,pipe),
+/// 1 = tag arm (generic), 2 = rep arms (generic), 3 = rest.
+#[cfg(feature = "profile")]
+pub static FF_ARM: [core::sync::atomic::AtomicU64; 4] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Read and clear the dispatch-arm census.
+#[cfg(feature = "profile")]
+pub fn take_ff_arms() -> [u64; 4] {
+    let mut o = [0u64; 4];
+    for i in 0..4 { o[i] = FF_ARM[i].swap(0, core::sync::atomic::Ordering::Relaxed); }
+    o
 }
 
 pub static FF_PIPE_BLOCKS: core::sync::atomic::AtomicU64 =

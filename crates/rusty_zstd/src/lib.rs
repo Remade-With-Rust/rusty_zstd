@@ -71,6 +71,8 @@ pub use compressed::set_seqloop_avx2_arm;
 #[cfg(feature = "profile")]
 pub use encode::take_envhits;
 #[cfg(feature = "profile")]
+pub use encode::take_ff_arms;
+#[cfg(feature = "profile")]
 pub use compressed::take_dec_copies;
 #[cfg(feature = "profile")]
 pub use compressed::take_dec_bands;
