@@ -36,28 +36,62 @@ separate `--features profile` build and are comparable only as shares within a r
 
 ## 1. Level 1 - the full board, all 18 corpora
 
-**Re-measured 2026-08-17**, after the literals entropy gate. Sorted by `us/c size`.
+**Re-measured 2026-08-20.** Sorted by `us/c size`. C is the pinned v1.5.7 via
+`-b1 -i1 -T1`; ours at CHECKSUM PARITY (`checksum: false`, matching
+`ZSTD_c_checksumFlag = 0`), best-of-25 per phase with warmup discarded, decode into a
+REUSED buffer via `decompress_into`.
+
+> **READ THE TWO HALVES DIFFERENTLY ON THIS BOARD.** `us/c size` is a byte count --
+> deterministic, no clock, fully trustworthy. The four SPEED columns are weaker than the
+> 2026-08-17 board: that run pinned affinity=4 at High priority, this one could not, and
+> a second session was active on the box throughout. The **same-arm null spread was
+> 14.09%**. Read speed cells as a band, not a value, and do not difference individual
+> speed cells against the older board.
+
+> **THE RATIO GAINS BELOW ARE NOT FROM THE OPTIMIZATION CAMPAIGN.** Every change in
+> [`m7-optimize-anatomy.md`](m7-optimize-anatomy.md) is byte-identical by construction
+> and CANNOT move a ratio. These come from the concurrent gate work.
 
 | corpus       |  C comp | us comp | **C/us c** | C decomp | us decomp | **C/us d** | us/c size |
 | ------------ | ------: | ------: | ---------: | -------: | --------: | ---------: | --------: |
-| versions-16m |  1099.3 |  7852.7 |   **0.14** |   2853.0 |   14414.7 |   **0.20** | **0.075** |
-| zeros-32m    | 11113.8 | 22473.0 |   **0.49** |  29988.9 |   40470.9 |   **0.74** | **0.901** |
-| incomp-32m   |  5377.4 |  6598.1 |   **0.81** |  14066.8 |   14997.7 |   **0.94** |     1.000 |
-| x-ray        |   983.7 |   389.4 |       2.53 |   1498.7 |     983.0 |       1.52 |     1.000 |
-| smallmsg-8m  |   551.4 |   304.7 |       1.81 |   2414.2 |     922.3 |       2.62 |     1.031 |
-| jsonlog-16m  |   681.9 |   309.0 |       2.21 |   1859.1 |     994.1 |       1.87 |     1.061 |
-| sao          |   464.7 |   249.1 |       1.87 |   1244.8 |     572.8 |       2.17 |     1.067 |
-| osdb         |   571.8 |   232.4 |       2.46 |   1881.8 |    1078.2 |       1.75 |     1.100 |
-| text-32m     | 15439.6 | 26462.5 |   **0.58** |  10544.0 |   33719.7 |   **0.31** |     1.100 |
-| mr           |   521.8 |   214.2 |       2.44 |   1838.8 |    1337.1 |       1.38 |     1.111 |
-| ooffice      |   473.8 |   183.5 |       2.58 |   1268.8 |     855.8 |       1.48 |     1.113 |
-| webster      |   428.3 |   215.3 |       1.99 |   1828.2 |     914.5 |       2.00 |     1.137 |
-| samba        |   646.7 |   330.4 |       1.96 |   2332.2 |    1147.8 |       2.03 |     1.144 |
-| dickens      |   367.3 |   191.2 |       1.92 |   1748.1 |     850.4 |       2.06 |     1.168 |
-| mozilla      |   581.7 |   231.9 |       2.51 |   1527.4 |     891.4 |       1.71 |     1.186 |
-| xml          |   865.9 |   441.9 |       1.96 |   2770.4 |    1340.4 |       2.07 |     1.217 |
-| reymont      |   360.7 |   210.3 |       1.71 |   1816.8 |     852.0 |       2.13 |     1.240 |
-| nci          |  1077.8 |   531.3 |       2.03 |   2919.1 |    1339.4 |       2.18 |     1.301 |
+| versions-16m |  1814.0 | 10875.5 |   **0.17** |   4364.9 |   22271.7 |   **0.20** | **0.082** |
+| zeros-32m    | 13059.0 | 26845.6 |   **0.49** |  41872.7 |   44642.9 |   **0.94** | **0.967** |
+| incomp-32m   |  6178.8 |  3333.6 |       1.85 |  25151.2 |   26711.2 |   **0.94** |     1.000 |
+| x-ray        |   965.9 |   341.5 |       2.83 |   1468.9 |    1024.1 |       1.43 |     1.000 |
+| smallmsg-8m  |   578.7 |   211.6 |       2.73 |   2511.5 |     940.5 |       2.67 |     1.017 |
+| mozilla      |   794.3 |   321.1 |       2.47 |   2344.6 |    1152.6 |       2.03 |     1.021 |
+| ooffice      |   480.6 |   130.8 |       3.68 |   1271.9 |     795.1 |       1.60 |     1.027 |
+| samba        |   596.0 |   223.3 |       2.67 |   2462.2 |    1061.7 |       2.32 |     1.028 |
+| osdb         |   584.9 |   185.8 |       3.15 |   1935.5 |    1001.0 |       1.93 |     1.045 |
+| webster      |   431.9 |   159.0 |       2.72 |   1845.8 |     817.8 |       2.26 |     1.053 |
+| jsonlog-16m  |   715.7 |   228.6 |       3.13 |   1935.3 |     960.2 |       2.02 |     1.063 |
+| sao          |   469.3 |   237.7 |       1.97 |   1197.1 |     586.2 |       2.04 |     1.065 |
+| dickens      |   380.4 |   141.0 |       2.70 |   1808.3 |     798.4 |       2.26 |     1.082 |
+| xml          |   755.4 |   342.1 |       2.21 |   2731.4 |    1160.3 |       2.35 |     1.086 |
+| mr           |   539.2 |   156.2 |       3.45 |   1883.5 |    1098.2 |       1.72 |     1.089 |
+| text-32m     | 19490.9 | 24844.7 |   **0.78** |  10837.2 |   40383.6 |   **0.27** |     1.126 |
+| nci          |  1035.2 |   430.6 |       2.40 |   2836.3 |    1242.0 |       2.28 |     1.129 |
+| reymont      |   372.3 |   160.6 |       2.32 |   1900.8 |     731.7 |       2.60 |     1.131 |
+
+**mean C/us comp 2.32, decomp 1.77 | mean ratio 1.001 | worst ratio 1.131 (reymont) |
+we beat C: 3 comp, 4 decomp, 2 ratio**
+
+**THE RATIO STORY IS THE STORY.** The worst cell on the board moved from **1.301
+(`nci`) to 1.131 (`reymont`)**, and the mean landed at **1.001**. Every row that used to
+sit above 1.13 came down:
+
+| corpus | `us/c size` 08-17 | 08-20 |
+| --- | ---: | ---: |
+| `nci` | 1.301 | **1.129** |
+| `reymont` | 1.240 | **1.131** |
+| `xml` | 1.217 | **1.086** |
+| `mozilla` | 1.186 | **1.021** |
+| `dickens` | 1.168 | **1.082** |
+| `samba` | 1.144 | **1.028** |
+| `webster` | 1.137 | **1.053** |
+
+L1 has moved from a board that was smaller than C on 3 corpora and badly larger on 5,
+to one whose mean is parity and whose worst cell is +13.1%.
 
 ### Where we win or tie
 
@@ -90,53 +124,54 @@ function: `find_fast` had a repcode search and no other finder did.
 
 ## 2. Level 3 (dfast) - the shipping default
 
-**Re-measured 2026-08-17.** Sorted by `us/c size`.
+**Re-measured 2026-08-20.** Sorted by `us/c size`. Same protocol and the same two
+caveats as section 1: the ratio column is a byte count and is trustworthy; the speed
+columns were taken without pinned affinity or raised priority, with a second session
+active, at a **13.45% same-arm null spread**.
 
 | corpus       | C comp | us comp | **C/us c** | C decomp | us decomp | **C/us d** | us/c size |
 | ------------ | -----: | ------: | ---------: | -------: | --------: | ---------: | --------: |
-| versions-16m | 5094.9 | 10710.0 |   **0.48** |  24626.6 |   19911.2 |       1.24 | **0.648** |
-| zeros-32m    | 7951.6 | 22002.9 |   **0.36** |  28701.2 |   39364.7 |   **0.73** | **0.972** |
-| x-ray        |  214.3 |    98.1 |       2.18 |   1111.6 |     423.8 |       2.62 | **0.982** |
-| incomp-32m   | 4662.1 |  3971.7 |       1.17 |  13961.1 |   15769.5 |   **0.89** |     1.000 |
-| mr           |  302.1 |   151.9 |       1.99 |   1637.7 |     479.8 |       3.41 |     1.020 |
-| ooffice      |  271.6 |   109.9 |       2.47 |   1167.7 |     514.9 |       2.27 |     1.029 |
-| osdb         |  387.3 |   175.9 |       2.20 |   1949.5 |     816.0 |       2.39 |     1.032 |
-| jsonlog-16m  |  417.7 |   202.9 |       2.06 |   2007.2 |     926.1 |       2.17 |     1.036 |
-| sao          |  227.6 |   120.6 |       1.89 |   1048.5 |     550.9 |       1.90 |     1.039 |
-| smallmsg-8m  |  351.3 |   162.6 |       2.16 |   2410.9 |     838.4 |       2.88 |     1.049 |
-| reymont      |  307.3 |   178.4 |       1.72 |   1693.3 |     594.1 |       2.85 |     1.054 |
-| webster      |  281.0 |   164.1 |       1.71 |   1651.9 |     599.0 |       2.76 |     1.057 |
-| dickens      |  241.8 |   136.6 |       1.77 |   1544.2 |     515.6 |       2.99 |     1.066 |
-| mozilla      |  367.4 |   157.6 |       2.33 |   1449.8 |     629.8 |       2.30 |     1.071 |
-| samba        |  468.0 |   254.5 |       1.84 |   2290.9 |     894.1 |       2.56 |     1.073 |
-| text-32m     | 9358.9 | 25645.4 |   **0.36** |  10591.4 |   34674.4 |   **0.31** |     1.082 |
-| nci          |  945.3 |   489.6 |       1.93 |   2858.6 |    1321.7 |       2.16 |     1.100 |
-| xml          |  709.5 |   393.0 |       1.81 |   2751.7 |    1244.1 |       2.21 |     1.104 |
+| versions-16m | 5169.8 |  8048.3 |   **0.64** |  23579.5 |   19097.6 |       1.23 | **0.659** |
+| zeros-32m    | 8543.1 | 33543.0 |   **0.25** |  42477.2 |   45532.2 |   **0.93** | **0.967** |
+| x-ray        |  226.3 |    70.1 |       3.23 |   1140.7 |     410.0 |       2.78 | **0.983** |
+| incomp-32m   | 5854.8 |  3408.3 |       1.72 |  24674.9 |   24676.1 |   **1.00** |     1.000 |
+| jsonlog-16m  |  418.1 |   182.3 |       2.29 |   2018.1 |     907.7 |       2.22 |     1.010 |
+| osdb         |  385.1 |   153.1 |       2.51 |   1952.9 |     829.5 |       2.35 |     1.016 |
+| mr           |  292.1 |   126.1 |       2.32 |   1677.9 |     474.7 |       3.53 |     1.022 |
+| smallmsg-8m  |  357.6 |   126.1 |       2.84 |   2455.7 |     836.1 |       2.94 |     1.029 |
+| mozilla      |  460.3 |   187.9 |       2.45 |   2216.5 |    1074.3 |       2.06 |     1.029 |
+| ooffice      |  275.0 |    87.2 |       3.15 |   1177.5 |     512.4 |       2.30 |     1.032 |
+| sao          |  224.5 |    78.2 |       2.87 |   1039.2 |     496.6 |       2.09 |     1.034 |
+| samba        |  466.3 |   229.8 |       2.03 |   2696.0 |    1009.5 |       2.67 |     1.036 |
+| reymont      |  316.6 |   158.4 |       2.00 |   1762.5 |     529.7 |       3.33 |     1.041 |
+| webster      |  299.4 |   141.2 |       2.12 |   1754.5 |     617.9 |       2.84 |     1.050 |
+| dickens      |  250.0 |   113.8 |       2.20 |   1617.0 |     503.1 |       3.21 |     1.052 |
+| text-32m     | 11228.2 | 24585.1 |   **0.46** |  10774.2 |   37986.7 |   **0.28** |     1.071 |
+| xml          |  745.9 |   343.1 |       2.17 |   2876.0 |    1213.8 |       2.37 |     1.079 |
+| nci          |  941.1 |   435.8 |       2.16 |   2926.0 |    1257.3 |       2.33 |     1.100 |
 
-**L3 is the shipping default, and on RATIO it is now excellent: 16 of 18 corpora are
-within 11% of C, and three BEAT it** -- `versions-16m` 0.648, `zeros-32m` 0.972 and
-**`x-ray` 0.982**, which is new. The worst cell on the whole board is `xml` at 1.104.
+**mean C/us comp 2.08, decomp 2.25 | mean ratio 1.012 | worst ratio 1.100 (nci) |
+we beat C: 3 comp, 3 decomp, 3 ratio**
 
-`versions-16m` compress moved **4126.5 -> 10710.0 MB/s** (C/us 1.20 -> **0.48**) from
-brick 88 alone, at unchanged 0.648 ratio -- the same tree-amortization defect that
-halved it at L1 was costing more than half of L3.
+**L3 ratio was already excellent and it tightened.** The mean is unchanged at **1.012**,
+but the worst cell moved from `xml` **1.104** to `nci` **1.100**, and the middle of the
+board compressed toward parity: `mozilla` 1.071 -> **1.029**, `samba` 1.073 ->
+**1.036**, `xml` 1.104 -> **1.079**, `dickens` 1.066 -> **1.052**. Three corpora still
+BEAT C -- `versions-16m` 0.659, `zeros-32m` 0.967 and `x-ray` 0.983.
 
-Compress is 1.71-2.47 across Silesia; decompress 1.90-3.41. **Decompress is now the
-weaker half at L3**, the reverse of the pre-gate picture, and it follows directly from
-emitting Huffman literals where we used to emit raw ones.
+**Decompress remains the weaker half at L3** (2.06-3.53 against compress 2.00-3.23),
+unchanged in character from the 08-17 board and still following from emitting Huffman
+literals where we used to emit raw ones.
 
-Against mission section 7: **4 pass compress** (zeros 0.36, text 0.36, versions 0.48,
-incomp 1.17), **3 pass decompress** (text 0.31, zeros 0.73, incomp 0.89).
+Against mission section 7: **3 pass compress** (zeros 0.25, text 0.46, versions 0.64),
+**3 pass decompress** (text 0.28, zeros 0.93, incomp 1.00).
+
+> **WHAT THIS BOARD DOES NOT SAY.** It does not say the optimization campaign made us
+> faster. Its speed columns cannot carry that claim at a 13.45% null spread, and the
+> campaign never made it -- every item shipped on strictly-less-work plus byte-identity.
+> See [`m7-optimize-anatomy.md`](m7-optimize-anatomy.md) section 4.
 
 ---
-
-> **THE OPTIMIZATION CAMPAIGN HAS ITS OWN ANATOMY.** What shipped, what was refused
-> with numbers beside it, the Prometheus adjudication of the fitted constants, and the
-> measured cost of every instrument used to decide any of it, are in
-> [`m7-optimize-anatomy.md`](m7-optimize-anatomy.md). Read its instrument rule before
-> quoting a speed number from this document: the per-frame clock has a **±24.15%**
-> null-arm floor on encode and **±25%** on decode, which is wider than most of the
-> effects the campaign ships.
 
 ## 3. Stage anatomy — where OUR time goes
 
