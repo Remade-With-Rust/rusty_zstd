@@ -660,7 +660,15 @@ impl MatchTables {
         if let Some(t) = self.tags.get_mut(h) {
             *t = tag;
         }
-        *unsafe { self.hash.get_unchecked_mut(h) } = if false {
+        // ffanat 5a: the packed form is LIVE when `pack_tags` is set for a Fast
+        // frame (< 16 MiB, proven by `enable_packed_tags`). The historical
+        // refutation of this representation was real but misattributed -- see
+        // the forward-mirror comment in the pipelined loop -- and its one
+        // structural hazard, the mid-frame Fast->Lazy shared table, is handled
+        // by unpacking at the switch. With it on, the separate `tags` array is
+        // dropped entirely: one random line loaded and one stored per probe
+        // instead of two of each.
+        *unsafe { self.hash.get_unchecked_mut(h) } = if self.pack_tags {
             (((pos as u32).wrapping_add(1)) & 0x00FF_FFFF) | (u32::from(tag) << 24)
         } else {
             // BRICK 57: `wrapping_add`, not `saturating_add`. The slot holds
@@ -701,10 +709,24 @@ impl MatchTables {
         if e == 0 {
             return 0;
         }
+        // ffanat 5a: packed-in-slot -- the tag compare reads the byte that
+        // arrived WITH the position, on the cache line already loaded. `pos+1`
+        // is in `1..=0xFF_FFFF` (the enable guard bounds the frame), so a
+        // written slot is never 0 and the mask cannot truncate a live position.
+        if self.pack_tags {
+            #[cfg(feature = "profile")]
+            PACKED_TAG_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if PACKED && (e >> 24) as u8 != tag {
+                return 0;
+            }
+            return e & 0x00FF_FFFF;
+        }
         if !PACKED {
             return e;
         }
         if let Some(&t) = self.tags.get(h) {
+            #[cfg(feature = "profile")]
+            TAGARR_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if t != tag {
                 return 0;
             }
@@ -715,7 +737,8 @@ impl MatchTables {
     /// Raw slot, bypassing the tag filter -- diagnostic only.
     #[inline(always)]
     fn raw_fast(&self, h: usize) -> u32 {
-        self.hash[h]
+        let e = self.hash[h];
+        if self.pack_tags { e & 0x00FF_FFFF } else { e }
     }
 
     /// HAZARD (recorded 2026-08-18, not yet fixed): this writes `hash[h]` and
@@ -905,9 +928,18 @@ pub(crate) fn encode_oneshot(
     // loads. Decided against the real buffer length, so the 24-bit bound is
     // proven per frame rather than assumed.
     tables.enable_packed_tags(
-        params.strategy == Strategy::DFast && dfast_tag_enabled(),
+        (params.strategy == Strategy::DFast && dfast_tag_enabled())
+            || (params.strategy == Strategy::Fast
+                && tag_alloc_enabled()
+                && fast_pack_enabled()),
         hist_prefix.len() + src.len(),
     );
+    if tables.pack_tags && params.strategy == Strategy::Fast {
+        // ffanat 5a: under packing the separate tag array is dead weight --
+        // dropping it is the deterministic receipt that the second cache line
+        // per probe is gone (1 << hash_log bytes, 16 KiB at L1).
+        tables.tags = alloc::vec::Vec::new();
+    }
     let mut reps = [1u32, 4, 8];
     let mut entropy = EntropyState::default();
     if let Some(d) = dict {
@@ -1773,7 +1805,8 @@ pub(crate) fn prime_tables(
     // Derived exactly like `hash4_tag` rather than via `hash_mls`: `find_fast`
     // always hashes 4 bytes whatever `min_match` says, so a `mls >= 8` Fast row
     // would otherwise prime hash8 slots the finder never reads.
-    let is_fast = params.strategy == Strategy::Fast && !tables.tags.is_empty();
+    let is_fast =
+        params.strategy == Strategy::Fast && (tables.pack_tags || !tables.tags.is_empty());
     let hash_shift = 32u32.saturating_sub(hash_log.min(32));
     let mut iters = 0u64;
     // FINDING 2: on the Bt ladder, INSERT each position into the tree rather
@@ -2955,6 +2988,20 @@ fn find_sequences_strategy(
                 tables.rep_run = 0;
             }
             if fast_lazy_enabled() && tables.rep_run >= FAST_LAZY_RUN {
+                // ffanat 5a: the ONE hazard of the packed Fast table, handled at
+                // its one site. Lazy reads this table through `get_h`, which
+                // must see plain `pos + 1` -- the historical refutation of the
+                // packed form was exactly this shared read. Strip the tag bytes
+                // once (16K entries, on a dispatch that fires rarely) and stay
+                // unpacked for the rest of the frame; the tag filter is a pure
+                // filter, so later Fast blocks running without it are
+                // byte-identical by T1's argument.
+                if tables.pack_tags {
+                    for e in tables.hash.iter_mut() {
+                        *e &= 0x00FF_FFFF;
+                    }
+                    tables.pack_tags = false;
+                }
                 // `Fast` does not allocate a chain (brick 47), so materialise it
                 // on FIRST FIRE only -- files that never trip the dispatch keep
                 // brick 47's smaller L1 footprint.
@@ -3308,7 +3355,9 @@ fn find_fast(
     } else {
         tables.rep_probe - 1
     };
-    let ut = !tables.tags.is_empty() && tag_enabled() && tables.tag_yield >= tag_min();
+    let ut = (tables.pack_tags || !tables.tags.is_empty())
+        && tag_enabled()
+        && tables.tag_yield >= tag_min();
     // The GATE 6 re-probe countdown ticks HERE, not in `find_fast_impl`'s tail:
     // the pipelined loop returns early, so a countdown in the tail stops
     // advancing exactly when the gain term has the gate shut -- a one-way latch
@@ -10955,4 +11004,34 @@ pub fn set_dfast_tag_arm(on: bool) {
 
 fn dfast_tag_enabled() -> bool {
     !matches!(DFAST_TAG_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
+}
+
+
+/// ffanat 5a receipt counters: which representation served each tag compare.
+/// `TAGARR_READS` is a load from a SECOND random cache line; `PACKED_TAG_READS`
+/// reads the byte that arrived with the position.
+#[cfg(feature = "profile")]
+pub static TAGARR_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static PACKED_TAG_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear `(tag-array reads, packed reads)`.
+#[cfg(feature = "profile")]
+pub fn take_tag_reads() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (TAGARR_READS.swap(0, Relaxed), PACKED_TAG_READS.swap(0, Relaxed))
+}
+
+/// ffanat 5a arm: pack the Fast ladder's rejection tag into the hash slot
+/// (dropping the separate `tags` array). DEFAULT ON; the guard in
+/// `enable_packed_tags` still refuses frames >= 16 MiB.
+static FAST_PACK_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for the packed Fast tag.
+pub fn set_fast_pack_arm(on: bool) {
+    FAST_PACK_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn fast_pack_enabled() -> bool {
+    !matches!(FAST_PACK_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
 }

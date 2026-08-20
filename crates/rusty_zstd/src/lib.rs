@@ -68,10 +68,13 @@ pub use dict::{
 #[cfg(feature = "profile")]
 pub use simd::{set_eqlen_arm, take_eqlen_stats, take_eq_ops, bench_eq_avx2, bench_eq_words};
 pub use compressed::set_seqloop_avx2_arm;
+pub use encode::set_fast_pack_arm;
 #[cfg(feature = "profile")]
 pub use encode::take_envhits;
 #[cfg(feature = "profile")]
 pub use encode::take_ff_arms;
+#[cfg(feature = "profile")]
+pub use encode::take_tag_reads;
 #[cfg(feature = "profile")]
 pub use compressed::take_dec_copies;
 #[cfg(feature = "profile")]
