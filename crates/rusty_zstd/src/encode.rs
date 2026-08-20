@@ -3887,7 +3887,17 @@ fn find_fast_impl<
     //      And per-position rep-cold hysteresis (27,631) barely moved it,
     //      because the harmful accepts live INSIDE the miss runs where any
     //      hysteresis re-enables.
-    // What survives all four: the harm is RATE-DISTORTION, not chain-breaking.
+    // Design #7 (2026-08-20, REMOVED after census): REP-SUBSTITUTION -- swap an
+    // accepted far match for the same gram at rep1 distance (one masked
+    // compare; offset_value_for encodes offset==reps[0] as repcode 1). Census:
+    // of the veto-block accepts on versions, ALL 80 that reached the check had
+    // NO gram at rep1 -- zero declined on length -- and every adjudication
+    // total was identical to four decimals on both levels. The anchors sit at
+    // genuine change points where the far match is the ONLY match; 311 of 391
+    // accepts happen BEFORE rep dominance is established. Removed per the
+    // OPT_SKIP_FLOOR precedent: built, measured inert, removed.
+    //
+    // What survives all seven: the harm is RATE-DISTORTION, not chain-breaking.
     // Rep re-locks by CONTENT (src[at] == src[at - rep1]), not alignment, so a
     // consumed match cannot derail it -- but ~1,800 short cross-version matches
     // each pay a FULL offset where literals + rep re-lock were cheaper. The
