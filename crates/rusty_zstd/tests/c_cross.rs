@@ -298,3 +298,52 @@ fn bt_specialisation_covers_every_input_size() {
         }
     }
 }
+
+/// REGRESSION (2026-08-19, GATE 18 step 3): `compress_with_params` accepts a
+/// `CompressionParameters` struct and applies NO validation of its own. Every
+/// clamp lives in `compression_params`, the DERIVATION point -- so a caller who
+/// derives params and then mutates a field bypasses all of them.
+///
+/// That asymmetry already shipped one panic: `hash_log` was clamped to 24 in
+/// `MatchTables` while the finders indexed with the raw value, and `hash_log =
+/// 25` at L9 gave "index out of bounds: the len is 16777216 but the index is
+/// 28488790". It was found by hand; nothing guarded against the next one.
+///
+/// `min_match` survives the same treatment only by luck -- each consumer
+/// re-clamps with `.max(3)` and `match_ok` guards its own slices. Luck is not a
+/// contract, so this asserts the whole surface instead.
+#[test]
+fn out_of_range_parameters_never_panic() {
+    let src: Vec<u8> = (0..600_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let vals = [0u32, 1, 2, 3, 5, 8, 16, 24, 31, 32, 64, 1024, 65535, u32::MAX];
+    type Setter = fn(&mut rusty_zstd::CompressionParameters, u32);
+    let fields: &[(&str, Setter)] = &[
+        ("window_log", |p, v| p.window_log = v),
+        ("hash_log", |p, v| p.hash_log = v),
+        ("chain_log", |p, v| p.chain_log = v),
+        ("search_log", |p, v| p.search_log = v),
+        ("min_match", |p, v| p.min_match = v),
+        ("target_length", |p, v| p.target_length = v),
+    ];
+    for (name, set) in fields {
+        for &v in &vals {
+            for lvl in [1i32, 3, 7, 13, 19, 22] {
+                let Ok(mut p) = rusty_zstd::compression_params(lvl, Some(src.len() as u64))
+                else {
+                    continue;
+                };
+                set(&mut p, v);
+                // An Err return is fine; a panic or a broken round-trip is not.
+                if let Ok(z) = rusty_zstd::compress_with_params(&src, p, false) {
+                    assert_eq!(
+                        rusty_zstd::decompress(&z).unwrap(),
+                        src,
+                        "round-trip broken with {name} = {v} at L{lvl}"
+                    );
+                }
+            }
+        }
+    }
+}
