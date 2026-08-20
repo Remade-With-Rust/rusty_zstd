@@ -280,7 +280,71 @@ Third by share, first by *concentration*: on literal-heavy content it is the
 largest single consumer (`sao` 33.2%, `ooffice` 23.1%, `mr` 20.4%). Scope any work
 here to literal-dominated input at L1/L2, where match-find has little to do.
 
-### T4 — The decoder, 2.04× and almost ungated
+### T4 — The decoder — **CLOSED**
+
+Three tranches, all byte-identical, all decided on deterministic instruments.
+
+**1. Per-sequence bounds checks.** `FseTable::entry()` is called THREE TIMES PER
+SEQUENCE (LL, ML, OF) and its index is already masked by `len - 1`; both
+constructors give a non-empty power of two. `LL_BITS`/`ML_BITS`/`LL_BASE`/
+`ML_BASE` are indexed per sequence by codes that `seq_table` bounds in ALL FOUR
+modes — including the RLE mode, which was hardened with an explicit
+`sym > max_sym` test for exactly this reason. `compressed.rs` **5 → 0**.
+
+**2. The rest of the codec path, to zero.** `reader.rs::peek_u32_le` was 4 of
+them in one expression: `get(a..b)` yields a slice of statically *unknown*
+length, so `[s[0], s[1], s[2], s[3]]` cost four checks — `try_into` to `[u8; 4]`
+fixes it with **no unsafe**, the conversion is the proof. `normalize_count` and
+`FseCTable::from_norm` needed entry guards (`count.is_empty()`,
+`norm.is_empty()`) that are **correctness fixes in their own right**: both
+replaced a latent out-of-bounds with `Error::Corruption`. The stubborn pair was
+`cumul[s as usize]`, where `s` is a value READ OUT OF a Vec rather than an
+induction variable, so LLVM had nothing to work with.
+
+**Codec path: 30 → 0 panic sites**, with instruction counts DOWN
+(fse.rs 4,077 → 3,994; decode.rs 1,518 → 1,499).
+
+**3. The structural one — the match-copy tiers were tested in the wrong order.**
+
+| route | calls | share | mean bytes |
+| --- | ---: | ---: | ---: |
+| 32B tier, **len <= 16** | **5,452,942** | **86.6%** | **7.4** |
+| 32B tier (genuine) | 504,761 | 8.0% | 21.5 |
+| extend_from_within | 254,415 | 4.0% | 67.1 |
+| 16B tier | 69,652 | 1.1% | 8.9 |
+
+The 32-byte tier was tested FIRST, so every short match with a large offset
+landed in it — **86.6% of all match copies moving 32 bytes to publish 7.4**.
+
+**And the 32-byte move is not one instruction.** This crate targets baseline
+x86-64, so there is **no AVX2 anywhere in the decode path** — the emitted asm is
+SSE `movups`/`movdqu` on `%xmm` throughout, and a 32-byte copy is TWO 16-byte
+load/store pairs (visible as the `movups %xmm6, 16(%rax)` / `movups %xmm6,
+(%rax)` pair in `decompress_into_history`). Testing 16 first is byte-identical
+and moved **5,452,942 calls per board pass** onto a copy costing half as much:
+16B tier **1.1% → 87.7%**.
+
+*Note:* `copy_literals` already had the tiers in the right order. Only the match
+path was inverted — the same "capability present in one path, absent in its
+neighbour" shape this campaign keeps finding.
+
+**On AVX2, it is now mostly moot.** With the tiers ordered correctly the 32-byte
+path serves 8% of calls, so a runtime-dispatched AVX2 copy would chase ~1M
+instructions where the reorder already took ~10.9M — and would add a feature
+check to a routine two instructions long.
+
+**Verification throughout:** a corruption sweep (`t4fuzz`) walks every byte of
+real frames at L1/L3/L9/L19 through four mutation patterns — **release 192,128
+mutated frames, debug 14,208 with `debug_assert`s live** — no panic, no hang, no
+out-of-bounds, and identical Err/Ok counts before and after every tranche. The
+72-cell identity A/B had to be run with `encode.rs` **hash-verified unchanged**
+across the window, because the other session edits it live and a naive
+fingerprint diff wrongly attributed its L1 movement once already.
+
+**STILL OPEN:** none of this is measured wall-clock. The 2.04× decode gap is not
+proven to live in any of it; these ship on strictly-less-work plus byte-identity.
+
+### T4 — original note
 `dickens` 3.11, `mr` 3.13, `x-ray` 2.42. Untouched by this campaign,
 structurally simpler than the encoder, and the cleanest proof that the gap is
 implementation rather than policy. Probably the best effort-to-reward on the board.
