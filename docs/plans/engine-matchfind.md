@@ -19,20 +19,20 @@ engine-function inventory for it.
 
 ## 0. Current asm footprint (2026-08-20, release, per symbol)
 
-| function | copies | instrs | calls out | stack movs | runs |
-| --- | ---: | ---: | ---: | ---: | --- |
-| `find_fast_impl` | 34 | 41,587 | 1,078 | 6,866 | per position, L1/L2 |
-| `find_dfast_impl` | 1 | 1,816 | 48 | 325 | per position, **L3/L4 (default)** |
-| `find_greedy` | 1 | 685 | 23 | 153 | per position, L5 |
-| `find_lazy` | 1 | 1,202 | 38 | 278 | per position, L6–L12 |
-| `find_bt_lazy` | 1 | 711 | 27 | 172 | per position, L13–L15 |
-| `bt_find_best_impl` | 21 | 7,079 | 126 | 672 | per position ×30M, L13–L22 |
-| `bt_find_best_runtime` | 1 | 381 | 6 | 49 | fallback copy |
-| `chain_find_best` | 1 | 168 | 3 | 20 | per position (lazy path) |
-| `find_sequences_strategy` | 1 | 4,391 | 217 | 1,553 | per block (carries `find_opt` inlined) |
-| `count_match` | 1 | 143 | 1 | 1 | per candidate hit |
-| `match_ok` | 1 | 82 | 4 | 4 | per candidate |
-| `count_eq_len` / `fast_probe` / `try_rep1` / `fill_hash_after_match` | — | inlined | — | — | per probe / per match |
+| function                                                             | copies |  instrs | calls out | stack movs | runs                                   |
+| -------------------------------------------------------------------- | -----: | ------: | --------: | ---------: | -------------------------------------- |
+| `find_fast_impl`                                                     |     34 |  41,587 |     1,078 |      6,866 | per position, L1/L2                    |
+| `find_dfast_impl`                                                    |      1 |   1,816 |        48 |        325 | per position, **L3/L4 (default)**      |
+| `find_greedy`                                                        |      1 |     685 |        23 |        153 | per position, L5                       |
+| `find_lazy`                                                          |      1 |   1,202 |        38 |        278 | per position, L6–L12                   |
+| `find_bt_lazy`                                                       |      1 |     711 |        27 |        172 | per position, L13–L15                  |
+| `bt_find_best_impl`                                                  |     21 |   7,079 |       126 |        672 | per position ×30M, L13–L22             |
+| `bt_find_best_runtime`                                               |      1 |     381 |         6 |         49 | fallback copy                          |
+| `chain_find_best`                                                    |      1 |     168 |         3 |         20 | per position (lazy path)               |
+| `find_sequences_strategy`                                            |      1 |   4,391 |       217 |      1,553 | per block (carries `find_opt` inlined) |
+| `count_match`                                                        |      1 |     143 |         1 |          1 | per candidate hit                      |
+| `match_ok`                                                           |      1 |      82 |         4 |          4 | per candidate                          |
+| `count_eq_len` / `fast_probe` / `try_rep1` / `fill_hash_after_match` |      — | inlined |         — |          — | per probe / per match                  |
 
 Panic sites across all of the above: effectively zero (the T2/T4 work); the residue is
 17 in `find_sequences_strategy` and an unattributable 13 in one inlined
@@ -158,16 +158,16 @@ in the keyword audit (clean on allocation, arms, and bounds).
 
 ## Priority order
 
-| # | item | ladder | confidence | deciding instrument |
-| --- | --- | --- | --- | --- |
-| 1 | **1a** long-table tag | L3/L4 default | high — T1's proof shape | long-table reject counter + 72 cells |
-| 2 | **4** first-word early-exit in `count_eq_len` | all, worst L16–L22 | high — histogram exists | `EQ_LEN_HIST` + asm head count |
-| 3 | **3a** chain prefetch (address known ahead) | L5–L12 | medium-high | 80-cell board + parity |
-| 4 | **2b** hoist Bt loop invariants | L13–L22 | high, small | asm loop-body count |
-| 5 | **2a** Bt child prefetch (dependent chase) | L13–L22 | medium — needs cycle evidence | rdtsc micro-harness |
-| 6 | **6** `find_sequences_strategy` chain alloc + 17 sites | all | high, small | `g6alloc` + census |
-| 7 | **1b** telemetry register pressure | L3/L4 | blocked on gate campaign | stack movs in hot region |
-| 8 | **2c/5a** dead-copy censuses | L1, L13+ | census first | per-copy call counters |
+| #   | item                                                   | ladder             | confidence                    | deciding instrument                  |
+| --- | ------------------------------------------------------ | ------------------ | ----------------------------- | ------------------------------------ |
+| 1   | **1a** long-table tag                                  | L3/L4 default      | high — T1's proof shape       | long-table reject counter + 72 cells |
+| 2   | **4** first-word early-exit in `count_eq_len`          | all, worst L16–L22 | high — histogram exists       | `EQ_LEN_HIST` + asm head count       |
+| 3   | **3a** chain prefetch (address known ahead)            | L5–L12             | medium-high                   | 80-cell board + parity               |
+| 4   | **2b** hoist Bt loop invariants                        | L13–L22            | high, small                   | asm loop-body count                  |
+| 5   | **2a** Bt child prefetch (dependent chase)             | L13–L22            | medium — needs cycle evidence | rdtsc micro-harness                  |
+| 6   | **6** `find_sequences_strategy` chain alloc + 17 sites | all                | high, small                   | `g6alloc` + census                   |
+| 7   | **1b** telemetry register pressure                     | L3/L4              | blocked on gate campaign      | stack movs in hot region             |
+| 8   | **2c/5a** dead-copy censuses                           | L1, L13+           | census first                  | per-copy call counters               |
 
 **The standing pattern check applies here first:** items 1a and 3b are both "the
 capability exists in one path and not its neighbour" (tag: short table but not long;
