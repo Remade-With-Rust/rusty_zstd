@@ -198,6 +198,16 @@ early. Byte-identical 54/54 + 36/36; rejects equal to the unit.
   C hashes `mls` bytes. Output-changing; strongest known L1 lever; needs
   worst-corpus gates. Census: `ffwaste.rs`, counters inside `fast_probe`.
 
+### 5d4. The mls-wide hash — mechanism SOLVED, shipping is a gate cell (`set_fast_hash_arm`)
+Waste receipt with the arm on: **13,956,827 → 2,676 wasted candidates (82.9% → 0.1%)**.
+Adjudication: L1 TOTAL −2.59%, **HOLDOUT −4.92%** (reymont −10.2%, mr −7.2%), worst
+**versions-16m +14.8%** — fails worst-corpus, so DEFAULT OFF. Two protections
+**refuted and recorded**: per-block key dispatch (+34.6% — mixed keys poison the
+shared table) and a frame latch with table clear (+17.2%, degrades L2 too). The
+descent showed versions' hash path sees ~2K candidates total: the loss is dispatch
+COUPLING (early matches shift `rep_yield`/`rep_run`, breaking the repcode chain), so
+the protection belongs with Gate 5/8/10's versions playbook, not in the key.
+
 ### 5d. Named, not taken *(next descent's shortlist)*
 * **Hash width diverges from C**: we hash 4 bytes at every `min_match` while C's
   `ZSTD_hashPtr` hashes `mls` bytes (6–7 at L1) — lower precision, wasted
