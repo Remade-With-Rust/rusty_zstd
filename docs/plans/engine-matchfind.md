@@ -198,7 +198,15 @@ early. Byte-identical 54/54 + 36/36; rejects equal to the unit.
   C hashes `mls` bytes. Output-changing; strongest known L1 lever; needs
   worst-corpus gates. Census: `ffwaste.rs`, counters inside `fast_probe`.
 
-### 5d4. The mls-wide hash — mechanism SOLVED, shipping is a gate cell (`set_fast_hash_arm`)
+### 5d4. The mls-wide hash — **SHIPPED DEFAULT ON** (owner's call, protections found)
+Six-design refutation ladder recorded in-code; survivors: switch-latch + window
+**re-seed** (lazy inherits real heads) + ML≥16 anchor bar on rep-dominated blocks.
+Final: L1 TOTAL −2.49%, **HOLDOUT −4.92%**, worst versions **+6.33%** (from +14.8%;
+segment experiment proves the residue is cross-block state-path divergence — the
+family's floor). L2 TOTAL −2.82% with versions itself **−8.14%**. Waste receipt
+82.9% → **0.1%**. Worst-corpus law waived for versions@L1 only, explicitly.
+
+#### Original entry
 Waste receipt with the arm on: **13,956,827 → 2,676 wasted candidates (82.9% → 0.1%)**.
 Adjudication: L1 TOTAL −2.59%, **HOLDOUT −4.92%** (reymont −10.2%, mr −7.2%), worst
 **versions-16m +14.8%** — fails worst-corpus, so DEFAULT OFF. Two protections
