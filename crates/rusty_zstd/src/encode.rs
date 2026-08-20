@@ -4056,7 +4056,11 @@ fn find_fast_impl<
             } else {
                 (0usize, 0u8, 0u32)
             };
-            if let Some((m, ml)) = fast_probe(&mut cand, src, m0, ip, window, lowest, mls, block_end)
+            if let Some((m, ml)) = (if WIDE {
+                fast_probe_wide::<true>(&mut cand, src, m0, ip, window, lowest, mls, f_mask, block_end)
+            } else {
+                fast_probe(&mut cand, src, m0, ip, window, lowest, mls, block_end)
+            })
                 .filter(|&(_, ml)| !veto_block || ml >= ff_anchor_ml())
             {
                 if COUNT {
@@ -4266,7 +4270,11 @@ fn find_fast_impl<
                 continue;
             }
         }
-        if let Some((m, ml)) = fast_probe(&mut cand, src, m0, ip, window, lowest, mls, block_end)
+        if let Some((m, ml)) = (if WIDE {
+                fast_probe_wide::<true>(&mut cand, src, m0, ip, window, lowest, mls, f_mask, block_end)
+            } else {
+                fast_probe(&mut cand, src, m0, ip, window, lowest, mls, block_end)
+            })
                 .filter(|&(_, ml)| !veto_block || ml >= ff_anchor_ml())
             {
             if COUNT {
@@ -4347,7 +4355,11 @@ fn find_fast_impl<
                 // a harmful one, because the harm is a property of the CONTENT
                 // (repcode already covers that span) and not of the candidate.
                 // That is why `rep_yield` is the right and sufficient variable.
-                if let Some((m, ml)) = fast_probe(&mut cand, src, m1, ip1, window, lowest, mls, block_end)
+                if let Some((m, ml)) = (if WIDE {
+                    fast_probe_wide::<false>(&mut cand, src, m1, ip1, window, lowest, mls, f_mask, block_end)
+                } else {
+                    fast_probe(&mut cand, src, m1, ip1, window, lowest, mls, block_end)
+                })
                     .filter(|&(_, ml)| !veto_block || ml >= ff_anchor_ml())
                 {
                     if COUNT {
@@ -4478,6 +4490,63 @@ fn find_fast_impl<
 /// C zstd_fast: 4-byte probe then ZSTD_count from +4. `ilimit` keeps ip+4 in-bounds.
 /// `match_slot` is the hash-table value (`pos+1`, or 0 = empty).
 #[inline(always)]
+/// The WIDE probe -- the last piece the mls-hash ship missed. The legacy probe
+/// reloads `src[ip]` as a u32 (the wide hash loaded those exact bytes as a u64
+/// in the SAME iteration; different widths, so LLVM cannot CSE them), passes a
+/// 4-byte compare the mls-keyed table satisfies almost by construction, and
+/// then `count_match` re-walks bytes 4..mls. One masked u64 compare settles the
+/// whole gram: identical accepted set, identical `ml` (the count walks the same
+/// equality run from `mls` instead of 4), and the `ml >= mls` test disappears
+/// because the compare IS the proof. `cand` counts move from the 4-byte to the
+/// gram compare -- `tag_yield`'s only shipped consumer is `ut` at
+/// `tag_min = 0.0`, where the value gates nothing (bench arms that raise
+/// RZSTD_TAG_T see the new denomination).
+///
+/// SAFE mirrors `fast_hash_tag`: callers with `ip <= ilimit` prove `ip + 8 <=
+/// block_end`, and `m < ip` carries the same bound for the candidate side.
+#[inline(always)]
+fn fast_probe_wide<const SAFE: bool>(
+    cand: &mut (u64, u64),
+    src: &[u8],
+    match_slot: u32,
+    ip: usize,
+    window: usize,
+    lowest: usize,
+    mls: usize,
+    mask: u64,
+    block_end: usize,
+) -> Option<(usize, usize)> {
+    if match_slot == 0 {
+        return None;
+    }
+    let m = (match_slot as usize) - 1;
+    if m < lowest || m >= ip || ip - m > window {
+        return None;
+    }
+    let a = if SAFE {
+        debug_assert!(ip + 8 <= src.len());
+        crate::simd::load_u64_le(src, ip)
+    } else {
+        load_u64le_tail(src, ip)
+    };
+    let b = if SAFE {
+        debug_assert!(m + 8 <= src.len());
+        crate::simd::load_u64_le(src, m)
+    } else {
+        load_u64le_tail(src, m)
+    };
+    if (a ^ b) & mask != 0 {
+        cand.0 += 1;
+        return None;
+    }
+    cand.1 += 1;
+    #[cfg(feature = "profile")]
+    FF_CAND4.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "profile")]
+    FF_ACCEPT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    Some((m, mls + count_match(src, m + mls, ip + mls, block_end)))
+}
+
 fn fast_probe(
     cand: &mut (u64, u64),
     src: &[u8],
