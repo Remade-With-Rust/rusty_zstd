@@ -4173,7 +4173,7 @@ fn find_fast_impl<
         // The pipelined loop returns HERE, before the main tail -- so before this
         // it never refreshed `tag_yield` at all and the old global counters just
         // accumulated across blocks.
-    tables.tag_yield = cand_yield(cand);
+        tables.tag_yield = cand_yield(cand);
         let (ls, lm) = lit_shares(&seqs);
         tables.lit_short_share = ls;
         tables.lit_mid_share = lm;
@@ -4393,8 +4393,8 @@ fn find_fast_impl<
                         &mut tags_v,
                         pack,
                         f_wide,
-                    f_mask,
-                    f_shift,
+                        f_mask,
+                        f_shift,
                         &mut seqs,
                         &mut lits,
                         anchor,
@@ -4421,12 +4421,18 @@ fn find_fast_impl<
         MM_TOTAL.fetch_add(mm_total, Relaxed);
         MM_MISS.fetch_add(mm_miss, Relaxed);
     }
-    {
+    // ffanat full-read: this block was UNGUARDED -- five atomic RMWs plus a
+    // full O(nseq) walk of `seqs`, per block, in SHIPPING builds, feeding
+    // statics whose only consumers are the take_* bench APIs. The pipelined
+    // tail has the same counters correctly inside `if COUNT`; the pair tail
+    // never got the guard (ninth neighbour instance). The walk was also
+    // DUPLICATED two lines later for `rep_len_ratio` -- now computed once and
+    // shared.
+    if COUNT {
         use core::sync::atomic::Ordering::Relaxed;
         REP_PROBES.fetch_add(rep_probes, Relaxed);
         REP_BYTES.fetch_add(rep_bytes, Relaxed);
         REP_HITS_G.fetch_add(rep_hits, Relaxed);
-        // all match bytes emitted this block, for the rep-vs-hash length compare
         let mb: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
         ALL_MATCH_BYTES.fetch_add(mb, Relaxed);
         ALL_SEQS.fetch_add(seqs.len() as u64, Relaxed);
