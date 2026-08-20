@@ -411,10 +411,30 @@ pub(crate) fn decode_sequences(
             return Err(Error::Corruption);
         }
         let offset_add = br.read_bits(of_code as u32);
-        let ml_add = br.read_bits(u32::from(ML_BITS[ml_code]));
-        let ll_add = br.read_bits(u32::from(LL_BITS[ll_code]));
-        let litlen = LL_BASE[ll_code] + ll_add;
-        let matchlen = ML_BASE[ml_code] + ml_add;
+        // T4: the same build-time bound the `debug_assert` above states, used.
+        // `seq_table` bounds the symbol in ALL FOUR modes -- predefined by its
+        // norm length, compressed by `read_ncount`'s `charnum > max_symbol`
+        // reject, repeat by inheriting a validated table, and RLE by an explicit
+        // `sym > max_sym` test added for exactly this reason. So `ll_code <= 35`
+        // and `ml_code <= 52` hold even for hostile input, and the tables are
+        // `[_; 36]` and `[_; 53]` -- the bound and the length match exactly.
+        //
+        // This is per SEQUENCE, and LLVM cannot derive the bound from a value
+        // that came out of an FSE table.
+        #[allow(unsafe_code)]
+        let (ml_bits, ll_bits, ll_base, ml_base) = unsafe {
+            debug_assert!(ll_code < LL_BITS.len() && ml_code < ML_BITS.len());
+            (
+                *ML_BITS.get_unchecked(ml_code),
+                *LL_BITS.get_unchecked(ll_code),
+                *LL_BASE.get_unchecked(ll_code),
+                *ML_BASE.get_unchecked(ml_code),
+            )
+        };
+        let ml_add = br.read_bits(u32::from(ml_bits));
+        let ll_add = br.read_bits(u32::from(ll_bits));
+        let litlen = ll_base + ll_add;
+        let matchlen = ml_base + ml_add;
         let offset_value = if of_code == 0 {
             1
         } else {

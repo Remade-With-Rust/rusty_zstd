@@ -119,10 +119,25 @@ impl FseTable {
     }
 
     /// Power-of-two DTable (or RLE len=1): mask, no Option.
+    ///
+    /// T4 -- SAFETY. The index is already masked by `len - 1`, so it is in range
+    /// for any non-empty power-of-two table, and both constructors give exactly
+    /// that: `rle` builds len 1, and `from_norm` builds `1 << accuracy_log`
+    /// after rejecting any log outside `5..=9`. `FseTable` is crate-private, is
+    /// not re-exported from `lib.rs`, and nothing else writes `decode`, so no
+    /// other shape can reach here.
+    ///
+    /// This runs THREE TIMES PER SEQUENCE on the decode path (LL, ML and OF
+    /// tables), and LLVM cannot see the mask invariant because the length is a
+    /// runtime value -- so it emitted a compare and a branch on every one.
     #[inline(always)]
+    #[allow(unsafe_code)]
     pub(crate) fn entry(&self, state: u16) -> FseEntry {
         let dt = self.decode.as_slice();
-        dt[(state as usize) & dt.len().wrapping_sub(1)]
+        debug_assert!(!dt.is_empty() && dt.len().is_power_of_two());
+        let i = (state as usize) & dt.len().wrapping_sub(1);
+        debug_assert!(i < dt.len());
+        *unsafe { dt.get_unchecked(i) }
     }
 
     #[inline(always)]
