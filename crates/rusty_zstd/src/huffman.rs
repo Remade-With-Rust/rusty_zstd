@@ -45,7 +45,12 @@ impl HuffmanTable {
         let mut br = BitRev::new(src)?;
         let max = u32::from(self.max_bits);
         let dt = self.table.as_slice();
-        let mask = dt.len().saturating_sub(1);
+        // Required by `decode_one`/`write_x2`: `saturating_sub` would turn an
+        // empty table into `mask == 0` and then index it. Checked once per call.
+        if dt.is_empty() {
+            return Err(Error::Corruption);
+        }
+        let mask = dt.len() - 1;
         for slot in dst.iter_mut() {
             let _ = br.reload();
             let e = dt[br.look_bits(max) as usize & mask];
@@ -59,9 +64,19 @@ impl HuffmanTable {
         Ok(())
     }
 
+    /// SAFETY for the lookup below (and the same argument serves `write_x2`):
+    /// `mask` is `dt.len() - 1` and every DTable is built `1 << table_log`
+    /// entries -- a non-empty power of two -- so `idx & mask < dt.len()`. The
+    /// callers check `dt.is_empty()` once per call, because `saturating_sub`
+    /// would otherwise turn an empty table into `mask == 0` and index it.
+    ///
+    /// This runs once per LITERAL, which is why it is worth proving: it was 7 of
+    /// the 63 bounds checks on the Huffman decode path.
     #[inline(always)]
+    #[allow(unsafe_code)]
     fn decode_one(br: &mut BitRev<'_>, dt: &[u16], mask: usize, max: u32) -> Result<u8, Error> {
-        let e = dt[br.look_bits_fast(max) as usize & mask];
+        debug_assert!(!dt.is_empty() && dt.len().is_power_of_two() && mask == dt.len() - 1);
+        let e = *unsafe { dt.get_unchecked(br.look_bits_fast(max) as usize & mask) };
         let nbits = (e >> 8) as u8;
         if nbits == 0 {
             return Err(Error::Corruption);
@@ -77,16 +92,26 @@ impl HuffmanTable {
     fn decode_into_x1(&self, br: &mut BitRev<'_>, dst: &mut [u8]) -> Result<(), Error> {
         let max = u32::from(self.max_bits);
         let dt = self.table.as_slice();
-        let mask = dt.len().saturating_sub(1);
+        // Required by `decode_one`/`write_x2`: `saturating_sub` would turn an
+        // empty table into `mask == 0` and then index it. Checked once per call.
+        if dt.is_empty() {
+            return Err(Error::Corruption);
+        }
+        let mask = dt.len() - 1;
         let n = dst.len();
         let mut i = 0usize;
+        // The loop guard is `i + 5 <= n`, so `i + 4 <= n - 1`: all five writes
+        // are in range by the condition that admitted the iteration.
         while i + 5 <= n {
             let _ = br.reload();
-            dst[i] = Self::decode_one(br, dt, mask, max)?;
-            dst[i + 1] = Self::decode_one(br, dt, mask, max)?;
-            dst[i + 2] = Self::decode_one(br, dt, mask, max)?;
-            dst[i + 3] = Self::decode_one(br, dt, mask, max)?;
-            dst[i + 4] = Self::decode_one(br, dt, mask, max)?;
+            debug_assert!(i + 4 < n);
+            for k in 0..5 {
+                let v = Self::decode_one(br, dt, mask, max)?;
+                #[allow(unsafe_code)]
+                unsafe {
+                    *dst.get_unchecked_mut(i + k) = v;
+                }
+            }
             i += 5;
         }
         while i < n {
@@ -101,7 +126,12 @@ impl HuffmanTable {
     fn decode_into_x2(&self, br: &mut BitRev<'_>, dst: &mut [u8]) -> Result<(), Error> {
         let max = u32::from(self.max_bits);
         let dt = self.table_x2.as_slice();
-        let mask = dt.len().saturating_sub(1);
+        // Required by `decode_one`/`write_x2`: `saturating_sub` would turn an
+        // empty table into `mask == 0` and then index it. Checked once per call.
+        if dt.is_empty() {
+            return Err(Error::Corruption);
+        }
+        let mask = dt.len() - 1;
         let n = dst.len();
         let mut i = 0usize;
         while i + 10 <= n {
@@ -141,11 +171,22 @@ impl HuffmanTable {
         dst: &mut [u8],
         i: usize,
     ) -> usize {
-        let e = dt[br.look_bits_fast(max) as usize & mask];
+        // SAFETY: same masked-table argument as `decode_one`. For the two
+        // output bytes, every caller advances `i` under a `i + 10 <= dst.len()`
+        // loop guard and emits at most 5 symbols of 2 bytes per stream per pass,
+        // so `i <= dst.len() - 2` at every write -- that 10-byte headroom is
+        // exactly what the guard reserves.
+        debug_assert!(!dt.is_empty() && mask == dt.len() - 1);
+        debug_assert!(i + 1 < dst.len());
+        #[allow(unsafe_code)]
+        let e = *unsafe { dt.get_unchecked(br.look_bits_fast(max) as usize & mask) };
         debug_assert!(((e >> 16) & 0xff) != 0);
         br.skip_bits((e >> 16) & 0xff);
-        dst[i] = e as u8;
-        dst[i + 1] = (e >> 8) as u8;
+        #[allow(unsafe_code)]
+        unsafe {
+            *dst.get_unchecked_mut(i) = e as u8;
+            *dst.get_unchecked_mut(i + 1) = (e >> 8) as u8;
+        }
         (e >> 24) as usize
     }
 
@@ -190,7 +231,12 @@ impl HuffmanTable {
         let mut b3 = BitRev::new(s3)?;
         let max = u32::from(self.max_bits);
         let dt = self.table_x2.as_slice();
-        let mask = dt.len().saturating_sub(1);
+        // Required by `decode_one`/`write_x2`: `saturating_sub` would turn an
+        // empty table into `mask == 0` and then index it. Checked once per call.
+        if dt.is_empty() {
+            return Err(Error::Corruption);
+        }
+        let mask = dt.len() - 1;
         let mut i0 = 0usize;
         let mut i1 = 0usize;
         let mut i2 = 0usize;
@@ -341,7 +387,12 @@ impl HuffmanTable {
         let mut b3 = BitRev::new(s3)?;
         let max = u32::from(self.max_bits);
         let dt = self.table.as_slice();
-        let mask = dt.len().saturating_sub(1);
+        // Required by `decode_one`/`write_x2`: `saturating_sub` would turn an
+        // empty table into `mask == 0` and then index it. Checked once per call.
+        if dt.is_empty() {
+            return Err(Error::Corruption);
+        }
+        let mask = dt.len() - 1;
         let n = d0.len().min(d1.len()).min(d2.len()).min(d3.len());
         let mut i = 0usize;
         while i + 4 <= n {
@@ -349,22 +400,24 @@ impl HuffmanTable {
             let _ = b1.reload();
             let _ = b2.reload();
             let _ = b3.reload();
-            d0[i] = Self::decode_one(&mut b0, dt, mask, max)?;
-            d1[i] = Self::decode_one(&mut b1, dt, mask, max)?;
-            d2[i] = Self::decode_one(&mut b2, dt, mask, max)?;
-            d3[i] = Self::decode_one(&mut b3, dt, mask, max)?;
-            d0[i + 1] = Self::decode_one(&mut b0, dt, mask, max)?;
-            d1[i + 1] = Self::decode_one(&mut b1, dt, mask, max)?;
-            d2[i + 1] = Self::decode_one(&mut b2, dt, mask, max)?;
-            d3[i + 1] = Self::decode_one(&mut b3, dt, mask, max)?;
-            d0[i + 2] = Self::decode_one(&mut b0, dt, mask, max)?;
-            d1[i + 2] = Self::decode_one(&mut b1, dt, mask, max)?;
-            d2[i + 2] = Self::decode_one(&mut b2, dt, mask, max)?;
-            d3[i + 2] = Self::decode_one(&mut b3, dt, mask, max)?;
-            d0[i + 3] = Self::decode_one(&mut b0, dt, mask, max)?;
-            d1[i + 3] = Self::decode_one(&mut b1, dt, mask, max)?;
-            d2[i + 3] = Self::decode_one(&mut b2, dt, mask, max)?;
-            d3[i + 3] = Self::decode_one(&mut b3, dt, mask, max)?;
+            // `n` is the MINIMUM of the four output lengths and the guard is
+            // `i + 4 <= n`, so `i + 3` is in range for every stream. Stream
+            // order within each k is preserved exactly (b0, b1, b2, b3), which
+            // is what keeps the four bit readers in step.
+            debug_assert!(i + 3 < n);
+            for k in 0..4 {
+                let v0 = Self::decode_one(&mut b0, dt, mask, max)?;
+                let v1 = Self::decode_one(&mut b1, dt, mask, max)?;
+                let v2 = Self::decode_one(&mut b2, dt, mask, max)?;
+                let v3 = Self::decode_one(&mut b3, dt, mask, max)?;
+                #[allow(unsafe_code)]
+                unsafe {
+                    *d0.get_unchecked_mut(i + k) = v0;
+                    *d1.get_unchecked_mut(i + k) = v1;
+                    *d2.get_unchecked_mut(i + k) = v2;
+                    *d3.get_unchecked_mut(i + k) = v3;
+                }
+            }
             i += 4;
         }
         while i < n {
@@ -555,9 +608,24 @@ fn init_fast_dstream(src: &[u8], ip: usize) -> u64 {
 
 #[inline(always)]
 fn x2_fast_sym(bits: &mut u64, op: &mut usize, dst: &mut [u8], dt: &[u32]) {
-    let e = dt[(*bits >> 53) as usize];
-    dst[*op] = e as u8;
-    dst[*op + 1] = (e >> 8) as u8;
+    // SAFETY. `bits >> 53` is an 11-bit value, 0..=2047, and the caller refuses
+    // the whole fast path unless `table_x2.len() == 1 << FAST_TABLELOG` (2048) --
+    // `upsample_dtable` widens any narrower table to exactly that. For the
+    // output, `iters` is floored at `(dst.len() - op) / 10` and each pass emits
+    // 5 symbols of at most 2 bytes per stream, so `op <= dst.len() - 2` at every
+    // write.
+    //
+    // This is the hottest of the lot: 48 of the 63 Huffman bounds checks were in
+    // this one unrolled loop.
+    debug_assert!(dt.len() == 1 << FAST_TABLELOG);
+    debug_assert!(*op + 1 < dst.len());
+    #[allow(unsafe_code)]
+    let e = *unsafe { dt.get_unchecked((*bits >> 53) as usize) };
+    #[allow(unsafe_code)]
+    unsafe {
+        *dst.get_unchecked_mut(*op) = e as u8;
+        *dst.get_unchecked_mut(*op + 1) = (e >> 8) as u8;
+    }
     *bits <<= (e >> 16) & 0x3F;
     *op += (e >> 24) as usize;
 }
@@ -778,25 +846,28 @@ impl HuffCTable {
         600 / mean_x10 > k + 2
     }
 
+    /// SAFETY throughout: `i` starts at `src.len()` and every access is preceded
+    /// by `i -= 1` under a `while i >= K` guard, so `i < src.len()` at each read.
+    /// This is brick 69's argument -- `emit_fill` next door has used it since --
+    /// and `emit_k5`/`emit_k` were simply never given it. Per LITERAL.
+    #[allow(unsafe_code)]
     fn emit_k5(&self, bits: &mut crate::bit::BitCStream, src: &[u8]) {
         let mut i = src.len();
         while i >= 5 {
             bits.flush();
-            i -= 1;
-            self.huff_sym(bits, src[i]);
-            i -= 1;
-            self.huff_sym(bits, src[i]);
-            i -= 1;
-            self.huff_sym(bits, src[i]);
-            i -= 1;
-            self.huff_sym(bits, src[i]);
-            i -= 1;
-            self.huff_sym(bits, src[i]);
+            for _ in 0..5 {
+                i -= 1;
+                debug_assert!(i < src.len());
+                self.huff_sym(bits, unsafe { *src.get_unchecked(i) });
+            }
         }
         self.emit_tail(bits, src, i);
     }
 
+    /// SAFETY: identical to `emit_k5` and `emit_fill` -- `i` only decreases from
+    /// `src.len()` and every read follows an `i -= 1` under `while i >= K`.
     #[inline(always)]
+    #[allow(unsafe_code)]
     fn emit_k<const K: usize>(&self, bits: &mut crate::bit::BitCStream, src: &[u8]) {
         let mut i = src.len();
         while i >= K {
@@ -804,7 +875,8 @@ impl HuffCTable {
             let mut n = 0usize;
             while n < K {
                 i -= 1;
-                self.huff_sym(bits, src[i]);
+                debug_assert!(i < src.len());
+                self.huff_sym(bits, unsafe { *src.get_unchecked(i) });
                 n += 1;
             }
         }
