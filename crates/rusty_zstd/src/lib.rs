@@ -180,3 +180,6 @@ mod tests {
         assert!(compress_bound(1_000_000) > 1_000_000);
     }
 }
+
+/// Bench-only re-export of the frame checksum hash (GATE 20 ceiling work).
+pub fn xxh64_pub(d: &[u8]) -> u64 { xxh64::xxh64(d) }
