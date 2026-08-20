@@ -875,6 +875,54 @@ impl MatchTables {
             Some((v as usize) - 1)
         }
     }
+
+    /// 1a: long-table stores carry the SHORT tag (`hash4_tag`'s byte) in the
+    /// high 8 bits on packed frames -- the same representation and < 16 MiB
+    /// bound as `put_h_tag`, and the tag costs NOTHING new: it is a function
+    /// of the first 4 bytes and is already computed at every store site for
+    /// the short table. Every long-candidate acceptance verifies at least 4
+    /// leading bytes (`match_ok` with `max(4, ..)`), so a mismatch provably
+    /// cannot hide a match. Representation follows `pack_tags`
+    /// unconditionally (the 190ad8b rule); the arm gates only the COMPARE.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn put_hl_tag(&mut self, h: usize, pos: usize, tag: u8) {
+        debug_assert!(h < self.hash_long.len());
+        if self.pack_tags {
+            *unsafe { self.hash_long.get_unchecked_mut(h) } =
+                (((pos as u32).saturating_add(1)) & 0x00FF_FFFF) | (u32::from(tag) << 24);
+            return;
+        }
+        *unsafe { self.hash_long.get_unchecked_mut(h) } = (pos as u32).saturating_add(1);
+    }
+
+    /// 1a: tag-filtered long-table load. `on` gates the compare only; the
+    /// unmask under `pack_tags` is unconditional, because the slot holds the
+    /// packed form whenever the frame does.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn get_hl_tag(&self, h: usize, tag: u8, on: bool) -> Option<usize> {
+        debug_assert!(h < self.hash_long.len());
+        let v = *unsafe { self.hash_long.get_unchecked(h) };
+        if v == 0 {
+            return None;
+        }
+        if self.pack_tags {
+            if on && (v >> 24) as u8 != tag {
+                return None;
+            }
+            return Some(((v & 0x00FF_FFFF) as usize) - 1);
+        }
+        Some((v as usize) - 1)
+    }
+
+    /// Diagnostic twin: the raw long-slot position with the mask honored
+    /// (COUNT paths only -- the false-reject re-probe).
+    #[inline(always)]
+    fn raw_hl(&self, h: usize) -> u32 {
+        let e = self.hash_long[h];
+        if self.pack_tags { e & 0x00FF_FFFF } else { e }
+    }
 }
 
 /// Huffman / FSE tables carried across compressed blocks (Repeat / Treeless).
@@ -1891,13 +1939,21 @@ pub(crate) fn prime_tables(
             // the same 4 bytes as the index.
             if tables.tags.is_empty() && !tables.pack_tags {
                 tables.put_h(h, p);
+                if do_long {
+                    let hl = hash8(src, p, hash_log);
+                    tables.put_hl(hl, p);
+                }
             } else {
                 let hv = load_u32le(src, p).wrapping_mul(HASH4_PRIME);
-                tables.put_h_tag(h, p, (hv ^ (hv >> 15)) as u8);
-            }
-            if do_long {
-                let hl = hash8(src, p, hash_log);
-                tables.put_hl(hl, p);
+                let g = (hv ^ (hv >> 15)) as u8;
+                tables.put_h_tag(h, p, g);
+                // 1a: prime the LONG tag too, or the filter rejects every
+                // primed long slot -- the exact -59.3% priming-poison class
+                // the short table was bitten by.
+                if do_long {
+                    let hl = hash8(src, p, hash_log);
+                    tables.put_hl_tag(hl, p, g);
+                }
             }
         }
         iters += 1;
@@ -6468,19 +6524,25 @@ fn fill_hash_long_after_match(
     match_ip: usize,
     match_end: usize,
     hash_log: u32,
+    // 1a: the short-tag shift, for the packed long store. Passed in like
+    // `fill_hash_after_match`'s -- never re-derived from the struct field
+    // (see 4a30eb4: that fold was build-to-build unstable).
+    hash_shift: u32,
     ilimit: usize,
 ) {
     let (do_a, do_b) = dfast_fill_ends();
     let mut n = 0u64;
     let a = match_ip.saturating_add(2);
     if do_a && a <= ilimit {
-        tables.put_hl(hash8(src, a, hash_log), a);
+        let g = if tables.pack_tags { hash4_tag(src, a, hash_shift).1 } else { 0 };
+        tables.put_hl_tag(hash8(src, a, hash_log), a, g);
         n += 1;
     }
     if do_b && match_end >= 2 {
         let b = match_end - 2;
         if b <= ilimit && b != a {
-            tables.put_hl(hash8(src, b, hash_log), b);
+            let g = if tables.pack_tags { hash4_tag(src, b, hash_shift).1 } else { 0 };
+            tables.put_hl_tag(hash8(src, b, hash_log), b, g);
             n += 1;
         }
     }
@@ -6726,6 +6788,9 @@ fn find_dfast_impl<const HLOG: u32>(
     // same slots as `hash_mls(src, ip, 4, hlog)` did.
     let dtag_on = tables.pack_tags || !tables.tags.is_empty();
     let dtag_shift = 32u32.saturating_sub(hlog.min(32));
+    // 1a: the long-table tag filter. Packed frames only (the representation
+    // needs the 24-bit position proof); the arm gates the compare.
+    let lt_on = long_tag_enabled() && tables.pack_tags;
     // Loop-invariant arm reads, hoisted from the MATCH path to once per block.
     let fill_anchor_c = dfast_fill_anchor_c();
     let fill_stride = dfast_fill_stride();
@@ -6799,11 +6864,39 @@ fn find_dfast_impl<const HLOG: u32>(
                         }
                     }
                 }
-                (a, ga, b, m, tables.get_hl(b))
+                let ml8 = tables.get_hl_tag(b, ga, lt_on);
+                // 1a ledger, THREE counters so the long table never inherits
+                // the short counters' split personality (see the tag audit):
+                // nonempty / rejected / FALSE (provably lost -- must be 0).
+                #[cfg(feature = "profile")]
+                if COUNT && lt_on {
+                    use core::sync::atomic::Ordering::Relaxed;
+                    let raw = tables.raw_hl(b);
+                    if raw != 0 {
+                        LTAG_NONEMPTY.fetch_add(1, Relaxed);
+                        if ml8.is_none() {
+                            LTAG_REJECT.fetch_add(1, Relaxed);
+                            let mr = (raw as usize) - 1;
+                            if match_ok(
+                                src,
+                                mr,
+                                ip,
+                                window,
+                                block_start,
+                                8.min(mls).max(4),
+                                tables.frame_start,
+                            ) && count_match(src, mr, ip, block_end) >= mls
+                            {
+                                LTAG_FALSE.fetch_add(1, Relaxed);
+                            }
+                        }
+                    }
+                }
+                (a, ga, b, m, ml8)
             }
         };
         tables.put_h_tag(h4, ip, g4);
-        tables.put_hl(h8, ip);
+        tables.put_hl_tag(h8, ip, g4);
         // Issue the NEXT position's two loads NOW, so they are in flight while
         // this position's match logic runs. The miss-advance does not depend on
         // the match result, so `nip` is knowable here; a match or a rep hit
@@ -6831,7 +6924,18 @@ fn find_dfast_impl<const HLOG: u32>(
                 } else {
                     tables.get_h_tag(a, ga, dtag_on)
                 };
-                let vb = if b == h8 { Some(ip) } else { tables.get_hl(b) };
+                // The long hand-forward mirrors `get_hl_tag`: the store
+                // above wrote tag `g4` at `h8`, so a speculation landing on
+                // that slot sees `ip` only when its own short tag matches.
+                let vb = if b == h8 {
+                    if !lt_on || ga == g4 {
+                        Some(ip)
+                    } else {
+                        None
+                    }
+                } else {
+                    tables.get_hl_tag(b, ga, lt_on)
+                };
                 spec_made += 1;
                 carried = Some((a, ga, b, va, vb));
             }
@@ -6875,7 +6979,11 @@ fn find_dfast_impl<const HLOG: u32>(
         if best_ml < good_ml && nl_on && ip + 1 <= ilimit {
             nl_probes += 1;
             let h8b = hash8(src, ip + 1, hlog);
-            if let Some(m8b) = tables.get_hl(h8b) {
+            // The only long consumer without a free tag: `ip + 1` never
+            // computed a short hash. One mul+xor on a path already gated by
+            // `best_ml < good_ml && nl_on`.
+            let g8b = if lt_on { hash4_tag(src, ip + 1, dtag_shift).1 } else { 0 };
+            if let Some(m8b) = tables.get_hl_tag(h8b, g8b, lt_on) {
                 if COUNT {
                     probes += 1;
                 }
@@ -6969,7 +7077,7 @@ fn find_dfast_impl<const HLOG: u32>(
             // next-long probe won, `best_ip == ip + 1` and the two tables index
             // different positions for one match. See `dfast_fill_anchor_c`.
             let long_anchor = if fill_anchor_c { best_ip } else { ip };
-            fill_hash_long_after_match(tables, src, long_anchor, end, hlog, ilimit);
+            fill_hash_long_after_match(tables, src, long_anchor, end, hlog, dtag_shift, ilimit);
             // GATE 12 @ L3: the density knob DFast never had. Off by default.
             let dfs = fill_stride;
             if dfs != 0 {
@@ -6987,7 +7095,7 @@ fn find_dfast_impl<const HLOG: u32>(
                     // the slot unpacked, which a packed reader would decode as a
                     // bogus position.
                     tables.put_h_tag(h, p, g);
-                    tables.put_hl(hash8(src, p, hlog), p);
+                    tables.put_hl_tag(hash8(src, p, hlog), p, g);
                     #[cfg(feature = "profile")]
                     DF_FILL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     p += dfs;
@@ -11697,6 +11805,38 @@ pub fn set_dfast_tag_arm(on: bool) {
 
 fn dfast_tag_enabled() -> bool {
     !matches!(DFAST_TAG_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
+}
+
+/// 1a arm: the LONG-table rejection tag (packed frames only). DEFAULT ON.
+static LONG_TAG_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for 1a.
+pub fn set_long_tag_arm(on: bool) {
+    LONG_TAG_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn long_tag_enabled() -> bool {
+    !matches!(LONG_TAG_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
+}
+
+/// 1a ledger: (nonempty long probes, rejections, FALSE rejections). Three
+/// counters with one meaning each -- see the tag audit's instrument trap.
+#[cfg(feature = "profile")]
+pub static LTAG_NONEMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static LTAG_REJECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static LTAG_FALSE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear the 1a ledger.
+#[cfg(feature = "profile")]
+pub fn take_long_tag() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        LTAG_NONEMPTY.swap(0, Relaxed),
+        LTAG_REJECT.swap(0, Relaxed),
+        LTAG_FALSE.swap(0, Relaxed),
+    )
 }
 
 

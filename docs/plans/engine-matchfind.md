@@ -336,7 +336,7 @@ allocation per frame. The Fast array precedent accepted this same trade at a
 
 | #   | item                                                   | ladder             | confidence                    | deciding instrument                  |
 | --- | ------------------------------------------------------ | ------------------ | ----------------------------- | ------------------------------------ |
-| 1   | **1a** long-table tag                                  | L3/L4 default      | high — T1's proof shape       | long-table reject counter + 72 cells |
+| ~~1~~ | **1a** long-table tag — **DONE 2026-08-21**: the long tag IS the short tag (zero new arithmetic), packed under the same < 16 MiB proof. `ltag` census: **10,955,562 avoided of 15,175,449 long probes (72.2%)**, 36/36 byte-identical, FALSE asserted 0 per cell. x-ray 99.6%, sao 91.8%, ooffice 91.2%, mozilla 85.4%; controls (zeros/incomp/versions) ~0 probes. | L3/L4 default | shipped | `ltag` |
 | 2   | **4** first-word early-exit in `count_eq_len`          | all, worst L16–L22 | high — histogram exists       | `EQ_LEN_HIST` + asm head count       |
 | 3   | **3a** chain prefetch (address known ahead)            | L5–L12             | medium-high                   | 80-cell board + parity               |
 | 4   | **2b** hoist Bt loop invariants                        | L13–L22            | high, small                   | asm loop-body count                  |
