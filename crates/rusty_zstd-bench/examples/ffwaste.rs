@@ -6,7 +6,8 @@
 //! hash rests on this number.
 const IDS: &[&str] = &["dickens","reymont","webster","samba","sao","mr","jsonlog-16m","nci","mozilla","osdb","ooffice","x-ray"];
 fn main() {
-    for lvl in [1i32, 2] {
+    if std::env::args().nth(1).as_deref() == Some("wide") { rusty_zstd::set_fast_hash_arm(true); println!("(wide hash ON)"); }
+    for lvl in [1i32] {
         println!("L{lvl} (min_match {})", if lvl==1 {7} else {6});
         println!("  {:<12} {:>12} {:>12} {:>10}", "corpus", "4B passes", "accepted", "WASTED%");
         let (mut tc, mut ta) = (0u64, 0u64);

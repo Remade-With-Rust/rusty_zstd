@@ -1891,9 +1891,11 @@ pub(crate) fn prime_tables(
     let mut p = from;
     while p <= ilimit && p + 8 <= src.len() {
         if is_fast {
-            let hv = load_u32le(src, p).wrapping_mul(HASH4_PRIME);
-            let h = (hv >> hash_shift) as usize;
-            let tag = (hv ^ (hv >> 15)) as u8;
+            // ffanat hash-width: MUST mirror `fast_hash_tag` exactly, or every
+            // primed slot mismatches the finder's keys -- the -59.3% priming
+            // poison this function has already been bitten by once.
+            let fhp = fast_hash_spec(mls, hash_log);
+            let (h, tag) = fast_hash_tag::<true>(src, p, fhp);
             tables.store_fast::<true>(h, p, tag);
         } else {
             let h = hash_mls(src, p, mls, hash_log);
@@ -3751,6 +3753,21 @@ fn find_fast_impl<
     } else {
         32u32.saturating_sub(tables.hash_log)
     };
+    let _ = hash_shift;
+    // ffanat hash-width: one spec, hoisted per block, consumed by EVERY hash
+    // site in this function and by the end-fill it calls -- the writers move
+    // together or priming poisons (190ad8b).
+    // ffanat hash-width: ONE spec per block, consumed by every hash site in
+    // this function and the end-fill it calls. PROTECTION FOR versions-16m IS
+    // AN OPEN GATE CELL, and two designs are already REFUTED -- record them so
+    // they are not retried: (1) a per-BLOCK rep_yield dispatch made it WORSE
+    // (+14.8% -> +34.6%; mixed keys poison the shared table); (2) a one-way
+    // per-frame latch with a table clear ALSO made it worse (+17.2% at L1, and
+    // it degraded L2's versions from +0.5% to +4.4%). The corpus's hash path
+    // sees only ~2K candidates on 8 MiB -- the loss is DISPATCH COUPLING
+    // (different early matches shift rep_yield/rep_run and break the repcode
+    // chain), not the key itself, which is why key-side protection fails.
+    let fh = fast_hash_spec(mls, if HLOG != 0 { HLOG } else { tables.hash_log });
     // 2-WAY SOFTWARE PIPELINE (brick 39, `RZSTD_MF_PIPE=0` disables).
     //
     // Measured: 26 cycles per probe on webster, while we probe 0.259/byte
@@ -3787,7 +3804,7 @@ fn find_fast_impl<
         // path 93.8% of the time. 4.41's position ledger was an undercount.
         let mut pipe_pos = 0u64;
         let (mut ff_made, mut ff_used) = (0u64, 0u64);
-        let (mut h0, mut g0) = hash4_tag::<PACKED>(src, ip, hash_shift);
+        let (mut h0, mut g0) = fast_hash_tag::<PACKED>(src, ip, fh);
         let mut m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h0, g0);
         loop {
             if COUNT {
@@ -3846,7 +3863,7 @@ fn find_fast_impl<
                     // bytes and made the tag filter look non-byte-identical,
                     // which is why the packed representation was blamed and
                     // removed. The representation was fine; this caller was not.
-                    let (nh, ng) = hash4_tag::<PACKED>(src, ip, hash_shift);
+                    let (nh, ng) = fast_hash_tag::<PACKED>(src, ip, fh);
                     h0 = nh;
                     g0 = ng;
                     m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h0, g0);
@@ -3860,7 +3877,7 @@ fn find_fast_impl<
                 ff_made += 1;
             }
             let (h1, g1, m1) = if nip <= ilimit {
-                let (h, g) = hash4_tag::<PACKED>(src, nip, hash_shift);
+                let (h, g) = fast_hash_tag::<PACKED>(src, nip, fh);
                 // The store above may have just overwritten this slot, so the
                 // value is forwarded by hand rather than re-read.
                 //
@@ -3900,7 +3917,7 @@ fn find_fast_impl<
                     &mut hash_v,
                     &mut tags_v,
                     pack,
-                    hash_shift,
+                    fh,
                     &mut seqs,
                     &mut lits,
                     anchor,
@@ -3943,7 +3960,7 @@ fn find_fast_impl<
                 if ip > ilimit {
                     break;
                 }
-                let (nh, ng) = hash4_tag::<PACKED>(src, ip, hash_shift);
+                let (nh, ng) = fast_hash_tag::<PACKED>(src, ip, fh);
                 h0 = nh;
                 g0 = ng;
                 m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h0, g0);
@@ -4036,7 +4053,7 @@ fn find_fast_impl<
                 probes += 1;
             }
         }
-        let (h0, g0) = hash4_tag::<PACKED>(src, ip, hash_shift);
+        let (h0, g0) = fast_hash_tag::<PACKED>(src, ip, fh);
         let m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h0, g0);
         if COUNT && PACKED {
             // Gate 7 is recorded byte-identical: a tag mismatch should imply the
@@ -4066,7 +4083,7 @@ fn find_fast_impl<
         // nothing between here and the pair branch writes the table -- the rep
         // and match paths both `continue`. Only the issue order moves.
         let pair_pre = if pair && ip + 1 <= ilimit {
-            let (h1, g1) = hash4_tag::<PACKED>(src, ip + 1, hash_shift);
+            let (h1, g1) = fast_hash_tag::<PACKED>(src, ip + 1, fh);
             Some((h1, g1, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h1, g1)))
         } else {
             None
@@ -4104,7 +4121,7 @@ fn find_fast_impl<
                 &mut hash_v,
                 &mut tags_v,
                 pack,
-                hash_shift,
+                fh,
                 &mut seqs,
                 &mut lits,
                 anchor,
@@ -4148,7 +4165,7 @@ fn find_fast_impl<
                 let (h1, g1, m1) = match pair_pre {
                     Some(v) => v,
                     None => {
-                        let (h, g) = hash4_tag::<PACKED>(src, ip1, hash_shift);
+                        let (h, g) = fast_hash_tag::<PACKED>(src, ip1, fh);
                         (h, g, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h, g))
                     }
                 };
@@ -4193,7 +4210,7 @@ fn find_fast_impl<
                         &mut hash_v,
                         &mut tags_v,
                         pack,
-                        hash_shift,
+                        fh,
                         &mut seqs,
                         &mut lits,
                         anchor,
@@ -5158,6 +5175,71 @@ fn step0_default() -> usize {
 
 
 
+/// ffanat hash-width: the per-block spec for the Fast ladder's table hash.
+/// Legacy = 4 bytes at every `min_match` (this codebase's historical choice);
+/// wide = `mls` bytes, C's `ZSTD_hashPtr` design. The census that motivated
+/// this (`ffwaste`): with the 4-byte hash, **82.9% of candidates whose four
+/// bytes match die below `min_match` at L1** (sao 96.1%, mr 95.7%, x-ray
+/// 98.9%) -- ~14M wasted random loads + compares + `count_match` calls per
+/// 12-corpus pass. Keying the table on the bytes acceptance actually needs
+/// removes the waste at its source.
+#[derive(Clone, Copy)]
+struct FastHash {
+    wide: bool,
+    mask: u64,
+    shift: u32,
+}
+
+const FAST_HASH_PRIME64: u64 = 0x9E37_79B1_85EB_CA87;
+
+#[inline(always)]
+fn fast_hash_spec(mls: usize, hash_log: u32) -> FastHash {
+    if fast_hash_wide_enabled() && (5..=8).contains(&mls) {
+        FastHash {
+            wide: true,
+            mask: if mls == 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 },
+            shift: 64u32.saturating_sub(hash_log),
+        }
+    } else {
+        FastHash { wide: false, mask: 0, shift: 32u32.saturating_sub(hash_log) }
+    }
+}
+
+/// Wide load with a zero-extended tail: several call sites are only 4-byte
+/// safe (`ip + 1`, fill ends), so inside the last 8 bytes the missing bytes
+/// read as zero. Deterministic and CONSISTENT between store and load -- a
+/// tail-keyed slot can only ever be matched against the same tail key, and
+/// every candidate is verified by compare + `count_match` regardless.
+#[inline(always)]
+fn load_u64le_tail(src: &[u8], pos: usize) -> u64 {
+    if pos + 8 <= src.len() {
+        return crate::simd::load_u64_le(src, pos);
+    }
+    let mut v = 0u64;
+    let mut i = 0;
+    while pos + i < src.len() {
+        v |= u64::from(src[pos + i]) << (8 * i);
+        i += 1;
+    }
+    v
+}
+
+/// The Fast ladder's hash+tag under a block-hoisted `FastHash` spec. The tag
+/// remains sound for the filter in BOTH modes: it is a function of bytes the
+/// accepted match must reproduce (4 <= mls always; wide = the mls-gram
+/// itself), so a mismatch cannot reject a match acceptance would keep.
+#[inline(always)]
+fn fast_hash_tag<const PACKED: bool>(src: &[u8], pos: usize, fh: FastHash) -> (usize, u8) {
+    if fh.wide {
+        let v = load_u64le_tail(src, pos) & fh.mask;
+        let hv = v.wrapping_mul(FAST_HASH_PRIME64);
+        ((hv >> fh.shift) as usize, (hv ^ (hv >> 29)) as u8)
+    } else {
+        let hv = load_u32le(src, pos).wrapping_mul(HASH4_PRIME);
+        ((hv >> fh.shift) as usize, (hv ^ (hv >> 15)) as u8)
+    }
+}
+
 
 /// hash4 index AND its 8-bit tag, from one multiply.
 ///
@@ -5889,7 +5971,7 @@ fn fill_fast_after_match<const PACKED: bool>(
     hash: &mut [u32],
     tags: &mut [u8],
     pack: bool,
-    hash_shift: u32,
+    fh: FastHash,
     src: &[u8],
     match_ip: usize,
     match_end: usize,
@@ -5899,14 +5981,14 @@ fn fill_fast_after_match<const PACKED: bool>(
     let mut n = 0u64;
     let a = match_ip.saturating_add(2);
     if do_a && a <= ilimit {
-        let (h, g) = hash4_tag::<PACKED>(src, a, hash_shift);
+        let (h, g) = fast_hash_tag::<PACKED>(src, a, fh);
         fast_slot_store(hash, tags, pack, h, a, g);
         n += 1;
     }
     if do_b && match_end >= 2 {
         let b = match_end - 2;
         if b <= ilimit && b != a {
-            let (h, g) = hash4_tag::<PACKED>(src, b, hash_shift);
+            let (h, g) = fast_hash_tag::<PACKED>(src, b, fh);
             fast_slot_store(hash, tags, pack, h, b, g);
             n += 1;
         }
@@ -5922,7 +6004,7 @@ fn emit_fast_seq<const PACKED: bool>(
     hash: &mut [u32],
     tags: &mut [u8],
     pack: bool,
-    hash_shift: u32,
+    fh: FastHash,
     seqs: &mut Vec<Seq>,
     lits: &mut Vec<u8>,
     anchor: usize,
@@ -5959,7 +6041,7 @@ fn emit_fast_seq<const PACKED: bool>(
         offset: (ip - mm) as u32,
     });
     let end = ip + n;
-    fill_fast_after_match::<PACKED>(hash, tags, pack, hash_shift, src, found_ip, end, ilimit);
+    fill_fast_after_match::<PACKED>(hash, tags, pack, fh, src, found_ip, end, ilimit);
     end
 }
 
@@ -11211,6 +11293,8 @@ fn fast_pack_enabled() -> bool {
 /// every such candidate costs a random `src[m]` load, a compare, and a
 /// `count_match` that dies below `mls`.
 #[cfg(feature = "profile")]
+pub static FF_LATCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
 pub static FF_CAND4: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "profile")]
 pub static FF_ACCEPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -11220,4 +11304,19 @@ pub static FF_ACCEPT: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 pub fn take_ff_waste() -> (u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
     (FF_CAND4.swap(0, Relaxed), FF_ACCEPT.swap(0, Relaxed))
+}
+
+
+/// ffanat hash-width arm. OFF = the historical 4-byte hash; ON = key the Fast
+/// table on `mls` bytes (C's `ZSTD_hashPtr` design). OUTPUT-CHANGING -- gated
+/// on the worst-corpus size boards, not on byte-identity.
+static FAST_HASH_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for the mls-wide Fast hash.
+pub fn set_fast_hash_arm(on: bool) {
+    FAST_HASH_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn fast_hash_wide_enabled() -> bool {
+    FAST_HASH_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
 }
