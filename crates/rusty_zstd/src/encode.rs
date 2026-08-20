@@ -353,6 +353,9 @@ pub(crate) struct MatchTables {
     /// content (dickens 45%, reymont 41%) wins big.
     walk_first_share: f32,
     walk_probe: u32,
+    /// See `set_chain_tag_arm`: lazy-ladder heads and links carry the hash4
+    /// tag in their high 8 bits this frame.
+    chain_pack: bool,
     /// Blocks whose finder has actually RUN and written back its signals.
     ///
     /// GATE 1 @ L1 needs this because `rep_yield` starts OPTIMISTIC at 1.0 so
@@ -624,6 +627,7 @@ impl MatchTables {
             last_search_per_byte: 1.0,
             walk_first_share: 0.0,
             walk_probe: 0,
+            chain_pack: false,
             blocks_done: 0,
             payload_scratch: Vec::new(),
             seq_scratch: Vec::new(),
@@ -861,6 +865,54 @@ impl MatchTables {
         }
     }
 
+    /// Chain-link tag helpers (see `set_chain_tag_arm`). Head format under
+    /// `chain_pack`: `(pos+1) | tag << 24` (0 = empty, pos+1 < 2^24 by the
+    /// frame guard); link format: `pos | tag << 24` (low 24 = 0 keeps the
+    /// historical none-sentinel semantics).
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn lz_head_raw(&self, h: usize) -> u32 {
+        debug_assert!(h < self.hash.len());
+        *unsafe { self.hash.get_unchecked(h) }
+    }
+
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn lz_head_put(&mut self, h: usize, pos: usize, tag: u8, cp: bool) {
+        debug_assert!(h < self.hash.len());
+        let v = if cp {
+            (((pos as u32).saturating_add(1)) & 0x00FF_FFFF) | (u32::from(tag) << 24)
+        } else {
+            (pos as u32).saturating_add(1)
+        };
+        *unsafe { self.hash.get_unchecked_mut(h) } = v;
+    }
+
+    #[inline(always)]
+    fn lz_head_pos(raw: u32, cp: bool) -> Option<usize> {
+        let p = if cp { raw & 0x00FF_FFFF } else { raw };
+        if p == 0 { None } else { Some((p as usize) - 1) }
+    }
+
+    #[inline(always)]
+    fn lz_head_tag(raw: u32) -> u8 {
+        (raw >> 24) as u8
+    }
+
+    /// The link stored for a new position is the OLD head, re-encoded from
+    /// `(pos+1) | tag<<24` to `pos | tag<<24` (empty stays 0).
+    #[inline(always)]
+    fn lz_link_from_head(raw: u32, cp: bool) -> u32 {
+        if cp {
+            let p = raw & 0x00FF_FFFF;
+            if p == 0 { 0 } else { (p - 1) | (raw & 0xFF00_0000) }
+        } else if raw == 0 {
+            0
+        } else {
+            raw - 1
+        }
+    }
+
     /// T2: binary-tree slot read.
     ///
     /// SAFETY: every caller indexes `(x & bt_mask) << 1` or that `+ 1`, and
@@ -1033,6 +1085,14 @@ pub(crate) fn encode_oneshot(
         // `tagbig`: see the commit.
         tables.tags = alloc::vec![0u8; tables.hash.len()];
     }
+    // Chain-link tag: lazy strategies only (Bt shares the chain array as
+    // TREE NODES and must never see tag bits), same < 16 MiB bound.
+    tables.chain_pack = matches!(
+        params.strategy,
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
+    ) && chain_tag_enabled()
+        && (params.min_match.max(3) as usize) < 8
+        && (hist_prefix.len() + src.len()) < 0x00FF_FFFF;
     // 1a array route: the LONG table's filter for the same frames. Priced by
     // `ltagbig` on the same instrument.
     if params.strategy == Strategy::DFast
@@ -1976,6 +2036,24 @@ pub(crate) fn prime_tables(
                 fast_hash_tag::<true>(src, p, fhp.wide, fhp.mask, fhp.shift);
             tables.store_fast(h, p, tag);
         } else {
+            // Chain-pack frames prime in the finder's own packed format --
+            // the -59.3% priming-poison rule, third application.
+            if tables.chain_pack {
+                let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
+                let (hh, gt) = hash4_link_tag(src, p, hash_log, smask);
+                let raw = tables.lz_head_raw(hh);
+                if write_chain {
+                    tables.chain[p & chain_mask] = MatchTables::lz_link_from_head(raw, true);
+                }
+                tables.lz_head_put(hh, p, gt, true);
+                if do_long {
+                    let hl = hash8(src, p, hash_log);
+                    tables.put_hl(hl, p);
+                }
+                iters += 1;
+                p += stride;
+                continue;
+            }
             let h = hash_mls(src, p, mls, hash_log);
             if write_chain {
                 tables.chain[p & chain_mask] = tables.get_h(h).map(|x| x as u32).unwrap_or(0);
@@ -7615,6 +7693,8 @@ fn find_greedy(
         tables.walk_probe - 1
     };
     let mut wcls = (0u32, 0u32);
+    let cp = tables.chain_pack;
+    let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
     let mut ip = block_start;
     while ip <= ilimit {
         if use_rep {
@@ -7632,14 +7712,20 @@ fn find_greedy(
                 continue;
             }
         }
-        let h = hash_mls(src, ip, mls, hash_log);
-        let prev = tables.get_h(h);
-        tables.chain[ip & chain_mask] = prev.map(|p| p as u32).unwrap_or(0);
-        tables.put_h(h, ip);
+        let (h, gtag) = if mls >= 8 && ip + 8 <= src.len() {
+            (hash8(src, ip, hash_log), 0u8)
+        } else {
+            hash4_link_tag(src, ip, hash_log, smask)
+        };
+        let head_raw = tables.lz_head_raw(h);
+        tables.chain[ip & chain_mask] = MatchTables::lz_link_from_head(head_raw, cp);
+        tables.lz_head_put(h, ip, gtag, cp);
+        let prev = MatchTables::lz_head_pos(head_raw, cp);
 
         let mut best_m = 0usize;
         let mut best_ml = 0usize;
         if let Some(mut m) = prev {
+            let mut mtag = MatchTables::lz_head_tag(head_raw);
             if ip + mls <= src.len() {
                 let mut missed_before = false;
                 for _ in 0..attempts {
@@ -7647,6 +7733,36 @@ fn find_greedy(
                     // step (walk-continue arm) or break (legacy).
                     if m >= ip || ip - m > window || m < lowest_rep {
                         break;
+                    }
+                    // Link-tag reject: the tag rode in on the load that
+                    // produced `m`, so a collision skips `mls_eq`'s src[m]
+                    // load entirely. Sound: mls_eq true => 4 bytes equal =>
+                    // tags equal.
+                    // `m == 0` is ambiguous with the none-sentinel (whose
+                    // fabricated tag is 0), and legacy walks probe position 0
+                    // through it -- never tag-filter it (the 2-FALSE-skips
+                    // catch on mozilla L5).
+                    if cp && m != 0 && mtag != gtag {
+                        #[cfg(feature = "profile")]
+                        if COUNT {
+                            use core::sync::atomic::Ordering::Relaxed;
+                            LINK_SKIPS.fetch_add(1, Relaxed);
+                            if mls_eq(src, m, ip, mls) {
+                                LINK_FALSE.fetch_add(1, Relaxed);
+                            }
+                        }
+                        missed_before = true;
+                        if !walk_cont {
+                            break;
+                        }
+                        let link = tables.chain[m & chain_mask];
+                        let next = (link & 0x00FF_FFFF) as usize;
+                        if next >= m {
+                            break;
+                        }
+                        m = next;
+                        mtag = (link >> 24) as u8;
+                        continue;
                     }
                     if COUNT {
                         probes += 1;
@@ -7687,11 +7803,13 @@ fn find_greedy(
                             break;
                         }
                     }
-                    let next = tables.chain[m & chain_mask] as usize;
+                    let link = tables.chain[m & chain_mask];
+                    let next = if cp { (link & 0x00FF_FFFF) as usize } else { link as usize };
                     if next >= m {
                         break;
                     }
                     m = next;
+                    mtag = (link >> 24) as u8;
                 }
             }
         }
@@ -7725,9 +7843,14 @@ fn find_greedy(
             // `ip`; re-inserting them would self-loop the chain (see B2).
             let mut p = ip + 1;
             while p < end && p <= ilimit {
-                let hh = hash_mls(src, p, mls, hash_log);
-                tables.chain[p & chain_mask] = tables.get_h(hh).map(|x| x as u32).unwrap_or(0);
-                tables.put_h(hh, p);
+                let (hh, gt) = if mls >= 8 && p + 8 <= src.len() {
+                    (hash8(src, p, hash_log), 0u8)
+                } else {
+                    hash4_link_tag(src, p, hash_log, smask)
+                };
+                let raw = tables.lz_head_raw(hh);
+                tables.chain[p & chain_mask] = MatchTables::lz_link_from_head(raw, cp);
+                tables.lz_head_put(hh, p, gt, cp);
                 p += 1;
             }
             ip = end;
@@ -7776,10 +7899,17 @@ fn chain_find_best(
     // chain-walking finders on the raw value.
     let hash_log = tables.hash_log;
     let chain_mask = tables.chain.len() - 1;
-    let h = hash_mls(src, ip, mls, hash_log);
-    let prev = tables.get_h(h);
-    tables.chain[ip & chain_mask] = prev.map(|p| p as u32).unwrap_or(0);
-    tables.put_h(h, ip);
+    let cp = tables.chain_pack;
+    let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
+    let (h, gtag) = if mls >= 8 && ip + 8 <= src.len() {
+        (hash8(src, ip, hash_log), 0u8)
+    } else {
+        hash4_link_tag(src, ip, hash_log, smask)
+    };
+    let head_raw = tables.lz_head_raw(h);
+    tables.chain[ip & chain_mask] = MatchTables::lz_link_from_head(head_raw, cp);
+    tables.lz_head_put(h, ip, gtag, cp);
+    let prev = MatchTables::lz_head_pos(head_raw, cp);
     // P0/gg-matchfind: candidate examinations are the WORK COUNTER, the primary
     // evidence under the Great Gate 2026-08-06 law. Compiled out entirely when
     // the profile feature is off.
@@ -7790,6 +7920,7 @@ fn chain_find_best(
     let Some(mut m) = prev else {
         return (0, 0);
     };
+    let mut mtag = MatchTables::lz_head_tag(head_raw);
     let lowest = block_start.saturating_sub(window).max(tables.frame_start);
     let mut missed_before = false;
     if ip + mls <= src.len() {
@@ -7798,6 +7929,33 @@ fn chain_find_best(
             // a failure here correctly ends the walk.
             if m >= ip || ip - m > window || m < lowest {
                 break;
+            }
+            // Link-tag reject: skip `mls_eq`'s src[m] load on a tag byte the
+            // link load already delivered. Sound: mls_eq true => 4 bytes
+            // equal => tags equal.
+            // See the greedy walk: position 0 is sentinel-ambiguous, never
+            // tag-filtered.
+            if cp && m != 0 && mtag != gtag {
+                #[cfg(feature = "profile")]
+                if COUNT {
+                    use core::sync::atomic::Ordering::Relaxed;
+                    LINK_SKIPS.fetch_add(1, Relaxed);
+                    if mls_eq(src, m, ip, mls) {
+                        LINK_FALSE.fetch_add(1, Relaxed);
+                    }
+                }
+                missed_before = true;
+                if !walk_cont {
+                    break;
+                }
+                let link = tables.chain[m & chain_mask];
+                let next = (link & 0x00FF_FFFF) as usize;
+                if next >= m {
+                    break;
+                }
+                m = next;
+                mtag = (link >> 24) as u8;
+                continue;
             }
             if COUNT {
                 probes += 1;
@@ -7848,11 +8006,13 @@ fn chain_find_best(
                     break;
                 }
             }
-            let next = tables.chain[m & chain_mask] as usize;
+            let link = tables.chain[m & chain_mask];
+            let next = if cp { (link & 0x00FF_FFFF) as usize } else { link as usize };
             if next >= m {
                 break;
             }
             m = next;
+            mtag = (link >> 24) as u8;
         }
     }
     if COUNT {
@@ -7960,6 +8120,8 @@ fn find_lazy(
         tables.walk_probe - 1
     };
     let mut wcls = (0u32, 0u32);
+    let cp = tables.chain_pack;
+    let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
     let gain_cmp = lazy_gain_enabled();
     while ip <= ilimit {
         if use_rep {
@@ -8078,9 +8240,14 @@ fn find_lazy(
                 while p < end && p <= ilimit {
                     #[cfg(feature = "profile")]
                     LF_INSERTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    let hh = hash_mls(src, p, mls, hash_log);
-                    tables.chain[p & chain_mask] = tables.get_h(hh).map(|x| x as u32).unwrap_or(0);
-                    tables.put_h(hh, p);
+                    let (hh, gt) = if mls >= 8 && p + 8 <= src.len() {
+                        (hash8(src, p, hash_log), 0u8)
+                    } else {
+                        hash4_link_tag(src, p, hash_log, smask)
+                    };
+                    let raw = tables.lz_head_raw(hh);
+                    tables.chain[p & chain_mask] = MatchTables::lz_link_from_head(raw, cp);
+                    tables.lz_head_put(hh, p, gt, cp);
                     p += stride;
                 }
             }
@@ -9924,6 +10091,53 @@ fn walk_first_max(attempts: usize) -> f32 {
 /// Re-probe period for the walk gate (the Gate-2 shut-and-re-probe rule: an
 /// immediate shut needs a scheduled reopen, or it is a one-way latch).
 const WALK_PROBE_PERIOD: u32 = 16;
+
+/// CHAIN-LINK TAG (win 5 of the chain-walk arc): pack the hash4 rejection
+/// tag into the lazy ladder's hash HEADS ((pos+1) | tag << 24) and CHAIN
+/// LINKS (pos | tag << 24), under the same < 16 MiB position proof as
+/// `enable_packed_tags` -- a SEPARATE frame flag (`chain_pack`), so the
+/// audited `pack_tags` contract is untouched. Every walk step then rejects
+/// a colliding candidate from the tag byte ALREADY IN the link it just
+/// loaded, skipping the random src[m] load that `mls_eq` would pay -- and
+/// the walk-continue fix made those steps 31M-249M per board level.
+/// Soundness (the T1 proof): mls >= 4 on this ladder, `mls_eq` true implies
+/// the first 4 bytes equal implies tags equal -- a mismatch cannot hide a
+/// match. The tag is the hash4 formula, computed from the u32 the hasher
+/// already loads, and the PRIME path mirrors it exactly (the -59.3% rule).
+static CHAIN_TAG_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for the chain-link tag.
+pub fn set_chain_tag_arm(on: bool) {
+    CHAIN_TAG_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn chain_tag_enabled() -> bool {
+    !matches!(CHAIN_TAG_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
+}
+
+/// hash4 index + the lazy ladder's link tag. The tag is MLS-WIDTH
+/// (`hash4_tag_mls`), not 4-byte: chain buckets are keyed by the 4-byte
+/// gram, so colliding candidates mostly SHARE those 4 bytes and die at byte
+/// 5 -- the short table's structure, not the long table's. Measured with the
+/// 4-byte tag first: only 2.4M of L12's 169M bytemiss steps caught (1.4%);
+/// the byte-5 class is the whole game here. Index bit-identical to `hash4`.
+#[inline(always)]
+fn hash4_link_tag(src: &[u8], pos: usize, hash_log: u32, smask: u64) -> (usize, u8) {
+    hash4_tag_mls(src, pos, 32u32.saturating_sub(hash_log.min(32)), smask)
+}
+
+/// Chain-walk census: src loads the link tag skipped, and (COUNT) the
+/// FALSE-skip re-probe -- a skipped candidate whose bytes would have matched
+/// must never exist.
+#[cfg(feature = "profile")]
+pub static LINK_SKIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static LINK_FALSE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub fn take_link_tag() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (LINK_SKIPS.swap(0, Relaxed), LINK_FALSE.swap(0, Relaxed))
+}
 
 /// Attribute only when the walk RAN and produced enough samples -- a block
 /// that measured nothing must not move the EWMA (the Gate 14 rule).
