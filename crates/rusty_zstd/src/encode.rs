@@ -3061,9 +3061,20 @@ fn find_fast(
         // it. Fixing the plumbing exposed the missing veto as versions-16m
         // +12.75%.
         0
+    } else if tables.pair_gain < pair_gain_lo() {
+        // 4.72: cheap-pair band. See `pair_gain_lo`.
+        2
     } else {
         1
     };
+    #[cfg(feature = "profile")]
+    {
+        use core::sync::atomic::Ordering;
+        ROUTE_HIST[tables.pair_route.min(2) as usize].fetch_add(1, Ordering::Relaxed);
+        ROUTE_GAIN.fetch_add((tables.pair_gain * 1000.0) as u64, Ordering::Relaxed);
+        ROUTE_REP.fetch_add((tables.rep_yield * 1000.0) as u64, Ordering::Relaxed);
+        ROUTE_N.fetch_add(1, Ordering::Relaxed);
+    }
     let s0 = if params.target_length == 0 {
         if tables.pair_route == 1 {
             1
@@ -10177,6 +10188,62 @@ fn pair_enabled() -> bool {
 /// Above this previous-block repcode yield the pair search is switched OFF: the
 /// repcode path already holds those matches, so pairing spends probes to reach a
 /// worse parse. `RZSTD_PAIR_T` sweeps it.
+/// 4.72: below this `pair_gain` the PAIR route is net CHEAPER in total search ops.
+///
+/// Counter-intuitive until you read the probe COUNT rather than the rate.
+/// `pair_gain` is bytes-per-probe, and across the corpus it runs INVERSELY to
+/// how often the pair search fires. Forcing route 1 -> 2:
+///
+/// ```text
+///   corpus     pair_gain   d positions      d pair     NET ops
+///   x-ray         0.3674        -15608       11826       -3782   cheaper
+///   sao           0.4404      -1592127      162900    -1429227   cheaper
+///   mozilla       0.6835       -663818      394230     -269588   cheaper
+///   ---------------------------------------------------- 0.71 --
+///   ooffice       0.7406      -1491034     1713353     +222319   costs
+///   incomp-32m    0.8056          -889        3740       +2851   costs
+///   dickens       0.8735      -2193266     2193539        +273   costs
+///   mr            0.9012      -1723724     2132991     +409267   costs
+///   samba         1.5846       -447848      513447      +65599   costs
+/// ```
+///
+/// At low gain the pair search barely fires, so the step-2 position saving is
+/// nearly free; at high gain it fires millions of times and the saving is more
+/// than repaid in probes. **8/8 on the work sign**, including the two corpora
+/// that were not in the set that suggested the threshold.
+///
+/// This makes the gate non-monotonic in `pair_gain` (2 below 0.20 is route 0,
+/// then 2, then 1, then 2 above 1.00) -- correct, because the two route-2
+/// branches are selected for DIFFERENT reasons: this one for cheapness, the
+/// `pair_rate_hi` one for the bytes the search returns.
+#[inline(always)]
+fn pair_gain_lo() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        use core::sync::atomic::Ordering;
+        let c = PAIR_LO_ARM.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_PAIR_LO")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.71);
+        PAIR_LO_ARM.store(v.to_bits(), Ordering::Relaxed);
+        v
+    }
+    #[cfg(not(feature = "std"))]
+    0.71
+}
+
+static PAIR_LO_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Pin `pair_gain_lo`. `f32::NAN` restores the env/default path.
+pub fn set_pair_lo_arm(v: f32) {
+    use core::sync::atomic::Ordering;
+    PAIR_LO_ARM.store(if v.is_nan() { u32::MAX } else { v.to_bits() }, Ordering::Relaxed);
+}
+
 fn pair_rep_max() -> f32 {
     #[cfg(feature = "std")]
     {
@@ -10221,6 +10288,29 @@ pub fn take_pair_split() -> (u64, u64, u64, u64, u64, u64) {
 pub static MAIN_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Read and clear: `(probes, hits, pair_match_bytes, all_match_bytes)`.
+static ROUTE_HIST: [core::sync::atomic::AtomicU64; 3] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+static ROUTE_GAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ROUTE_REP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ROUTE_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Per-block route histogram and the mean state that decided it.
+/// Returns `(route0, route1, route2, mean pair_gain, mean rep_yield)`.
+pub fn take_route_hist() -> (u64, u64, u64, f64, f64) {
+    use core::sync::atomic::Ordering;
+    let n = ROUTE_N.swap(0, Ordering::Relaxed).max(1);
+    (
+        ROUTE_HIST[0].swap(0, Ordering::Relaxed),
+        ROUTE_HIST[1].swap(0, Ordering::Relaxed),
+        ROUTE_HIST[2].swap(0, Ordering::Relaxed),
+        ROUTE_GAIN.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n as f64,
+        ROUTE_REP.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n as f64,
+    )
+}
+
 pub fn take_pair_stats() -> (u64, u64, u64, u64) {
     use core::sync::atomic::Ordering;
     (
