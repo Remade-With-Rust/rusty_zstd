@@ -1904,7 +1904,8 @@ pub(crate) fn prime_tables(
             // primed slot mismatches the finder's keys -- the -59.3% priming
             // poison this function has already been bitten by once.
             let fhp = fast_hash_spec(mls, hash_log);
-            let (h, tag) = fast_hash_tag::<true>(src, p, fhp);
+            let (h, tag) =
+                fast_hash_tag::<true, true>(src, p, fhp.wide, fhp.mask, fhp.shift);
             tables.store_fast::<true>(h, p, tag);
         } else {
             let h = hash_mls(src, p, mls, hash_log);
@@ -3113,16 +3114,29 @@ const FAST_LAZY_RUN: u32 = 4;
 fn fast_lazy_threshold() -> f32 {
     #[cfg(feature = "profile")]
     ENVHIT[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // ffanat: cached (the tag_min pattern). This is read per BLOCK on the
+    // find_fast path -- an uncached `std::env::var` is 115.6 ns and a String
+    // allocation per read, for a process constant.
     #[cfg(feature = "std")]
     {
-        std::env::var("RZSTD_FASTLAZY_T")
+        use core::sync::atomic::Ordering;
+        let c = FASTLAZY_T_CACHE.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_FASTLAZY_T")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0.7)
+            .unwrap_or(0.7);
+        FASTLAZY_T_CACHE.store(v.to_bits(), Ordering::Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     0.7
 }
+
+static FASTLAZY_T_CACHE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Dispatch the Fast match finder on the frame-latched packed flag ONCE per
 /// block, so neither the flag load nor the dead tag computation appears inside
@@ -3164,16 +3178,29 @@ const REP_PROBE_PERIOD: u32 = 16;
 fn rep_len_min() -> f32 {
     #[cfg(feature = "profile")]
     ENVHIT[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // ffanat: cached (the tag_min pattern). This is read per BLOCK on the
+    // find_fast path -- an uncached `std::env::var` is 115.6 ns and a String
+    // allocation per read, for a process constant.
     #[cfg(feature = "std")]
     {
-        std::env::var("RZSTD_REPLEN")
+        use core::sync::atomic::Ordering;
+        let c = REPLEN_CACHE.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_REPLEN")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(1.0)
+            .unwrap_or(1.0);
+        REPLEN_CACHE.store(v.to_bits(), Ordering::Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     1.0
 }
+
+static REPLEN_CACHE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Decay floor on `rep_yield` for DFast. 0.0 = shut on the first dry block.
 ///
@@ -3371,18 +3398,41 @@ fn find_fast(
         tables.step_used = 0;
         params.target_length as usize + 1
     };
+    // ffanat: WIDE is the sixth const. Runtime `fh.wide` inside the copies
+    // forced a per-position branch, a register-resident mask, and `shrq %cl`
+    // where specialised copies should emit an immediate -- the asm survey
+    // showed shrq$50 x0 / shrq%cl x7 on EVERY wide copy. The latch decides
+    // wide-vs-legacy per block BEFORE dispatch, so it is a dispatch input like
+    // ut/rep. One branch here doubles the arms mechanically; the executed path
+    // carries only its own mode.
+    let wide_block = fast_hash_wide_enabled()
+        && (5..=8).contains(&(params.min_match.max(3) as usize))
+        && !tables.fast_hash_legacy;
     macro_rules! go {
         ($p:expr, $r:expr, $h:expr, $s:expr, $pi:expr) => {
-            find_fast_impl::<$p, $r, $h, $s, $pi>(
-                s0,
-                src,
-                block_start,
-                block_end,
-                window,
-                params,
-                tables,
-                reps,
-            )
+            if wide_block {
+                find_fast_impl::<$p, $r, $h, $s, $pi, true>(
+                    s0,
+                    src,
+                    block_start,
+                    block_end,
+                    window,
+                    params,
+                    tables,
+                    reps,
+                )
+            } else {
+                find_fast_impl::<$p, $r, $h, $s, $pi, false>(
+                    s0,
+                    src,
+                    block_start,
+                    block_end,
+                    window,
+                    params,
+                    tables,
+                    reps,
+                )
+            }
         };
     }
     // BRICK 67: repcode-1 is DISPATCHED on its own yield, not globally on/off.
@@ -3585,6 +3635,7 @@ fn find_fast_impl<
     const HLOG: u32,
     const STEP: usize,
     const PIPE: bool,
+    const WIDE: bool,
 >(
     step_rt: usize,
     src: &[u8],
@@ -3803,6 +3854,18 @@ fn find_fast_impl<
     } else {
         fast_hash_spec(mls, if HLOG != 0 { HLOG } else { tables.hash_log })
     };
+    // Scalarized AND const-moded: WIDE is a monomorphisation axis, so the
+    // per-position mode branch is gone and specialised copies emit the shift
+    // as an immediate. Only the mask (a function of runtime `mls`) stays in a
+    // register.
+    debug_assert!(fh.wide == WIDE);
+    let f_wide = WIDE;
+    let f_mask = if WIDE { fh.mask } else { 0 };
+    let f_shift = if HLOG != 0 {
+        if WIDE { 64 - HLOG } else { 32 - HLOG }
+    } else {
+        fh.shift
+    };
     // THE versions PROTECTION, found where Gate 6 found it for the pair search
     // and step-1: on rep-dominated content, hash matches do not add coverage --
     // they PREEMPT free repcode matches with full-offset ones and break the
@@ -3853,7 +3916,7 @@ fn find_fast_impl<
     // very harm -- 1,824 accepts, broken rep_runs. Lazy keeps the heads; fast
     // is barred from the shorties). `fast_hash_legacy` is only ever set under
     // the wide arm, so the off arm stays byte-identical.
-    let veto_block = (fh.wide || tables.fast_hash_legacy)
+    let veto_block = (WIDE || tables.fast_hash_legacy)
         && (bar_all || (tables.blocks_done > 0 && tables.rep_yield > fast_lazy_threshold()));
     // 2-WAY SOFTWARE PIPELINE (brick 39, `RZSTD_MF_PIPE=0` disables).
     //
@@ -3891,7 +3954,7 @@ fn find_fast_impl<
         // path 93.8% of the time. 4.41's position ledger was an undercount.
         let mut pipe_pos = 0u64;
         let (mut ff_made, mut ff_used) = (0u64, 0u64);
-        let (mut h0, mut g0) = fast_hash_tag::<PACKED>(src, ip, fh);
+        let (mut h0, mut g0) = fast_hash_tag::<PACKED, true>(src, ip, WIDE, f_mask, f_shift);
         let mut m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h0, g0);
         loop {
             if COUNT {
@@ -3950,7 +4013,7 @@ fn find_fast_impl<
                     // bytes and made the tag filter look non-byte-identical,
                     // which is why the packed representation was blamed and
                     // removed. The representation was fine; this caller was not.
-                    let (nh, ng) = fast_hash_tag::<PACKED>(src, ip, fh);
+                    let (nh, ng) = fast_hash_tag::<PACKED, true>(src, ip, WIDE, f_mask, f_shift);
                     h0 = nh;
                     g0 = ng;
                     m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h0, g0);
@@ -3964,7 +4027,7 @@ fn find_fast_impl<
                 ff_made += 1;
             }
             let (h1, g1, m1) = if nip <= ilimit {
-                let (h, g) = fast_hash_tag::<PACKED>(src, nip, fh);
+                let (h, g) = fast_hash_tag::<PACKED, true>(src, nip, WIDE, f_mask, f_shift);
                 // The store above may have just overwritten this slot, so the
                 // value is forwarded by hand rather than re-read.
                 //
@@ -4006,7 +4069,9 @@ fn find_fast_impl<
                     &mut hash_v,
                     &mut tags_v,
                     pack,
-                    fh,
+                    f_wide,
+                    f_mask,
+                    f_shift,
                     &mut seqs,
                     &mut lits,
                     anchor,
@@ -4049,7 +4114,7 @@ fn find_fast_impl<
                 if ip > ilimit {
                     break;
                 }
-                let (nh, ng) = fast_hash_tag::<PACKED>(src, ip, fh);
+                let (nh, ng) = fast_hash_tag::<PACKED, true>(src, ip, WIDE, f_mask, f_shift);
                 h0 = nh;
                 g0 = ng;
                 m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h0, g0);
@@ -4142,7 +4207,7 @@ fn find_fast_impl<
                 probes += 1;
             }
         }
-        let (h0, g0) = fast_hash_tag::<PACKED>(src, ip, fh);
+        let (h0, g0) = fast_hash_tag::<PACKED, true>(src, ip, WIDE, f_mask, f_shift);
         let m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h0, g0);
         if COUNT && PACKED {
             // Gate 7 is recorded byte-identical: a tag mismatch should imply the
@@ -4172,7 +4237,7 @@ fn find_fast_impl<
         // nothing between here and the pair branch writes the table -- the rep
         // and match paths both `continue`. Only the issue order moves.
         let pair_pre = if pair && ip + 1 <= ilimit {
-            let (h1, g1) = fast_hash_tag::<PACKED>(src, ip + 1, fh);
+            let (h1, g1) = fast_hash_tag::<PACKED, false>(src, ip + 1, WIDE, f_mask, f_shift);
             Some((h1, g1, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h1, g1)))
         } else {
             None
@@ -4212,7 +4277,9 @@ fn find_fast_impl<
                 &mut hash_v,
                 &mut tags_v,
                 pack,
-                fh,
+                f_wide,
+                f_mask,
+                f_shift,
                 &mut seqs,
                 &mut lits,
                 anchor,
@@ -4256,7 +4323,7 @@ fn find_fast_impl<
                 let (h1, g1, m1) = match pair_pre {
                     Some(v) => v,
                     None => {
-                        let (h, g) = fast_hash_tag::<PACKED>(src, ip1, fh);
+                        let (h, g) = fast_hash_tag::<PACKED, false>(src, ip1, WIDE, f_mask, f_shift);
                         (h, g, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h, g))
                     }
                 };
@@ -4303,7 +4370,9 @@ fn find_fast_impl<
                         &mut hash_v,
                         &mut tags_v,
                         pack,
-                        fh,
+                        f_wide,
+                    f_mask,
+                    f_shift,
                         &mut seqs,
                         &mut lits,
                         anchor,
@@ -5317,19 +5386,34 @@ fn load_u64le_tail(src: &[u8], pos: usize) -> u64 {
     v
 }
 
-/// The Fast ladder's hash+tag under a block-hoisted `FastHash` spec. The tag
-/// remains sound for the filter in BOTH modes: it is a function of bytes the
-/// accepted match must reproduce (4 <= mls always; wide = the mls-gram
-/// itself), so a mismatch cannot reject a match acceptance would keep.
+/// The Fast ladder's hash+tag, SCALARIZED. The struct form kept `FastHash` on
+/// the stack and the live wide copy reloaded mask, shift, AND the wide flag
+/// per position -- with the table base re-spilled beside them (`296(%rbp)`
+/// twice, `shrq %cl` from `64(%rbp)` in an HLOG=14 copy that should emit
+/// `shrq $50`). Scalars stay in registers, and `SAFE = true` sites (proven
+/// `pos <= ilimit`, i.e. `pos + 8 <= block_end`) skip the tail branch and its
+/// inline byte-loop entirely. The tag remains sound in both modes: it is a
+/// function of bytes the accepted match must reproduce.
 #[inline(always)]
-fn fast_hash_tag<const PACKED: bool>(src: &[u8], pos: usize, fh: FastHash) -> (usize, u8) {
-    if fh.wide {
-        let v = load_u64le_tail(src, pos) & fh.mask;
+fn fast_hash_tag<const PACKED: bool, const SAFE: bool>(
+    src: &[u8],
+    pos: usize,
+    wide: bool,
+    mask: u64,
+    shift: u32,
+) -> (usize, u8) {
+    if wide {
+        let v = if SAFE {
+            debug_assert!(pos + 8 <= src.len());
+            crate::simd::load_u64_le(src, pos)
+        } else {
+            load_u64le_tail(src, pos)
+        } & mask;
         let hv = v.wrapping_mul(FAST_HASH_PRIME64);
-        ((hv >> fh.shift) as usize, (hv ^ (hv >> 29)) as u8)
+        ((hv >> shift) as usize, (hv ^ (hv >> 29)) as u8)
     } else {
         let hv = load_u32le(src, pos).wrapping_mul(HASH4_PRIME);
-        ((hv >> fh.shift) as usize, (hv ^ (hv >> 15)) as u8)
+        ((hv >> shift) as usize, (hv ^ (hv >> 15)) as u8)
     }
 }
 
@@ -6132,7 +6216,9 @@ fn fill_fast_after_match<const PACKED: bool>(
     hash: &mut [u32],
     tags: &mut [u8],
     pack: bool,
-    fh: FastHash,
+    f_wide: bool,
+    f_mask: u64,
+    f_shift: u32,
     src: &[u8],
     match_ip: usize,
     match_end: usize,
@@ -6142,14 +6228,14 @@ fn fill_fast_after_match<const PACKED: bool>(
     let mut n = 0u64;
     let a = match_ip.saturating_add(2);
     if do_a && a <= ilimit {
-        let (h, g) = fast_hash_tag::<PACKED>(src, a, fh);
+        let (h, g) = fast_hash_tag::<PACKED, true>(src, a, f_wide, f_mask, f_shift);
         fast_slot_store(hash, tags, pack, h, a, g);
         n += 1;
     }
     if do_b && match_end >= 2 {
         let b = match_end - 2;
         if b <= ilimit && b != a {
-            let (h, g) = fast_hash_tag::<PACKED>(src, b, fh);
+            let (h, g) = fast_hash_tag::<PACKED, true>(src, b, f_wide, f_mask, f_shift);
             fast_slot_store(hash, tags, pack, h, b, g);
             n += 1;
         }
@@ -6165,7 +6251,9 @@ fn emit_fast_seq<const PACKED: bool>(
     hash: &mut [u32],
     tags: &mut [u8],
     pack: bool,
-    fh: FastHash,
+    f_wide: bool,
+    f_mask: u64,
+    f_shift: u32,
     seqs: &mut Vec<Seq>,
     lits: &mut Vec<u8>,
     anchor: usize,
@@ -6202,7 +6290,7 @@ fn emit_fast_seq<const PACKED: bool>(
         offset: (ip - mm) as u32,
     });
     let end = ip + n;
-    fill_fast_after_match::<PACKED>(hash, tags, pack, fh, src, found_ip, end, ilimit);
+    fill_fast_after_match::<PACKED>(hash, tags, pack, f_wide, f_mask, f_shift, src, found_ip, end, ilimit);
     end
 }
 
@@ -11063,16 +11151,29 @@ pub fn set_pair_lo_arm(v: f32) {
 fn pair_rep_max() -> f32 {
     #[cfg(feature = "profile")]
     ENVHIT[12].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // ffanat: cached (the tag_min pattern). This is read per BLOCK on the
+    // find_fast path -- an uncached `std::env::var` is 115.6 ns and a String
+    // allocation per read, for a process constant.
     #[cfg(feature = "std")]
     {
-        std::env::var("RZSTD_PAIR_T")
+        use core::sync::atomic::Ordering;
+        let c = PAIR_T_CACHE.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_PAIR_T")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0.7)
+            .unwrap_or(0.7);
+        PAIR_T_CACHE.store(v.to_bits(), Ordering::Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     0.7
 }
+
+static PAIR_T_CACHE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// PROMETHEUS PREREQ: how often is each fitted constant actually READ?
 /// Each of these accessors calls `std::env::var` with no cache -- a
