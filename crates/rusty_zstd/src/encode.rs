@@ -6083,7 +6083,7 @@ fn find_greedy(
                 // a candidate that DIFFERS at the current best length cannot
                 // exceed it, so the full `count_match` is provably wasted. The
                 // same candidate still wins, so this is byte-identical.
-                if best_ml == 0 || src[m + best_ml] == src[ip + best_ml] {
+                if best_ml == 0 || pre_eq(src, m, ip, best_ml) {
                     let ml = count_match(src, m, ip, block_end);
                     if ml >= mls && ml > best_ml {
                         best_ml = ml;
@@ -6114,7 +6114,7 @@ fn find_greedy(
             let mut s = ip;
             let mut mm = best_m;
             let mut n = best_ml;
-            while s > anchor && mm > tables.frame_start && src[s - 1] == src[mm - 1] {
+            while s > anchor && mm > tables.frame_start && back_eq(src, s, mm) {
                 s -= 1;
                 mm -= 1;
                 n += 1;
@@ -6196,7 +6196,7 @@ fn chain_find_best(
             probes += 1;
         }
         // C's `match[ml] == ip[ml]` prefilter -- see `find_greedy`.
-        if best_ml == 0 || src[m + best_ml] == src[ip + best_ml] {
+        if best_ml == 0 || pre_eq(src, m, ip, best_ml) {
             let ml = count_match(src, m, ip, block_end);
             if ml >= mls && ml > best_ml && offset_ok(ip - m, window) && m >= tables.frame_start {
                 best_ml = ml;
@@ -6326,7 +6326,7 @@ fn find_lazy(
             let mut s = best_ip;
             let mut mm = best_m;
             let mut n = best_ml;
-            while s > anchor && mm > tables.frame_start && src[s - 1] == src[mm - 1] {
+            while s > anchor && mm > tables.frame_start && back_eq(src, s, mm) {
                 s -= 1;
                 mm -= 1;
                 n += 1;
@@ -7250,7 +7250,7 @@ fn find_bt_lazy(
             let mut s = best_ip;
             let mut mm = best_m;
             let mut n = best_ml;
-            while s > anchor && mm > tables.frame_start && src[s - 1] == src[mm - 1] {
+            while s > anchor && mm > tables.frame_start && back_eq(src, s, mm) {
                 s -= 1;
                 mm -= 1;
                 n += 1;
@@ -8092,6 +8092,40 @@ fn load_u64le(src: &[u8], i: usize) -> u64 {
 }
 
 #[inline(always)]
+/// T2: C's `match[ml] == ip[ml]` prefilter, without its two bounds checks.
+///
+/// SAFETY: only reached with `best_ml > 0`, and the loop above `break`s the
+/// moment `ip + best_ml >= block_end`. So any candidate that gets here has
+/// `ip + off < block_end <= src.len()`, and `match_ok` has already established
+/// that `m` is a past position (`m < ip`), giving `m + off < ip + off`.
+#[inline(always)]
+#[allow(unsafe_code)]
+fn pre_eq(src: &[u8], m: usize, ip: usize, off: usize) -> bool {
+    debug_assert!(m + off < src.len() && ip + off < src.len());
+    unsafe { *src.get_unchecked(m + off) == *src.get_unchecked(ip + off) }
+}
+
+/// T2: one byte compare for the back-extension walk, without the two bounds
+/// checks the indexed form pays on EVERY byte it extends.
+///
+/// SAFETY, and it is what the loop condition already establishes:
+///   * the caller tests `s > anchor` before calling, so `s >= 1` and `s - 1`
+///     cannot wrap; likewise `mm > tables.frame_start` gives `mm >= 1`.
+///   * `s` starts at a scan position inside the block (`< block_end <=
+///     src.len()`) and only ever decreases; `mm` starts at a match position
+///     strictly below it. So both `s - 1` and `mm - 1` are `< src.len()`.
+///
+/// The three back-extension loops (`find_greedy`, `find_lazy`, `find_bt_lazy`)
+/// carried 2 panic sites each -- 6 of the 10 left after the DFast and Bt
+/// tranches -- and they sit in a PER-BYTE loop, which is the worst place in the
+/// encoder to pay a bounds check.
+#[inline(always)]
+#[allow(unsafe_code)]
+fn back_eq(src: &[u8], s: usize, mm: usize) -> bool {
+    debug_assert!(s >= 1 && mm >= 1 && s - 1 < src.len() && mm - 1 < src.len());
+    unsafe { *src.get_unchecked(s - 1) == *src.get_unchecked(mm - 1) }
+}
+
 fn hash4(v: u32, hash_log: u32) -> usize {
     let shift = 32u32.saturating_sub(hash_log.min(32));
     (v.wrapping_mul(HASH4_PRIME) >> shift) as usize
