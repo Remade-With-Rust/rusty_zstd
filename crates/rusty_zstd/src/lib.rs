@@ -46,6 +46,7 @@ mod xxh64;
 pub use xxh64::xxh64;
 
 pub use compressed::{set_litcopy_arm, set_lut_arm, set_matchcopy_arm, set_seqcheck_arm};
+
 pub use decode::{content_size, set_ck_stream_arm, decompress_with, find_frame_compressed_size, DecompressOptions};
 pub use error::Error;
 pub use frame::{
@@ -69,6 +70,8 @@ pub use simd::{set_eqlen_arm, take_eqlen_stats, take_eq_ops, bench_eq_avx2, benc
 #[cfg(feature = "profile")]
 pub use compressed::take_dec_copies;
 #[cfg(feature = "profile")]
+pub use compressed::take_dec_bands;
+#[cfg(feature = "profile")]
 pub use encode::{take_raw_margin, take_raw_exits, take_step_forfeit};
 pub use encode::{
     BT_SPEC_PAIRS, set_bt_depth_cached_arm, set_bt_depth_target_arm, take_opt_signals, set_bt_deep_min_arm, set_bt_deep_arm, set_dfast_litpush_arm, take_lit_push, take_lit_hist, take_lit_tiers, set_lit_push_tiers_arm,
@@ -78,7 +81,7 @@ pub use encode::{
 };
 #[cfg(feature = "alloc")]
 pub use encode::{
-    reset_env_arms, set_opt_lit_arm, set_pair_gain_arm, set_pair_hi_arm, set_tag_arm, set_tag_alloc_arm, set_bt_spec_arm, set_next_long_arm, set_pair_on_arm, take_pair_stats, take_pair_split, set_dfast_spec_arm, set_dfast_pipe_arm, set_dfast_step_arm, set_dfast_spec_min_arm, set_fast_spec_arm, take_bt_calls, take_bt_iters, take_lazy_fill, take_bt_probe_stats, take_dfast_calls, take_dfast_spec, take_dfast_match_stats, take_dfast_rep_blocks, take_opt_rep, take_opt_bt, take_opt_skips, set_opt_rep_arm, take_finder_calls,
+    reset_env_arms, set_opt_lit_arm, set_pair_gain_arm, set_pair_hi_arm, set_pair_lo_arm, set_tag_arm, set_tag_alloc_arm, set_bt_spec_arm, set_next_long_arm, set_pair_on_arm, take_pair_stats, take_route_hist, take_pair_split, set_dfast_spec_arm, set_dfast_pipe_arm, set_dfast_step_arm, set_dfast_spec_min_arm, set_fast_spec_arm, take_bt_calls, take_bt_iters, take_lazy_fill, take_bt_probe_stats, take_dfast_calls, take_dfast_spec, take_dfast_match_stats, take_dfast_rep_blocks, take_opt_rep, take_opt_bt, take_opt_skips, set_opt_rep_arm, take_finder_calls,
     set_huff_fast_arm, set_lazy_fill_arm, set_lazy_fill_stride_arm, set_litpush_arm, set_litpush_hoist_arm, set_payload_arm, set_pipe_arm, set_pipe_rep1_arm, take_ff_pipe, take_mm, take_rep_rate, take_tag_rejects,
     set_fast_lazy_arm, set_incomp_skip_arm, set_raw_skip_arm, set_raw_run_min_arm, set_raw_probe_arm, set_rep1_mode,
     set_lazy_fill_threshold_arm, set_prefix_bound_arm, set_prefix_window_arm, take_next_long, take_nl_band, take_nl_off, set_nl_off_worse_arm, set_nl_dispatch_arm, set_dfast_good_ml_arm, set_dfast_good_ml2_arm, set_dfast_fill_stride_arm, set_dfast_fill_anchor_arm, set_dfast_fill_n_arm, take_dfast_endfill, set_replen_pipe_arm, set_accel_shift_arm, set_opt_hoist_arm, set_opt_ops_arm, set_finder_scratch_arm, set_dfast_tag_arm, set_opt_fill_stride_arm, set_opt_fill_max_arm, take_opt_fill_ins, take_dfast_fill, set_prime_bt_arm, set_prime_bt_tree_arm, set_prime_bt_depth_arm, set_prime_bt_extent_arm, set_prime_stride_arm, take_prime_iters,

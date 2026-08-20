@@ -18,6 +18,54 @@ pub static DEC_LIT16: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 #[cfg(feature = "profile")]
 pub static DEC_MATCH16: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// T4 band census for `copy_match`: which route does each match actually take?
+/// 0 = offset 1 splat, 1 = 32-byte tier, 2 = 16-byte tier,
+/// 3 = extend_from_within (offset >= len, runtime-length memcpy CALL),
+/// 4 = overlapping loop (offset < len).
+#[cfg(feature = "profile")]
+pub static DEC_BAND: [core::sync::atomic::AtomicU64; 6] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Bytes moved by each route, so a rare-but-long band cannot hide.
+#[cfg(feature = "profile")]
+pub static DEC_BAND_B: [core::sync::atomic::AtomicU64; 6] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+#[cfg(feature = "profile")]
+pub fn take_dec_bands() -> ([u64; 6], [u64; 6]) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut a = [0u64; 6];
+    let mut b = [0u64; 6];
+    for i in 0..6 {
+        a[i] = DEC_BAND[i].swap(0, Relaxed);
+        b[i] = DEC_BAND_B[i].swap(0, Relaxed);
+    }
+    (a, b)
+}
+
+#[cfg(feature = "profile")]
+#[inline(always)]
+fn note_band(i: usize, len: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    DEC_BAND[i].fetch_add(1, Relaxed);
+    DEC_BAND_B[i].fetch_add(len as u64, Relaxed);
+}
+#[cfg(not(feature = "profile"))]
+#[inline(always)]
+fn note_band(_i: usize, _len: usize) {}
+
 /// Read and clear `(lit32, match32, lit16, match16)`.
 #[cfg(feature = "profile")]
 pub fn take_dec_copies() -> (u64, u64, u64, u64) {
@@ -1000,6 +1048,7 @@ fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize) -> Result<(), Er
     // Offset 1 is a byte splat (C wildcopy / ZSTD_overlapCopy8). Doubling
     // extend_from_within would memcpy 1, then 2, then 4, ...
     if offset == 1 {
+        note_band(0, len);
         let b = out[src];
         out.resize(out.len() + len, b);
         return Ok(());
@@ -1012,6 +1061,41 @@ fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize) -> Result<(), Er
     // `offset >= 32` does double duty: it guarantees 32 readable source bytes
     // (`src + 32 <= out.len()`) AND that the source range ends at or before the
     // destination start, so the two 32-byte regions cannot overlap.
+    // T4 -- ORDER MATTERS, and it was backwards.
+    //
+    // The 32-byte tier was tested FIRST, so every short match with a large
+    // offset landed in it: a band census over 12 corpora at L3 puts **86.6% of
+    // ALL match copies** there with `len <= 16`, at a mean of 7.4 bytes. They
+    // moved 32 bytes to publish 7.4.
+    //
+    // And the 32-byte move is not one instruction. This crate targets baseline
+    // x86-64, so there is no AVX2 anywhere in the decode path -- the emitted asm
+    // is SSE `movups`/`movdqu` on `%xmm` throughout, and a 32-byte copy is TWO
+    // 16-byte load/store pairs (visible as the `movups %xmm6, 16(%rax)` /
+    // `movups %xmm6, (%rax)` pair in `decompress_into_history`). So the wider
+    // tier costs double the narrow one and the majority of calls never needed
+    // it.
+    //
+    // Testing 16 first is byte-identical -- the same `len` bytes are published
+    // either way, and `offset >= 32` implies `offset >= 16` while the capacity
+    // requirement only relaxes -- so every one of those calls simply moves to
+    // the cheaper path.
+    if matchcopy_on() && len <= 16 && offset >= 16 && out.capacity() - out.len() >= 16 {
+        let dst_at = out.len();
+        // SAFETY: `offset >= 16` means `src + 16 <= out.len() == dst_at`, so the
+        // source is initialised and disjoint from the destination.
+        // `capacity - len >= 16` gives 16 writable bytes. Only `len <= 16`
+        // bytes are published by `set_len`.
+        unsafe {
+            let p = out.as_mut_ptr();
+            #[cfg(feature = "profile")]
+            DEC_MATCH16.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            note_band(2, len);
+            core::ptr::copy_nonoverlapping(p.add(src), p.add(dst_at), 16);
+            out.set_len(dst_at + len);
+        }
+        return Ok(());
+    }
     if matchcopy_on() && len <= 32 && offset >= 32 && out.capacity() - out.len() >= 32 {
         let dst_at = out.len();
         // SAFETY: `offset >= 32` means `src + 32 <= out.len() == dst_at`, so
@@ -1028,6 +1112,10 @@ fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize) -> Result<(), Er
             // so the 32-byte copy became `2 movs + callq` (3) plus a 4-
             // instruction callee = 7, against 4 for the two inline SSE `movups`
             // pairs. Measured, not assumed. Left as the baseline copy.
+            // Sub-census: how much of the 32-byte tier would a 16-byte copy
+            // have served? The tier is tested BEFORE the 16-byte one, so any
+            // short match with a large offset lands here regardless.
+            note_band(if len <= 16 { 5 } else { 1 }, len);
             core::ptr::copy_nonoverlapping(p.add(src), p.add(dst_at), 32);
             out.set_len(dst_at + len);
         }
@@ -1044,25 +1132,12 @@ fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize) -> Result<(), Er
     // 16-byte regions are disjoint, capturing the `len <= 16` part of that
     // slice. Same invariant as the 32-byte tier, same shape as brick 80 on
     // literals.
-    if matchcopy_on() && len <= 16 && offset >= 16 && out.capacity() - out.len() >= 16 {
-        let dst_at = out.len();
-        // SAFETY: `offset >= 16` means `src + 16 <= out.len() == dst_at`, so the
-        // source is initialised and disjoint from the destination.
-        // `capacity - len >= 16` gives 16 writable bytes. Only `len <= 16`
-        // bytes are published by `set_len`.
-        unsafe {
-            let p = out.as_mut_ptr();
-            #[cfg(feature = "profile")]
-            DEC_MATCH16.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            core::ptr::copy_nonoverlapping(p.add(src), p.add(dst_at), 16);
-            out.set_len(dst_at + len);
-        }
-        return Ok(());
-    }
     if offset >= len {
+        note_band(3, len);
         out.extend_from_within(src..src + len);
         return Ok(());
     }
+    note_band(4, len);
     out.reserve(len);
     let mut copied = 0usize;
     while copied < len {
