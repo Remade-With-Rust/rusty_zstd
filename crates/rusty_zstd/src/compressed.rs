@@ -427,6 +427,7 @@ pub(crate) fn decode_sequences(
         frame_skipped,
         window_size,
         block_max,
+        wide: matchcopy_on(),
     };
     // BRICK 64b: hoist the arm read OUT of the loop, WITHOUT making the function
     // generic.
@@ -969,7 +970,31 @@ struct MatchCtx<'a> {
     frame_skipped: usize,
     window_size: u64,
     block_max: u32,
+    /// T4/brick-79: `matchcopy_on()` was read THREE TIMES PER CALL inside
+    /// `copy_match`, i.e. three atomic loads per SEQUENCE. The literal path
+    /// already carries its arm as a parameter (`copy_literals(.., arm)`); the
+    /// match path never got the same treatment. Resolved once per block here.
+    wide: bool,
 }
+
+// T4 -- AVX2 WAS BUILT HERE AND REFUTED. Kept as a note so it is not retried.
+//
+// `#[target_feature(enable = "avx2")]` on a 32-byte copy compiles to exactly
+// what you want:
+//
+//     vmovups (%rcx), %ymm0 ; vmovups %ymm0, (%rdx) ; vzeroupper ; retq
+//
+// but a `target_feature` function CANNOT be inlined into a caller that lacks
+// the feature, and this crate targets baseline x86-64. So the emitted code was
+// a CALL from `copy_from_decoded` -- call + 2 vmovups + vzeroupper + ret --
+// replacing 4 inline SSE instructions. A net loss, deterministically, before
+// any clock is involved.
+//
+// The only way AVX2 pays here is the way libzstd does it: duplicate the WHOLE
+// sequence-decode loop under `#[target_feature]` and dispatch once per block,
+// so the wide copy is inlined inside an AVX2-compiled loop. That is a real
+// refactor, and its ceiling is bounded by how much traffic the 32-byte tier
+// actually carries -- 8.0% of calls once the tiers are ordered 16-first.
 
 #[allow(clippy::explicit_counter_loop)]
 fn copy_match(
@@ -984,6 +1009,7 @@ fn copy_match(
         frame_skipped,
         window_size,
         block_max,
+        wide,
     } = *ctx;
     let off = offset as usize;
     if off == 0 {
@@ -1011,7 +1037,7 @@ fn copy_match(
             return Err(Error::Corruption);
         }
         let i = frame_start + (frame_off - frame_skipped);
-        return copy_from_decoded(out, i, len);
+        return copy_from_decoded(out, i, len, wide);
     }
     let mut src_pos = src_pos0;
     out.reserve(len);
@@ -1034,7 +1060,7 @@ fn copy_match(
 
 /// Overlapping-safe copy from already-decoded `out[src..]`. C wildcopy equivalent.
 #[allow(unsafe_code)]
-fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize) -> Result<(), Error> {
+fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize, wide: bool) -> Result<(), Error> {
     if src >= out.len() {
         return Err(Error::Corruption);
     }
@@ -1080,7 +1106,7 @@ fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize) -> Result<(), Er
     // either way, and `offset >= 32` implies `offset >= 16` while the capacity
     // requirement only relaxes -- so every one of those calls simply moves to
     // the cheaper path.
-    if matchcopy_on() && len <= 16 && offset >= 16 && out.capacity() - out.len() >= 16 {
+    if wide && len <= 16 && offset >= 16 && out.capacity() - out.len() >= 16 {
         let dst_at = out.len();
         // SAFETY: `offset >= 16` means `src + 16 <= out.len() == dst_at`, so the
         // source is initialised and disjoint from the destination.
@@ -1096,7 +1122,7 @@ fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize) -> Result<(), Er
         }
         return Ok(());
     }
-    if matchcopy_on() && len <= 32 && offset >= 32 && out.capacity() - out.len() >= 32 {
+    if wide && len <= 32 && offset >= 32 && out.capacity() - out.len() >= 32 {
         let dst_at = out.len();
         // SAFETY: `offset >= 32` means `src + 32 <= out.len() == dst_at`, so
         // the source is fully initialised and disjoint from the destination.
@@ -1184,7 +1210,7 @@ mod tests {
                         let b = slow[slow.len() - off];
                         slow.push(b);
                     }
-                    copy_from_decoded(&mut fast, src, len).unwrap();
+                    copy_from_decoded(&mut fast, src, len, true).unwrap();
                     assert_eq!(slow, fast, "off={off} len={len} spare={spare}");
                 }
             }
@@ -1201,7 +1227,7 @@ mod tests {
                 let before = prefix.len();
                 let mut v = Vec::with_capacity(before + 4096);
                 v.extend_from_slice(&prefix);
-                copy_from_decoded(&mut v, before - off, len).unwrap();
+                copy_from_decoded(&mut v, before - off, len, true).unwrap();
                 assert_eq!(v.len(), before + len, "off={off} len={len}");
                 assert_eq!(&v[..before], &prefix[..], "prefix damaged");
                 for k in 0..len {
