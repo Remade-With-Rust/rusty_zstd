@@ -6790,6 +6790,22 @@ fn find_dfast_impl<const HLOG: u32>(
     let dtag_shift = 32u32.saturating_sub(hlog.min(32));
     // 1a: the long-table tag filter. Packed frames only (the representation
     // needs the 24-bit position proof); the arm gates the compare.
+    //
+    // REFUTED (2026-08-21): an mls-width tag ("1a-strong" -- index and tag
+    // from ONE u64 load, tag masked to the mlx bytes acceptance verifies).
+    // Built in full and measured on the consume-site ledger with clean
+    // counters: unfiltered 31,874,138 wasted loads/board; the shipped 4-byte
+    // tag leaves 126,529 (0.40%); the mls-width tag leaves 124,718 (0.39%).
+    // BOTH sit at the 8-bit collision floor (1/256 = 0.39%), because the
+    // unfiltered waste is almost entirely FIRST-FOUR-BYTES-DIFFER bucket
+    // collisions of the 8-byte hash -- the byte-5-differs class the wider
+    // tag targets barely exists. It bought 1,811 loads/board for one AND and
+    // one MUL per position in the hot loop. More tag BITS, not more tag
+    // BYTES, is the only axis left, and 24-bit positions leave none.
+    //
+    // Instrument lesson that found this (the "32M" false lead): the residual
+    // statics ran during the arm-OFF pass too -- read counters out between
+    // arms or the baseline contaminates the treatment 4:1.
     let lt_on = long_tag_enabled() && tables.pack_tags;
     // Loop-invariant arm reads, hoisted from the MATCH path to once per block.
     let fill_anchor_c = dfast_fill_anchor_c();
@@ -6960,6 +6976,34 @@ fn find_dfast_impl<const HLOG: u32>(
                 if ml >= mls {
                     best_m = m8;
                     best_ml = ml;
+                }
+            }
+            // 1a residual census: a survivor that fails acceptance is waste
+            // the 4-byte tag could not see. SPLIT by failure class, because
+            // the costs differ completely: a window/bounds fail is pure ALU
+            // (match_ok tests them FIRST, no memory touched), while a bytes
+            // fail paid the random src[m] load the filter exists to prevent.
+            // Only the bytes class is a stronger tag's budget. The guard
+            // below mirrors match_ok's cheap tests -- COUNT-only, drift risk
+            // accepted for an instrument.
+            #[cfg(feature = "profile")]
+            if COUNT {
+                use core::sync::atomic::Ordering::Relaxed;
+                if best_ml == 0 {
+                    let mlx = 8.min(mls).max(4);
+                    let lowest = block_start.saturating_sub(window).max(tables.frame_start);
+                    let cheap = m8 >= ip
+                        || ip - m8 > window
+                        || m8 < lowest
+                        || ip + mlx > src.len()
+                        || m8 + mlx > src.len();
+                    if cheap {
+                        LTAG_SURV_WFAIL.fetch_add(1, Relaxed);
+                    } else {
+                        LTAG_SURV_FAIL.fetch_add(1, Relaxed);
+                    }
+                } else {
+                    LTAG_SURV_ACC.fetch_add(1, Relaxed);
                 }
             }
         }
@@ -11836,6 +11880,26 @@ pub fn take_long_tag() -> (u64, u64, u64) {
         LTAG_NONEMPTY.swap(0, Relaxed),
         LTAG_REJECT.swap(0, Relaxed),
         LTAG_FALSE.swap(0, Relaxed),
+    )
+}
+
+/// 1a residual: survivors of the 4-byte tag that (failed, passed) acceptance
+/// at the MAIN long consume site. The fail share is the ceiling on what a
+/// stronger tag could still remove.
+#[cfg(feature = "profile")]
+pub static LTAG_SURV_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static LTAG_SURV_WFAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static LTAG_SURV_ACC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// `(bytes_fail, window_fail, accepted)` -- only `bytes_fail` paid a load.
+#[cfg(feature = "profile")]
+pub fn take_long_tag_residual() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        LTAG_SURV_FAIL.swap(0, Relaxed),
+        LTAG_SURV_WFAIL.swap(0, Relaxed),
+        LTAG_SURV_ACC.swap(0, Relaxed),
     )
 }
 

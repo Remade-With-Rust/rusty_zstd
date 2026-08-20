@@ -79,6 +79,8 @@ pub use encode::take_tag_reads;
 #[cfg(feature = "profile")]
 pub use encode::take_long_tag;
 #[cfg(feature = "profile")]
+pub use encode::take_long_tag_residual;
+#[cfg(feature = "profile")]
 pub use encode::take_ff_waste;
 #[cfg(feature = "profile")]
 pub use encode::FF_LATCH;
