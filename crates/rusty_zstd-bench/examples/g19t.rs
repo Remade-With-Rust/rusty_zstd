@@ -1,4 +1,4 @@
-//! GATE 19 @ L3: is the block-size time cost REAL? ABBA-paired, with a null arm
+//! GATE 19 @ L1: is the block-size time cost REAL? ABBA-paired, with a null arm
 //! (128 vs 128) so a +2% reading can be told from noise.
 use std::time::Instant;
 const IDS:&[&str]=&["mr","mozilla","sao","xml","ooffice","samba","osdb","x-ray","smallmsg-8m","nci"];
@@ -11,7 +11,7 @@ fn t(src:&[u8],kb:usize,n:usize)->f64{
     let mut b=f64::MAX;
     for _ in 0..n{
         let s=Instant::now();
-        let z=std::hint::black_box(rusty_zstd::compress(std::hint::black_box(src),3).unwrap());
+        let z=std::hint::black_box(rusty_zstd::compress(std::hint::black_box(src),1).unwrap());
         let e=s.elapsed().as_secs_f64();
         std::hint::black_box(z.len());
         if e<b{b=e;}
@@ -19,7 +19,7 @@ fn t(src:&[u8],kb:usize,n:usize)->f64{
     b
 }
 fn main(){
-    println!("L3 encode, 8 MiB, best-of-7 x ABBA x4. negative = FASTER than 128 KiB\n");
+    println!("L1 encode, 8 MiB, best-of-7 x ABBA x4. negative = FASTER than 128 KiB\n");
     println!("{:<12}{:>9}{:>9}{:>9}{:>9}","corpus","null","96KB","64KB","32KB");
     let (mut sn,mut s96,mut s64,mut s32,mut c)=(0.0,0.0,0.0,0.0,0.0);
     for id in IDS{

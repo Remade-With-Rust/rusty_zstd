@@ -1396,14 +1396,35 @@ fn adaptive_block_max(
         _ => (g5_rep_min(), g5_ratio_min(), g5_drift_min()),
     };
     #[cfg(feature = "profile")]
-    G5_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        G5_CALLS.fetch_add(1, Relaxed);
+        // WHY a block is not reduced: record the two inputs the live mechanisms
+        // test, so "0% reduced" can be attributed to a value rather than guessed.
+        if r_prev >= 0.0 {
+            G5_RPREV.fetch_add((r_prev.clamp(0.0, 10.0) * 10000.0) as u64, Relaxed);
+            G5_RPREV_N.fetch_add(1, Relaxed);
+            if r_prev2 >= 0.0 {
+                let d = (r_prev - r_prev2).abs() / r_prev.max(1e-6);
+                G5_DRIFTSUM.fetch_add((d.clamp(0.0, 100.0) * 10000.0) as u64, Relaxed);
+                G5_DRIFT_N.fetch_add(1, Relaxed);
+            }
+        }
+    }
     // block 0 has no history: always take the full size
     if r_prev < 0.0 {
         return base;
     }
-    // degenerate (RLE / near-RLE): one byte per block, so never split
-    if r_prev < G5_RLE_MAX {
+    // degenerate: TRUE RLE, one byte per block, so splitting is pure header.
+    if r_prev < g5_tiny_max() {
         return base;
+    }
+    // 4.76 -- the VERY-COMPRESSIBLE band, [tiny, rle). Not RLE: compressible by
+    // long-range MATCHES. At L1 `Fast` never finds those matches, so splitting
+    // costs nothing it was earning and lets the entropy tables re-adapt.
+    // `versions-16m` sits alone in this band at r_prev 0.0028 and wants -3.935%.
+    if r_prev < G5_RLE_MAX {
+        return base.min(g5_band());
     }
     // mechanism 3 -- long-range matches cross boundaries; splitting breaks them
     if rep_yield >= rep_min {
@@ -1427,6 +1448,22 @@ fn adaptive_block_max(
     base
 }
 
+pub static G5_RPREV: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static G5_RPREV_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static G5_DRIFTSUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static G5_DRIFT_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// GATE 5 inputs, as block means: `(mean r_prev, mean drift)`.
+pub fn take_g5_inputs() -> (f64, f64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let a = G5_RPREV_N.swap(0, Relaxed).max(1) as f64;
+    let b = G5_DRIFT_N.swap(0, Relaxed).max(1) as f64;
+    (
+        G5_RPREV.swap(0, Relaxed) as f64 / 10000.0 / a,
+        G5_DRIFTSUM.swap(0, Relaxed) as f64 / 10000.0 / b,
+    )
+}
+
 pub static G5_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static G5_HIT_RATIO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static G5_HIT_DRIFT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1435,6 +1472,67 @@ pub static G5_HIT_DRIFT: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 pub fn take_g5() -> (u64, u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
     (G5_CALLS.swap(0, Relaxed), G5_HIT_RATIO.swap(0, Relaxed), G5_HIT_DRIFT.swap(0, Relaxed))
+}
+
+/// 4.76. Below this a block is TRUE RLE and must never be split.
+///
+/// `G5_RLE_MAX` was 0.01 and returned `base` for everything under it, which
+/// intercepted `versions-16m` (r_prev **0.0028**) before any other mechanism ran.
+/// The Fast ladder's `G5_REP_MIN_FAST = 2.00` was set to an OFF switch
+/// specifically to release `versions` for a **-3.935%** win -- and the win was
+/// never delivered, because this guard sits EARLIER in the chain and the comment
+/// recording the fix does not mention it.
+///
+/// The separation is clean over two orders of magnitude:
+///
+/// ```text
+///   zeros-32m     r_prev 0.000000   +32.593% if split   MUST NOT
+///   text-32m      r_prev 0.000013   +30.159% if split   MUST NOT
+///   versions-16m  r_prev 0.002817    -3.935% if split   WANTS SPLIT
+/// ```
+const G5_TINY_MAX: f32 = 0.0005;
+
+/// DEFAULT OFF (`usize::MAX` never binds). The band was BUILT and MEASURED and it
+/// LOSES: versions-16m **+1.685%** at L1 where the sweep promised -3.935%, and
+/// text-32m +1.270% despite sitting below the tiny guard on its mean.
+///
+/// The reason is the finding. The sweep's -3.935% comes from a UNIFORM 96 KiB
+/// grid over the whole frame. GATE 5 is PER BLOCK and block 0 always takes
+/// `base`, so every later boundary is offset from that grid. `versions-16m` is a
+/// versioned-file corpus whose ratio comes from long-range near-copies, and its
+/// block-size curve is non-monotonic (+21.2% at 16 KiB, -0.516% at 64 KiB,
+/// **-3.935%** at 96 KiB, 0 at 128 KiB) -- an ALIGNMENT signature, not a
+/// "smaller blocks re-adapt sooner" one. A per-block mechanism cannot produce an
+/// aligned uniform grid, so this win is structurally GATE 19's (per frame), not
+/// GATE 5's (per block).
+///
+/// Kept, default off, because the band itself is correct machinery and the
+/// separation it keys on is real (two orders of magnitude, see `G5_TINY_MAX`).
+const G5_BAND: usize = usize::MAX;
+
+static G5_TINY_A: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static G5_BAND_A: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[inline(always)]
+fn g5_tiny_max() -> f32 {
+    let v = G5_TINY_A.load(core::sync::atomic::Ordering::Relaxed);
+    if v == u32::MAX { G5_TINY_MAX } else { f32::from_bits(v) }
+}
+
+#[inline(always)]
+fn g5_band() -> usize {
+    let v = G5_BAND_A.load(core::sync::atomic::Ordering::Relaxed);
+    if v == 0 { G5_BAND } else { v }
+}
+
+/// Bench arms for the 4.76 band. `set_g5_band_arm(usize::MAX)` disables the band
+/// (it can then never bind), restoring the pre-4.76 behaviour exactly.
+pub fn set_g5_tiny_arm(v: f32) {
+    G5_TINY_A.store(if v.is_nan() { u32::MAX } else { v.to_bits() },
+        core::sync::atomic::Ordering::Relaxed);
+}
+pub fn set_g5_band_arm(v: usize) {
+    G5_BAND_A.store(v, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Below this ratio a block is RLE or near-RLE: splitting only adds headers.
@@ -8066,16 +8164,31 @@ fn find_opt(
     let fill_step = opt_fill_stride();
     let fill_span_max = opt_fill_max();
     while i < n {
-        if price[i] >= inf {
+        // T2/T4 SAFETY, for the literal edge below -- the ONLY part of this loop
+        // that runs at EVERY position.
+        //
+        // `price`, `prev`, `is_match`, `match_off` and `match_ml` are all reset
+        // to exactly `n + 1` entries at the top of `find_opt`, and the loop
+        // condition is `i < n`, so `i` and `i + 1` are both `<= n` and therefore
+        // in range. LLVM cannot carry that through the `saturating_add` and the
+        // early-continue, so it bounds-checked a per-position access. Every
+        // other index in this DP is already guarded by an explicit `if j <= n`.
+        debug_assert!(i + 1 < price.len() && price.len() == n + 1);
+        #[allow(unsafe_code)]
+        let pi = *unsafe { price.get_unchecked(i) };
+        if pi >= inf {
             o_skip_inf += 1;
             i += 1;
             continue;
         }
-        let np = price[i].saturating_add(lit_cost);
-        if np < price[i + 1] {
-            price[i + 1] = np;
-            prev[i + 1] = i;
-            is_match[i + 1] = false;
+        let np = pi.saturating_add(lit_cost);
+        #[allow(unsafe_code)]
+        unsafe {
+            if np < *price.get_unchecked(i + 1) {
+                *price.get_unchecked_mut(i + 1) = np;
+                *prev.get_unchecked_mut(i + 1) = i;
+                *is_match.get_unchecked_mut(i + 1) = false;
+            }
         }
         let ip = block_start + i;
         if ip + 8 > block_end {
