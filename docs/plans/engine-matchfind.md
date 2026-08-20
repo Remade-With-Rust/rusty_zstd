@@ -186,6 +186,18 @@ walk — two bounds checks **per extended byte, per match**; `back_eq` applied v
 check against a guaranteed-empty array on packed frames; the packed write now returns
 early. Byte-identical 54/54 + 36/36; rejects equal to the unit.
 
+### 5d3. Round-4 results (2026-08-20 later)
+* **SHIPPED**: table base register-resident (`8bbf719`, iteration-window rbp-reloads
+  3 → 0); deferred tag allocation (alloc receipt **−1,548,740 B**/board, the per-frame
+  memset gone).
+* **REFUSED**: culling the dead `(false,false)` family — those arms are the gate
+  campaign's measurement-parity arms (RZSTD_TAG=0), and culling rebuilds the
+  work-parity break they exist to prevent.
+* **PRICED for the gate campaign**: the 4-byte hash wastes **82.9% of candidate
+  passes at L1** (13.96M/board: sao 96.1%, mr 95.7%, x-ray 98.9%), 75.8% at L2 —
+  C hashes `mls` bytes. Output-changing; strongest known L1 lever; needs
+  worst-corpus gates. Census: `ffwaste.rs`, counters inside `fast_probe`.
+
 ### 5d. Named, not taken *(next descent's shortlist)*
 * **Hash width diverges from C**: we hash 4 bytes at every `min_match` while C's
   `ZSTD_hashPtr` hashes `mls` bytes (6–7 at L1) — lower precision, wasted
