@@ -25,11 +25,18 @@ impl<'a> Reader<'a> {
     }
 
     pub(crate) fn peek_u32_le(&self) -> Result<u32, Error> {
-        let s = self
+        // T4: `get(a..b)` yields a slice of statically UNKNOWN length, so
+        // indexing it four times cost four bounds checks -- 4 of the codec
+        // path's remaining panic sites, all in `decompress_into_history`.
+        // Converting to a fixed-size array states the length instead, and needs
+        // no unsafe: the conversion itself proves it.
+        let s: [u8; 4] = self
             .data
             .get(self.pos..self.pos.saturating_add(4))
-            .ok_or(Error::UnexpectedEof)?;
-        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+            .ok_or(Error::UnexpectedEof)?
+            .try_into()
+            .map_err(|_| Error::UnexpectedEof)?;
+        Ok(u32::from_le_bytes(s))
     }
 
     pub(crate) fn u8(&mut self) -> Result<u8, Error> {

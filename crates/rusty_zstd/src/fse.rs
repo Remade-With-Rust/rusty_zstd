@@ -339,6 +339,12 @@ pub(crate) struct FseCTable {
 #[cfg(feature = "alloc")]
 impl FseCTable {
     pub(crate) fn from_norm(norm: &[i16], table_log: u8) -> Result<Self, Error> {
+        // T4: `max_sv` is `norm.len().saturating_sub(1)`, which SILENTLY yields
+        // 0 for an empty `norm` and then indexes `norm[0]`. Rejecting it here
+        // turns that into a clean error and makes every index below provable.
+        if norm.is_empty() {
+            return Err(Error::Corruption);
+        }
         if !(5..=9).contains(&table_log) {
             return Err(Error::Corruption);
         }
@@ -350,22 +356,50 @@ impl FseCTable {
 
         cumul[0] = 0;
         for u in 1..=max_sv + 1 {
-            if norm[u - 1] == -1 {
-                cumul[u] = cumul[u - 1] + 1;
-                table_symbol[high_threshold] = (u - 1) as u16;
+            // SAFETY: `u - 1` spans `0..=max_sv`, i.e. exactly `norm`'s range
+            // (non-empty, checked at entry); `cumul` is `max_sv + 2` long so
+            // both `u` and `u - 1` are in range; and `high_threshold` starts at
+            // `table_size - 1` and only saturating-decreases, so it indexes
+            // `table_symbol` (len `table_size`) in range.
+            debug_assert!(u - 1 < norm.len() && u < cumul.len() && high_threshold < table_symbol.len());
+            #[allow(unsafe_code)]
+            let nv = *unsafe { norm.get_unchecked(u - 1) };
+            #[allow(unsafe_code)]
+            let prev = *unsafe { cumul.get_unchecked(u - 1) };
+            if nv == -1 {
+                #[allow(unsafe_code)]
+                unsafe {
+                    *cumul.get_unchecked_mut(u) = prev + 1;
+                    *table_symbol.get_unchecked_mut(high_threshold) = (u - 1) as u16;
+                }
                 high_threshold = high_threshold.saturating_sub(1);
             } else {
-                cumul[u] = cumul[u - 1].wrapping_add(norm[u - 1].max(0) as u16);
+                #[allow(unsafe_code)]
+                unsafe {
+                    *cumul.get_unchecked_mut(u) = prev.wrapping_add(nv.max(0) as u16);
+                }
             }
         }
-        cumul[max_sv + 1] = (table_size + 1) as u16;
+        // `cumul` was built `max_sv + 2` long, so this is its last slot.
+        debug_assert!(max_sv + 1 < cumul.len());
+        #[allow(unsafe_code)]
+        unsafe {
+            *cumul.get_unchecked_mut(max_sv + 1) = (table_size + 1) as u16;
+        }
 
         let mask = table_size - 1;
         let step = (table_size >> 1) + (table_size >> 3) + 3;
         let mut position = 0usize;
         for (symbol, &freq) in norm.iter().enumerate() {
             for _ in 0..freq.max(0) {
-                table_symbol[position] = symbol as u16;
+                // `position` is always `& mask` with `mask == table_size - 1`
+                // and `table_size` a power of two, so it indexes
+                // `table_symbol` (len `table_size`) in range.
+                debug_assert!(position < table_symbol.len());
+                #[allow(unsafe_code)]
+                unsafe {
+                    *table_symbol.get_unchecked_mut(position) = symbol as u16;
+                }
                 position = (position + step) & mask;
                 while position > high_threshold {
                     position = (position + step) & mask;
@@ -375,24 +409,41 @@ impl FseCTable {
 
         let mut state_table = vec![0u16; table_size];
         for (u, &s) in table_symbol.iter().enumerate() {
-            let idx = cumul[s as usize] as usize;
+            // SAFETY: every value in `table_symbol` is <= max_sv -- they are
+            // written as `(u - 1)` with `u - 1 <= max_sv`, as a `norm` index in
+            // the spread loop above, or left at the 0 default -- and `cumul` is
+            // built `max_sv + 2` long. LLVM cannot derive that, because `s` is a
+            // value READ OUT OF a Vec rather than a loop induction variable.
+            debug_assert!((s as usize) < cumul.len());
+            #[allow(unsafe_code)]
+            let cs = unsafe { cumul.get_unchecked_mut(s as usize) };
+            let idx = *cs as usize;
             if idx >= state_table.len() {
                 return Err(Error::Corruption);
             }
             state_table[idx] = (table_size + u) as u16;
-            cumul[s as usize] = cumul[s as usize].wrapping_add(1);
+            *cs = cs.wrapping_add(1);
         }
 
         let mut delta = vec![FseCDelta { nb: 0, find: 0 }; max_sv + 1];
         let mut total: u32 = 0;
         for s in 0..=max_sv {
-            match norm[s] {
+            // SAFETY: `s <= max_sv` is `norm`'s range (non-empty, checked at
+            // entry) and `delta` is built `max_sv + 1` long just above.
+            debug_assert!(s < norm.len() && s < delta.len());
+            #[allow(unsafe_code)]
+            let nv = *unsafe { norm.get_unchecked(s) };
+            // One bound reference for the whole arm, instead of re-proving `s`
+            // on each of the six writes below.
+            #[allow(unsafe_code)]
+            let d = unsafe { delta.get_unchecked_mut(s) };
+            match nv {
                 0 => {
-                    delta[s].nb = ((u32::from(table_log) + 1) << 16) - (1 << table_log);
+                    d.nb = ((u32::from(table_log) + 1) << 16) - (1 << table_log);
                 }
                 -1 | 1 => {
-                    delta[s].nb = (u32::from(table_log) << 16) - (1 << table_log);
-                    delta[s].find = total as i32 - 1;
+                    d.nb = (u32::from(table_log) << 16) - (1 << table_log);
+                    d.find = total as i32 - 1;
                     total += 1;
                 }
                 freq => {
@@ -400,8 +451,8 @@ impl FseCTable {
                     let hb = 31 - (freq - 1).leading_zeros();
                     let max_bits_out = u32::from(table_log) - hb;
                     let min_state_plus = freq << max_bits_out;
-                    delta[s].nb = (max_bits_out << 16).wrapping_sub(min_state_plus);
-                    delta[s].find = total as i32 - freq as i32;
+                    d.nb = (max_bits_out << 16).wrapping_sub(min_state_plus);
+                    d.find = total as i32 - freq as i32;
                     total += freq;
                 }
             }
@@ -515,9 +566,14 @@ pub(crate) fn normalize_count(
     total: u32,
     use_low_prob: bool,
 ) -> Result<Vec<i16>, Error> {
-    if total == 0 || !(5..=9).contains(&table_log) {
+    if total == 0 || !(5..=9).contains(&table_log) || count.is_empty() {
         return Err(Error::Corruption);
     }
+    // T4: the `count.is_empty()` arm above is what makes `max_sv` -- and every
+    // index derived from it -- provable. `max_sv = count.len() - 1` already
+    // relied on non-empty; stating it turns a latent underflow into a clean
+    // error AND lets the loop below index without a check.
+    debug_assert!(!count.is_empty());
     let max_sv = count.len() - 1;
     if count.contains(&total) {
         return Err(Error::Corruption);
@@ -533,7 +589,11 @@ pub(crate) fn normalize_count(
     let mut largest = 0usize;
     let mut largest_p: i16 = 0;
     for s in 0..=max_sv {
-        let c = count[s];
+        // SAFETY: `max_sv == count.len() - 1` with `count` non-empty (checked at
+        // entry), and `norm` is built `max_sv + 1` long just above.
+        debug_assert!(s < count.len() && s < norm.len());
+        #[allow(unsafe_code)]
+        let c = *unsafe { count.get_unchecked(s) };
         if c == 0 {
             continue;
         }
@@ -545,7 +605,11 @@ pub(crate) fn normalize_count(
         let mut proba = ((u64::from(c) * step) >> scale) as i16;
         if proba < 8 {
             let rest = (u64::from(c) * step) - ((proba as u64) << scale);
-            if rest > v_step * rtb[proba as usize] {
+            // `proba < 8` is guaranteed by the branch above and `proba` comes
+            // from an unsigned shift, so the clamp is a no-op -- it exists only
+            // to let LLVM drop the bounds check on an 8-entry table.
+            debug_assert!((0..8).contains(&proba));
+            if rest > v_step * rtb[(proba as usize).min(7)] {
                 proba += 1;
             }
         }
@@ -556,7 +620,14 @@ pub(crate) fn normalize_count(
         norm[s] = proba;
         still -= i32::from(proba);
     }
-    if still.abs() >= i32::from(norm[largest].unsigned_abs()) / 2 && still < 0 {
+    // SAFETY for the `largest` accesses here and below: `largest` starts at 0
+    // and is only ever assigned `s` from the loop above, so `largest <= max_sv`,
+    // and both `norm` and `n2` are built `max_sv + 1` long. `count` is non-empty
+    // by the check at entry, so `max_sv + 1 >= 1` and index 0 is valid too.
+    #[allow(unsafe_code)]
+    let norm_largest = || *unsafe { norm.get_unchecked(largest) };
+    debug_assert!(largest < norm.len());
+    if still.abs() >= i32::from(norm_largest().unsigned_abs()) / 2 && still < 0 {
         // fallback: scale by table size
         let mut n2 = vec![0i16; max_sv + 1];
         let mut dist = 0i32;
@@ -569,15 +640,22 @@ pub(crate) fn normalize_count(
             dist += i32::from(w);
         }
         let leftover = (1i32 << table_log) - dist;
-        n2[largest] = (i32::from(n2[largest]) + leftover) as i16;
-        if n2[largest] < 1 {
-            n2[largest] = 1;
+        debug_assert!(largest < n2.len());
+        #[allow(unsafe_code)]
+        unsafe {
+            let v = n2.get_unchecked_mut(largest);
+            *v = (i32::from(*v) + leftover) as i16;
+            if *v < 1 {
+                *v = 1;
+            }
         }
         return Ok(n2);
     }
-    norm[largest] = (i32::from(norm[largest]) + still) as i16;
-    if norm[largest] < 1 {
-        norm[largest] = 1;
+    #[allow(unsafe_code)]
+    let nl = unsafe { norm.get_unchecked_mut(largest) };
+    *nl = (i32::from(*nl) + still) as i16;
+    if *nl < 1 {
+        *nl = 1;
     }
     Ok(norm)
 }
