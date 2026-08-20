@@ -312,16 +312,23 @@ unconditionally since the Gate-7 per-block poison fix), live only in
 means exactly one thing: this monomorphisation compares tags. The dead
 `load_fast` (superseded by `fast_slot_load`) is deleted.
 
-**Routing holes found (performance, not correctness) — candidate work:**
+**Routing holes — CLOSED 2026-08-21, priced on the T1 instrument (`tagbig`):**
 
-1. **DFast >= 16 MiB frames run with NO tag filter.** `dfast_tag` is on, but
-   `enable_packed_tags` refuses the length and the array fallback is
-   Fast-only, so `dtag_on` is silently false. T1's 2.9M-loads-avoided receipt
-   applies only below 16 MiB.
-2. **Streaming DFast: same hole** — `alloc_fast_tags` is Fast-only.
+1. **DFast >= 16 MiB frames ran with NO tag filter** (`enable_packed_tags`
+   refuses the length; the array fallback was Fast-only, so `dtag_on` was
+   silently false). The frame-init fallback now routes the S1 array to DFast.
+2. **Streaming DFast: same hole** — `alloc_fast_tags` extended likewise.
 
-Both want the S1 array route extended to DFast, priced on the T1 instrument
-(rejects gained vs the `1<<hlog` alloc + second-line loads).
+`tagbig` (full-length frames, 9 corpora x L3/L4, in-process arm A/B where
+arm-off == pre-fix behavior): **18/18 byte-identical**, and the filter
+rejects **12,202,975 of 37,031,552 nonempty probes (33.0%)** — each one a
+random `src[m]` load + gram compare + dying `count_match` the frames
+previously paid in full. `mozilla` (51 MB) rejects **61.2%** at L3, `samba`
+29.6%; the degenerate big corpora (versions/text/zeros/incomp) probe the
+short table almost never and are unaffected. Cost: one `tags[h]` byte read
+per nonempty probe, a tag write per store, and a `1 << hash_log` (<= 256 KiB)
+allocation per frame. The Fast array precedent accepted this same trade at a
+22.7% rejection rate; the DFast big-frame board clears it at 33.0%.
 
 ---
 

@@ -775,7 +775,13 @@ impl MatchTables {
     /// Allocate the array form of the Fast tag filter (for callers with no
     /// frame length to prove the packed bound -- the streaming compressor).
     pub(crate) fn alloc_fast_tags(&mut self, params: CompressionParameters) {
-        if params.strategy == Strategy::Fast && tag_alloc_enabled() && self.tags.is_empty() {
+        // TAG AUDIT hole #2 closed: streaming DFast now gets the array form
+        // too (this was Fast-only, leaving `dtag_on` false for every
+        // streaming DFast frame).
+        if ((params.strategy == Strategy::Fast && tag_alloc_enabled())
+            || (params.strategy == Strategy::DFast && dfast_tag_enabled()))
+            && self.tags.is_empty()
+        {
             self.tags = alloc::vec![0u8; self.hash.len()];
         }
     }
@@ -921,12 +927,24 @@ pub(crate) fn encode_oneshot(
                 && fast_pack_enabled()),
         hist_prefix.len() + src.len(),
     );
-    if params.strategy == Strategy::Fast && tag_alloc_enabled() && !tables.pack_tags {
-        // Non-packed Fast frames (>= 16 MiB) still carry the array form of the
+    if !tables.pack_tags
+        && ((params.strategy == Strategy::Fast && tag_alloc_enabled())
+            || (params.strategy == Strategy::DFast && dfast_tag_enabled()))
+    {
+        // Non-packed frames (>= 16 MiB) still carry the array form of the
         // tag filter; `new` no longer allocates it, so this is the one site
         // that does. Packed frames never allocate it at all -- previously it
         // was built zeroed here-ish and dropped, a per-frame memset for
         // nothing.
+        //
+        // TAG AUDIT hole #1 closed: this fallback was Fast-only, so DFast
+        // frames >= 16 MiB ran with dfast_tag ON and NO filter at all --
+        // `dtag_on` silently false. The writers already honor the array
+        // representation unconditionally (190ad8b), so routing the
+        // allocation is the whole fix; byte-identity follows from the T1
+        // proof (the tag derives from the same 4 bytes as the index, and a
+        // real match implies an equal tag). Priced on the T1 instrument by
+        // `tagbig`: see the commit.
         tables.tags = alloc::vec![0u8; tables.hash.len()];
     }
     let mut reps = [1u32, 4, 8];
