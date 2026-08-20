@@ -5776,6 +5776,16 @@ fn find_dfast_impl<const HLOG: u32>(
     // GATE 8 signal: share of speculated loads that were actually CONSUMED. A
     // speculation is discarded whenever the position ends in a match or a rep
     // hit, so match-dense content pays for loads it never uses.
+    // T2: these three are DIAGNOSTICS, and leaving them ungated kept `mm_total`
+    // live across the whole search loop for no shipping purpose. The gate signal
+    // below is computed from `spec_used`/`spec_made` directly, not from the
+    // atomics, so gating the atomics costs no dispatch anything. The `nl_probes`
+    // block immediately after this one was already gated exactly this way.
+    //
+    // The DFast hot loop is only 151 instructions but carries 27 stack reloads,
+    // 23 of them loop-invariant across 12 slots -- it is short of registers, and
+    // what it is spending them on is the gates' own telemetry.
+    #[cfg(feature = "profile")]
     {
         use core::sync::atomic::Ordering::Relaxed;
         MM_TOTAL.fetch_add(mm_total, Relaxed);

@@ -217,7 +217,45 @@ order is to derive `bt_mask` from `tables.chain.len()` — making the invariant
 provable *and* closing the edge — and only then take the checks out. That is a
 behaviour-affecting change on the Bt ladder and needs its own verification pass.
 
-**Register pressure remains open.** `find_dfast_impl` holds 60 distinct spill
+**REGISTER PRESSURE -- MEASURED PROPERLY, AND MY EARLIER CLAIM WAS WRONG.**
+
+I said "60 spill slots and one reloaded 20 times against a single store." Those
+numbers are FUNCTION-WIDE, and most of that traffic is nowhere near the hot
+path. Splitting `find_dfast_impl` by source line against the main loop
+(`encode.rs:5509-5700`):
+
+| region | instrs | reloads | stores |
+| --- | ---: | ---: | ---: |
+| **hot loop** | **151** | **27** | 10 |
+| rest of the function (tail, fill, EWMA) | 1,557 | 188 | 62 |
+
+So the hot loop is short -- 151 instructions -- and carries 27 reloads, of which
+**23 are loop-invariant, spread across 12 distinct slots** reloaded 1-4 times
+each. It is **not** one stubborn value; the loop simply needs more live values
+than x86-64 has registers.
+
+**And what it is spending them on is the gates' own telemetry.** The loop
+maintains ~9 accumulators across iterations -- `rep_hits`, `spec_made`,
+`spec_used`, `mm_total`, `nl_probes`, `nl_hits`, `band_hits`, `band_worse`,
+`d_rep_bytes` -- and most exist to feed gate signals (`rep_yield`,
+`dfast_spec_yield`, `nl_off_worse`) rather than to compress anything. That is a
+direct cost the gate campaign imposes on the engine, and it is the first place
+the two threads have actually met.
+
+Splitting the tail into a separate function does NOT fix it: those accumulators
+are incremented *inside* the loop, so they are live across iterations either
+way. The real fix is to reduce live state -- derive the signals after the loop
+from `seqs` where possible instead of counting during it. That changes how gate
+signals are gathered, so it belongs to a gate cell, not to T2.
+
+**One thing was tractable and is done:** the `MM_TOTAL`/`DFAST_SPEC_MADE`/
+`DFAST_SPEC_USED` block was ungated while the `nl_probes` block immediately
+below it was already `#[cfg(feature = "profile")]`. Gating it removes three
+atomic read-modify-writes per block from shipping builds. **It did not move the
+hot loop** (151 instrs / 27 reloads, unchanged) -- recorded as measured, not
+claimed as a win.
+
+**Original note follows.** `find_dfast_impl` holds 60 distinct spill
 slots and reloads one of them 20 times against a single store — a loop-invariant
 value LLVM refuses to keep in a register. And `find_fast_impl` has **34
 monomorphisations totalling 39,424 instructions**. Note that dead specialisations
@@ -305,6 +343,7 @@ dispatch that had to be thrown away.
 3. **T2** — inner-loop codegen and register pressure. Slowest to verify.
 4. **T3** — huffman, scoped to literal-heavy content at L1.
 5. **Owed:** the L19 `opt_ops` timing pass from §6.
+6. find_opt improvements
 
 Harnesses in place: `hotspot.rs` (stage + counter map), `tagprice.rs` (what the
 tag buys), `allocost.rs` (allocation pricing), `g6null.rs` (noise floor),
