@@ -783,8 +783,13 @@ pub fn set_matchcopy_arm(on: bool) {
     );
 }
 
+/// T4/brick-79, third and last instance. `lut_on()` was read INSIDE `ll_code`
+/// and `ml_code`, which the sequence-coder calls once each PER SEQUENCE -- two
+/// atomic loads per sequence, ~15M across the corpus. `litcopy_on` and
+/// `matchcopy_on` are both resolved once per block and passed down; this one
+/// never was. Callers now hoist it the same way.
 #[inline(always)]
-fn lut_on() -> bool {
+pub(crate) fn lut_on() -> bool {
     LUT_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
 }
 #[inline(always)]
@@ -847,8 +852,8 @@ const fn build_code_lut<const N: usize>(base: &[u32]) -> [u8; N] {
 static LL_CODE_LUT: [u8; LL_LUT_LEN] = build_code_lut::<LL_LUT_LEN>(&LL_BASE);
 static ML_CODE_LUT: [u8; ML_LUT_LEN] = build_code_lut::<ML_LUT_LEN>(&ML_BASE);
 
-pub(crate) fn ll_code(len: u32) -> (u8, u32, u8) {
-    if lut_on() && (len as usize) < LL_LUT_LEN {
+pub(crate) fn ll_code(len: u32, lut: bool) -> (u8, u32, u8) {
+    if lut && (len as usize) < LL_LUT_LEN {
         let c = LL_CODE_LUT[len as usize] as usize;
         // `code_from_base` falls off the bottom as `(0, val, 0)` rather than
         // `val - base[0]`, so mirror that instead of subtracting blindly.
@@ -862,8 +867,8 @@ pub(crate) fn ll_code(len: u32) -> (u8, u32, u8) {
     code_from_base(len, &LL_BASE, &LL_BITS)
 }
 
-pub(crate) fn ml_code(len: u32) -> (u8, u32, u8) {
-    if lut_on() && (len as usize) < ML_LUT_LEN {
+pub(crate) fn ml_code(len: u32, lut: bool) -> (u8, u32, u8) {
+    if lut && (len as usize) < ML_LUT_LEN {
         let c = ML_CODE_LUT[len as usize] as usize;
         // ML_BASE[0] is 3, so any len < 3 lands here and must NOT subtract.
         let base = ML_BASE[c];
@@ -1278,12 +1283,12 @@ mod tests {
         probes.extend([65535, 65536, 65537, 100_000, u32::MAX - 1]);
         for v in probes {
             assert_eq!(
-                ll_code(v),
+                ll_code(v, true),
                 code_from_base(v, &LL_BASE, &LL_BITS),
                 "ll_code({v})"
             );
             assert_eq!(
-                ml_code(v),
+                ml_code(v, true),
                 code_from_base(v, &ML_BASE, &ML_BITS),
                 "ml_code({v})"
             );
@@ -1332,8 +1337,8 @@ mod tests {
     #[test]
     fn code_lut_exhaustive_over_lut_domain() {
         for v in 0..(ML_LUT_LEN as u32 * 2) {
-            assert_eq!(ll_code(v), code_from_base(v, &LL_BASE, &LL_BITS));
-            assert_eq!(ml_code(v), code_from_base(v, &ML_BASE, &ML_BITS));
+            assert_eq!(ll_code(v, true), code_from_base(v, &LL_BASE, &LL_BITS));
+            assert_eq!(ml_code(v, true), code_from_base(v, &ML_BASE, &ML_BITS));
         }
     }
 }

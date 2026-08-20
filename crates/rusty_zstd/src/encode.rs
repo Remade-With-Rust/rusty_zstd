@@ -2461,6 +2461,11 @@ fn write_sequences(
 
     let (coded, ll_count, of_count, ml_count) = {
         let _sc = crate::prof::scope(crate::prof::Stage::EncodeSeqCode);
+        // T4/brick-79: hoist the LUT arm out of the per-sequence loop. It was
+        // read inside `ll_code` AND `ml_code`, i.e. two atomic loads per
+        // sequence, while the two copy arms beside it are both resolved once
+        // per block.
+        let lut_arm = crate::compressed::lut_on();
         let mut coded: Vec<CodedSeq> = Vec::with_capacity(seqs.len());
         for s in seqs {
             let ov = offset_value_for(s.offset, s.litlen, reps);
@@ -2489,8 +2494,8 @@ fn write_sequences(
                     _ => {}
                 }
             }
-            let (llc, llx, llb) = ll_code(s.litlen);
-            let (mlc, mlx, mlb) = ml_code(s.matchlen);
+            let (llc, llx, llb) = ll_code(s.litlen, lut_arm);
+            let (mlc, mlx, mlb) = ml_code(s.matchlen, lut_arm);
             let (ofc, ofx) = of_code(ov);
             if ofc > 31 {
                 return Err(Error::Corruption);
@@ -8581,8 +8586,8 @@ pub(crate) fn harvest_dict_entropy(
                 if resolve_offset(ov, s.litlen, &mut reps).is_err() {
                     continue;
                 }
-                let (llc, _, _) = ll_code(s.litlen);
-                let (mlc, _, _) = ml_code(s.matchlen);
+                let (llc, _, _) = ll_code(s.litlen, true);
+                let (mlc, _, _) = ml_code(s.matchlen, true);
                 let (ofc, _) = of_code(ov);
                 if (llc as usize) < ll_count.len() {
                     ll_count[llc as usize] = ll_count[llc as usize].saturating_add(1);
@@ -8845,8 +8850,8 @@ mod tests {
                     for s in &seqs {
                         let ov = offset_value_for(s.offset, s.litlen, &reps);
                         let _ = resolve_offset(ov, s.litlen, &mut reps).expect("ov");
-                        let (llc, _, _) = ll_code(s.litlen);
-                        let (mlc, _, _) = ml_code(s.matchlen);
+                        let (llc, _, _) = ll_code(s.litlen, true);
+                        let (mlc, _, _) = ml_code(s.matchlen, true);
                         let (ofc, _) = of_code(ov);
                         want_codes.push((s.litlen, s.matchlen, ov, llc, mlc, ofc));
                     }
