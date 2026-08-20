@@ -6739,6 +6739,18 @@ fn find_dfast_impl<const HLOG: u32>(
     // Loop-invariant arm reads, hoisted from the MATCH path to once per block.
     let fill_anchor_c = dfast_fill_anchor_c();
     let fill_stride = dfast_fill_stride();
+    // REFUTED (2026-08-20): the Fast loop's mem::take table surgery, applied
+    // here -- take hash/hash_long/tags into locals, slice-based slot twins,
+    // slice-signature fill helpers. Byte-identical (dfid L1-L4 exact) but
+    // strictly MORE work on every deterministic axis: family 8,656 -> 8,862
+    // instrs, rbp-relative operands 2,001 -> 2,305, ALL memory operands
+    // 3,309 -> 3,559. The mechanism is not Fast's: LLVM already keeps ONE
+    // register on `tables` and folds the field offsets into addressing modes,
+    // so the struct costs no per-access reload here, while THREE taken Vec
+    // triples plus their restores add three competing base pointers to a loop
+    // whose live set (spec tuple, two tables, rep, nl, band counters) is
+    // already past sixteen GPRs. Fast won because it took TWO vecs into a
+    // smaller live set. Do not redo without first shrinking the live set.
     while ip <= ilimit {
         #[cfg(feature = "profile")]
         if COUNT {
