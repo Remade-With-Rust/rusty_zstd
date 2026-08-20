@@ -657,9 +657,6 @@ impl MatchTables {
         // Written UNCONDITIONALLY whenever the array exists. Gating the STORE
         // on the same flag as the compare is what lets tags go stale, which is
         // the defect class that cost this gate a day (190ad8b).
-        if let Some(t) = self.tags.get_mut(h) {
-            *t = tag;
-        }
         // ffanat 5a: the packed form is LIVE when `pack_tags` is set for a Fast
         // frame (< 16 MiB, proven by `enable_packed_tags`). The historical
         // refutation of this representation was real but misattributed -- see
@@ -668,9 +665,22 @@ impl MatchTables {
         // by unpacking at the switch. With it on, the separate `tags` array is
         // dropped entirely: one random line loaded and one stored per probe
         // instead of two of each.
-        *unsafe { self.hash.get_unchecked_mut(h) } = if self.pack_tags {
-            (((pos as u32).wrapping_add(1)) & 0x00FF_FFFF) | (u32::from(tag) << 24)
-        } else {
+        //
+        // The packed branch RETURNS EARLY so the `tags.get_mut` length check
+        // below never runs on packed frames -- the array is empty there, and a
+        // per-position len-load + compare + branch against an empty Vec is pure
+        // waste in the hottest store in the encoder. The 190ad8b rule ("written
+        // unconditionally whenever the array exists") still holds in the
+        // else-path: packing removes the array, it does not gate the store.
+        if self.pack_tags {
+            *unsafe { self.hash.get_unchecked_mut(h) } =
+                (((pos as u32).wrapping_add(1)) & 0x00FF_FFFF) | (u32::from(tag) << 24);
+            return;
+        }
+        if let Some(t) = self.tags.get_mut(h) {
+            *t = tag;
+        }
+        *unsafe { self.hash.get_unchecked_mut(h) } = {
             // BRICK 57: `wrapping_add`, not `saturating_add`. The slot holds
             // `pos + 1` with 0 meaning "empty". The only input that differs is
             // `pos as u32 == u32::MAX`, where saturating stored `u32::MAX` --
@@ -5778,7 +5788,14 @@ fn emit_fast_seq<const PACKED: bool>(
     let mut mm = m;
     let mut n = ml;
     let back_from = ip;
-    while ip > anchor && mm > frame_start && src[ip - 1] == src[mm - 1] {
+    // T2's `back_eq`, finally applied HERE too. This is the Fast ladder's copy
+    // of the exact back-extension walk that find_greedy/find_lazy/find_bt_lazy
+    // had de-checked -- a PER-BYTE loop paying two bounds checks per extended
+    // byte, running on EVERY match at L1/L2. Same proof: `ip > anchor` gives
+    // `ip >= 1`, `mm > frame_start` gives `mm >= 1`, both start below the block
+    // end and only decrease. Seventh instance of a capability present in one
+    // path and absent in its neighbour.
+    while ip > anchor && mm > frame_start && back_eq(src, ip, mm) {
         ip -= 1;
         mm -= 1;
         n += 1;
