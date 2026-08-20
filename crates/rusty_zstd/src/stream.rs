@@ -95,8 +95,13 @@ impl Compressor {
     /// New compressor with options and an optional size hint (picks window/hash).
     pub fn with_options(opts: CompressOptions, src_hint: Option<u64>) -> Result<Self, Error> {
         let params = compression_params(opts.level, src_hint)?;
+        let mut tables = MatchTables::new(params);
+        // The streaming compressor has no pledged total length to prove the
+        // packed-tag bound, so it keeps the array form of the Fast tag filter;
+        // `MatchTables::new` no longer allocates it (see ffanat), so do it here.
+        tables.alloc_fast_tags(params);
         Ok(Self {
-            tables: MatchTables::new(params),
+            tables,
             params,
             checksum: opts.checksum,
             pledged: src_hint,

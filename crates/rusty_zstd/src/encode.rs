@@ -551,7 +551,14 @@ impl MatchTables {
         // the slot it already loads, so allocating a second array here would
         // reintroduce exactly the per-position store that made the unpacked form
         // fail to pay.
-        let use_tags = params.strategy == Strategy::Fast && tag_alloc_enabled();
+        // ffanat: `new` no longer allocates the tag array. Packed frames (the
+        // L1/L2 default, every frame < 16 MiB) never need it, and allocating
+        // 1 << hash_log bytes of ZEROED memory per frame only to drop it at the
+        // enable site was a pure memset tax. The array is now allocated at the
+        // one place that knows whether packing applies (`encode_oneshot`) and,
+        // for the streaming compressor, right after construction.
+        let use_tags = false;
+        let _ = tag_alloc_enabled;
         let use_chain = !matches!(params.strategy, Strategy::Fast | Strategy::DFast);
         let hash_b = (hsz as u64).saturating_mul(4);
         let long_b = if use_long { hash_b } else { 0 };
@@ -803,6 +810,14 @@ impl MatchTables {
         *unsafe { self.hash.get_unchecked_mut(h) } = (pos as u32).saturating_add(1);
     }
 
+    /// Allocate the array form of the Fast tag filter (for callers with no
+    /// frame length to prove the packed bound -- the streaming compressor).
+    pub(crate) fn alloc_fast_tags(&mut self, params: CompressionParameters) {
+        if params.strategy == Strategy::Fast && tag_alloc_enabled() && self.tags.is_empty() {
+            self.tags = alloc::vec![0u8; self.hash.len()];
+        }
+    }
+
     /// Enable packed tags for this frame, but only when every position the
     /// finder can store fits in the 24 bits the representation leaves.
     /// `len` must be the length of the buffer the finder indexes into.
@@ -944,11 +959,13 @@ pub(crate) fn encode_oneshot(
                 && fast_pack_enabled()),
         hist_prefix.len() + src.len(),
     );
-    if tables.pack_tags && params.strategy == Strategy::Fast {
-        // ffanat 5a: under packing the separate tag array is dead weight --
-        // dropping it is the deterministic receipt that the second cache line
-        // per probe is gone (1 << hash_log bytes, 16 KiB at L1).
-        tables.tags = alloc::vec::Vec::new();
+    if params.strategy == Strategy::Fast && tag_alloc_enabled() && !tables.pack_tags {
+        // Non-packed Fast frames (>= 16 MiB) still carry the array form of the
+        // tag filter; `new` no longer allocates it, so this is the one site
+        // that does. Packed frames never allocate it at all -- previously it
+        // was built zeroed here-ish and dropped, a per-frame memset for
+        // nothing.
+        tables.tags = alloc::vec![0u8; tables.hash.len()];
     }
     let mut reps = [1u32, 4, 8];
     let mut entropy = EntropyState::default();
@@ -3971,7 +3988,7 @@ fn find_fast_impl<
         // The pipelined loop returns HERE, before the main tail -- so before this
         // it never refreshed `tag_yield` at all and the old global counters just
         // accumulated across blocks.
-        tables.tag_yield = cand_yield(cand);
+    tables.tag_yield = cand_yield(cand);
         let (ls, lm) = lit_shares(&seqs);
         tables.lit_short_share = ls;
         tables.lit_mid_share = lm;
@@ -4304,8 +4321,12 @@ fn fast_probe(
         return None;
     }
     cand.1 += 1;
+    #[cfg(feature = "profile")]
+    FF_CAND4.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let ml = 4 + count_match(src, m + 4, ip + 4, block_end);
     if ml >= mls {
+        #[cfg(feature = "profile")]
+        FF_ACCEPT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Some((m, ml))
     } else {
         None
@@ -11181,4 +11202,22 @@ pub fn set_fast_pack_arm(on: bool) {
 
 fn fast_pack_enabled() -> bool {
     !matches!(FAST_PACK_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
+}
+
+
+/// ffanat hash-width census: candidates whose FOUR bytes matched (`cand.1`)
+/// versus matches actually ACCEPTED (`ml >= mls`). The difference is work a
+/// 4-byte hash creates that an `mls`-byte hash (C's `ZSTD_hashPtr`) would not:
+/// every such candidate costs a random `src[m]` load, a compare, and a
+/// `count_match` that dies below `mls`.
+#[cfg(feature = "profile")]
+pub static FF_CAND4: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static FF_ACCEPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear `(four-byte passes, accepted matches)`.
+#[cfg(feature = "profile")]
+pub fn take_ff_waste() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (FF_CAND4.swap(0, Relaxed), FF_ACCEPT.swap(0, Relaxed))
 }

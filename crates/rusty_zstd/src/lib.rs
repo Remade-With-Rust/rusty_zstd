@@ -76,6 +76,8 @@ pub use encode::take_ff_arms;
 #[cfg(feature = "profile")]
 pub use encode::take_tag_reads;
 #[cfg(feature = "profile")]
+pub use encode::take_ff_waste;
+#[cfg(feature = "profile")]
 pub use compressed::take_dec_copies;
 #[cfg(feature = "profile")]
 pub use compressed::take_dec_bands;
