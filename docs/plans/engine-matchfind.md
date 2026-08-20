@@ -178,6 +178,24 @@ finds nothing in 12-bit greyscale). Its C/us 2.83 belongs to the **Huffman encod
 — a separate engine target (`encode_stream`/`emit_fill`), not listed in this file's
 priority order until now. `sao` decode similarly flipped to DecLits 78.3%.
 
+### 5b2. Hit/store-path wins — **SHIPPED** (`15065b3`)
+`emit_fast_seq`'s back-extension was the Fast ladder's un-de-checked copy of the T2
+walk — two bounds checks **per extended byte, per match**; `back_eq` applied verbatim
+(211 → 194 instrs, 2 → 0 panic sites; the **seventh** neighbour-capability instance).
+`store_fast` ran the tags-array length check ahead of the pack branch — a per-position
+check against a guaranteed-empty array on packed frames; the packed write now returns
+early. Byte-identical 54/54 + 36/36; rejects equal to the unit.
+
+### 5d. Named, not taken *(next descent's shortlist)*
+* **Hash width diverges from C**: we hash 4 bytes at every `min_match` while C's
+  `ZSTD_hashPtr` hashes `mls` bytes (6–7 at L1) — lower precision, wasted
+  `count_match` on sub-mls hits. **Output-changing** — needs worst-corpus gates, not
+  byte-identity. Potentially the largest remaining L1 lever.
+* `accel` is a per-block variable shift (`shr %cl`) that is the constant 7 for Fast
+  unless pinned — const-specialisable.
+* `dfast_fill_ends()` is one atomic load **per match** for a process constant
+  (brick-79 shape, small).
+
 ### 5c. Residue
 The 13 panic sites in one inlined instantiation still need the CodeView inline-site
 chain (OPEN). The dead-copy census question is now answered for the OLD family (0%);
