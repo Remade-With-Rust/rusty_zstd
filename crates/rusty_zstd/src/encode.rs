@@ -3074,6 +3074,22 @@ fn find_fast(
         ROUTE_GAIN.fetch_add((tables.pair_gain * 1000.0) as u64, Ordering::Relaxed);
         ROUTE_REP.fetch_add((tables.rep_yield * 1000.0) as u64, Ordering::Relaxed);
         ROUTE_N.fetch_add(1, Ordering::Relaxed);
+        // THE DISPATCH-VARIABLE DUMP. Every per-block content signal the encoder
+        // already maintains, sampled at one point. 4.72's law: before inventing
+        // a signal, dump the ones that already exist.
+        // Every accumulator here is INDEPENDENT of the route histogram's, and has
+        // its own block count: sharing ROUTE_N made `take_route_hist` drain this
+        // dump to zero when called first, and the whole table read 0.0000.
+        let q = |v: f32| -> u64 { (v.max(0.0).min(1.0e6) * 1000.0) as u64 };
+        SIG_GAIN.fetch_add(q(tables.pair_gain), Ordering::Relaxed);
+        SIG_REP.fetch_add(q(tables.rep_yield), Ordering::Relaxed);
+        SIG_TAG.fetch_add(q(tables.tag_yield), Ordering::Relaxed);
+        SIG_REPLEN.fetch_add(q(tables.rep_len_ratio), Ordering::Relaxed);
+        SIG_NSEQ.fetch_add(tables.last_nseq as u64, Ordering::Relaxed);
+        // `opt_rep_rate` initialises to f32::MAX; `* 1000.0` overflows to inf and
+        // saturates the cast, which is what printed 1.8e19. Clamp at source.
+        SIG_OPTREP.fetch_add(q(tables.opt_rep_rate), Ordering::Relaxed);
+        SIG_N.fetch_add(1, Ordering::Relaxed);
     }
     let s0 = if params.target_length == 0 {
         if tables.pair_route == 1 {
@@ -10296,6 +10312,36 @@ static ROUTE_HIST: [core::sync::atomic::AtomicU64; 3] = [
 static ROUTE_GAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static ROUTE_REP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static ROUTE_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+static SIG_GAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SIG_REP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SIG_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SIG_TAG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SIG_REPLEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SIG_NSEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SIG_OPTREP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// EVERY per-block content signal the encoder already maintains, as block means:
+/// `(pair_gain, rep_yield, tag_yield, rep_len_ratio, last_nseq, opt_rep_rate)`.
+///
+/// The campaign's 4.72 law in tool form: before inventing a dispatch signal,
+/// dump the ones already in `MatchTables`. Four invented signals were refuted in
+/// 4.70 while the working one (`pair_gain`) sat in the struct the whole time.
+///
+/// SCOPE: `pair_gain` is maintained ONLY in `find_fast_impl` (L1/L2).
+/// `rep_yield` is maintained in all five finders (L1-L15). Check a signal EXISTS
+/// at the level you are dispatching before reading meaning into its value.
+pub fn take_content_signals() -> (f64, f64, f64, f64, f64, f64) {
+    use core::sync::atomic::Ordering;
+    let n = SIG_N.swap(0, Ordering::Relaxed).max(1) as f64;
+    let g = SIG_GAIN.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n;
+    let y = SIG_REP.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n;
+    let t = SIG_TAG.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n;
+    let r = SIG_REPLEN.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n;
+    let q = SIG_NSEQ.swap(0, Ordering::Relaxed) as f64 / n;
+    let o = SIG_OPTREP.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n;
+    (g, y, t, r, q, o)
+}
 
 /// Per-block route histogram and the mean state that decided it.
 /// Returns `(route0, route1, route2, mean pair_gain, mean rep_yield)`.
