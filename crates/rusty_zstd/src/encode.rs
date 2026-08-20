@@ -1010,7 +1010,14 @@ pub(crate) fn encode_oneshot(
         let mut r_prev: f32 = -1.0;
         let mut r_prev2: f32 = -1.0;
         while off < workspace.len() {
-            let bmax = adaptive_block_max(block_max, r_prev, r_prev2, tables.rep_yield, params.strategy);
+            let bmax = adaptive_block_max(
+                block_max,
+                r_prev,
+                r_prev2,
+                tables.rep_yield,
+                params.strategy,
+                workspace.len(),
+            );
             let mut end = (off + bmax).min(workspace.len());
             if adv.rsyncable && end > off + 64 {
                 if let Some(cut) = crate::ldm::rsync_cut(&workspace[off..end], rbits) {
@@ -1374,7 +1381,28 @@ fn adaptive_block_max(
     r_prev2: f32,
     rep_yield: f32,
     strategy: Strategy,
+    input_len: usize,
 ) -> usize {
+    // 4.77 -- THE FAST LADDER IS SIZE-DISPATCHED. Its own fitting grid, re-run:
+    //
+    // ```text
+    //   input     TOTAL       sao        mozilla
+    //   1 MiB   -0.1118%    -0.341%     -0.230%
+    //   2 MiB   -0.0274%    +0.077%     -0.139%
+    //   4 MiB   +0.0692%    +0.376%     +0.236%
+    //   8 MiB   +0.0658%       --       +0.641%
+    // ```
+    //
+    // The fit was real when it was made (1 MiB still reads -0.1118% against its
+    // claimed -0.1140%) and has since INVERTED: `sao` and `mozilla` both
+    // sign-flip, and the recorded "worst +0.000%" is now `mozilla` +0.641%.
+    //
+    // It costs TIME on exactly the content it no longer earns on -- `x-ray`
+    // +26.40% and `sao` +8.63% against a 2.31% null, for +0.000% and +0.126%
+    // size. Above the crossover the ladder is pure loss on both axes.
+    if strategy == Strategy::Fast && input_len > g5_fast_max_len() {
+        return base;
+    }
     // LEVEL-AWARE. The thresholds below were fitted at L3 and they do NOT
     // transfer to L1: there they regressed `mozilla` +0.208% and `samba` +0.153%
     // at 8 MiB, while blocking `versions-16m` from a -3.935% win because the
@@ -1472,6 +1500,24 @@ pub static G5_HIT_DRIFT: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 pub fn take_g5() -> (u64, u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
     (G5_CALLS.swap(0, Relaxed), G5_HIT_RATIO.swap(0, Relaxed), G5_HIT_DRIFT.swap(0, Relaxed))
+}
+
+/// 4.77: the Fast ladder is OFF above this input length. Crossover measured
+/// between 2 and 4 MiB (total -0.0274% -> +0.0692%); 2 MiB keeps every cell that
+/// still earns and drops every cell that regressed.
+const G5_FAST_MAX_LEN: usize = 2 << 20;
+
+static G5_FAST_LEN_A: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[inline(always)]
+fn g5_fast_max_len() -> usize {
+    let v = G5_FAST_LEN_A.load(core::sync::atomic::Ordering::Relaxed);
+    if v == 0 { G5_FAST_MAX_LEN } else { v }
+}
+
+/// Bench arm. `usize::MAX` restores the pre-4.77 behaviour (ladder always on).
+pub fn set_g5_fast_len_arm(v: usize) {
+    G5_FAST_LEN_A.store(v, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// 4.76. Below this a block is TRUE RLE and must never be split.
@@ -2962,6 +3008,8 @@ const FAST_LAZY_RUN: u32 = 4;
 
 /// Per-block yield threshold feeding the run counter. `RZSTD_FASTLAZY_T` sweeps.
 fn fast_lazy_threshold() -> f32 {
+    #[cfg(feature = "profile")]
+    ENVHIT[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
         std::env::var("RZSTD_FASTLAZY_T")
@@ -3011,6 +3059,8 @@ const REP_PROBE_PERIOD: u32 = 16;
 
 /// GATE 2 second threshold: minimum rep-to-mean match length ratio.
 fn rep_len_min() -> f32 {
+    #[cfg(feature = "profile")]
+    ENVHIT[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
         std::env::var("RZSTD_REPLEN")
@@ -3033,6 +3083,8 @@ fn rep_len_min() -> f32 {
 /// one-way latch as Gate 6's, merely eight blocks slower to engage. What makes
 /// an immediate shut safe is the RE-PROBE (`rep_probe`), not the decay.
 fn rep_decay() -> f32 {
+    #[cfg(feature = "profile")]
+    ENVHIT[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
         std::env::var("RZSTD_REP_DECAY")
@@ -3045,6 +3097,8 @@ fn rep_decay() -> f32 {
 }
 
 fn rep_yield_min_for(strategy: Strategy) -> f32 {
+    #[cfg(feature = "profile")]
+    ENVHIT[3].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     if let Some(v) = std::env::var("RZSTD_REPMIN")
         .ok()
@@ -3094,6 +3148,8 @@ fn rep_yield_min_for(strategy: Strategy) -> f32 {
 
 #[allow(dead_code)]
 fn rep_yield_min() -> f32 {
+    #[cfg(feature = "profile")]
+    ENVHIT[4].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
         std::env::var("RZSTD_REPMIN")
@@ -6273,6 +6329,8 @@ fn find_dfast_impl<const HLOG: u32>(
 /// the hash work at some ratio cost. Swept via `RZSTD_DFAST_STEP`.
 /// Mean match length at or above which DFast may probe every OTHER position.
 fn dfast_ml_min() -> f32 {
+    #[cfg(feature = "profile")]
+    ENVHIT[5].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
         std::env::var("RZSTD_DFAST_ML")
@@ -7865,6 +7923,8 @@ const OPT_REP_WARMUP: u32 = 4;
 /// 91.0% of the probes instead of 85.8%, but costs +0.1179% size against
 /// +0.0195%. Those 6M extra probes buy back 0.098 percentage points.
 fn opt_rep_min() -> f32 {
+    #[cfg(feature = "profile")]
+    ENVHIT[6].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
         std::env::var("RZSTD_OPT_REP_MIN")
@@ -7951,6 +8011,8 @@ pub fn take_opt_rep() -> (u64, u64, u64) {
 /// dispatched it costs +1.11% for -361 bytes with NO corpus regressing -- 115
 /// bytes per million probes against 4.4, a 26x better exchange rate.
 fn opt_fill_enabled() -> bool {
+    #[cfg(feature = "profile")]
+    ENVHIT[7].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
         std::env::var("RZSTD_OPT_FILL").map(|v| v.trim() != "0").unwrap_or(true)
@@ -7962,6 +8024,8 @@ fn opt_fill_enabled() -> bool {
 /// Above this bytes-per-rep-probe the content is rep-dominated and the jumped
 /// span's interior is not worth inserting.
 fn opt_fill_rep_max() -> f32 {
+    #[cfg(feature = "profile")]
+    ENVHIT[8].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
         std::env::var("RZSTD_OPT_FILL_REP")
@@ -7976,6 +8040,8 @@ fn opt_fill_rep_max() -> f32 {
 /// Longest span the back-fill will walk. Beyond this the jump is a single huge
 /// repeat and its interior is not worth inserting.
 fn opt_fill_max() -> usize {
+    #[cfg(feature = "profile")]
+    ENVHIT[9].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let a = OPT_FILL_MAX_ARM.load(core::sync::atomic::Ordering::Relaxed);
     if a != 0 {
         return a;
@@ -8034,6 +8100,8 @@ fn opt_hoisted() -> bool {
 }
 
 fn opt_fill_stride() -> usize {
+    #[cfg(feature = "profile")]
+    ENVHIT[10].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let a = OPT_FILL_S_ARM.load(core::sync::atomic::Ordering::Relaxed);
     if a != 0 {
         return a;
@@ -10337,6 +10405,8 @@ fn next_long_enabled() -> bool {
 /// have WON on the previous block for the probe to run on this one.
 /// `RZSTD_NEXT_LONG_T` sweeps it.
 fn next_long_min() -> f32 {
+    #[cfg(feature = "profile")]
+    ENVHIT[11].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
         std::env::var("RZSTD_NEXT_LONG_T")
@@ -10430,6 +10500,8 @@ pub fn set_pair_lo_arm(v: f32) {
 }
 
 fn pair_rep_max() -> f32 {
+    #[cfg(feature = "profile")]
+    ENVHIT[12].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
         std::env::var("RZSTD_PAIR_T")
@@ -10439,6 +10511,28 @@ fn pair_rep_max() -> f32 {
     }
     #[cfg(not(feature = "std"))]
     0.7
+}
+
+/// PROMETHEUS PREREQ: how often is each fitted constant actually READ?
+/// Each of these accessors calls `std::env::var` with no cache -- a
+/// GetEnvironmentVariableW plus a String allocation for a process constant.
+#[cfg(feature = "profile")]
+pub static ENVHIT: [core::sync::atomic::AtomicU64; 14] = [
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Read and clear the fitted-constant read counts.
+#[cfg(feature = "profile")]
+pub fn take_envhits() -> [u64; 14] {
+    let mut o = [0u64; 14];
+    for i in 0..14 { o[i] = ENVHIT[i].swap(0, core::sync::atomic::Ordering::Relaxed); }
+    o
 }
 
 /// Diagnostic counters for Gate 6 candidate variables: how often the pair probe
@@ -10561,6 +10655,8 @@ fn tag_enabled() -> bool {
 /// GATE 7 dispatch threshold: minimum share of the previous block's candidates
 /// the tag must have rejected for the filter to run. `RZSTD_TAG_T` sweeps.
 fn tag_min() -> f32 {
+    #[cfg(feature = "profile")]
+    ENVHIT[13].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
         std::env::var("RZSTD_TAG_T")
