@@ -354,6 +354,23 @@ pub(crate) struct MatchTables {
     /// reason as `payload_scratch` and worth far more -- this one carried the
     /// bulk of the 340 MB L19 was pushing through `realloc` on a 2 MiB board.
     opt_ops: Vec<(usize, usize, bool, u32, u32)>,
+    /// T2: `find_opt`'s DP arrays, kept on the frame.
+    ///
+    /// Sized `n + 1` for a block of `n`, they were built fresh EVERY block:
+    /// `price` 0.50 MiB, `prev` **1.00 MiB**, `is_match` 0.13, `match_off` 0.50,
+    /// `match_ml` 0.50 -- **2.63 MiB allocated and freed per block** at a 128 KiB
+    /// block size.
+    ///
+    /// This is the one allocation site on the board where the size class
+    /// actually matters. `allocost` measured no cliff at 128-512 KiB (a fresh
+    /// buffer costs what a kept one costs, to within noise) but a large one at
+    /// 1 MiB: 392 us fresh against 33 us reused, +1078%, the OS zero-filling
+    /// pages the heap has stopped recycling. `prev` sits exactly there.
+    opt_price: Vec<u32>,
+    opt_prev: Vec<usize>,
+    opt_is_match: Vec<bool>,
+    opt_off: Vec<u32>,
+    opt_ml: Vec<u32>,
     /// GATE 6 @ L3: share of DFast positions where C's `_search_next_long`
     /// probe at `ip+1` actually BEAT the short-hash candidate, measured on the
     /// PREVIOUS block. Same self-calibrating shape as `rep_yield`: the probe
@@ -554,6 +571,11 @@ impl MatchTables {
             seq_scratch: Vec::new(),
             lit_scratch: Vec::new(),
             opt_ops: Vec::new(),
+            opt_price: Vec::new(),
+            opt_prev: Vec::new(),
+            opt_is_match: Vec::new(),
+            opt_off: Vec::new(),
+            opt_ml: Vec::new(),
             rep_run: 0,
             next_long_yield: 1.0,
             nl_off_worse: 0.0,
@@ -7575,11 +7597,18 @@ fn find_opt(
         return (Vec::new(), src[block_start..block_end].to_vec());
     }
     let inf = u32::MAX / 4;
-    let mut price = vec![inf; n + 1];
-    let mut prev = vec![0usize; n + 1];
-    let mut is_match = vec![false; n + 1];
-    let mut match_off = vec![0u32; n + 1];
-    let mut match_ml = vec![0u32; n + 1];
+    // T2: take the DP arrays from the frame instead of building 2.63 MiB of
+    // them per block. See `MatchTables::opt_price`.
+    let mut price = std::mem::take(&mut tables.opt_price);
+    let mut prev = std::mem::take(&mut tables.opt_prev);
+    let mut is_match = std::mem::take(&mut tables.opt_is_match);
+    let mut match_off = std::mem::take(&mut tables.opt_off);
+    let mut match_ml = std::mem::take(&mut tables.opt_ml);
+    reset_to(&mut price, n + 1, inf);
+    reset_to(&mut prev, n + 1, 0usize);
+    reset_to(&mut is_match, n + 1, false);
+    reset_to(&mut match_off, n + 1, 0u32);
+    reset_to(&mut match_ml, n + 1, 0u32);
     price[0] = 0;
     // BRICK 75: offer the REPCODE as a DP candidate (find_opt was the last
     // finder without repcode search).
@@ -7855,6 +7884,11 @@ fn find_opt(
         i += 1;
     }
     if price[n] >= inf {
+    tables.opt_price = price;
+    tables.opt_prev = prev;
+    tables.opt_is_match = is_match;
+    tables.opt_off = match_off;
+    tables.opt_ml = match_ml;
         return find_bt_lazy(src, block_start, block_end, window, params, tables, 2, reps);
     }
     // GATE 6, one layer under the payload buffer: `ops` had the SAME defect,
@@ -8031,6 +8065,11 @@ fn find_opt(
     // Probes reported by `bt_find_best`, which the DP calls per position.
     note_finder_work(cfg!(feature = "profile"), 0, seqs.len() as u64, &seqs, &lits);
     tables.opt_ops = ops;
+    tables.opt_price = price;
+    tables.opt_prev = prev;
+    tables.opt_is_match = is_match;
+    tables.opt_off = match_off;
+    tables.opt_ml = match_ml;
     (seqs, lits)
 }
 
@@ -8092,6 +8131,21 @@ fn load_u64le(src: &[u8], i: usize) -> u64 {
 }
 
 #[inline(always)]
+/// T2/GATE 6: reset a kept scratch vector to `n` copies of `val` without a
+/// growth `realloc`.
+///
+/// The contents are dead at this point, so growing through `reserve` would
+/// memcpy a buffer holding nothing live -- the defect that made the first
+/// `opt_ops` attempt cost more than it saved. Replacing instead copies nothing.
+#[inline]
+fn reset_to<T: Clone>(v: &mut Vec<T>, n: usize, val: T) {
+    if v.capacity() < n {
+        *v = Vec::with_capacity(n);
+    }
+    v.clear();
+    v.resize(n, val);
+}
+
 /// T2: C's `match[ml] == ip[ml]` prefilter, without its two bounds checks.
 ///
 /// SAFETY: only reached with `best_ml > 0`, and the loop above `break`s the
