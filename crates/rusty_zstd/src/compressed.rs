@@ -335,7 +335,88 @@ pub(crate) const ML_BITS: [u8; 53] = [
 /// atomic out of a loop, so the shipping build paid it per sequence to ask a
 /// question whose answer is fixed for the whole process. As a const it vanishes
 /// from the loop entirely.
+/// T4 -- AVX2 by DUPLICATING THE WHOLE LOOP, which is the only shape that can
+/// work on a portable build.
+///
+/// A `#[target_feature(enable = "avx2")]` function cannot be inlined into a
+/// caller that lacks the feature. Putting the attribute on the 32-byte copy
+/// alone therefore turned a 4-instruction inline SSE move into
+/// `call` + 2 `vmovups` + `vzeroupper` + `ret` -- measured, and a loss. The fix
+/// is libzstd's: compile the ENTIRE sequence loop twice and dispatch once per
+/// block, so every copy inside it inlines as AVX2.
+///
+/// `decode_sequences_inner` is `#[inline(always)]` so its body is compiled into
+/// both wrappers -- once at baseline, once with AVX2 enabled.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_sequences(
+    src: &[u8],
+    literals: &[u8],
+    out: &mut Vec<u8>,
+    window_size: u64,
+    block_max: u32,
+    state: &mut BlockState,
+    dict: &[u8],
+    frame_start: usize,
+    frame_skipped: usize,
+) -> Result<(), Error> {
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if seqloop_avx2_on() && crate::simd::has_avx2() {
+        // SAFETY: guarded by a runtime AVX2 check; the body is identical.
+        #[allow(unsafe_code)]
+        return unsafe {
+            decode_sequences_avx2(
+                src, literals, out, window_size, block_max, state, dict, frame_start,
+                frame_skipped,
+            )
+        };
+    }
+    decode_sequences_inner(
+        src, literals, out, window_size, block_max, state, dict, frame_start, frame_skipped,
+    )
+}
+
+/// The AVX2-compiled twin. Everything `decode_sequences_inner` does -- including
+/// the 16- and 32-byte fixed-width copies -- is emitted with AVX2 available.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_code)]
+unsafe fn decode_sequences_avx2(
+    src: &[u8],
+    literals: &[u8],
+    out: &mut Vec<u8>,
+    window_size: u64,
+    block_max: u32,
+    state: &mut BlockState,
+    dict: &[u8],
+    frame_start: usize,
+    frame_skipped: usize,
+) -> Result<(), Error> {
+    decode_sequences_inner(
+        src, literals, out, window_size, block_max, state, dict, frame_start, frame_skipped,
+    )
+}
+
+/// T4 arm: compile-twice + dispatch for the sequence loop. Default OFF until
+/// measured.
+static SEQLOOP_AVX2_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+
+/// Bench hook for the AVX2 sequence-loop twin.
+pub fn set_seqloop_avx2_arm(on: bool) {
+    SEQLOOP_AVX2_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[inline(always)]
+fn seqloop_avx2_on() -> bool {
+    SEQLOOP_AVX2_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn decode_sequences_inner(
     src: &[u8],
     literals: &[u8],
     out: &mut Vec<u8>,

@@ -67,6 +67,7 @@ pub use dict::{
 #[cfg(feature = "alloc")]
 #[cfg(feature = "profile")]
 pub use simd::{set_eqlen_arm, take_eqlen_stats, take_eq_ops, bench_eq_avx2, bench_eq_words};
+pub use compressed::set_seqloop_avx2_arm;
 #[cfg(feature = "profile")]
 pub use compressed::take_dec_copies;
 #[cfg(feature = "profile")]
