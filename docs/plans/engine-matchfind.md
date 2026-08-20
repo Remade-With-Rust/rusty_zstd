@@ -149,7 +149,17 @@ per-position closure: ~10 ns ≈ **45 cycles/position** against a ~20-instructio
 path → implied IPC ≈ 0.5, arithmetic does not close → before blaming memory, prove
 which code runs → census said *none of the specialised code runs at all*.
 
-### 5a. The remaining memory signature — tags as a SECOND array *(top open L1 lever)*
+### 5a. tags as a SECOND array — **SHIPPED 2026-08-20** (`2f4383a`)
+Packed-in-slot on the Fast ladder, guarded < 16 MiB like T1; the one hazard (the
+mid-frame Fast→Lazy shared table — the exact reason for the historical refutation)
+is handled by a one-time unpack at the switch site. Receipts: dickens L1 tag compares
+OFF tag-array **4,027,923** / ON tag-array **0**, rejects **913,538 = 913,538** to the
+unit; byte-identical **54/54** (L1/L2/L3 × 18) in-process; the second store per
+position gone structurally (array dropped on packed frames). No clock claim.
+*Open flag:* cross-session `tagprice` totals moved 19.4% → 50.7% at identical probe
+counts — unattributed drift from the concurrent gate work, does not affect the A/B.
+
+#### The original analysis (kept for the mechanism)
 The 45-cycle closure still is not fully explained by the generic body. On the live tag
 path every probe touches **two arrays**: `load_fast::<true>` reads `hash[h]` then
 `tags[h]` (two random cache lines), and `store_fast::<true>` writes both, every
