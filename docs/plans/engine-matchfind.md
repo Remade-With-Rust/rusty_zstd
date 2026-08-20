@@ -19,6 +19,8 @@ engine-function inventory for it.
 
 ## 0. Current asm footprint (2026-08-20, release, per symbol)
 
+TAGS ARE AWFUL FOR ISSUES.
+
 | function                                                             | copies |  instrs | calls out | stack movs | runs                                   |
 | -------------------------------------------------------------------- | -----: | ------: | --------: | ---------: | -------------------------------------- |
 | `find_fast_impl` *(2026-08-20e: 140 copies / ~231K after WIDE×spec — binary, not executed; live copy 2,021 instrs)* | 140 | 231,000 | — | — | per position, L1/L2 |
@@ -253,6 +255,73 @@ census; `g6alloc` board.
 sites are profile plumbing. `fill_hash_after_match` fully inlines. `try_rep1`
 inlines. **No identified lever** — listed so nobody re-audits them: they were swept
 in the keyword audit (clean on allocation, arms, and bounds).
+
+---
+
+## 8. The tag system — states, transitions, invariants (audit 2026-08-20)
+
+Five incidents in one campaign traced to this machinery (the 190ad8b stale-tag
+day, the fill-representation bug that moved 12/18 corpora, the oracle parity
+break, the ffpack A/B silently becoming a finder comparison, and the
+misattributed packed-tag refutation). A full audit was run; this section is the
+contract that came out of it.
+
+**Why it bites: the axes.** "The tag filter" is not one feature. It is the
+product of: THREE short-table representations x TWO key widths x mid-frame
+transitions x FOUR arms (`tag_alloc`, `fast_pack`, `dfast_tag`, `fast_hash_wide`)
+x per-block read gates (`ut`, `dtag_on`). Every incident happened at a pairwise
+interaction of axes, never inside one.
+
+**States of the short table (per frame):**
+
+| state | `pack_tags` | `tags` | slot contents | who |
+| --- | --- | --- | --- | --- |
+| S0 legacy | false | empty | `pos+1` | no filter |
+| S1 array | false | `1<<hlog` bytes | `pos+1`, tag beside | Fast >=16 MiB, streaming Fast |
+| S2 packed | true | empty | `(pos+1)&0xFFFFFF \| tag<<24` | Fast/DFast <16 MiB |
+
+Transitions: frame init picks the state (`enable_packed_tags` + the Fast-only
+array fallback); the Fast->Lazy switch runs S2 -> S0; `fast_hash_relatch`
+(wide frames) re-seeds a window and latches legacy. **After a relatch the
+unpack loop is SKIPPED** (the relatch already cleared `pack_tags`), so slots
+outside the re-seeded window keep packed, wide-keyed bits while the flag says
+unpacked. That is safe BY `match_ok` DISCIPLINE, not by representation:
+`m >= ip` is its first test, every consumer routes through it (audited:
+chain walk, lazy heads/fills, Bt never sees tags at all), and the clear-vs-not
+experiment measured byte-identity. The invariant to preserve: **`pack_tags ==
+false` does not promise tag-free slots; never add a consumer that trusts
+positions without `match_ok`.**
+
+**The one output-corrupting failure mode** is a false reject — the filter
+hiding a candidate that would have matched. Receipt (`tagaudit`, profile):
+L1 23,384,133 rejects / **0 false**; L2 17,198,345 / **0 false**; L3 ledger
+2,040,379 rejections of 8,010,108 nonempty slots (25.5% avoided). The proof
+shape behind the zeros: the tag derives from the same bytes as the index, so
+an accepted match implies an equal tag.
+
+**Instrument trap:** `TAG_FALSE_REJECT`/`TAG_REJECT_TOTAL` carry DIFFERENT
+semantics per finder — Fast counts provably-lost matches (must be 0) after
+re-probing the raw slot; DFast reuses the same counters as (rejections,
+nonempty slots), where rejections are the WINS. Never assert across levels.
+
+**De-confusion (shipped with this audit):** the `PACKED` const generic used to
+exist in five signatures with three liveness states — dead in `hash4_tag`,
+`fast_hash_tag`, `store_fast`, and `fill_hash_after_match` (tags are computed
+unconditionally since the Gate-7 per-block poison fix), live only in
+`fast_slot_load` as the compare gate. The dead ones are removed; `PACKED` now
+means exactly one thing: this monomorphisation compares tags. The dead
+`load_fast` (superseded by `fast_slot_load`) is deleted.
+
+**Routing holes found (performance, not correctness) — candidate work:**
+
+1. **DFast >= 16 MiB frames run with NO tag filter.** `dfast_tag` is on, but
+   `enable_packed_tags` refuses the length and the array fallback is
+   Fast-only, so `dtag_on` is silently false. T1's 2.9M-loads-avoided receipt
+   applies only below 16 MiB.
+2. **Streaming DFast: same hole** — `alloc_fast_tags` is Fast-only.
+
+Both want the S1 array route extended to DFast, priced on the T1 instrument
+(rejects gained vs the `1<<hlog` alloc + second-line loads).
 
 ---
 

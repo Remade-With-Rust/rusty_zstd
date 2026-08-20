@@ -660,7 +660,7 @@ impl MatchTables {
     /// Store a Fast-strategy slot (packed with its tag, or plain).
     #[inline(always)]
     #[allow(unsafe_code)]
-    fn store_fast<const PACKED: bool>(&mut self, h: usize, pos: usize, tag: u8) {
+    fn store_fast(&mut self, h: usize, pos: usize, tag: u8) {
         // BRICK 50 -- SAFETY: `h` always arrives from `hash4_tag`, which returns
         // `(hv >> hash_shift) as usize & hash_mask`, and `hash_mask` is
         // `self.hash.len() - 1` where the length is `1 << hash_log` (a non-zero
@@ -712,53 +712,6 @@ impl MatchTables {
         };
     }
 
-    /// Load a Fast-strategy candidate as `pos+1` (0 = none / tag mismatch).
-    ///
-    /// In packed mode a tag mismatch returns 0 WITHOUT reading `src[m]`.
-    ///
-    /// The 24-bit-residue representation this once carried -- store `pos+1`
-    /// truncated and lift it back against `ip+1` -- was REFUTED: it fails
-    /// byte-identity through GATE 1's mid-frame Fast->Lazy switch, where the two
-    /// strategies share one table and Lazy reads entries Fast truncated. It was
-    /// disabled by an early `return e;` with the lifting code left below it as
-    /// unreachable, which cost the function a dead `ip` parameter and left this
-    /// comment describing behaviour the function no longer had. Removed rather
-    /// than left as a trap for whoever deletes the `return` to "fix" the
-    /// unreachable-code warning.
-    #[inline(always)]
-    #[allow(unsafe_code)]
-    fn load_fast<const PACKED: bool>(&self, h: usize, tag: u8) -> u32 {
-        // SAFETY: identical invariant to `store_fast` -- `h` is masked by
-        // `hash.len() - 1` with a power-of-two length. See brick 50.
-        debug_assert!(h < self.hash.len());
-        let e = *unsafe { self.hash.get_unchecked(h) };
-        if e == 0 {
-            return 0;
-        }
-        // ffanat 5a: packed-in-slot -- the tag compare reads the byte that
-        // arrived WITH the position, on the cache line already loaded. `pos+1`
-        // is in `1..=0xFF_FFFF` (the enable guard bounds the frame), so a
-        // written slot is never 0 and the mask cannot truncate a live position.
-        if self.pack_tags {
-            #[cfg(feature = "profile")]
-            PACKED_TAG_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if PACKED && (e >> 24) as u8 != tag {
-                return 0;
-            }
-            return e & 0x00FF_FFFF;
-        }
-        if !PACKED {
-            return e;
-        }
-        if let Some(&t) = self.tags.get(h) {
-            #[cfg(feature = "profile")]
-            TAGARR_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if t != tag {
-                return 0;
-            }
-        }
-        e
-    }
 
     /// Raw slot, bypassing the tag filter -- diagnostic only.
     #[inline(always)]
@@ -1905,8 +1858,8 @@ pub(crate) fn prime_tables(
             // poison this function has already been bitten by once.
             let fhp = fast_hash_spec(mls, hash_log);
             let (h, tag) =
-                fast_hash_tag::<true, true>(src, p, fhp.wide, fhp.mask, fhp.shift);
-            tables.store_fast::<true>(h, p, tag);
+                fast_hash_tag::<true>(src, p, fhp.wide, fhp.mask, fhp.shift);
+            tables.store_fast(h, p, tag);
         } else {
             let h = hash_mls(src, p, mls, hash_log);
             if write_chain {
@@ -3053,6 +3006,21 @@ fn find_sequences_strategy(
                     // latches legacy so every later block stays coherent.
                     fast_hash_relatch(tables, src, block_start, window);
                 }
+                // TAG AUDIT 2026-08-20: when the relatch above ran, it
+                // already set `pack_tags = false`, so this unpack loop is
+                // SKIPPED and slots outside the re-seeded window keep their
+                // packed (and wide-keyed) bits while the flag says unpacked.
+                // That is SAFE, not sloppy, and deliberately so: every
+                // consumer downstream of the switch (lazy heads, chain walk,
+                // fills) validates candidates through `match_ok`, whose FIRST
+                // test rejects `m >= ip`, so a stale tag byte decoding as a
+                // huge position costs one dead probe and can never underflow,
+                // read out of bounds, or change output -- and the clear-vs-not
+                // experiment in the relatch comment measured byte-identity
+                // directly. The invariant to preserve: `pack_tags == false`
+                // does NOT promise the slots are tag-free; only `match_ok`
+                // discipline makes that irrelevant. Do not add a consumer
+                // that trusts positions without it.
                 if tables.pack_tags {
                     for e in tables.hash.iter_mut() {
                         *e &= 0x00FF_FFFF;
@@ -3998,7 +3966,7 @@ fn find_fast_impl<
         // path 93.8% of the time. 4.41's position ledger was an undercount.
         let mut pipe_pos = 0u64;
         let (mut ff_made, mut ff_used) = (0u64, 0u64);
-        let (mut h0, mut g0) = fast_hash_tag::<PACKED, true>(src, ip, WIDE, f_mask, f_shift);
+        let (mut h0, mut g0) = fast_hash_tag::<true>(src, ip, WIDE, f_mask, f_shift);
         let mut m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h0, g0);
         loop {
             if COUNT {
@@ -4063,7 +4031,7 @@ fn find_fast_impl<
                     // bytes and made the tag filter look non-byte-identical,
                     // which is why the packed representation was blamed and
                     // removed. The representation was fine; this caller was not.
-                    let (nh, ng) = fast_hash_tag::<PACKED, true>(src, ip, WIDE, f_mask, f_shift);
+                    let (nh, ng) = fast_hash_tag::<true>(src, ip, WIDE, f_mask, f_shift);
                     h0 = nh;
                     g0 = ng;
                     m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h0, g0);
@@ -4077,7 +4045,7 @@ fn find_fast_impl<
                 ff_made += 1;
             }
             let (h1, g1, m1) = if nip <= ilimit {
-                let (h, g) = fast_hash_tag::<PACKED, true>(src, nip, WIDE, f_mask, f_shift);
+                let (h, g) = fast_hash_tag::<true>(src, nip, WIDE, f_mask, f_shift);
                 // The store above may have just overwritten this slot, so the
                 // value is forwarded by hand rather than re-read.
                 //
@@ -4168,7 +4136,7 @@ fn find_fast_impl<
                 if ip > ilimit {
                     break;
                 }
-                let (nh, ng) = fast_hash_tag::<PACKED, true>(src, ip, WIDE, f_mask, f_shift);
+                let (nh, ng) = fast_hash_tag::<true>(src, ip, WIDE, f_mask, f_shift);
                 h0 = nh;
                 g0 = ng;
                 m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h0, g0);
@@ -4261,7 +4229,7 @@ fn find_fast_impl<
                 probes += 1;
             }
         }
-        let (h0, g0) = fast_hash_tag::<PACKED, true>(src, ip, WIDE, f_mask, f_shift);
+        let (h0, g0) = fast_hash_tag::<true>(src, ip, WIDE, f_mask, f_shift);
         let m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h0, g0);
         if COUNT && PACKED {
             // Gate 7 is recorded byte-identical: a tag mismatch should imply the
@@ -4291,7 +4259,7 @@ fn find_fast_impl<
         // nothing between here and the pair branch writes the table -- the rep
         // and match paths both `continue`. Only the issue order moves.
         let pair_pre = if pair && ip + 1 <= ilimit {
-            let (h1, g1) = fast_hash_tag::<PACKED, false>(src, ip + 1, WIDE, f_mask, f_shift);
+            let (h1, g1) = fast_hash_tag::<false>(src, ip + 1, WIDE, f_mask, f_shift);
             Some((h1, g1, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h1, g1)))
         } else {
             None
@@ -4383,7 +4351,7 @@ fn find_fast_impl<
                 let (h1, g1, m1) = match pair_pre {
                     Some(v) => v,
                     None => {
-                        let (h, g) = fast_hash_tag::<PACKED, false>(src, ip1, WIDE, f_mask, f_shift);
+                        let (h, g) = fast_hash_tag::<false>(src, ip1, WIDE, f_mask, f_shift);
                         (h, g, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h, g))
                     }
                 };
@@ -5522,7 +5490,7 @@ fn load_u64le_tail(src: &[u8], pos: usize) -> u64 {
 /// inline byte-loop entirely. The tag remains sound in both modes: it is a
 /// function of bytes the accepted match must reproduce.
 #[inline(always)]
-fn fast_hash_tag<const PACKED: bool, const SAFE: bool>(
+fn fast_hash_tag<const SAFE: bool>(
     src: &[u8],
     pos: usize,
     wide: bool,
@@ -5552,7 +5520,7 @@ fn fast_hash_tag<const PACKED: bool, const SAFE: bool>(
 /// differ, i.e. the tag can only reject candidates the probe would reject
 /// anyway. That is what makes the whole scheme byte-identical by construction.
 #[inline(always)]
-fn hash4_tag<const PACKED: bool>(src: &[u8], pos: usize, hash_shift: u32) -> (usize, u8) {
+fn hash4_tag(src: &[u8], pos: usize, hash_shift: u32) -> (usize, u8) {
     let hv = load_u32le(src, pos).wrapping_mul(HASH4_PRIME);
     // Fold high bits down: the index consumes the top `hash_log` bits, so the
     // raw low byte would be the weakest part of a multiplicative hash.
@@ -6355,14 +6323,14 @@ fn fill_fast_after_match<const PACKED: bool>(
     let mut n = 0u64;
     let a = match_ip.saturating_add(2);
     if do_a && a <= ilimit {
-        let (h, g) = fast_hash_tag::<PACKED, true>(src, a, f_wide, f_mask, f_shift);
+        let (h, g) = fast_hash_tag::<true>(src, a, f_wide, f_mask, f_shift);
         fast_slot_store(hash, tags, pack, h, a, g);
         n += 1;
     }
     if do_b && match_end >= 2 {
         let b = match_end - 2;
         if b <= ilimit && b != a {
-            let (h, g) = fast_hash_tag::<PACKED, true>(src, b, f_wide, f_mask, f_shift);
+            let (h, g) = fast_hash_tag::<true>(src, b, f_wide, f_mask, f_shift);
             fast_slot_store(hash, tags, pack, h, b, g);
             n += 1;
         }
@@ -6424,7 +6392,7 @@ fn emit_fast_seq<const PACKED: bool>(
 /// C `zstd_fast.c` after a match: insert hash(start+2) and hash(end-2) only.
 /// Filling every byte of a long match was ~src_len hash writes on repeating text.
 #[inline]
-fn fill_hash_after_match<const PACKED: bool>(
+fn fill_hash_after_match(
     tables: &mut MatchTables,
     src: &[u8],
     match_ip: usize,
@@ -6442,7 +6410,7 @@ fn fill_hash_after_match<const PACKED: bool>(
     let mut n = 0u64;
     let a = match_ip.saturating_add(2);
     if do_a && a <= ilimit {
-        let (h, g) = hash4_tag::<PACKED>(src, a, hash_shift);
+        let (h, g) = hash4_tag(src, a, hash_shift);
         // T1: this helper runs after EVERY match on the DFast path too, so it
         // must write the short table in whatever representation the frame is
         // using. Writing it unpacked while the reader is packed decodes the tag
@@ -6451,18 +6419,18 @@ fn fill_hash_after_match<const PACKED: bool>(
         if tables.pack_tags {
             tables.put_h_tag(h, a, g);
         } else {
-            tables.store_fast::<PACKED>(h, a, g);
+            tables.store_fast(h, a, g);
         }
         n += 1;
     }
     if do_b && match_end >= 2 {
         let b = match_end - 2;
         if b <= ilimit && b != a {
-            let (h, g) = hash4_tag::<PACKED>(src, b, hash_shift);
+            let (h, g) = hash4_tag(src, b, hash_shift);
             if tables.pack_tags {
                 tables.put_h_tag(h, b, g);
             } else {
-                tables.store_fast::<PACKED>(h, b, g);
+                tables.store_fast(h, b, g);
             }
             n += 1;
         }
@@ -6800,7 +6768,7 @@ fn find_dfast_impl<const HLOG: u32>(
                 v
             }
             None => {
-                let (a, ga) = hash4_tag::<true>(src, ip, dtag_shift);
+                let (a, ga) = hash4_tag(src, ip, dtag_shift);
                 let b = hash8(src, ip, hlog);
                 let m = tables.get_h_tag(a, ga, dtag_on);
                 // T1 ledger: a rejection is a candidate load AVOIDED. Counted
@@ -6831,7 +6799,7 @@ fn find_dfast_impl<const HLOG: u32>(
         if dpipe {
             let nip = ip + dstep + ((ip - anchor) >> accel);
             if nip <= ilimit {
-                let (a, ga) = hash4_tag::<true>(src, nip, dtag_shift);
+                let (a, ga) = hash4_tag(src, nip, dtag_shift);
                 let b = hash8(src, nip, hlog);
                 // The hand-forward has to respect the filter: `put_h_tag` just
                 // wrote `g4` at slot `h4`, so a speculation landing on that slot
@@ -6978,7 +6946,7 @@ fn find_dfast_impl<const HLOG: u32>(
             }
             let end = best_ip + best_ml;
             // DFast never sets `packed` (it is gated on Strategy::Fast).
-            fill_hash_after_match::<false>(tables, src, best_ip, end, dtag_shift, ilimit);
+            fill_hash_after_match(tables, src, best_ip, end, dtag_shift, ilimit);
             // GATE 12 @ L3: `ip` here is the PRE-probe position; when the
             // next-long probe won, `best_ip == ip + 1` and the two tables index
             // different positions for one match. See `dfast_fill_anchor_c`.
@@ -6996,7 +6964,7 @@ fn find_dfast_impl<const HLOG: u32>(
                 let stop = end.saturating_sub(2).min(ilimit + 1);
                 let mut p = best_ip + 2 + dfs;
                 while p < stop {
-                    let (h, g) = hash4_tag::<false>(src, p, hash_shift);
+                    let (h, g) = hash4_tag(src, p, hash_shift);
                     // T1: same table, same representation. `store_fast` writes
                     // the slot unpacked, which a packed reader would decode as a
                     // bogus position.
