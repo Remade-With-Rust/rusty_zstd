@@ -10654,18 +10654,49 @@ fn tag_enabled() -> bool {
 
 /// GATE 7 dispatch threshold: minimum share of the previous block's candidates
 /// the tag must have rejected for the filter to run. `RZSTD_TAG_T` sweeps.
+/// PROMETHEUS ADJUDICATION: this was MIS-FITTED at 0.50, and cached besides.
+///
+/// The tag is a PURE FILTER -- it cannot hide a match, and 0 false rejects were
+/// measured across the whole board -- so its only axis is WORK. Swept on that
+/// axis at L1 (candidate loads avoided out of 8,248,621 probes):
+///
+///   tag_min 0.00 -> 4,538,058 avoided (55.0%)   <- best
+///           0.25 -> 2,055,500 (24.9%)
+///           0.50 -> 1,859,598 (22.5%)           <- was shipped
+///           0.90 ->   356,859 (4.3%)
+///           1.00 ->    29,487 (0.4%)
+///
+/// Lowering it to 0 more than DOUBLES the loads the filter avoids, for no size
+/// change at all. The threshold was forfeiting benefit for nothing, because
+/// `store_fast` writes the tag UNCONDITIONALLY whenever the array exists -- only
+/// the COMPARE was gated. So a high `tag_min` pays the store and then declines
+/// to use it. That asymmetry is the same one 190ad8b documents from the other
+/// direction.
+///
+/// Also cached: this was one of 19 accessors calling `std::env::var` per read --
+/// 115.6 ns each, ~1,875 reads per 32 MiB pass -- for a process constant.
+static TAG_MIN_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
 fn tag_min() -> f32 {
     #[cfg(feature = "profile")]
     ENVHIT[13].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
-        std::env::var("RZSTD_TAG_T")
+        use core::sync::atomic::Ordering;
+        let c = TAG_MIN_ARM.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_TAG_T")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0.50)
+            .unwrap_or(0.0);
+        TAG_MIN_ARM.store(v.to_bits(), Ordering::Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
-    0.50
+    0.0
 }
 
 /// Candidates a tag could reject without loading `src[m]`, and those it cannot.
