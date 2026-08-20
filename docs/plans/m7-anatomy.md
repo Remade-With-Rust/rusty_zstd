@@ -140,55 +140,77 @@ incomp 1.17), **3 pass decompress** (text 0.31, zeros 0.73, incomp 0.89).
 
 ## 3. Stage anatomy — where OUR time goes
 
-**Re-measured 2026-08-16 (third pass), at CHECKSUM PARITY.** Share of encode
+**Re-measured 2026-08-20 (fourth pass), L3, 8 MiB board, after the optimization
+campaign** ([`m7-optimize-anatomy.md`](m7-optimize-anatomy.md)). Share of encode
 (`stage / EncodeTotal`) and of decode (`stage / DecodeTotal`); bold marks the LEADING
 stage on each half. Leaf stages only -- `EncodeEntropy`, `EncodeBlocks` and
 `DecodeBlocks` are PARENT scopes and ranking them against their own children is
 meaningless (a mistake made twice while deriving this board).
 
+> **THESE ARE SHARES, NOT TIMES.** They come from a `--features profile` build whose
+> own instrumentation is part of what it measures, so a share may move because its
+> stage shrank OR because another grew. Do not read an absolute speedup out of this
+> table; read WHERE THE TIME IS.
+
 | corpus       | MatchFind |     Huff | FseSeq | SeqCode |  DecLits |   DecSeq |    DecCk |
 | ------------ | --------: | -------: | -----: | ------: | -------: | -------: | -------: |
-| sao          |  **85.8** |      2.7 |    2.4 |     2.4 |     17.8 | **58.2** |     23.5 |
-| webster      |  **66.7** |      7.8 |   12.4 |     8.9 |     10.9 | **82.1** |      6.9 |
-| smallmsg-8m  |  **66.5** |      0.9 |   16.7 |    10.0 |      2.6 | **89.5** |      7.8 |
-| ooffice      |  **65.1** |     18.6 |    7.2 |     4.6 |     27.3 | **63.7** |      8.8 |
-| jsonlog-16m  |  **62.9** |      2.7 |   16.4 |    12.9 |      3.8 | **89.3** |      6.8 |
-| reymont      |  **60.5** |     15.4 |   12.5 |     8.0 |     16.5 | **77.9** |      5.5 |
-| dickens      |  **60.2** |     22.5 |    9.2 |     5.0 |     31.9 | **62.2** |      5.8 |
-| samba        |  **60.1** |     11.0 |   13.8 |     9.7 |     13.7 | **77.9** |      8.2 |
-| xml          |  **54.5** |     10.3 |   16.9 |    11.9 |     10.4 | **80.4** |      9.2 |
-| mozilla      |  **47.4** |     33.7 |    8.7 |     6.2 |     32.0 | **61.8** |      6.0 |
-| nci          |  **47.3** |     11.8 |   20.4 |    13.5 |     11.8 | **79.6** |      8.6 |
-| text-32m     |  **40.8** |      1.9 |    0.5 |     0.3 |      0.5 |     44.2 | **53.4** |
-| mr           |      40.3 | **52.5** |    1.7 |     1.5 | **65.7** |     24.4 |      9.6 |
-| versions-16m |  **39.2** |      0.9 |    9.9 |     8.8 |      0.3 | **55.7** |     43.6 |
-| osdb         |      39.1 | **40.5** |   10.4 |     6.0 |     26.1 | **66.2** |      7.6 |
-| incomp-32m   |  **30.0** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **43.7** |
-| x-ray        |      22.2 | **56.8** |    0.4 |     0.0 | **47.5** |      3.6 |     24.4 |
-| zeros-32m    |   **0.0** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **32.6** |
+| smallmsg-8m  |  **78.7** |      5.9 |    4.8 |     6.2 |     10.2 | **86.0** |      2.2 |
+| sao          |  **78.7** |     10.8 |    4.8 |     2.6 |     33.3 | **64.4** |      2.1 |
+| x-ray        |  **77.3** |     10.9 |    5.0 |     3.4 |     17.5 | **78.8** |      3.5 |
+| mozilla      |  **74.1** |     10.2 |    5.8 |     4.6 |     13.9 | **82.2** |      3.6 |
+| jsonlog-16m  |  **74.1** |      6.6 |    7.0 |     7.0 |      9.9 | **85.8** |      2.7 |
+| ooffice      |  **73.7** |     12.2 |    5.3 |     4.8 |     19.2 | **77.5** |      1.9 |
+| samba        |  **73.7** |      7.3 |    7.7 |     6.2 |      7.5 | **88.7** |      3.3 |
+| dickens      |  **72.7** |      4.1 |    9.4 |     9.2 |      3.2 | **94.5** |      2.3 |
+| reymont      |  **72.0** |      3.8 |   10.3 |     9.1 |      2.8 | **95.3** |      1.5 |
+| webster      |  **72.0** |      4.9 |    9.7 |     8.9 |      4.0 | **94.1** |      1.8 |
+| mr           |  **68.6** |      8.7 |    9.5 |     8.3 |      5.9 | **92.1** |      1.8 |
+| osdb         |  **68.2** |     16.4 |    5.8 |     5.8 |     10.5 | **86.0** |      3.1 |
+| xml          |  **67.7** |      7.7 |   10.3 |     7.9 |      7.1 | **88.3** |      3.9 |
+| nci          |  **64.8** |      6.7 |   12.6 |     9.2 |      6.3 | **88.8** |      4.6 |
+| text-32m     |  **61.8** |      3.5 |    0.9 |     0.3 |      0.2 | **65.0** |     33.8 |
+| versions-16m |  **54.6** |      0.8 |    3.7 |     4.8 |      0.3 | **67.4** |     31.6 |
+| incomp-32m   |  **11.5** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **17.9** |
+| zeros-32m    |   **0.0** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **28.3** |
 
-**`EncodeMatchFind` is #1 on 15 of 18**, Huffman on 3 (`mr`, `x-ray`, `osdb`) --
-**unchanged** from the pre-parity board. The encoder ranking was never distorted.
+**`EncodeMatchFind` is now #1 on 18 of 18** -- up from 15 of 18. **Huffman no longer
+leads ANY corpus on encode**, where it previously led three:
 
-**`DecodeSeq` is #1 on 13 of 18** -- DOWN from the 16 of 18 previously claimed, and
-the correction matters. It is still the single biggest decode stage and still the right
-standing target, but its dominance was overstated.
+| corpus | Huff, 08-16 | Huff, 08-20 |
+| --- | ---: | ---: |
+| `x-ray` | **56.8** | 10.9 |
+| `mr` | **52.5** | 8.7 |
+| `osdb` | **40.5** | 16.4 |
+| `mozilla` | 33.7 | 10.2 |
 
-**The runner-up changed identity: it is now `DecodeChecksum`, leading on 3 of 18.**
-Previously the #2 was `DecodeLiterals`; bricks 63/79/80/81/82 shrank that side (a
-per-block Huffman table clone, the arm read, two copy tiers, the inlined literal copy),
-so literals fell to 2 of 18 and the checksum surfaced behind it. Where it leads it
-leads by a lot: **`text-32m` 53%, `incomp-32m` 44%, `versions-16m` 44%, `zeros-32m`
-33% of decode.**
+**`DecodeSeq` is #1 on 16 of 18**, up from 13. **`DecodeLiterals` leads NOWHERE**, down
+from 2 -- and it collapsed on exactly the corpora that used to be its own:
 
-That is a real finding, not an artefact of the parity fix. On high-ratio and
-incompressible content there is little to decode, so VERIFICATION IS THE DECODER.
-It also means `--no-check` / `DecompressOptions::force_ignore_checksum` is not a
-micro-option on those corpora -- it removes the largest single stage.
+| corpus | DecLits, 08-16 | DecLits, 08-20 |
+| --- | ---: | ---: |
+| `mr` | **65.7** | 5.9 |
+| `x-ray` | **47.5** | 17.5 |
+| `dickens` | 31.9 | 3.2 |
+| `mozilla` | 32.0 | 13.9 |
 
-**The two halves remain near mirror images** on the compressible files: where the
-encoder spends its time in Huffman (`mr`, `x-ray`, `osdb`) the decoder spends its time
-in literals. One content axis -- alphabet flatness -- drives both.
+**Both halves moved together, and that is the point.** The literal path was the
+campaign's densest target: 63 per-literal bounds checks removed from
+`decode_4x`/`decode_into_x1`/`decode_into_x2`, 8 more from `encode_stream`, and
+`huffman.rs` taken from 91 panic sites to **zero** with the file 7.5% smaller. The
+alphabet-flatness axis that used to drive BOTH sides now drives neither: the encoder's
+Huffman share and the decoder's literal share fell in step.
+
+**`DecodeChecksum` still leads the degenerate corpora** (`text-32m` 33.8%,
+`versions-16m` 31.6%, `zeros-32m` 28.3%, `incomp-32m` 17.9%) but by less than before
+(53.4 / 43.6 / 32.6 / 43.7). The standing conclusion holds unchanged: on high-ratio and
+incompressible content there is little to decode, so **verification IS the decoder**,
+and `--no-check` / `DecompressOptions::force_ignore_checksum` removes the largest single
+stage there rather than shaving a micro-option.
+
+**WHAT THIS SAYS NOW.** The encoder has ONE target and no second: match-find leads every
+corpus, from 54.6% (`versions`) to 78.7% (`smallmsg`, `sao`). The decoder has one too --
+sequence execution, 64-95% on every compressible file. The entropy stages that used to
+compete for the lead are no longer in the running on either half.
 
 ---
 
