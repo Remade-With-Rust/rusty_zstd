@@ -39,6 +39,11 @@ fn run(s: &[u8], lvl: i32, on: bool) -> (Vec<u8>, u64) {
     (z, BYTES.load(Relaxed))
 }
 fn main() {
+    // Guard unification (encode.rs dispatch): pack-off now IMPLIES the legacy
+    // hash, so a raw pack A/B would compare wide-vs-legacy FINDERS, not the
+    // storage transform this board exists to receipt. Pin the wide arm OFF for
+    // the whole board; the wide arm has its own byte receipts (ffvers, ffhash).
+    rusty_zstd::set_fast_hash_arm(false);
     let (mut same, mut tot) = (0usize, 0usize);
     let (mut boff, mut bon) = (0u64, 0u64);
     for id in IDS {

@@ -3405,9 +3405,18 @@ fn find_fast(
     // wide-vs-legacy per block BEFORE dispatch, so it is a dispatch input like
     // ut/rep. One branch here doubles the arms mechanically; the executed path
     // carries only its own mode.
+    // ffanat guard unification: WIDE additionally requires `pack_tags`. Three
+    // payoffs. (1) pack's < 16 MiB frame bound is exactly the proof WIDE never
+    // had of its own; (2) inside WIDE copies `pack` becomes CONST-TRUE, so the
+    // per-position pack tests and cmov chain fold away and the tags pointer
+    // goes dead -- freeing the registers the wide mask and src base were
+    // starving for; (3) frames >= 16 MiB run the legacy key, and the one
+    // corpus that wanted that at full length is versions-16m itself. Board
+    // bytes cannot move: every board runs < 16 MiB where pack is already true.
     let wide_block = fast_hash_wide_enabled()
         && (5..=8).contains(&(params.min_match.max(3) as usize))
-        && !tables.fast_hash_legacy;
+        && !tables.fast_hash_legacy
+        && tables.pack_tags;
     macro_rules! go {
         ($p:expr, $r:expr, $h:expr, $s:expr, $pi:expr) => {
             if wide_block {
@@ -3720,6 +3729,11 @@ fn find_fast_impl<
     let mut hash_v = core::mem::take(&mut tables.hash);
     let mut tags_v = core::mem::take(&mut tables.tags);
     let pack = tables.pack_tags;
+    // Guard unification (see the dispatch): WIDE implies pack, so in WIDE
+    // copies this is const-true -- the slot helpers' pack branches fold and
+    // `tags_v` is provably untouched.
+    debug_assert!(!WIDE || pack);
+    let pack_eff = if WIDE { true } else { pack };
     // BRICK 51: `probes`/`hits` feed ONLY `note_search`, which is a no-op
     // without the `profile` feature (their other consumers, `last_hit_rate` and
     // `tag_latch`, were write-only dead state left by the brick-41 revert).
@@ -3975,7 +3989,7 @@ fn find_fast_impl<
         let mut pipe_pos = 0u64;
         let (mut ff_made, mut ff_used) = (0u64, 0u64);
         let (mut h0, mut g0) = fast_hash_tag::<PACKED, true>(src, ip, WIDE, f_mask, f_shift);
-        let mut m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h0, g0);
+        let mut m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h0, g0);
         loop {
             if COUNT {
                 pipe_pos += 1;
@@ -3986,7 +4000,7 @@ fn find_fast_impl<
                 }
             }
             if COUNT && PACKED {
-                let raw = fast_slot_raw(&hash_v, pack, h0);
+                let raw = fast_slot_raw(&hash_v, pack_eff, h0);
                 if m0 == 0 && raw != 0 {
                     if fast_probe(&mut (0, 0), src, raw, ip, window, lowest, mls, block_end).is_some() {
                         TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -3994,7 +4008,7 @@ fn find_fast_impl<
                     TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
-            fast_slot_store(&mut hash_v, &mut tags_v, pack, h0, ip, g0);
+            fast_slot_store(&mut hash_v, &mut tags_v, pack_eff, h0, ip, g0);
             if REP {
                 // ffanat release-asm read: this unconditional per-position
                 // increment was one of six spilled u64 locals -- `incq (%rbp)`
@@ -4042,7 +4056,7 @@ fn find_fast_impl<
                     let (nh, ng) = fast_hash_tag::<PACKED, true>(src, ip, WIDE, f_mask, f_shift);
                     h0 = nh;
                     g0 = ng;
-                    m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h0, g0);
+                    m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h0, g0);
                     continue;
                 }
             }
@@ -4076,7 +4090,7 @@ fn find_fast_impl<
                         0
                     }
                 } else {
-                    fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h, g)
+                    fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h, g)
                 };
                 (h, g, v)
             } else {
@@ -4098,7 +4112,7 @@ fn find_fast_impl<
                     src,
                     &mut hash_v,
                     &mut tags_v,
-                    pack,
+                    pack_eff,
                     f_wide,
                     f_mask,
                     f_shift,
@@ -4147,7 +4161,7 @@ fn find_fast_impl<
                 let (nh, ng) = fast_hash_tag::<PACKED, true>(src, ip, WIDE, f_mask, f_shift);
                 h0 = nh;
                 g0 = ng;
-                m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h0, g0);
+                m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h0, g0);
                 continue;
             }
             if nip > ilimit {
@@ -4238,12 +4252,12 @@ fn find_fast_impl<
             }
         }
         let (h0, g0) = fast_hash_tag::<PACKED, true>(src, ip, WIDE, f_mask, f_shift);
-        let m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h0, g0);
+        let m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h0, g0);
         if COUNT && PACKED {
             // Gate 7 is recorded byte-identical: a tag mismatch should imply the
             // 4 bytes differ, so `fast_probe` would have rejected the candidate
             // anyway. Count the cases where it would NOT have.
-            let raw = fast_slot_raw(&hash_v, pack, h0);
+            let raw = fast_slot_raw(&hash_v, pack_eff, h0);
             if m0 == 0 && raw != 0 {
                 if fast_probe(&mut (0, 0), src, raw, ip, window, lowest, mls, block_end).is_some() {
                     TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -4251,7 +4265,7 @@ fn find_fast_impl<
                 TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
-        fast_slot_store(&mut hash_v, &mut tags_v, pack, h0, ip, g0);
+        fast_slot_store(&mut hash_v, &mut tags_v, pack_eff, h0, ip, g0);
         // GATE 6 SPEED: issue the PAIR probe's load HERE, next to the main
         // probe's, instead of after `fast_probe` has consumed `m0`.
         //
@@ -4268,7 +4282,7 @@ fn find_fast_impl<
         // and match paths both `continue`. Only the issue order moves.
         let pair_pre = if pair && ip + 1 <= ilimit {
             let (h1, g1) = fast_hash_tag::<PACKED, false>(src, ip + 1, WIDE, f_mask, f_shift);
-            Some((h1, g1, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h1, g1)))
+            Some((h1, g1, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h1, g1)))
         } else {
             None
         };
@@ -4360,11 +4374,11 @@ fn find_fast_impl<
                     Some(v) => v,
                     None => {
                         let (h, g) = fast_hash_tag::<PACKED, false>(src, ip1, WIDE, f_mask, f_shift);
-                        (h, g, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack, h, g))
+                        (h, g, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h, g))
                     }
                 };
                 if COUNT && PACKED {
-                    let raw = fast_slot_raw(&hash_v, pack, h1);
+                    let raw = fast_slot_raw(&hash_v, pack_eff, h1);
                     if m1 == 0 && raw != 0 {
                         if fast_probe(&mut (0, 0), src, raw, ip1, window, lowest, mls, block_end).is_some() {
                             TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -4372,7 +4386,7 @@ fn find_fast_impl<
                         TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                fast_slot_store(&mut hash_v, &mut tags_v, pack, h1, ip1, g1);
+                fast_slot_store(&mut hash_v, &mut tags_v, pack_eff, h1, ip1, g1);
                 // A THIRD VARIABLE WAS TESTED AND REJECTED: the pair match's
                 // LENGTH. `versions-16m` sits at exactly +10.55% for every
                 // minimum from 0 to 24, while the winners degrade badly (total
@@ -4409,7 +4423,7 @@ fn find_fast_impl<
                         src,
                         &mut hash_v,
                         &mut tags_v,
-                        pack,
+                        pack_eff,
                         f_wide,
                         f_mask,
                         f_shift,
@@ -9773,6 +9787,13 @@ mod tests {
         src.truncate(277_521);
         let params = crate::compression_params(1, Some(src.len() as u64)).expect("params");
         let mut tables = MatchTables::new(params);
+        // Mirror the encode path's table init (encode_frame): `pack_tags` now
+        // participates in WIDE dispatch, so an oracle that skips this runs a
+        // different finder arm than the frame it is checking against.
+        tables.enable_packed_tags(
+            params.strategy == Strategy::Fast && tag_alloc_enabled() && fast_pack_enabled(),
+            src.len(),
+        );
         let window = 1usize << params.window_log.min(31);
         let zst = compress_with(
             &src,
