@@ -1983,8 +1983,12 @@ pub(crate) fn prime_tables(
                     tables.put_hl(hl, p);
                 }
             } else {
-                let hv = load_u32le(src, p).wrapping_mul(HASH4_PRIME);
-                let g = (hv ^ (hv >> 15)) as u8;
+                // MUST mirror `hash4_tag_mls` exactly -- the -59.3% priming
+                // poison. `p + 8 <= len` is this loop's own guard.
+                let sk = 8.min(mls);
+                let smask = if sk == 8 { u64::MAX } else { (1u64 << (8 * sk)) - 1 };
+                let tv = (load_u64le(src, p) & smask).wrapping_mul(FAST_HASH_PRIME64);
+                let g = (tv ^ (tv >> 29)) as u8;
                 tables.put_h_tag(h, p, g);
                 // 1a: prime the LONG tag too, or the filter rejects every
                 // primed long slot -- the exact -59.3% priming-poison class
@@ -5633,30 +5637,25 @@ fn fast_hash_tag<const SAFE: bool>(
 /// differ, i.e. the tag can only reject candidates the probe would reject
 /// anyway. That is what makes the whole scheme byte-identical by construction.
 #[inline(always)]
-fn hash4_tag(src: &[u8], pos: usize, hash_shift: u32) -> (usize, u8) {
-    let hv = load_u32le(src, pos).wrapping_mul(HASH4_PRIME);
-    // Fold high bits down: the index consumes the top `hash_log` bits, so the
-    // raw low byte would be the weakest part of a multiplicative hash.
-    (
-        // BRICK 52: no mask. `hash_shift == 32 - hash_log` with the CLAMPED
-        // hash_log, so this yields at most `hash_log` bits, i.e. a value
-        // strictly below `1 << hash_log == hash.len()`. The `& hash_mask` it
-        // replaces was a live loop value costing a register and a stack reload
-        // on every probe.
-        (hv >> hash_shift) as usize,
-        // BRICK 46: the tag is DEAD unless the packed arm is on, and this sits on
-        // the hash's dependency chain in the hottest loop in the encoder. A
-        // const generic folds it away entirely instead of computing-then-
-        // discarding it on every probe.
-        // COMPUTED UNCONDITIONALLY. Brick 46 folded this away when PACKED was
-        // false, which is correct only if PACKED is fixed for the whole frame.
-        // Gate 7 dispatches it PER BLOCK, so a block with the filter off would
-        // otherwise store tag=0 into `tags[h]` and poison every later block that
-        // has the filter on -- the same stale-tag class as 190ad8b, one level up.
-        // One xor and one shift, off the critical path of the index.
-        (hv ^ (hv >> 15)) as u8,
-    )
+/// DFast's short-slot hasher with the MLS-WIDTH tag. The INDEX is bit-exact
+/// `hash4_tag`'s (the u32 gram times HASH4_PRIME, shifted) -- same slots,
+/// byte-identity by construction. The TAG sees `min(mls, 8)` bytes via
+/// `smask`, because the short consume-site census found the 4-byte tag's
+/// blind spot: survivors share the tag's whole 4 bytes and die at byte 5
+/// against mls = 5 -- 8,453,099 wasted random loads per board pass (32.2%
+/// of the unfiltered waste; the long table's same class measured 0.42%).
+/// SAFETY: every caller is bounded by `ilimit = block_end - 8` (or primes
+/// with `p + 8 <= len`), so the u64 load is in bounds.
+/// Soundness: acceptance verifies `mls` leading bytes, and the tag is a
+/// function of `min(mls, 8)` of them -- a mismatch cannot hide a match.
+#[inline(always)]
+fn hash4_tag_mls(src: &[u8], pos: usize, hash_shift: u32, smask: u64) -> (usize, u8) {
+    let v = load_u64le(src, pos);
+    let hv = (v as u32).wrapping_mul(HASH4_PRIME);
+    let tv = (v & smask).wrapping_mul(FAST_HASH_PRIME64);
+    ((hv >> hash_shift) as usize, (tv ^ (tv >> 29)) as u8)
 }
+
 
 /// Brick 39 arm state: 2-way pipelined probe. Runtime-settable so the
 /// in-process ABBA harness can flip it between adjacent measurements.
@@ -6510,6 +6509,7 @@ fn fill_hash_after_match(
     src: &[u8],
     match_ip: usize,
     match_end: usize,
+    smask: u64,
     // Shift from the table's OWN clamped hash_log -- never from `params`.
     // Passed IN rather than recomputed from the struct field: the caller's
     // spec copies hold it as a CONSTANT (dtag_shift from const hlog), and
@@ -6523,7 +6523,7 @@ fn fill_hash_after_match(
     let mut n = 0u64;
     let a = match_ip.saturating_add(2);
     if do_a && a <= ilimit {
-        let (h, g) = hash4_tag(src, a, hash_shift);
+        let (h, g) = hash4_tag_mls(src, a, hash_shift, smask);
         // T1: this helper runs after EVERY match on the DFast path too, so it
         // must write the short table in whatever representation the frame is
         // using. Writing it unpacked while the reader is packed decodes the tag
@@ -6539,7 +6539,7 @@ fn fill_hash_after_match(
     if do_b && match_end >= 2 {
         let b = match_end - 2;
         if b <= ilimit && b != a {
-            let (h, g) = hash4_tag(src, b, hash_shift);
+            let (h, g) = hash4_tag_mls(src, b, hash_shift, smask);
             if tables.pack_tags {
                 tables.put_h_tag(h, b, g);
             } else {
@@ -6563,6 +6563,7 @@ fn fill_hash_long_after_match(
     match_ip: usize,
     match_end: usize,
     hash_log: u32,
+    smask: u64,
     // 1a: the short-tag shift, for the packed long store. Passed in like
     // `fill_hash_after_match`'s -- never re-derived from the struct field
     // (see 4a30eb4: that fold was build-to-build unstable).
@@ -6574,14 +6575,14 @@ fn fill_hash_long_after_match(
     let a = match_ip.saturating_add(2);
     let ltag_live = tables.pack_tags || !tables.ltags.is_empty();
     if do_a && a <= ilimit {
-        let g = if ltag_live { hash4_tag(src, a, hash_shift).1 } else { 0 };
+        let g = if ltag_live { hash4_tag_mls(src, a, hash_shift, smask).1 } else { 0 };
         tables.put_hl_tag(hash8(src, a, hash_log), a, g);
         n += 1;
     }
     if do_b && match_end >= 2 {
         let b = match_end - 2;
         if b <= ilimit && b != a {
-            let g = if ltag_live { hash4_tag(src, b, hash_shift).1 } else { 0 };
+            let g = if ltag_live { hash4_tag_mls(src, b, hash_shift, smask).1 } else { 0 };
             tables.put_hl_tag(hash8(src, b, hash_log), b, g);
             n += 1;
         }
@@ -6840,13 +6841,23 @@ fn find_dfast_impl<const HLOG: u32>(
     // unfiltered waste is almost entirely FIRST-FOUR-BYTES-DIFFER bucket
     // collisions of the 8-byte hash -- the byte-5-differs class the wider
     // tag targets barely exists. It bought 1,811 loads/board for one AND and
-    // one MUL per position in the hot loop. More tag BITS, not more tag
-    // BYTES, is the only axis left, and 24-bit positions leave none.
+    // one MUL per position in the hot loop.
+    //
+    // EPILOGUE (same day): the refutation stands for DEDICATED long-side
+    // arithmetic -- but the SHORT table's consume census then found ITS
+    // byte-5 class is 8.45M loads/board, the short tag went mls-width
+    // (`hash4_tag_mls`), and since the long tag reuses the short tag it
+    // became mls-width for free, landing the long boards on the exact 0.39%
+    // floor anyway. Refuted work, delivered as a side effect at zero
+    // marginal cost.
     //
     // Instrument lesson that found this (the "32M" false lead): the residual
     // statics ran during the arm-OFF pass too -- read counters out between
     // arms or the baseline contaminates the treatment 4:1.
     let lt_on = long_tag_enabled() && (tables.pack_tags || !tables.ltags.is_empty());
+    // The mls-width short tag's byte mask (min(mls, 8) bytes).
+    let sk = 8.min(mls);
+    let smask = if sk == 8 { u64::MAX } else { (1u64 << (8 * sk)) - 1 };
     // Loop-invariant arm reads, hoisted from the MATCH path to once per block.
     let fill_anchor_c = dfast_fill_anchor_c();
     let fill_stride = dfast_fill_stride();
@@ -6907,7 +6918,7 @@ fn find_dfast_impl<const HLOG: u32>(
                 v
             }
             None => {
-                let (a, ga) = hash4_tag(src, ip, dtag_shift);
+                let (a, ga) = hash4_tag_mls(src, ip, dtag_shift, smask);
                 let b = hash8(src, ip, hlog);
                 let m = tables.get_h_tag(a, ga, dtag_on);
                 // T1 ledger: a rejection is a candidate load AVOIDED. Counted
@@ -6966,7 +6977,7 @@ fn find_dfast_impl<const HLOG: u32>(
         if dpipe {
             let nip = ip + dstep + ((ip - anchor) >> accel);
             if nip <= ilimit {
-                let (a, ga) = hash4_tag(src, nip, dtag_shift);
+                let (a, ga) = hash4_tag_mls(src, nip, dtag_shift, smask);
                 let b = hash8(src, nip, hlog);
                 // The hand-forward has to respect the filter: `put_h_tag` just
                 // wrote `g4` at slot `h4`, so a speculation landing on that slot
@@ -7066,7 +7077,7 @@ fn find_dfast_impl<const HLOG: u32>(
             // The only long consumer without a free tag: `ip + 1` never
             // computed a short hash. One mul+xor on a path already gated by
             // `best_ml < good_ml && nl_on`.
-            let g8b = if lt_on { hash4_tag(src, ip + 1, dtag_shift).1 } else { 0 };
+            let g8b = if lt_on { hash4_tag_mls(src, ip + 1, dtag_shift, smask).1 } else { 0 };
             if let Some(m8b) = tables.get_hl_tag(h8b, g8b, lt_on) {
                 if COUNT {
                     probes += 1;
@@ -7133,11 +7144,40 @@ fn find_dfast_impl<const HLOG: u32>(
                 if COUNT {
                     probes += 1;
                 }
+                let mut _acc = false;
                 if match_ok(src, m4, ip, window, block_start, mls, tables.frame_start) {
                     let ml = count_match(src, m4, ip, block_end);
+                    _acc = ml >= mls;
                     if ml >= mls && ml > best_ml {
                         best_m = m4;
                         best_ml = ml;
+                    }
+                }
+                // SHORT-table consume-site census, the mirror of the long
+                // table's (which found 60.8M invisible wasted loads across
+                // two boards). Survivors here share only FOUR guaranteed
+                // bytes against an mls of 5+, so the byte-5 class that
+                // barely existed for the long table is structurally real
+                // here. Classes: window/bounds fail (ALU only), bytes fail
+                // (paid the random src[m] load), produced a valid match.
+                #[cfg(feature = "profile")]
+                if COUNT {
+                    use core::sync::atomic::Ordering::Relaxed;
+                    if _acc {
+                        STAG_SURV_ACC.fetch_add(1, Relaxed);
+                    } else {
+                        let lowest =
+                            block_start.saturating_sub(window).max(tables.frame_start);
+                        let cheap = m4 >= ip
+                            || ip - m4 > window
+                            || m4 < lowest
+                            || ip + mls > src.len()
+                            || m4 + mls > src.len();
+                        if cheap {
+                            STAG_SURV_WFAIL.fetch_add(1, Relaxed);
+                        } else {
+                            STAG_SURV_FAIL.fetch_add(1, Relaxed);
+                        }
                     }
                 }
             }
@@ -7156,12 +7196,12 @@ fn find_dfast_impl<const HLOG: u32>(
             }
             let end = best_ip + best_ml;
             // DFast never sets `packed` (it is gated on Strategy::Fast).
-            fill_hash_after_match(tables, src, best_ip, end, dtag_shift, ilimit);
+            fill_hash_after_match(tables, src, best_ip, end, smask, dtag_shift, ilimit);
             // GATE 12 @ L3: `ip` here is the PRE-probe position; when the
             // next-long probe won, `best_ip == ip + 1` and the two tables index
             // different positions for one match. See `dfast_fill_anchor_c`.
             let long_anchor = if fill_anchor_c { best_ip } else { ip };
-            fill_hash_long_after_match(tables, src, long_anchor, end, hlog, dtag_shift, ilimit);
+            fill_hash_long_after_match(tables, src, long_anchor, end, hlog, smask, dtag_shift, ilimit);
             // GATE 12 @ L3: the density knob DFast never had. Off by default.
             let dfs = fill_stride;
             if dfs != 0 {
@@ -7174,7 +7214,7 @@ fn find_dfast_impl<const HLOG: u32>(
                 let stop = end.saturating_sub(2).min(ilimit + 1);
                 let mut p = best_ip + 2 + dfs;
                 while p < stop {
-                    let (h, g) = hash4_tag(src, p, hash_shift);
+                    let (h, g) = hash4_tag_mls(src, p, hash_shift, smask);
                     // T1: same table, same representation. `store_fast` writes
                     // the slot unpacked, which a packed reader would decode as a
                     // bogus position.
@@ -11932,6 +11972,24 @@ pub static LTAG_SURV_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 pub static LTAG_SURV_WFAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "profile")]
 pub static LTAG_SURV_ACC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// SHORT-table consume-site residual, mirror of the long table's.
+#[cfg(feature = "profile")]
+pub static STAG_SURV_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static STAG_SURV_WFAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static STAG_SURV_ACC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// `(bytes_fail, window_fail, accepted)` for the SHORT consume site.
+#[cfg(feature = "profile")]
+pub fn take_short_tag_residual() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        STAG_SURV_FAIL.swap(0, Relaxed),
+        STAG_SURV_WFAIL.swap(0, Relaxed),
+        STAG_SURV_ACC.swap(0, Relaxed),
+    )
+}
+
 /// `(bytes_fail, window_fail, accepted)` -- only `bytes_fail` paid a load.
 #[cfg(feature = "profile")]
 pub fn take_long_tag_residual() -> (u64, u64, u64) {

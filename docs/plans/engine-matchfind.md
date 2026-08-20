@@ -335,9 +335,24 @@ tag surface. `ltags` byte array beside `hash_long`, same g4 tag, engaged only
 where pack is refused. Full-length board: **28,187,616 of 36,885,171 long
 probes rejected (76.4%)** — `mozilla` 91.2%/90.6% — and the consume-site
 ledger lands at the collision floor again (28,897,386 unfiltered wasted loads
-→ 125,441, 0.43%). 18/18 byte-identical, FALSE 0. Every tag surface in the
-encoder (short packed, short array, long packed, long array) now runs at the
-8-bit collision floor at every frame size.
+→ 125,441, 0.43%). 18/18 byte-identical, FALSE 0.
+
+**The mls-width SHORT tag — SHIPPED 2026-08-21 (`stag`):** the short consume
+census (mirror of the long one) found the 4-byte tag's blind spot: survivors
+share the tag's whole 4 bytes and die at byte 5 against mls = 5 —
+**8,453,099 wasted random loads/board (32.2% of unfiltered)** where the long
+table's same class measured 0.42%. `hash4_tag_mls` keeps the index bit-exact
+and widens only the tag to `min(mls, 8)` bytes from the u64 the site already
+loads for `hash8`. Result: short residual **8,453,099 → 286,170 (1.1%)**,
+short load-site rejection 25.5% → 65.2%, accepted count bit-identical
+(4,460,182) across arms, and the long tables ride it for free (big-frame
+residual 125,441 → 112,755, the exact 0.39% floor). One AND + one MUL per
+position; the mlx-long refutation stands for dedicated long-side arithmetic
+and is subsumed as a free side effect.
+
+Every tag surface in the encoder (short packed, short array, long packed,
+long array) now runs at or near the 8-bit collision floor at every frame
+size.
 
 ---
 
