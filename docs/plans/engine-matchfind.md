@@ -21,7 +21,7 @@ engine-function inventory for it.
 
 | function                                                             | copies |  instrs | calls out | stack movs | runs                                   |
 | -------------------------------------------------------------------- | -----: | ------: | --------: | ---------: | -------------------------------------- |
-| `find_fast_impl`                                                     |     34 |  41,587 |     1,078 |      6,866 | per position, L1/L2                    |
+| `find_fast_impl` *(2026-08-20e: 140 copies / ~231K after WIDE×spec — binary, not executed; live copy 2,021 instrs)* | 140 | 231,000 | — | — | per position, L1/L2 |
 | `find_dfast_impl`                                                    |      1 |   1,816 |        48 |        325 | per position, **L3/L4 (default)**      |
 | `find_greedy`                                                        |      1 |     685 |        23 |        153 | per position, L5                       |
 | `find_lazy`                                                          |      1 |   1,202 |        38 |        278 | per position, L6–L12                   |
