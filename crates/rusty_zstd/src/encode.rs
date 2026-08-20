@@ -3953,7 +3953,17 @@ fn find_fast_impl<
     // the loop it actually runs.
     // Read ONCE per block, never per position -- see the -37% that an env
     // lookup inside the DP loop cost at L19.
-    let accel = accel_shift_for(params.strategy);
+    // ffanat release-asm read: `accel` is the constant 7 for Fast unless the
+    // RZSTD_ACCEL bench pin is set, yet it was computed, spilled, reloaded from
+    // the stack, and `shrq %cl`-shifted PER POSITION. Release builds take the
+    // constant (immediate shift, no CL, no slot); the pin stays available under
+    // `profile`, the same split EQLEN_ARM documents ("present ONLY under
+    // --features profile").
+    let accel = if cfg!(feature = "profile") {
+        accel_shift_for(params.strategy)
+    } else {
+        7
+    };
     if PIPE && !pair && ip <= ilimit {
         if COUNT {
             FF_PIPE_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -3986,7 +3996,13 @@ fn find_fast_impl<
             }
             fast_slot_store(&mut hash_v, &mut tags_v, pack, h0, ip, g0);
             if REP {
-                rep_probes += 1;
+                // ffanat release-asm read: this unconditional per-position
+                // increment was one of six spilled u64 locals -- `incq (%rbp)`
+                // per miss in SHIPPING builds -- and its only consumers are the
+                // COUNT-gated REP_PROBES publishes. Instrument, so gated.
+                if COUNT {
+                    rep_probes += 1;
+                }
                 if let Some(ml) = try_rep1(src, ip, rep1, lowest, block_end) {
                     rep_hits += 1;
                     rep_bytes += ml as u64;
@@ -4257,7 +4273,9 @@ fn find_fast_impl<
             None
         };
         if REP {
-            rep_probes += 1;
+            if COUNT {
+                rep_probes += 1;
+            }
             if let Some(ml) = try_rep1(src, ip, rep1, lowest, block_end) {
                 rep_hits += 1;
                 rep_bytes += ml as u64;
