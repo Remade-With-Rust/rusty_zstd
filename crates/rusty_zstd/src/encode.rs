@@ -288,6 +288,7 @@ struct Seq {
     offset: u32,
 }
 
+#[derive(Clone)]
 pub(crate) struct MatchTables {
     hash: Vec<u32>,
     hash_long: Vec<u32>,
@@ -314,6 +315,30 @@ pub(crate) struct MatchTables {
     /// over-reserving measurably regressed sao (+3.9% cyc/byte) -- the same
     /// holdout sign-flip that reverted bricks 31 and 34.
     last_nseq: usize,
+    /// GATE 18 @ L1 step probe. `pair_route == 1` pins the search step at 1, and
+    /// on sao/mr/dickens step 2 is SMALLER and saves 25-45% of positions. No
+    /// content signal separates those from samba/mozilla/x-ray, so the step is
+    /// MEASURED instead of predicted: alternate 1,2,1,2 over the first blocks,
+    /// compare compressed bytes per input byte, and latch the winner.
+    ///
+    /// 0 = still probing, 1 = latched on step 1, 2 = latched on step 2.
+    step_pick: u8,
+    /// Step used by the block currently being encoded, so the outcome can be
+    /// attributed to the arm that produced it.
+    step_used: u8,
+    /// Forces the step during a probe run. 0 = normal dispatch.
+    step_force: u8,
+    /// Forces the GATE 6 pair route during a probe run. 0 = normal dispatch.
+    route_force: u8,
+    /// Blocks probed, and accumulated (compressed / input) per arm.
+    step_probed: u32,
+    step_sum1: f64,
+    step_sum2: f64,
+    step_n1: u32,
+    step_n2: u32,
+    /// Countdown to a forced re-probe, so content that changes character is
+    /// picked up -- the warm-up + re-probe shape GATES 2, 6, 10 and 14 all need.
+    step_reprobe: u32,
     /// Search positions per byte from the PREVIOUS block -- the dispatch signal
     /// for the lazy back-fill (defect B1). Measured, not assumed: see the
     /// truth table in `m7-benchmark-repair.md`. High = the search is working
@@ -564,6 +589,16 @@ impl MatchTables {
             chain: if use_chain { vec![0; csz] } else { Vec::new() },
             frame_start: 0,
             last_nseq: 0,
+            step_pick: 0,
+            step_used: 0,
+            step_force: 0,
+            route_force: 0,
+            step_probed: 0,
+            step_sum1: 0.0,
+            step_sum2: 0.0,
+            step_n1: 0,
+            step_n2: 0,
+            step_reprobe: 0,
             // Start optimistic: the first block back-fills, then measures.
             last_search_per_byte: 1.0,
             blocks_done: 0,
@@ -1738,8 +1773,39 @@ pub(crate) fn encode_block(
     // hit in Gates 6, 2 and 10.
     let skip_search =
         raw_skip_on() && tables.raw_run >= raw_run_min() && tables.raw_probe != 0;
+    // LDM is excluded: the probe would have to clone and then discard the LDM
+    // state too, and a second pollution problem is not worth solving for a
+    // feature that is off by default on this path.
+    let probing = params.strategy == Strategy::Fast
+        && params.target_length == 0
+        && tables.pair_route == 1
+        && ldm.is_none()
+        && step_probe_on()
+        && (tables.step_pick == 0 || tables.step_reprobe == 0);
     let (seqs, literals) = if skip_search {
         (Vec::new(), block.to_vec())
+    } else if probing {
+        // GATE 18 @ L1 DISPATCH. Measure what step 2 would forfeit, from an
+        // IDENTICAL starting state, then keep step 1's output so a probe block
+        // is never worse than the pinned behaviour.
+        //
+        // Two earlier designs failed and are recorded so they are not retried:
+        // alternating the steps across blocks compares CONTENT (adjacent blocks
+        // differ in compressibility, and it latched mozilla and samba onto step
+        // 2 at +2.3% and +3.2%); counting match bytes at skipped positions
+        // overestimates, because a match at a skipped position usually SHIFTS to
+        // the next one rather than vanishing.
+        let mut probe = tables.clone();
+        probe.route_force = 2;
+        let (s2, l2) = find_sequences(
+            src, block_start, block_end, window, params, &mut probe, None, ldm_p, *reps,
+        );
+        let _m = crate::prof::scope(crate::prof::Stage::EncodeMatchFind);
+        let r = find_sequences(
+            src, block_start, block_end, window, params, tables, ldm, ldm_p, *reps,
+        );
+        note_step_probe(tables, &r.0, r.1.len(), &s2, l2.len());
+        r
     } else {
         let _m = crate::prof::scope(crate::prof::Stage::EncodeMatchFind);
         find_sequences(
@@ -1938,6 +2004,7 @@ pub(crate) fn encode_block(
         off_bkt,
     );
     note_raw_outcome(tables, false);
+    note_step_outcome(tables, payload.len(), block.len());
     write_block_header(out, last, BlockType::Compressed, payload.len() as u32);
     out.extend_from_slice(&payload);
     tables.payload_scratch = payload;
@@ -2962,7 +3029,16 @@ fn find_fast(
     // Every `PAIR_PROBE_PERIOD` blocks the route is forced back to `pair` so the
     // rate is RE-MEASURED; without that the low routes never run the search and
     // the gate could never re-open.
-    tables.pair_route = if !pair_enabled() {
+    // GATE 18 @ L1 DISPATCH. `route_force` is the probe's own arm; `step_pick`
+    // is its latched verdict. Route 2 skips the pair search, where 28.6% of L1's
+    // positions live, and the probe decides per content whether that costs
+    // bytes -- no static signal separates the free content from the costly
+    // (4.70: four content signals and three probe designs failed first).
+    tables.pair_route = if tables.route_force != 0 {
+        tables.route_force
+    } else if tables.step_pick == 2 && tables.step_reprobe > 0 && step_probe_on() {
+        2
+    } else if !pair_enabled() {
         0
     } else if params.target_length != 0 {
         2
@@ -2995,6 +3071,7 @@ fn find_fast(
             step0_default()
         }
     } else {
+        tables.step_used = 0;
         params.target_length as usize + 1
     };
     macro_rules! go {
@@ -4512,6 +4589,206 @@ static STEP0_ARM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 /// Bench hook for in-process ABBA; shipping default from `RZSTD_STEP0`.
 pub fn set_step0_arm(step: usize) {
     STEP0_ARM.store(step.max(1) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// GATE 18 @ L1: how many blocks to alternate before latching, and how often to
+/// re-probe. Four blocks gives two samples per arm on adjacent content.
+/// Probe blocks per decision, and blocks between re-probes.
+///
+/// A probe block runs the search TWICE, so the probe's own cost is
+/// `2 * BLOCKS / PERIOD` of the total search. At 4 and 32 that is 12.5% against
+/// a 15% saving -- measured at +2.62% SLOWER, the fifth time in this campaign
+/// that an instrument outweighed what it measured. At 1 and 256 it is 0.4%.
+const STEP_PROBE_BLOCKS: u32 = 1;
+/// Bytes a sequence costs once entropy-coded, for the probe's size proxy.
+/// Literal count plus this per sequence tracks emitted size closely enough to
+/// rank two parses; coverage does not (4.70).
+const SEQ_BYTES_EST: f64 = 3.0;
+const STEP_REPROBE_PERIOD: u32 = 256;
+
+static STEP_PROBE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: `false` restores the pinned step-1 behaviour on route 1.
+pub fn set_step_probe_arm(on: bool) {
+    STEP_PROBE_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// DEFAULT OFF. The complete ledger says this loses.
+///
+/// `pair_route == 2` does not SKIP the pair search -- it RUNS it, with step 2.
+/// Route 1 is the cheap arm: no pair search, step 1. So routing 1 -> 2 halves
+/// main-loop positions and DOUBLES pair probes:
+///
+/// ```text
+///   positions    28,411,771 -> 22,941,198   -5,470,573  (-19.25%)
+///   pair probes   8,323,627 -> 16,658,004   +8,334,377  (+100.13%)
+///   NET                                     +2,863,804  (+7.80%)
+/// ```
+///
+/// and the clock agrees at +2.21% against a 1.46% null. The -0.0131% size and
+/// -19.25% positions that looked like a free win were a HALF LEDGER: pair probes
+/// were never counted.
+///
+/// The machinery is kept because the probe itself is sound and reusable -- it
+/// measures a counterfactual from identical state on a cloned table -- and
+/// because the size result (-0.0131%) says route 2 genuinely parses better. What
+/// it does not do is parse CHEAPER.
+#[inline(always)]
+fn step_probe_on() -> bool {
+    STEP_PROBE_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
+}
+
+/// Which step this block should use on the contested route.
+///
+/// Probing runs at step 1 -- the SAFE arm -- and measures what step 2 would have
+/// cost, so a probe block is never worse than the pinned behaviour. Alternating
+/// the two arms across blocks was tried first and fails: adjacent blocks differ
+/// in compressibility, so the comparison measures CONTENT rather than the step,
+/// and it latched mozilla and samba onto step 2 at +2.3% and +3.2%.
+#[inline]
+fn step_probe_pick(tables: &mut MatchTables) -> u8 {
+    if !step_probe_on() {
+        return 1;
+    }
+    if tables.step_pick != 0 && tables.step_reprobe > 0 {
+        return tables.step_pick;
+    }
+    1
+}
+
+/// GATE 18 study: the measured step-2 forfeit, per mille x10.
+#[cfg(feature = "profile")]
+pub static STEP_FORFEIT_SUM: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static STEP_FORFEIT_N: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static STEP_SEQ_SUM: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear `(sum_x10000, n)`.
+#[cfg(feature = "profile")]
+pub fn take_step_forfeit() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        STEP_FORFEIT_SUM.swap(0, Relaxed),
+        STEP_FORFEIT_N.swap(0, Relaxed),
+        STEP_SEQ_SUM.swap(0, Relaxed),
+    )
+}
+
+/// Record one probe block: how much match coverage step 2 forfeits against
+/// step 1, both measured from the same starting tables.
+fn note_step_probe(
+    tables: &mut MatchTables,
+    seqs1: &[Seq],
+    lits1: usize,
+    seqs2: &[Seq],
+    lits2: usize,
+) {
+    if seqs1.is_empty() {
+        return;
+    }
+    // Judge on a SIZE PROXY, not on coverage. 4.70 measured coverage forfeit
+    // ANTI-correlating with the true cost -- samba forfeits the least and pays
+    // the most -- because a match the cheap route misses is usually re-found a
+    // byte later as an extra short sequence. Literals plus a per-sequence
+    // overhead tracks the emitted bytes; coverage does not.
+    let est1 = lits1 as f64 + seqs1.len() as f64 * SEQ_BYTES_EST;
+    let est2 = lits2 as f64 + seqs2.len() as f64 * SEQ_BYTES_EST;
+    let forfeit = est2 / est1.max(1.0) - 1.0;
+    let seq_ratio = 0.0;
+    #[cfg(feature = "profile")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        STEP_SEQ_SUM.fetch_add((seq_ratio * 10000.0) as u64, Relaxed);
+    }
+    #[cfg(feature = "profile")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        STEP_FORFEIT_SUM.fetch_add((forfeit.max(0.0) * 10000.0) as u64, Relaxed);
+        STEP_FORFEIT_N.fetch_add(1, Relaxed);
+    }
+    let _ = seq_ratio;
+    tables.step_sum1 += forfeit;
+    tables.step_sum2 += 1.0;
+    tables.step_probed = tables.step_probed.saturating_add(1);
+    if tables.step_probed >= STEP_PROBE_BLOCKS {
+        let n = f64::from(tables.step_probed);
+        let mean_forfeit = tables.step_sum1 / n;
+        let mean_seq = 0.0f64;
+        // TWO variables, each catching a case the other misses.
+        //
+        // `seq_ratio` -- the share of the sequence COUNT that survives step 2 --
+        // is the size predictor. samba 0.9332 and mozilla 1.0144 keep nearly
+        // every sequence and cost +9.1% and +13.6%: the matches step 2 skips are
+        // re-found a byte later as extra short sequences, so the entropy bill
+        // rises while the search saving is spent. mr 0.3916, sao 0.6575 and
+        // dickens 0.7451 shed sequences instead, and are free.
+        //
+        // `forfeit` -- match bytes lost -- catches x-ray, whose seq_ratio is a
+        // very low 0.1250 but which loses 89% of its coverage: there step 2 does
+        // not restructure the parse, it destroys it (+25.1%).
+        //
+        // Coverage ALONE is anti-correlated with cost (samba forfeits the least
+        // and costs the most), which is why four content signals and two earlier
+        // probe designs failed here.
+        let _ = mean_seq;
+        tables.step_pick = if mean_forfeit < step_forfeit_max() { 2 } else { 1 };
+        tables.step_reprobe = STEP_REPROBE_PERIOD;
+        tables.step_probed = 0;
+        tables.step_sum1 = 0.0;
+        tables.step_sum2 = 0.0;
+    }
+}
+
+/// Feed a probe block's measured counterfactual back to the step gate.
+///
+/// `step_sum1` carries the match bytes committed at positions step 2 would
+/// SKIP, and `step_sum2` the total match bytes. Their ratio is what step 2 would
+/// forfeit on this content, measured on a single step-1 pass with no double
+/// search and no table pollution.
+fn note_step_outcome(tables: &mut MatchTables, _payload: usize, _block_len: usize) {
+    if tables.step_pick != 0 && tables.step_reprobe > 0 {
+        tables.step_reprobe -= 1;
+    }
+}
+
+static STEP_FORFEIT_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Bench hook: the share of match bytes step 2 may forfeit before it is refused.
+pub fn set_step_forfeit_arm(v: f32) {
+    STEP_FORFEIT_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn step_forfeit_max() -> f64 {
+    let v = STEP_FORFEIT_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if v == u32::MAX {
+        0.002
+    } else {
+        f64::from(f32::from_bits(v))
+    }
+}
+
+static STEP_SEQ_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Bench hook: the share of sequences that may SURVIVE step 2 before it is
+/// refused.
+pub fn set_step_seq_arm(v: f32) {
+    STEP_SEQ_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn step_seq_max() -> f64 {
+    let v = STEP_SEQ_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if v == u32::MAX {
+        0.85
+    } else {
+        f64::from(f32::from_bits(v))
+    }
 }
 
 fn step0_default() -> usize {
