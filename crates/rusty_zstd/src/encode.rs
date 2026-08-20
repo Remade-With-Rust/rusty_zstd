@@ -1395,6 +1395,8 @@ fn adaptive_block_max(
         }
         _ => (g5_rep_min(), g5_ratio_min(), g5_drift_min()),
     };
+    #[cfg(feature = "profile")]
+    G5_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     // block 0 has no history: always take the full size
     if r_prev < 0.0 {
         return base;
@@ -1409,16 +1411,30 @@ fn adaptive_block_max(
     }
     // mechanism 2 -- barely compressible: let bad regions escape to RAW sooner
     if r_prev >= ratio_min {
+        #[cfg(feature = "profile")]
+        G5_HIT_RATIO.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return base.min(G5_SMALL);
     }
     // mechanism 1 -- entropy drift between the last two blocks
     if r_prev2 >= 0.0 {
         let drift = (r_prev - r_prev2).abs() / r_prev.max(1e-6);
         if drift >= drift_min {
+            #[cfg(feature = "profile")]
+            G5_HIT_DRIFT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return base.min(G5_SMALL);
         }
     }
     base
+}
+
+pub static G5_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static G5_HIT_RATIO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static G5_HIT_DRIFT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// GATE 5 coverage: `(calls, raw-escape fires, drift fires)`.
+pub fn take_g5() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (G5_CALLS.swap(0, Relaxed), G5_HIT_RATIO.swap(0, Relaxed), G5_HIT_DRIFT.swap(0, Relaxed))
 }
 
 /// Below this ratio a block is RLE or near-RLE: splitting only adds headers.
@@ -5658,16 +5674,31 @@ fn find_dfast_impl<const HLOG: u32>(
     };
     let block_len = block_end - block_start;
     let seq_guess = (tables.last_nseq + tables.last_nseq / 4 + 64).min(block_len / mls + 16);
-    let mut seqs = if lp {
-        Vec::with_capacity(seq_guess)
+    // GATE 6 family: DFast reserved its buffers but still built them fresh every
+    // block. `find_fast_impl` takes them from the frame; this never did, so the
+    // reservation was paid per block instead of once. Same scratch, same
+    // hand-back in `encode_block`.
+    let keep = finder_scratch_enabled();
+    let mut seqs = if keep {
+        let mut v = std::mem::take(&mut tables.seq_scratch);
+        v.clear();
+        v
     } else {
         Vec::new()
     };
-    let mut lits = if lp {
-        Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX)
+    if lp && seqs.capacity() < seq_guess {
+        seqs = Vec::with_capacity(seq_guess);
+    }
+    let mut lits = if keep {
+        let mut v = std::mem::take(&mut tables.lit_scratch);
+        v.clear();
+        v
     } else {
         Vec::new()
     };
+    if lp && lits.capacity() < block_len + LIT_PUSH_WIDTH_MAX {
+        lits = Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX);
+    }
     let mut anchor = block_start;
     let ilimit = block_end.saturating_sub(8);
     if block_start >= ilimit {
@@ -6325,8 +6356,31 @@ fn find_greedy(
     const COUNT: bool = cfg!(feature = "profile");
     let mut probes = 0u64;
     let mut hits = 0u64;
-    let mut seqs = Vec::new();
-    let mut lits = Vec::new();
+    // GATE 6 family, fourth instance: take the finder buffers from the FRAME.
+    //
+    // `find_fast_impl` was wired to `MatchTables::seq_scratch`/`lit_scratch`
+    // and `find_opt` to its own scratch, but Greedy/Lazy/BtLazy still built
+    // both from bare `Vec::new()` -- no reserve at all, growing by doubling
+    // with LIVE contents, so every growth is a real memcpy. Measured on the
+    // 18-corpus 8 MiB board: **172 MB** through `realloc` at L5, 164 MB at L9,
+    // 154 MB at L13, against 9.2 MB at L3 and 1.3 MB at L19.
+    //
+    // `encode_block` already hands these back at all four of its exits, so the
+    // plumbing was in place and only these finders were missing from it.
+    let mut seqs = if finder_scratch_enabled() {
+        let mut v = std::mem::take(&mut tables.seq_scratch);
+        v.clear();
+        v
+    } else {
+        Vec::new()
+    };
+    let mut lits = if finder_scratch_enabled() {
+        let mut v = std::mem::take(&mut tables.lit_scratch);
+        v.clear();
+        v
+    } else {
+        Vec::new()
+    };
     let mut anchor = block_start;
     let ilimit = block_end.saturating_sub(8);
     if block_start >= ilimit {
@@ -6534,8 +6588,31 @@ fn find_lazy(
     // chain-walking finders on the raw value.
     let hash_log = tables.hash_log;
     let chain_mask = tables.chain.len() - 1;
-    let mut seqs = Vec::new();
-    let mut lits = Vec::new();
+    // GATE 6 family, fourth instance: take the finder buffers from the FRAME.
+    //
+    // `find_fast_impl` was wired to `MatchTables::seq_scratch`/`lit_scratch`
+    // and `find_opt` to its own scratch, but Greedy/Lazy/BtLazy still built
+    // both from bare `Vec::new()` -- no reserve at all, growing by doubling
+    // with LIVE contents, so every growth is a real memcpy. Measured on the
+    // 18-corpus 8 MiB board: **172 MB** through `realloc` at L5, 164 MB at L9,
+    // 154 MB at L13, against 9.2 MB at L3 and 1.3 MB at L19.
+    //
+    // `encode_block` already hands these back at all four of its exits, so the
+    // plumbing was in place and only these finders were missing from it.
+    let mut seqs = if finder_scratch_enabled() {
+        let mut v = std::mem::take(&mut tables.seq_scratch);
+        v.clear();
+        v
+    } else {
+        Vec::new()
+    };
+    let mut lits = if finder_scratch_enabled() {
+        let mut v = std::mem::take(&mut tables.lit_scratch);
+        v.clear();
+        v
+    } else {
+        Vec::new()
+    };
     let mut anchor = block_start;
     let ilimit = block_end.saturating_sub(8);
     if block_start >= ilimit {
@@ -7480,8 +7557,31 @@ fn find_bt_lazy(
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
     let mls = params.min_match.max(3) as usize;
-    let mut seqs = Vec::new();
-    let mut lits = Vec::new();
+    // GATE 6 family, fourth instance: take the finder buffers from the FRAME.
+    //
+    // `find_fast_impl` was wired to `MatchTables::seq_scratch`/`lit_scratch`
+    // and `find_opt` to its own scratch, but Greedy/Lazy/BtLazy still built
+    // both from bare `Vec::new()` -- no reserve at all, growing by doubling
+    // with LIVE contents, so every growth is a real memcpy. Measured on the
+    // 18-corpus 8 MiB board: **172 MB** through `realloc` at L5, 164 MB at L9,
+    // 154 MB at L13, against 9.2 MB at L3 and 1.3 MB at L19.
+    //
+    // `encode_block` already hands these back at all four of its exits, so the
+    // plumbing was in place and only these finders were missing from it.
+    let mut seqs = if finder_scratch_enabled() {
+        let mut v = std::mem::take(&mut tables.seq_scratch);
+        v.clear();
+        v
+    } else {
+        Vec::new()
+    };
+    let mut lits = if finder_scratch_enabled() {
+        let mut v = std::mem::take(&mut tables.lit_scratch);
+        v.clear();
+        v
+    } else {
+        Vec::new()
+    };
     let mut anchor = block_start;
     let ilimit = block_end.saturating_sub(8);
     if block_start >= ilimit {
