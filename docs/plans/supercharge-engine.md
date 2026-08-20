@@ -412,3 +412,73 @@ dispatch that had to be thrown away.
 Harnesses in place: `hotspot.rs` (stage + counter map), `tagprice.rs` (what the
 tag buys), `allocost.rs` (allocation pricing), `g6null.rs` (noise floor),
 `g6time.rs` (paired timing with a null arm).
+
+---
+
+## 9. Keyword sweep — the `find_opt` class, swept properly
+
+`find_opt` was missed because it emits **no symbol** (it inlines), so every
+by-symbol scan skipped it. Swept the SOURCE for
+`find|skip|clamp|yield|route|pair|match`: **89 definitions, 67 non-test**. Eight
+hot ones have no own symbol and were invisible the same way:
+
+`clamp_reps`, `early_raw_skip`, `fill_hash_after_match`,
+`fill_hash_long_after_match`, `find_fast`, `find_opt`, `skip_bits`,
+`skip_literals_section`
+
+**The biggest find was not in that set — it was in plain sight.** `find_greedy`
+(L5), `find_lazy` (L6–L12) and `find_bt_lazy` (L13–L15) built `seqs`/`lits` from
+bare `Vec::new()`: no reserve, doubling growth, and unlike `opt_ops` these hold
+**live** data, so every growth is a real memcpy. `find_fast_impl` had been wired
+to the frame scratch and `find_opt` to its own; these three never were, and
+`find_dfast_impl` reserved but still built fresh per block.
+
+| board | bytes memcpy'd by realloc | |
+| --- | --- | ---: |
+| **L5** | 172,166,620 → **8,075,964** | **−95.3%** |
+| L9 | 164,212,638 → 8,100,305 | −95.1% |
+| L13 | 153,983,310 → 7,926,989 | −94.9% |
+| L3 | 9,172,321 → 6,899,677 | −24.8% |
+
+**164 MB removed per board pass at L5** — the ladders were moving 18× L3's
+traffic. Byte-identical on **198 (corpus, level) cells**, A/B'd IN-PROCESS via
+`set_finder_scratch_arm` (a build-to-build fingerprint cannot attribute anything
+while the other session edits `encode.rs` live). Ships **default-on**: `defchk`
+shows default == explicit-on exactly, against explicit-off at 19.6× the traffic.
+
+### The audit of the eight
+
+| function | verdict |
+| --- | --- |
+| `clamp_reps` | clean — 3-element loop, once per block |
+| `early_raw_skip` | clean — one arm read per block |
+| `fill_hash_after_match` | clean — 0 panic sites |
+| `fill_hash_long_after_match` | clean — 0 panic sites |
+| `skip_bits` | clean — two arithmetic lines |
+| `skip_literals_section` | clean — test helper, `.get()?` |
+| **`find_opt`** | **FIXED** — DP literal edge |
+| `find_fast` | see the limit below |
+
+`find_opt`'s DP indexes `price`/`prev`/`is_match` at `i` and `i + 1` at **every
+position** on L16–L22. `while i < n` plus arrays of exactly `n + 1` makes both
+provable, and every other index in that DP is already guarded by `if j <= n`.
+Now unchecked; byte-identical on 60 Bt-ladder cells.
+
+### The limit of the method — stated so it is not over-read
+
+13 panic sites attribute to `find_fast` and 4 to `find_opt`, but both land on
+**inlining boundaries** (a macro call line, a closing brace). `find_fast`'s own
+body contains no indexing at all, so its 13 belong to a `find_fast_impl`
+instantiation that was **inlined rather than emitted** — a 35th copy the
+by-symbol scan cannot see, while the 34 that do emit symbols carry 0. The counts
+did not move when the DP edge was fixed, confirming they are not where the
+attribution says. Localising them needs the CodeView **inline-site chain**, not
+a backward line scan. **OPEN.**
+
+### Prometheus — the actual candidate list
+
+The sweep also enumerated the fitted constants with runtime arms, which is where
+`codec-symbolic-discovery` genuinely fits (unlike the bounds-check work, these
+have a heuristic to distill): `pair_gain_lo`, `pair_gain_min`, `pair_rate_hi`,
+`pair_rep_max`, `rep_yield_min`, `rep_yield_min_for`, `dfast_spec_min`, plus
+`G5_REP_MIN`, `WIDEN_RATIO` and `tag_min`.
