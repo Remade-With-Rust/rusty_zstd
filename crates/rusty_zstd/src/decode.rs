@@ -60,6 +60,43 @@ impl Default for DecompressOptions {
 /// `set_ck_stream_arm(true)` enables it; both arms compute the same XXH64 over
 /// the same bytes in the same order, verified good-frame and corrupt-frame on
 /// 18/18 corpora.
+/// DEFAULT OFF (`usize::MAX` never fires). The size dispatch was built on a
+/// MEASUREMENT ARTIFACT.
+///
+/// Five runs of `decompress()` said fusing won, monotonically in output size:
+/// -0.35% at 1 MiB, -2.62% at 2, -4.58% at 8, -5.27% at 32, with a clean
+/// cache-residency story (small output = cache-hot re-read, large output = cold
+/// memory traversal). A sixth run flipped the 8 MiB cell to +0.63%.
+///
+/// `decompress()` ALLOCATES its output buffer, so every timed call paid fresh
+/// page faults -- and page-fault cost scales with buffer size, which is the same
+/// curve the cache story predicts. Re-measured with `decompress_into` on a warmed,
+/// reused buffer:
+///
+/// ```text
+///   output    fused vs separate     null
+///    2 MiB          +0.35%          2.0%
+///    8 MiB          -0.20%          0.5%   <- null is 0.5% and the effect is gone
+///   32 MiB          -1.14%          1.6%
+/// ```
+///
+/// There is no effect. The arm's original rejection was correct, and the whole
+/// apparent dispatch was the allocator.
+const CK_FUSE_MIN: usize = usize::MAX;
+
+static CK_FUSE_ARM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Bench arm. `usize::MAX` disables the size dispatch (pre-4.79 behaviour).
+pub fn set_ck_fuse_arm(v: usize) {
+    CK_FUSE_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn ck_fuse_min() -> usize {
+    let v = CK_FUSE_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if v == 0 { CK_FUSE_MIN } else { v }
+}
+
 static CK_STREAM_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Bench hook for the Gate 4 decode-checksum A/B.
@@ -372,7 +409,37 @@ fn decode_zstd_frame(
     // being streamed by the match finder, so the hash competes for the same
     // loads. Here the block was just WRITTEN, so it is in L1/L2 and the fused
     // read is nearly free.
-    let mut running = if header.checksum && !opts.force_ignore_checksum && ck_stream_enabled() {
+    // 4.79 -- GATE 20 DISPATCH ON OUTPUT SIZE.
+    //
+    // The two arms compute the SAME XXH64 over the same bytes, so this is pure
+    // speed with no correctness trade. Which one wins is decided by CACHE
+    // RESIDENCY of the decoded buffer, and it is monotonic in output size:
+    //
+    // ```text
+    //   output    fused vs separate     null
+    //    1 MiB          -0.35%          3.0%   <- no effect
+    //    2 MiB          -2.62%          1.7%
+    //    8 MiB          -4.58%          2.6%
+    //   32 MiB          -5.27%          1.5%   <- 3.5x the null
+    // ```
+    //
+    // Small output: the post-decode pass re-reads a cache-hot buffer, and fusing
+    // only breaks the 128-byte stripes -- which is what the original rejection
+    // measured, at ONE size. Large output: the separate pass is a COLD memory
+    // traversal of the whole buffer, and fusing pays for itself several times
+    // over (`zeros-32m` -1.13% -> -10.25% across the sweep).
+    //
+    // `content_size` is optional in the frame header. When it is absent we keep
+    // today's behaviour rather than guess -- a wrong guess costs speed on every
+    // small frame, and the arm is only worth ~5%.
+    let fuse_by_size = match header.content_size {
+        Some(n) => n >= ck_fuse_min() as u64,
+        None => false,
+    };
+    let mut running = if header.checksum
+        && !opts.force_ignore_checksum
+        && (ck_stream_enabled() || fuse_by_size)
+    {
         Some(crate::xxh64::Xxh64::new())
     } else {
         None
