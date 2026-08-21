@@ -7851,7 +7851,7 @@ fn find_greedy(
                         if COUNT {
                             use core::sync::atomic::Ordering::Relaxed;
                             LINK_SKIPS.fetch_add(1, Relaxed);
-                            if mls_eq(src, m, ip, mls) {
+                            if mls_eq(src, m, ip, mls, smask) {
                                 LINK_FALSE.fetch_add(1, Relaxed);
                             }
                         }
@@ -7873,7 +7873,7 @@ fn find_greedy(
                         #[cfg(feature = "profile")]
                         WALK_EXAM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     }
-                    if mls_eq(src, m, ip, mls) {
+                    if mls_eq(src, m, ip, mls, smask) {
                         // C's `match[ml] == ip[ml]` prefilter
                         // (`ZSTD_HcFindBestMatch`): a candidate that DIFFERS at
                         // the current best length cannot exceed it, so the full
@@ -8042,7 +8042,7 @@ fn chain_find_best(
                 if COUNT {
                     use core::sync::atomic::Ordering::Relaxed;
                     LINK_SKIPS.fetch_add(1, Relaxed);
-                    if mls_eq(src, m, ip, mls) {
+                    if mls_eq(src, m, ip, mls, smask) {
                         LINK_FALSE.fetch_add(1, Relaxed);
                     }
                 }
@@ -8064,7 +8064,7 @@ fn chain_find_best(
                 #[cfg(feature = "profile")]
                 WALK_EXAM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
-            if mls_eq(src, m, ip, mls) {
+            if mls_eq(src, m, ip, mls, smask) {
                 // C's `match[ml] == ip[ml]` prefilter -- see `find_greedy`.
                 if best_ml == 0 || pre_eq(src, m, ip, best_ml) {
                     // Count from the byte AFTER what mls_eq just verified --
@@ -8983,6 +8983,10 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
             break;
         }
     }
+    // Consumers are the g14/btdepth gate harnesses only; unguarded this was
+    // THREE lock-prefixed RMWs per walk -- per POSITION across L13-L22 (the
+    // 959e0ae class, fourth sighting, in both bt bodies).
+    #[cfg(feature = "profile")]
     {
         use core::sync::atomic::Ordering::Relaxed;
         BT_WALKS2.fetch_add(1, Relaxed);
@@ -8991,6 +8995,8 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
             BT_FULL.fetch_add(1, Relaxed);
         }
     }
+    #[cfg(not(feature = "profile"))]
+    let _ = iters;
     if COUNT {
         crate::prof::note_probes(probes);
     }
@@ -9166,6 +9172,10 @@ fn bt_find_best_runtime(
             break;
         }
     }
+    // Consumers are the g14/btdepth gate harnesses only; unguarded this was
+    // THREE lock-prefixed RMWs per walk -- per POSITION across L13-L22 (the
+    // 959e0ae class, fourth sighting, in both bt bodies).
+    #[cfg(feature = "profile")]
     {
         use core::sync::atomic::Ordering::Relaxed;
         BT_WALKS2.fetch_add(1, Relaxed);
@@ -9174,6 +9184,8 @@ fn bt_find_best_runtime(
             BT_FULL.fetch_add(1, Relaxed);
         }
     }
+    #[cfg(not(feature = "profile"))]
+    let _ = iters;
     if COUNT {
         crate::prof::note_probes(probes);
     }
@@ -10110,16 +10122,18 @@ fn find_opt(
 /// steps past it to the next link. Our walk broke on it, amputating the
 /// remaining chain at the first collision.
 #[inline(always)]
-fn mls_eq(src: &[u8], m: usize, ip: usize, mls: usize) -> bool {
+fn mls_eq(src: &[u8], m: usize, ip: usize, mls: usize, smask: u64) -> bool {
     // The census found the tail slice-eq compiled to a LIBC MEMCMP CALL per
     // candidate -- for mls = 5, a memcmp of ONE byte. Every caller sits in a
     // walk that has proven `m < ip <= len - 8` (ip <= ilimit and validity),
     // so for mls <= 8 the whole test is one masked u64 xor -- fewer loads
-    // than the old u32-head + tail, and no call.
+    // than the old u32-head + tail, and no call. `smask` is the caller's
+    // block-hoisted byte mask (recomputing it here was a shift PER
+    // CANDIDATE).
     if mls <= 8 {
         debug_assert!(m < ip && ip + 8 <= src.len());
-        let mask = if mls == 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
-        return (load_u64le(src, m) ^ load_u64le(src, ip)) & mask == 0;
+        debug_assert!(smask == if mls == 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 });
+        return (load_u64le(src, m) ^ load_u64le(src, ip)) & smask == 0;
     }
     if load_u32le(src, m) != load_u32le(src, ip) {
         return false;
