@@ -191,8 +191,14 @@ pub(crate) fn count_eq_len(a: &[u8], b: &[u8]) -> usize {
     if arm == 1 {
         return count_eq_len_words(a, b, max);
     }
-    if arm == 2 && max >= 8 {
-        // Peek one word before committing to a 64-byte read.
+    if arm != 1 && max >= 8 {
+        // First-word peek, now the DEFAULT path (was measurement arm 2; the
+        // arm keeps its meaning, it is just no longer distinct from 0). The
+        // count-from-verified change shifted the call mix to ~79% answering
+        // in < 8 bytes -- each of those paid a 32-byte vector pair (and a
+        // possible extra cache-line cross) for what one u64 pair answers.
+        // Long counts pay one extra u64 compare over bytes the vector loop
+        // re-reads from the same line. Result-identical by construction.
         let av = load_u64(a, 0);
         let bv = load_u64(b, 0);
         if av != bv {
