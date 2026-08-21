@@ -4,7 +4,7 @@ fn main() {
     {
         let ids = ["jsonlog-16m","smallmsg-8m","versions-16m","mr","ooffice","osdb","reymont","sao",
             "webster","dickens","mozilla","nci","samba","xml","x-ray","zeros-32m","text-32m","incomp-32m"];
-        for lvl in [3i32, 5, 7, 9, 12] {
+        for lvl in [3i32, 9, 16, 19] {
             let _ = rusty_zstd::take_eqlen_stats();
             for id in ids {
                 let f = std::fs::read(format!("corpora/data/generated/{id}"))

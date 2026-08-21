@@ -11566,7 +11566,12 @@ fn match_ok_cold_tail(src: &[u8], m: usize, ip: usize, mls: usize) -> bool {
 /// end in the head.
 #[inline(always)]
 fn count_match_fast(src: &[u8], m: usize, ip: usize, limit: usize) -> usize {
-    if ip + 8 <= limit && ip + 8 <= src.len() && m + 8 <= src.len() {
+    // CALL-SITE INVARIANTS (audited, all 17 sites): `limit` is block_end,
+    // which is a position in `src`, and `m` is a candidate strictly below
+    // `ip`. So `ip + 8 <= limit` implies both slice tests that used to sit
+    // beside it -- three compares collapse to one, per candidate.
+    debug_assert!(limit <= src.len() && m < ip);
+    if ip + 8 <= limit {
         let a = load_u64le(src, m);
         let b = load_u64le(src, ip);
         if a != b {
@@ -11579,17 +11584,30 @@ fn count_match_fast(src: &[u8], m: usize, ip: usize, limit: usize) -> usize {
 }
 
 fn count_match(src: &[u8], m: usize, ip: usize, limit: usize) -> usize {
-    if ip >= limit || m >= src.len() || ip >= src.len() {
+    // Same invariants as `count_match_fast`. They make every min redundant:
+    // `len - m > len - ip >= limit - ip`, so max IS `limit - ip`, and the
+    // three range guards collapse to `ip >= limit`. The slice constructions
+    // keep memory safety: a violated invariant panics, it cannot read wild.
+    debug_assert!(limit <= src.len() && m < ip);
+    if ip >= limit {
         return 0;
     }
-    let max = (limit - ip).min(src.len() - m).min(src.len() - ip);
-    if max == 0 {
-        return 0;
-    }
-    // Slice once so the inner loops see a proven length (LLVM drops per-word bounds).
+    let max = limit - ip;
     let a = &src[m..m + max];
-    let b = &src[ip..ip + max];
-    let n = crate::simd::count_eq_len(a, b);
+    let b = &src[ip..limit];
+    // Sub-8 boundary tails answer HERE, without the dispatch or the call.
+    if max < 8 {
+        let mut n = 0usize;
+        while n < max && a[n] == b[n] {
+            n += 1;
+        }
+        #[cfg(feature = "profile")]
+        crate::simd::note_eqlen(n);
+        return n;
+    }
+    // The slices have PROVEN equal length `max >= 8`; the known-length inner
+    // skips the re-min / zero-test / sub-8 re-branch the public entry does.
+    let n = crate::simd::count_eq_len_ge8(a, b, max);
     #[cfg(feature = "profile")]
     crate::simd::note_eqlen(n);
     n

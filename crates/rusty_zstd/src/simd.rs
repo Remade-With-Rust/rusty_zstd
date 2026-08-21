@@ -179,6 +179,22 @@ pub(crate) fn count_eq_len(a: &[u8], b: &[u8]) -> usize {
     if max == 0 {
         return 0;
     }
+    if max < 8 {
+        let mut n = 0usize;
+        while n < max && a[n] == b[n] {
+            n += 1;
+        }
+        return n;
+    }
+    count_eq_len_ge8(a, b, max)
+}
+
+/// The known-length entry: `count_match` has already proven the slices are
+/// exactly `max >= 8` long, so the re-min, the zero test, and the sub-8
+/// branch the public wrapper pays are skipped.
+#[inline(always)]
+pub(crate) fn count_eq_len_ge8(a: &[u8], b: &[u8], max: usize) -> usize {
+    debug_assert!(max >= 8 && a.len() >= max && b.len() >= max);
     #[cfg(feature = "profile")]
     {
         use core::sync::atomic::Ordering::Relaxed;
@@ -187,42 +203,73 @@ pub(crate) fn count_eq_len(a: &[u8], b: &[u8]) -> usize {
             EQ_WIDE_ELIGIBLE.fetch_add(1, Relaxed);
         }
     }
+    // Recorded refutations, so nobody re-chases them: (1) `eqlen_arm` is a
+    // per-call atomic ONLY under `profile` -- the shipping build folds it to
+    // the constant 0 (asm receipt: `has_avx2`'s cache byte is the sole static
+    // load in `count_match`). (2) bsf-vs-tzcnt is already optimal: LLVM emits
+    // `rep bsf`, the tzcnt encoding, at every `trailing_zeros/ones` here.
     let arm = eqlen_arm();
     if arm == 1 {
         return count_eq_len_words(a, b, max);
     }
-    if arm != 1 && max >= 8 {
-        // First-word peek, now the DEFAULT path (was measurement arm 2; the
-        // arm keeps its meaning, it is just no longer distinct from 0). The
-        // count-from-verified change shifted the call mix to ~79% answering
-        // in < 8 bytes -- each of those paid a 32-byte vector pair (and a
-        // possible extra cache-line cross) for what one u64 pair answers.
-        // Long counts pay one extra u64 compare over bytes the vector loop
-        // re-reads from the same line. Result-identical by construction.
-        let av = load_u64(a, 0);
-        let bv = load_u64(b, 0);
-        if av != bv {
-            return ((av ^ bv).trailing_zeros() as usize) / 8;
+    {
+        // WORDS TO 32 BEFORE ANY VECTOR. The L19 histogram (eqwork, 511M
+        // calls): 50.5% die in word 0 and another 32.6% by byte 31 -- 83% of
+        // calls never need a ymm register, its power-up, or the vzeroupper on
+        // exit. C's ZSTD_count is word-at-a-time for exactly this
+        // distribution. Calls that survive to 32 hand the wide arm the
+        // remainder, count-from-verified.
+        let cap = if max < 32 { max & !7 } else { 32 };
+        let mut n = 0usize;
+        while n < cap {
+            #[cfg(feature = "profile")]
+            EQ_OPS[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let av = load_u64(a, n);
+            let bv = load_u64(b, n);
+            if av != bv {
+                return n + ((av ^ bv).trailing_zeros() as usize) / 8;
+            }
+            n += 8;
         }
-    }
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    {
-        if arm != 1 && has_avx2() {
-            // SAFETY: `a[..max]` and `b[..max]` are in-bounds.
-            return unsafe { count_eq_len_avx2(a.as_ptr(), b.as_ptr(), max) };
+        if max <= 32 {
+            if n < max {
+                // The sub-8 tail as ONE overlapped compare: `max >= 8` makes
+                // bytes [max-8, max) in-bounds, and the shift discards the
+                // already-verified overlap.
+                let av = load_u64(a, max - 8);
+                let bv = load_u64(b, max - 8);
+                let x = (av ^ bv) >> (8 * (n - (max - 8)));
+                if x != 0 {
+                    return n + (x.trailing_zeros() as usize) / 8;
+                }
+            }
+            return max;
         }
+        #[cfg(all(target_arch = "x86_64", feature = "std"))]
+        {
+            if has_avx2() {
+                // SAFETY: `a[32..max]` and `b[32..max]` are in-bounds.
+                return 32
+                    + unsafe {
+                        count_eq_len_avx2(a.as_ptr().add(32), b.as_ptr().add(32), max - 32)
+                    };
+            }
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "std"), target_feature = "avx2"))]
+        {
+            // SAFETY: as above.
+            return 32
+                + unsafe { count_eq_len_avx2(a.as_ptr().add(32), b.as_ptr().add(32), max - 32) };
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // SAFETY: as above. NEON is baseline aarch64.
+            return 32
+                + unsafe { count_eq_len_neon(a.as_ptr().add(32), b.as_ptr().add(32), max - 32) };
+        }
+        #[allow(unreachable_code)]
+        return 32 + count_eq_len_words(&a[32..], &b[32..], max - 32);
     }
-    #[cfg(all(target_arch = "x86_64", not(feature = "std"), target_feature = "avx2"))]
-    {
-        return unsafe { count_eq_len_avx2(a.as_ptr(), b.as_ptr(), max) };
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: `a[..max]` and `b[..max]` are in-bounds. NEON is baseline aarch64.
-        return unsafe { count_eq_len_neon(a.as_ptr(), b.as_ptr(), max) };
-    }
-    #[allow(unreachable_code)]
-    count_eq_len_words(a, b, max)
 }
 
 /// Bucket a returned prefix length. Called by `count_match` so the histogram
@@ -242,17 +289,26 @@ pub(crate) fn note_eqlen(n: usize) {
 
 #[inline(always)]
 pub(crate) fn has_avx2() -> bool {
+    // The detect+store path is OUTLINED AND COLD: inlined, std_detect's cache
+    // probe and its `detect_and_initialize` call were compiled into every
+    // dispatch site -- count_match carried a 6-register prologue for a
+    // once-per-process branch. The hot path is one load and one compare.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
         use core::sync::atomic::{AtomicU8, Ordering};
         static C: AtomicU8 = AtomicU8::new(0);
+        #[cold]
+        #[inline(never)]
+        fn detect(c: &AtomicU8) -> bool {
+            let yes = is_x86_feature_detected!("avx2");
+            c.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
+            yes
+        }
         let v = C.load(Ordering::Relaxed);
         if v != 0 {
             return v == 1;
         }
-        let yes = is_x86_feature_detected!("avx2");
-        C.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
-        yes
+        detect(&C)
     }
     #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
     {
@@ -262,17 +318,23 @@ pub(crate) fn has_avx2() -> bool {
 
 #[inline(always)]
 pub(crate) fn has_bmi2() -> bool {
+    // Same cold-outline shape as `has_avx2` -- see the comment there.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
         use core::sync::atomic::{AtomicU8, Ordering};
         static C: AtomicU8 = AtomicU8::new(0);
+        #[cold]
+        #[inline(never)]
+        fn detect(c: &AtomicU8) -> bool {
+            let yes = is_x86_feature_detected!("bmi2");
+            c.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
+            yes
+        }
         let v = C.load(Ordering::Relaxed);
         if v != 0 {
             return v == 1;
         }
-        let yes = is_x86_feature_detected!("bmi2");
-        C.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
-        yes
+        detect(&C)
     }
     #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
     {
@@ -319,6 +381,9 @@ pub(crate) fn look_n_bits_bmi2(container: u64, consumed: u32, n: u32) -> u32 {
 }
 
 /// Scalar twin / fallback: u64 words then a byte tail. Oracle for SIMD tests.
+/// OUTLINED: on AVX2 machines this body is dead code, and inlined it sat in
+/// the middle of `count_match`'s per-candidate I-cache footprint.
+#[inline(never)]
 pub(crate) fn count_eq_len_words(a: &[u8], b: &[u8], max: usize) -> usize {
     let max = max.min(a.len()).min(b.len());
     let mut n = 0usize;
@@ -423,10 +488,26 @@ unsafe fn count_eq_len_avx2(a: *const u8, b: *const u8, max: usize) -> usize {
             }
             n += 8;
         }
-        while n < max && *a.add(n) == *b.add(n) {
-            #[cfg(feature = "profile")]
-            EQ_OPS[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            n += 1;
+        if n < max {
+            if max >= 8 {
+                // The sub-8 tail as ONE overlapped compare: the word loop ran
+                // (max >= 8), so bytes [max-8, max) are in bounds and every
+                // byte below `n` is already proven equal -- the shift discards
+                // exactly those. Replaces up to 7 load-compare-branch
+                // iterations; EQ_OPS[2] at the chain levels is the receipt.
+                let av = core::ptr::read_unaligned(a.add(max - 8) as *const u64);
+                let bv = core::ptr::read_unaligned(b.add(max - 8) as *const u64);
+                let x = (av ^ bv) >> (8 * (n - (max - 8)));
+                if x != 0 {
+                    return n + (x.trailing_zeros() as usize) / 8;
+                }
+                return max;
+            }
+            while n < max && *a.add(n) == *b.add(n) {
+                #[cfg(feature = "profile")]
+                EQ_OPS[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                n += 1;
+            }
         }
     }
     n
