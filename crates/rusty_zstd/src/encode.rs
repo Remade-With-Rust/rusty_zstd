@@ -8488,6 +8488,21 @@ fn find_lazy_impl<const MLS: usize>(
     push_lits_range(&mut lits, src, anchor, block_end);
     let span = (block_end - block_start).max(1) as f32;
     tables.last_search_per_byte = searches as f32 / span;
+    // Signal probe for the wide-chain latch design (profile only): expose
+    // the block-signal EWMAs so a harness can see what separates the
+    // first-heavy winners (sao) from the first-heavy losers (smallmsg).
+    #[cfg(feature = "profile")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        WALK_SIG_FIRST.store(tables.walk_first_share.to_bits(), Relaxed);
+        WALK_SIG_REP.store(tables.rep_yield.to_bits(), Relaxed);
+        WALK_SIG_SPB.store(tables.last_search_per_byte.to_bits(), Relaxed);
+        let mb: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
+        let ob: u64 = seqs.iter().map(|q| 64 - u64::from(q.offset.max(1)).leading_zeros() as u64).sum();
+        WALK_SIG_MB.store(mb, Relaxed);
+        WALK_SIG_NS.store(seqs.len() as u64, Relaxed);
+        WALK_SIG_OB.store(ob, Relaxed);
+    }
     // `searches` is SEARCH POSITIONS, not candidate examinations -- reporting it
     // as `probes` was a work-count parity break against `find_fast`. The real
     // probe count comes from `chain_find_best` via `note_probes`, so pass 0.
@@ -10496,6 +10511,16 @@ fn wide_first_max(attempts: usize) -> f32 {
     if attempts <= 16 { 0.65 } else { 0.60 }
 }
 
+/// UNLATCHED WINNERS, recorded so the next digger starts here: sao leaves
+/// -3.65% on the table at L9 (ooffice/osdb/mr smaller amounts) because its
+/// first-share ~0.81 sits above every bar -- alongside smallmsg (+2.1) and
+/// x-ray (+0.3), which MUST stay excluded. The signal census (sq probe,
+/// take_walk_signals) found no clean second separator among the maintained
+/// signals: mean-offset-log splits sao 15.66 from smallmsg 15.91 by a
+/// razor's edge with overlaps everywhere else. Capturing the sao class
+/// needs a new signal (its distinguishing mark: spb 0.66, twice anyone
+/// else's -- nearly every position searches), left as future work.
+///
 /// The wide-chain LATCH: at a block boundary, once walk_first_share has
 /// been measured (on narrow blocks) and says upgrade-rich, re-seed the
 /// HEADS over the lookback window with the wide key and latch the frame
@@ -10529,14 +10554,16 @@ fn maybe_latch_wide_chain(
     let ca = !tables.ctags.is_empty();
     let from = block_start.saturating_sub(window).max(tables.frame_start);
     let to = block_start.saturating_sub(8);
+    let chain_mask = tables.chain.len() - 1;
     let mut p = from;
     while p <= to && p + 8 <= src.len() {
         let (h, g) = hash_wide_link_tag(src, p, hash_log, smask);
-        if ca {
-            debug_assert!(h < tables.tags.len());
-            tables.tags[h] = g;
-        }
-        tables.lz_head_put(h, p, g, cp);
+        // FULL insert, not heads-only: heads-only reseeding left every
+        // wide bucket one deep with stale narrow-epoch links below it --
+        // the latched frame walked chains of length ~1 over its whole
+        // lookback. lz_insert rebuilds the links in wide keying, so the
+        // latch inherits real history. Same O(window) pass.
+        let _ = tables.lz_insert(h, p, g, cp, ca, chain_mask);
         p += 1;
     }
     tables.chain_wide = true;
@@ -10604,6 +10631,32 @@ fn update_walk_first_share(tables: &mut MatchTables, walked: bool, cls: (u32, u3
     } else {
         tables.wide_ok_blocks = 0;
     }
+}
+
+/// Signal probe statics (see the find_lazy epilogue).
+#[cfg(feature = "profile")]
+pub static WALK_SIG_FIRST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "profile")]
+pub static WALK_SIG_REP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "profile")]
+pub static WALK_SIG_SPB: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "profile")]
+pub static WALK_SIG_MB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static WALK_SIG_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static WALK_SIG_OB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub fn take_walk_signals() -> (f32, f32, f32, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        f32::from_bits(WALK_SIG_FIRST.load(Relaxed)),
+        f32::from_bits(WALK_SIG_REP.load(Relaxed)),
+        f32::from_bits(WALK_SIG_SPB.load(Relaxed)),
+        WALK_SIG_MB.load(Relaxed),
+        WALK_SIG_NS.load(Relaxed),
+        WALK_SIG_OB.load(Relaxed),
+    )
 }
 
 /// Chain-walk census: (candidates examined, byte-mismatch steps).
