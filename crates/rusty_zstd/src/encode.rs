@@ -353,6 +353,10 @@ pub(crate) struct MatchTables {
     /// content (dickens 45%, reymont 41%) wins big.
     walk_first_share: f32,
     walk_probe: u32,
+    /// True once `walk_first_share` has been fed at least one measured block.
+    walk_share_meas: bool,
+    /// Consecutive measured blocks with walk_first_share under the wide bar.
+    wide_ok_blocks: u32,
     /// See `set_chain_tag_arm`: lazy-ladder heads and links carry the hash4
     /// tag in their high 8 bits this frame.
     chain_pack: bool,
@@ -360,6 +364,8 @@ pub(crate) struct MatchTables {
     /// (>= 16 MiB, streaming): link tags beside `chain`, head tags in
     /// `tags`. Mirrors the ltags story exactly.
     ctags: Vec<u8>,
+    /// See `set_wide_chain_arm`.
+    chain_wide: bool,
     /// Blocks whose finder has actually RUN and written back its signals.
     ///
     /// GATE 1 @ L1 needs this because `rep_yield` starts OPTIMISTIC at 1.0 so
@@ -631,8 +637,11 @@ impl MatchTables {
             last_search_per_byte: 1.0,
             walk_first_share: 0.0,
             walk_probe: 0,
+            walk_share_meas: false,
+            wide_ok_blocks: 0,
             chain_pack: false,
             ctags: Vec::new(),
+            chain_wide: false,
             blocks_done: 0,
             payload_scratch: Vec::new(),
             seq_scratch: Vec::new(),
@@ -1178,6 +1187,12 @@ pub(crate) fn encode_oneshot(
     ) && chain_tag_enabled()
         && (params.min_match.max(3) as usize) < 8
         && (hist_prefix.len() + src.len()) < 0x00FF_FFFF;
+    // chain_wide is decided by the MID-FRAME LATCH in the walk finders (see
+    // `maybe_latch_wide_chain`): frames start narrow, and only content whose
+    // measured walk_first_share says the deeper effective search PAYS gets
+    // the wide key -- smallmsg-class content (first-find dominated, prefers
+    // its literal+rep economy) never latches. Frame init only resets it.
+    tables.chain_wide = false;
     // Array route where the 24-bit proof fails (>= 16 MiB): link tags in
     // `ctags`, head tags in `tags` (same hash index). Priced by `linkbig`.
     if matches!(
@@ -2156,7 +2171,11 @@ pub(crate) fn prime_tables(
                 let cp = tables.chain_pack;
                 let ca = !tables.ctags.is_empty();
                 let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
-                let (hh, gt) = hash4_link_tag(src, p, hash_log, smask);
+                let (hh, gt) = if tables.chain_wide {
+                    hash_wide_link_tag(src, p, hash_log, smask)
+                } else {
+                    hash4_link_tag(src, p, hash_log, smask)
+                };
                 if write_chain {
                     let _ = tables.lz_insert(hh, p, gt, cp, ca, chain_mask);
                 } else {
@@ -7848,8 +7867,10 @@ fn find_greedy_impl<const MLS: usize>(
         tables.walk_probe - 1
     };
     let mut wcls = (0u32, 0u32);
+    maybe_latch_wide_chain(tables, src, block_start, window, mls);
     let cp = tables.chain_pack;
     let ca = !tables.ctags.is_empty();
+    let wchain = tables.chain_wide;
     let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
     let mut ip = block_start;
     while ip <= ilimit {
@@ -7870,6 +7891,8 @@ fn find_greedy_impl<const MLS: usize>(
         }
         let (h, gtag) = if mls >= 8 && ip + 8 <= src.len() {
             (hash8(src, ip, hash_log), 0u8)
+        } else if wchain {
+            hash_wide_link_tag(src, ip, hash_log, smask)
         } else {
             hash4_link_tag(src, ip, hash_log, smask)
         };
@@ -8001,6 +8024,8 @@ fn find_greedy_impl<const MLS: usize>(
             while p < end && p <= ilimit {
                 let (hh, gt) = if mls >= 8 && p + 8 <= src.len() {
                     (hash8(src, p, hash_log), 0u8)
+                } else if wchain {
+                    hash_wide_link_tag(src, p, hash_log, smask)
                 } else {
                     hash4_link_tag(src, p, hash_log, smask)
                 };
@@ -8018,7 +8043,7 @@ fn find_greedy_impl<const MLS: usize>(
     } else {
         (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
     };
-    update_walk_first_share(tables, walk_cont, wcls);
+    update_walk_first_share(tables, walk_cont, wcls, attempts);
     push_lits_range(&mut lits, src, anchor, block_end);
     note_finder_work(COUNT, probes, hits, &seqs, &lits);
     (seqs, lits)
@@ -8060,9 +8085,12 @@ fn chain_find_best<const MLS: usize>(
     let chain_mask = tables.chain.len() - 1;
     let cp = tables.chain_pack;
     let ca = !tables.ctags.is_empty();
+    let wchain = tables.chain_wide;
     let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
     let (h, gtag) = if mls >= 8 && ip + 8 <= src.len() {
         (hash8(src, ip, hash_log), 0u8)
+    } else if wchain {
+        hash_wide_link_tag(src, ip, hash_log, smask)
     } else {
         hash4_link_tag(src, ip, hash_log, smask)
     };
@@ -8311,8 +8339,10 @@ fn find_lazy_impl<const MLS: usize>(
         tables.walk_probe - 1
     };
     let mut wcls = (0u32, 0u32);
+    maybe_latch_wide_chain(tables, src, block_start, window, mls);
     let cp = tables.chain_pack;
     let ca = !tables.ctags.is_empty();
+    let wchain = tables.chain_wide;
     let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
     let gain_cmp = lazy_gain_enabled();
     while ip <= ilimit {
@@ -8434,6 +8464,8 @@ fn find_lazy_impl<const MLS: usize>(
                     LF_INSERTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     let (hh, gt) = if mls >= 8 && p + 8 <= src.len() {
                         (hash8(src, p, hash_log), 0u8)
+                    } else if wchain {
+                        hash_wide_link_tag(src, p, hash_log, smask)
                     } else {
                         hash4_link_tag(src, p, hash_log, smask)
                     };
@@ -8452,7 +8484,7 @@ fn find_lazy_impl<const MLS: usize>(
     } else {
         (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
     };
-    update_walk_first_share(tables, walk_cont, wcls);
+    update_walk_first_share(tables, walk_cont, wcls, attempts);
     push_lits_range(&mut lits, src, anchor, block_end);
     let span = (block_end - block_start).max(1) as f32;
     tables.last_search_per_byte = searches as f32 / span;
@@ -10425,6 +10457,103 @@ fn hash4_link_tag(src: &[u8], pos: usize, hash_log: u32, smask: u64) -> (usize, 
     hash4_tag_mls(src, pos, 32u32.saturating_sub(hash_log.min(32)), smask)
 }
 
+/// WIDE-CHAIN arm: key the lazy ladder's buckets on the mls-byte gram
+/// instead of 4 bytes -- the L1 wide-hash cure applied to the chain. The
+/// census that motivates it: ~48% of all walk steps at L12 are collision
+/// link-chases (candidates sharing the 4-byte key but not the gram); a
+/// wide key never puts them in the same bucket. Byte-CHANGING (different
+/// buckets, different candidates); ships on the `chainwide` board or not
+/// at all.
+static WCHAIN_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for the wide chain key.
+pub fn set_wide_chain_arm(on: bool) {
+    WCHAIN_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn wide_chain_enabled() -> bool {
+    // DEFAULT ON: adjudicated on the chainwide board with the hold-3 latch
+    // and the attempts-scaled bar -- L5 -0.07% / L7 -0.46% / L9 -0.52% /
+    // L12 -0.32% totals with ZERO losing corpora at any level.
+    !matches!(WCHAIN_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
+}
+
+static WIDE_FIRST_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Bench hook: the first-find-share bar for the wide-chain latch.
+pub fn set_wide_first_max_arm(v: f32) {
+    WIDE_FIRST_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
+}
+
+fn wide_first_max(attempts: usize) -> f32 {
+    let c = WIDE_FIRST_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if c != u32::MAX {
+        return f32::from_bits(c);
+    }
+    // Level-scaled like walk_first_max: jsonlog's sustained share at deep
+    // attempts sits in (0.60, 0.65) and must stay excluded.
+    if attempts <= 16 { 0.65 } else { 0.60 }
+}
+
+/// The wide-chain LATCH: at a block boundary, once walk_first_share has
+/// been measured (on narrow blocks) and says upgrade-rich, re-seed the
+/// HEADS over the lookback window with the wide key and latch the frame
+/// wide. Chains below stale heads are miss-safe, not corrupt-safe-needing:
+/// every candidate is verified by mls_eq (the relatch precedent). The
+/// isolation experiment behind the bar: smallmsg loses ~+4.9% under the
+/// wide key with walk-continue ON OR OFF -- the key itself is the loser
+/// there -- while dickens wins ~-4% both ways.
+fn maybe_latch_wide_chain(
+    tables: &mut MatchTables,
+    src: &[u8],
+    block_start: usize,
+    window: usize,
+    mls: usize,
+) {
+    if tables.chain_wide
+        || !wide_chain_enabled()
+        || mls >= 8
+        || !tables.walk_share_meas
+        // The wide key gets its OWN bar, and the signal must HOLD for three
+        // measured blocks (see update_walk_first_share): smallmsg
+        // (share ~0.74) loses ~+4.9% under the wide key and must never
+        // latch; a transient dip must not latch jsonlog.
+        || tables.wide_ok_blocks < 3
+    {
+        return;
+    }
+    let hash_log = tables.hash_log;
+    let smask = (1u64 << (8 * mls)) - 1;
+    let cp = tables.chain_pack;
+    let ca = !tables.ctags.is_empty();
+    let from = block_start.saturating_sub(window).max(tables.frame_start);
+    let to = block_start.saturating_sub(8);
+    let mut p = from;
+    while p <= to && p + 8 <= src.len() {
+        let (h, g) = hash_wide_link_tag(src, p, hash_log, smask);
+        if ca {
+            debug_assert!(h < tables.tags.len());
+            tables.tags[h] = g;
+        }
+        tables.lz_head_put(h, p, g, cp);
+        p += 1;
+    }
+    tables.chain_wide = true;
+}
+
+/// Wide bucket key + tag from one u64 load and ONE multiply (tag and index
+/// take disjoint bit ranges of the same product, the fast-hash shape).
+#[inline(always)]
+fn hash_wide_link_tag(src: &[u8], pos: usize, hash_log: u32, smask: u64) -> (usize, u8) {
+    let v = load_u64le(src, pos) & smask;
+    let hv = v.wrapping_mul(FAST_HASH_PRIME64);
+    (
+        (hv >> (64u32.saturating_sub(hash_log.min(32)))) as usize,
+        (hv ^ (hv >> 29)) as u8,
+    )
+}
+
 /// Chain-walk census: src loads the link tag skipped, and (COUNT) the
 /// FALSE-skip re-probe -- a skipped candidate whose bytes would have matched
 /// must never exist.
@@ -10451,13 +10580,30 @@ fn push_lits_range(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize) {
 
 /// Attribute only when the walk RAN and produced enough samples -- a block
 /// that measured nothing must not move the EWMA (the Gate 14 rule).
-fn update_walk_first_share(tables: &mut MatchTables, walked: bool, cls: (u32, u32)) {
+fn update_walk_first_share(tables: &mut MatchTables, walked: bool, cls: (u32, u32), attempts: usize) {
     let n = cls.0 + cls.1;
     if !walked || n < 64 {
         return;
     }
     let now = cls.0 as f32 / n as f32;
-    tables.walk_first_share = 0.75 * tables.walk_first_share + 0.25 * now;
+    // The FIRST measurement SEEDS the EWMA. Blending it with the 0.0 init
+    // made every frame read as upgrade-rich for its first ~4 measured
+    // blocks (smallmsg's true 0.74 entered the wide-chain latch reading
+    // 0.185), which is a warmup artifact, not a signal.
+    tables.walk_first_share = if tables.walk_share_meas {
+        0.75 * tables.walk_first_share + 0.25 * now
+    } else {
+        now
+    };
+    tables.walk_share_meas = true;
+    // The wide-chain latch is ONE-WAY per frame, so a TRANSIENT dip must not
+    // fire it (jsonlog's EWMA dips under any bar at L12 and latched wide for
+    // +3.3%). Require the signal to HOLD.
+    if tables.walk_first_share <= wide_first_max(attempts) {
+        tables.wide_ok_blocks = tables.wide_ok_blocks.saturating_add(1);
+    } else {
+        tables.wide_ok_blocks = 0;
+    }
 }
 
 /// Chain-walk census: (candidates examined, byte-mismatch steps).
