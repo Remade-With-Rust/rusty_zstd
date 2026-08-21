@@ -1,7 +1,15 @@
 # Engine anatomy — MatchFind's functions, ranked by what optimizing them could buy
 
-**Date:** 2026-08-20. Companion to [`m7-optimize-anatomy.md`](m7-optimize-anatomy.md)
+**Date:** 2026-08-21 (updated post BMI2 twin campaign, `08d14e3`..`bfd0cf0`; original
+2026-08-20). Companion to [`m7-optimize-anatomy.md`](m7-optimize-anatomy.md)
 (what the campaign already did) and [`gg-matchfind.md`](gg-matchfind.md) (the gates).
+
+> **BASELINE SHIFT (2026-08-21).** Every finder in this file now runs a
+> `#[target_feature(enable = "bmi2,lzcnt")]` twin on modern hardware; the transitive
+> trap trace is empty and the CL-shift ledger is fully classified. The
+> cheaper-instructions well is DRY: every remaining win below is either LESS WORK
+> (fewer probes, fewer positions, fewer wasted loads) or MEMORY BEHAVIOUR (prefetch,
+> one-array-not-two). Section 0b is the ranked shortlist with locations.
 
 **Why this document exists.** The gates over match-find are set — this week gated
 every major decision in it. But gates choose *which* path runs; the 2.36× against C
@@ -17,28 +25,61 @@ engine-function inventory for it.
 > deterministic work counters (`probes/B`, `hit%`, `take_tag_rejects`), byte-identity
 > boards. Every "candidate lever" below names its deciding instrument.
 
-## 0. Current asm footprint (2026-08-20, release, per symbol)
+## 0. Current asm footprint (2026-08-21, release, per symbol family)
 
-TAGS ARE AWFUL FOR ISSUES.
+Post twin campaign: "copies" counts plain + BMI2-twin monomorphisations. Full table
+with ISA receipts lives in m7-anatomy's MatchFind Function Anatomy; the shape here:
 
-| function                                                             | copies |  instrs | calls out | stack movs | runs                                   |
-| -------------------------------------------------------------------- | -----: | ------: | --------: | ---------: | -------------------------------------- |
-| `find_fast_impl` *(2026-08-20e: 140 copies / ~231K after WIDE×spec — binary, not executed; live copy 2,021 instrs)* | 140 | 231,000 | — | — | per position, L1/L2 |
-| `find_dfast_impl`                                                    |      1 |   1,816 |        48 |        325 | per position, **L3/L4 (default)**      |
-| `find_greedy`                                                        |      1 |     685 |        23 |        153 | per position, L5                       |
-| `find_lazy`                                                          |      1 |   1,202 |        38 |        278 | per position, L6–L12                   |
-| `find_bt_lazy`                                                       |      1 |     711 |        27 |        172 | per position, L13–L15                  |
-| `bt_find_best_impl` *(2026-08-22: 22 syms / ~4,600 after the ten-win break-open — dead branches, fused count+descent, fn-ptr dispatch, u32 ABI)* | 22 | 4,600 | — | — | per position ×30M, L13–L22 |
-| `bt_find_best_runtime`                                               |      1 |     381 |         6 |         49 | fallback copy                          |
-| `chain_find_best`                                                    |      1 |     168 |         3 |         20 | per position (lazy path)               |
-| `find_sequences_strategy`                                            |      1 |   4,391 |       217 |      1,553 | per block (carries `find_opt` inlined) |
-| `count_match`                                                        |      1 |     143 |         1 |          1 | per candidate hit                      |
-| `match_ok`                                                           |      1 |      82 |         4 |          4 | per candidate                          |
-| `count_eq_len` / `fast_probe` / `try_rep1` / `fill_hash_after_match` |      — | inlined |         — |          — | per probe / per match                  |
+| function | copies | live-copy instrs | runs |
+| --- | ---: | ---: | --- |
+| `find_fast_impl` | 140 + 140 | <= 2,458 | per position, L1/L2 |
+| `find_dfast` (+impl twins) | 1 + 6 + 6 | 9,397 dispatcher / <= 1,908 twin | per position, **L3/L4 (default)** |
+| `find_greedy` | 1 + 1 | 2,269 | per position, L5 (walk inlined) |
+| `find_lazy` | 1 + 1 | 1,958 | per position, L6-L12 |
+| `chain_find_best` | 2 + 2 | <= 466 | per position + look-ahead (lazy path), `ChainFn` ptr per block |
+| `bt_find_best_impl` | 42 + 42 | <= 229 | per position x ~30M, L13-L22, ISA in `bt_resolve` |
+| `find_sequences_strategy` | 1 + 1 | 2,377 | per block (carries `find_opt` + `find_bt_lazy` inlined, both arms) |
+| `count_match` / `count_eq_len` | 1 / 1 | 153 / 77 | per candidate hit |
+| `match_ok` cold tail | 1 | 66 | cold (mls > 8) |
+| `emit_fast_seq` / `prime_tables` / `fill_fast_after_match` | -- | fully inlined | per match / per block |
 
-Panic sites across all of the above: effectively zero (the T2/T4 work); the residue is
-17 in `find_sequences_strategy` and an unattributable 13 in one inlined
-`find_fast_impl` instantiation.
+**Time by level** (mfanat, 18-corpus 8 MiB board, ms per input MiB): L1 **6.0**
+(73.9% of encode) -> L3 **7.0** (76.5%) -> L5 **11.0** (83.4%) -> L7 **44.1** (95.1%)
+-> L9 **74.8** -> L12 **174.3** (98.6%) -> L13 **273.0** -> L19 **379.4** -> L22
+**406.7** (99.3%). MatchFind IS the encoder; the ladder spans 68x.
+
+## 0b. TARGETS 2026-08-21 -- the remaining deterministic / instruction-reducing wins
+
+Ranked by (confidence x traffic). Locations are current as of `bfd0cf0` + the
+find_opt pin. Everything CL-shaped is DONE; these are work and memory levers.
+
+| rank | target | location | lever | instrument |
+| ---: | --- | --- | --- | --- |
+| 1 | **Chain-walk prefetch** (old §3) | `chain_find_best_inner`, encode.rs:8516; greedy's inlined walk, `find_greedy_impl` encode.rs:8155 | `chain[next]` is known BEFORE `count_match` runs on the current candidate -- a NON-dependent prefetch, the easiest in the file. `simd::prefetch_read` (simd.rs:24) still has no callers | instr parity (+1/step) + 80-cell L5-L12 board; serves the 44-174 ms/MiB band |
+| 2 | **Bt tree prefetch** (old §2a) | `bt_find_best_impl_inner` walk, encode.rs:9473 | prefetch the child row when `bt_idx` is computed -- both children share a line. C's `ZSTD_insertBt1` does this | instr parity + 60-cell Bt board; serves the 273-407 ms/MiB band |
+| 3 | **Bt loop-invariant hoist** (old §2b) | the flagged comment, encode.rs:9518 and :9767 (both copies) | hoist the saturating_sub + max + field load to locals before the walk | asm instr count of loop body; byte-identity by construction |
+| 4 | **`count_eq_len` first-word early-exit** (old §4) | simd.rs:177 | make XOR+TZCNT on word 0 the unconditional head of the AVX2 arm (C does); most calls die inside 8 bytes | `EQ_LEN_HIST`; byte-identical by definition |
+| 5 | **Dead-copy census of the twin families** (old §2c/§5c) | `FF_ARM`, `BT_SPEC_CALLS`, `DFAST_SPEC_CALLS` counters | 140+140 fast and 42+42 bt copies: which serve 0%? GATE 12 found one dead bt spec before; the families have since doubled. Cull = binary size only (measurement-parity arms STAY) | per-copy call census under profile |
+| 6 | **DFast register pressure is gate telemetry** (old §1b) | `find_dfast_impl_inner`, encode.rs:7221 | ~9 per-block gate accumulators live across the hot loop; derive post-loop from `seqs` or gate under `profile` | stack movs in the hot-loop region |
+| 7 | **DFast speculation waste** (old §1c) | dpipe in `find_dfast_impl_inner` | 14.5% of speculated loads discarded at the shipped threshold; make the speculation cheaper (it recomputes two hashes + probes both tables) | `take_dfast_spec` |
+| 8 | **Brick 48 A/B under the twins** | `chain_find_best`, encode.rs:8434 region | the outlining decision predates the twins and the `ChainFn` pointer; one experiment: point `cfb` at an `#[inline(always)]` variant in a scratch build and read the L5-L12 identity board + instr counts | asm + 80-cell board; owner decides |
+| 9 | **`dfast_fill_ends` per-match atomic** (old §5d) | encode.rs:5678 | one atomic load per MATCH for a process constant -- brick-79 shape | asm; trivial |
+| 10 | **Strategy-hub panic residue** (old §6) | `find_sequences_strategy` | the 17-site count predates the twin refactor -- RE-CENSUS first, then the huffman-style safe restructures | panic census |
+
+**Shipped since the 08-20 original:** §1a long-table rejection tag is IN and default
+ON (`LONG_TAG_ARM` encode.rs:13829, `get_hl_tag` encode.rs:1073, LTAG_* ledger);
+§5d's `accel` variable-shift item is ABSORBED by the twins (shrx in every live copy;
+const-specialisation would now buy ~0).
+
+**Do not chase (the irreducible ledger):** the dfast twins' two `shrb $const, %cl`
+set-membership tests (no 8-bit shrx exists); the encode twins' one memory-destination
+shift each (no memory-operand shrx); every plain fallback arm (dead code on BMI2
+hardware, kept for museum correctness and measurement parity).
+
+**Output-changing, adjudication-class (not in this file's lane):** the mls-wide hash
+residue on `versions` (cross-block state divergence, §5d4 -- family floor reached);
+DFast's missing back-extension; probe-density and depth gates (the gate campaign
+owns those).
 
 ---
 

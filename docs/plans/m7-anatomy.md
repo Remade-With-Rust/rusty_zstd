@@ -191,79 +191,66 @@ decompress misses by one hundredth at 1.12.
 | incomp-32m   |  **11.4** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **23.7** |
 | zeros-32m    |   **0.0** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **24.2** |
 
-**`EncodeMatchFind` is #1 on 18 of 18, unchanged**, and its shares NUDGED UP across
-the board (smallmsg 78.7 -> 82.3, jsonlog 74.1 -> 78.7, dickens 72.7 -> 75.0): the twin
-campaign compressed the entropy stages' absolute time, so the finder's share of what
-remains grew -- shares are ONLY comparable within a run, but the direction is the one
-the twins predict. **Huffman still leads NOWHERE on encode**, where it once led three:
+### MatchFind Function Anatomy
 
-| corpus | Huff, 08-16 | Huff, 08-20 |
-| --- | ---: | ---: |
-| `x-ray` | **56.8** | 10.9 |
-| `mr` | **52.5** | 8.7 |
-| `osdb` | **40.5** | 16.4 |
-| `mozilla` | 33.7 | 10.2 |
+The largest stage (#1 on **18 of 18** corpora -- see section 3) and by far the most
+dispatched.
 
-**`DecodeSeq` is #1 on 16 of 18, unchanged**, and now clears 75% even on the
-degenerate corpora (`text-32m` 65.0 -> 75.9, `versions-16m` 67.4 -> 76.9).
-**`DecodeLiterals` leads NOWHERE** -- it collapsed on exactly the corpora that were
-once its own:
+**Function-level breakdown, 2026-08-21 (post twin campaign).** Two instruments, read
+together: the profile clock allocates TIME per level (shares comparable only within
+the run, `mfanat.rs`), and the asm census gives each function's footprint and ISA
+state.
 
-| corpus | DecLits, 08-16 | DecLits, 08-20 |
-| --- | ---: | ---: |
-| `mr` | **65.7** | 5.9 |
-| `x-ray` | **47.5** | 17.5 |
-| `dickens` | 31.9 | 3.2 |
-| `mozilla` | 32.0 | 13.9 |
+**(a) Time -- which function owns MatchFind at each level.** 18-corpus 8 MiB board,
+profile build; milliseconds per input MiB.
 
-**Both halves moved together, and that is the point.** The literal path was the
-campaign's densest target: 63 per-literal bounds checks removed from
-`decode_4x`/`decode_into_x1`/`decode_into_x2`, 8 more from `encode_stream`, and
-`huffman.rs` taken from 91 panic sites to **zero** with the file 7.5% smaller. The
-alphabet-flatness axis that used to drive BOTH sides now drives neither: the encoder's
-Huffman share and the decoder's literal share fell in step.
+| level | strategy | serving function(s)          | MF ms/MiB | MF % of encode |
+| ----: | -------- | ---------------------------- | --------: | -------------: |
+|    L1 | Fast     | `find_fast_impl`             |       6.0 |           73.9 |
+|    L3 | DFast    | `find_dfast_impl`            |       7.0 |           76.5 |
+|    L5 | Greedy   | `find_greedy` (walk inlined) |      11.0 |           83.4 |
+|    L7 | Lazy     | `find_lazy` + `chain_find_best` |   44.1 |           95.1 |
+|    L9 | Lazy2    | `find_lazy` + `chain_find_best` |   74.8 |           97.0 |
+|   L12 | Lazy2    | `find_lazy` + `chain_find_best` |  174.3 |           98.6 |
+|   L13 | BtLazy2  | `find_bt_lazy` + `bt_find_best` | 273.0 |           99.2 |
+|   L15 | BtLazy2  | `find_bt_lazy` + `bt_find_best` | 329.9 |           99.3 |
+|   L16 | BtOpt    | `find_opt` + `bt_find_best`  |     319.9 |           99.3 |
+|   L19 | BtUltra2 | `find_opt` + `bt_find_best`  |     379.4 |           99.4 |
+|   L22 | BtUltra2 | `find_opt` + `bt_find_best`  |     406.7 |           99.3 |
 
-**`DecodeChecksum` leads only the two truly empty corpora now** (`zeros-32m` 24.2%,
-`incomp-32m` 23.7%); on `text-32m` and `versions-16m` its share fell to 22.2% and
-21.8% (from 33.8 / 31.6) and `DecodeSeq` took the lead there too. The standing conclusion holds unchanged: on high-ratio and
-incompressible content there is little to decode, so **verification IS the decoder**,
-and `--no-check` / `DecompressOptions::force_ignore_checksum` removes the largest single
-stage there rather than shaving a micro-option.
+Three readings. (1) **MatchFind IS the encoder at every level**: 73.9% at L1 rising
+to 99.3-99.4% from L13 up -- above the chain ladder there is no second stage worth a
+row. (2) The ladder spans **68x** in absolute cost, 6.0 -> 406.7 ms/MiB; the two big
+jumps are Greedy -> Lazy (11 -> 44, the look-ahead re-search at every found match)
+and Lazy2 -> BtLazy2 (174 -> 273, the tree walk). (3) L16 costs LESS than L15
+(319.9 vs 329.9): the DP prices candidates it then declines to re-search, where
+BtLazy2's look-ahead searches unconditionally.
 
-**WHAT THIS SAYS NOW.** The allocation is MORE concentrated than ever, and the twin
-campaign is why: the entropy and bitstream stages it rebuilt (Huff, FseSeq, SeqCode,
-DecLits, DecCk) all shrank or held their shares, so both halves now funnel into their
-single hot stage. The encoder's target is match-find, 55.0-82.3% on every compressible
-corpus; the decoder's is sequence execution, 67.5-94.8%. Slowness is allocated to
-exactly two loops, and both already run entirely on the twin architecture -- the next
-win on either must come from doing less WORK (fewer probes, fewer positions, better
-copy shapes), not from cheaper instructions.
+**(b) The functions -- footprint and ISA state** (asm census, same build; "copies"
+counts monomorphisations, plain + BMI2 twin).
 
----
+| function | copies | live-copy instrs | ISA receipt | unit of execution |
+| --- | ---: | ---: | --- | --- |
+| `find_fast_impl` | 140 + 140 | <= 2,458 / 2,425 | twins carry 1,878 shrx, 0 CL | per position, L1-L2 |
+| `find_dfast` + `find_dfast_impl` | 1 + 6 + 6 | dispatcher 9,397; twin <= 1,908 | 30 shrx; 2 `shrb $const` per twin (no 8-bit shrx exists -- irreducible) | per position, L3-L4 (default) |
+| `find_greedy` | 1 + 1 | 2,269 / 2,219 | 27 shrx, 0 CL in twin | per position, L5 |
+| `find_lazy` | 1 + 1 | 1,958 / 1,930 | 13 shrx, 0 CL in twin | per position, L6-L12 |
+| `chain_find_best` | 2 + 2 | <= 466 / 454 | 7 shrx; outlined by brick 48, ISA via per-block `ChainFn` pointer | per position + per look-ahead step, L5-L12 |
+| `bt_find_best_impl` | 42 + 42 | <= 229 each | 84 shrx total; ISA chosen once per block in `bt_resolve` | per position x ~30M, L13-L22 |
+| `bt_find_best_runtime` | 1 + 1 | 259 / 261 | 5 shrx | fallback arm |
+| `find_sequences_strategy` | 1 + 1 | 2,377 / 2,271 | `find_opt` + `find_bt_lazy` inlined into BOTH arms (find_opt pinned 08-21) | per block hub |
+| `find_sequences` | 1 + 1 | 722 / 672 | ldm glue | per block |
+| `count_match` / `count_eq_len` | 1 / 1 | 153 / 77 | AVX2 arm via `has_avx2()` | per candidate hit |
+| `match_ok` (+ cold tail) | inlined + 1 | 66 (tail) | memcmp only in the cold mls>8 tail | per candidate |
+| `emit_fast_seq`, `prime_tables`, `fill_fast_after_match`, `fast_hash_relatch` | -- | fully inlined into the twins | -- | per match / per block |
 
-### Dispatch inventory — how to read these
+Every function above runs its BMI2 twin on modern hardware; the remaining CL shifts
+in the binary are the plain fallback arms, two ISA-irreducible shapes (8-bit
+constant shifts, memory-destination shifts), and cold paths -- the classification is
+total (commits `08d14e3`..`bfd0cf0`).
 
-A **dispatch-gated function** is one whose behaviour is selected at RUN TIME rather
-than fixed at the call site. Four kinds appear below, and they are not equally
-trustworthy:
-
-| kind | selected by | trustworthy? |
-| --- | --- | --- |
-| **MEASURED** | a statistic of the CONTENT, recomputed per block or per section | yes -- this is the real dispatch |
-| **LEVEL** | `CompressionParameters` from the level table | yes, but static per level |
-| **ARM** | an env var / atomic, for in-process A/B | ships pinned; a shipped arm is a decision, not a dispatch |
-| **CPU** | `is_x86_feature_detected!` at first use | yes, but invisible to the corpus |
-
-`ARM` entries are listed because they are live branches in the shipping binary --
-several were left switchable after their brick landed, and each one is an atomic load
-or a `OnceLock` read that some hot loop may still be paying for. Bricks 49, 64 and 77
-were all exactly that bug.
-
----
-
-### MatchFind Function Anatomy -- Great Gate
-
-The largest stage (#1 on 15 of 18 corpora) and by far the most dispatched.
+**The gate inventory** (08-20 audit; line numbers predate the twin refactor -- the
+gates themselves are unchanged):
 
 | # | gate | kind | selects | where |
 | --- | --- | --- | --- | --- |
@@ -288,15 +275,6 @@ The largest stage (#1 on 15 of 18 corpora) and by far the most dispatched.
 | 19 | `price[j] < inf` / `np < price[j]` | **MEASURED** | the optimal-parse DP itself -- per position, per candidate length | `find_opt` encode.rs:2949-3002 |
 | 20 | `try_rep1` candidate admitted to the DP | **MEASURED** | brick 75 repcode candidate at `ip+1` | `find_opt` encode.rs:2964 |
 
-**Only #2, #3, #16, #19 and #20 are true content dispatches**, and #19/#20 exist only
-at L16+ (`find_opt`). At the shipping levels the biggest stage has exactly THREE live
-content-adaptive decisions, and two of them (`rep_yield`, `last_search_per_byte`) are
-single scalars carried from the previous block.
-
-`find_opt` (rows 17-20) is the codec's only true cost model on the encode side -- a DP
-over per-position prices. Its price terms are the known-crude part (literals flat 6,
-offsets `12 + log2(offset)` from brick 72); bricks 76 and 83 both tried to make the
-LITERAL term accurate while leaving the sequence term invented, and both reverted.
 
 ---
 
@@ -323,44 +301,6 @@ verify against the real number (9). It is also where the campaign's two worst
 regressions came from, because gates 3 and 4 sit UPSTREAM of an O(n) histogram, a
 ctable build and a `write_tree`. **A false accept there is not a wasted branch, it is
 a wasted table build** -- that is what halved `versions-16m`.
-
----
-
-### FseSeq Function Anatomy -- Great Gate
-
-| # | gate | kind | selects | where |
-| --- | --- | --- | --- | --- |
-| 1 | header-cost comparison | **MEASURED** | Predefined(0) / RLE(1) / FSE-compressed(2) / Repeat(3), **independently per table** | encode.rs:1140-1196 |
-| 2 | single distinct symbol | **MEASURED** | RLE mode (`best_mode = 3` path) | encode.rs:1170 |
-| 3 | built table beats predefined | **MEASURED** | FSE-compressed mode | encode.rs:1181 |
-| 4 | `force_compressed && best_mode == 0` | caller | override away from Predefined | encode.rs:1189 |
-
-Three tables (`ll`, `of`, `ml`) each run this dispatch independently, so a block picks
-one of 4^3 = 64 mode combinations. All four gates are content-measured and all compare
-REAL header bytes -- there is no estimator here to be wrong, which is why this stage
-has produced no regressions. `note_seq_mode` records the outcome (predef/rle/comp/
-REPEAT) and it is already in the profiler output.
-
----
-
-### SeqCode Function Anatomy -- Great Gate
-
-| # | gate | kind | selects | where |
-| --- | --- | --- | --- | --- |
-| 1 | `offset_value_for(offset, litlen, reps)` | **MEASURED** | repcode slot 1/2/3 vs a literal offset -- per sequence | encode.rs:982 |
-| 2 | -- | -- | -- | -- |
-
-**SeqCode has essentially NO dispatch, and that is the point.** It is a straight-line
-transcode of `Seq -> CodedSeq` plus the ll/of/ml histogram walk, scoped at
-encode.rs:979. The only decision is the repcode-vs-explicit-offset choice, which is
-forced by the RFC, not chosen.
-
-That matters because SeqCode was measured at **20-26% of encode on five corpora**
-(nci 26.3, xml 25.1, samba 21.8, reymont 21.4, webster 20.7) -- larger than FseSeq on
-every file. **A stage with a fifth of encode time and one forced decision is a pure
-throughput problem**, not a dispatch problem: the levers are the table lookup
-(`code_from_base`, already de-linearized) and the second histogram pass, not a smarter
-gate.
 
 ---
 
@@ -399,27 +339,6 @@ genuine per-sequence dispatches (#3-#6) are all on `(len, offset)` -- a shape th
 ENCODER chooses. The decoder's speed is therefore partly an encoder-side question: the
 distribution of `(litlen, matchlen, offset)` we emit determines which copy tier fires.
 That is the one unexplored lever here, and it does not live in this stage.
-
----
-
-### DecCk Function Anatomy -- Great Gate
-
-| # | gate | kind | selects | where |
-| --- | --- | --- | --- | --- |
-| 1 | `header.checksum` | stream | whether a 4-byte trailer exists at all | decode.rs:368 |
-| 2 | `opts.force_ignore_checksum` | caller | skip VERIFICATION but still CONSUME the 4 bytes | decode.rs:373 |
-| 3 | `data.len() >= 32` | size | 4-lane stripe loop vs the tail path | xxh64.rs:42, 50 |
-
-**xxh64 has NO CPU dispatch and no arms -- it is the only stage in the codec with
-none.** That is not an oversight: XXH64's round needs a full 64x64 multiply, which
-SSE2 and AVX2 do not have (`_mm_mul_epu32` is 32x32->64); only AVX-512DQ adds
-`_mm_mullo_epi64`. This is precisely why XXH3 exists, and RFC 8878 fixes us to XXH64.
-
-So the stage that is **#2 on decode overall and leads outright on 3 of 18** (text-32m
-53%, incomp-32m 44%, versions-16m 44%, zeros-32m 33%) has exactly one tunable bit,
-gate #2, and it is a correctness trade. **Everything else must come from moving the
-work, not changing it** -- overlapping the hash with decode on a second thread.
-Fusing it into the block loop was tried and measured ~12% WORSE (brick 85, reverted).
 
 ---
 
