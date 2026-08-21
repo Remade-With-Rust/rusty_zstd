@@ -784,7 +784,11 @@ impl MatchTables {
     #[allow(unsafe_code)]
     fn put_h(&mut self, h: usize, pos: usize) {
         debug_assert!(h < self.hash.len());
-        *unsafe { self.hash.get_unchecked_mut(h) } = (pos as u32).saturating_add(1);
+        // W9: same unreachable saturation as the tagged stores -- `pos` is an
+        // index into `src`, whose length is bounded well under `u32::MAX` on
+        // every path that reaches a hash table.
+        debug_assert!(pos < u32::MAX as usize);
+        *unsafe { self.hash.get_unchecked_mut(h) } = (pos as u32) + 1;
     }
 
     /// T1: `put_h` that also writes the tag, so the short table obeys the same
@@ -793,21 +797,30 @@ impl MatchTables {
     /// lets tags go stale (190ad8b, and again in `prime_tables`).
     #[inline(always)]
     #[allow(unsafe_code)]
-    fn put_h_tag(&mut self, h: usize, pos: usize, tag: u8) {
-        if self.pack_tags {
+    fn put_h_tag(&mut self, h: usize, pos: usize, tag: u8, packed: bool) {
+        debug_assert_eq!(packed, self.pack_tags);
+        if packed {
             // `pos + 1` is guaranteed < 2^24 by `enable_packed_tags`, so the
             // mask cannot truncate a live position, and the low bits are never
             // 0 -- an all-zero word still means "empty".
             debug_assert!(h < self.hash.len());
+            // W6: the saturating form's cmov is unreachable -- `pack_tags`
+            // requires `len < 0x00FF_FFFF`, so `pos + 1` fits the field.
+            debug_assert!(pos + 1 < 0x00FF_FFFF);
             *unsafe { self.hash.get_unchecked_mut(h) } =
-                (((pos as u32).saturating_add(1)) & 0x00FF_FFFF) | (u32::from(tag) << 24);
+                (((pos as u32) + 1) & 0x00FF_FFFF) | (u32::from(tag) << 24);
             return;
         }
-        if let Some(t) = self.tags.get_mut(h) {
-            *t = tag;
+        // W7: `tags` is allocated at EXACTLY `hash.len()` at all four of its
+        // sites and `h` indexes `hash` below, so the bounds test and branch
+        // were dead on every short-table store.
+        if !self.tags.is_empty() {
+            debug_assert_eq!(self.tags.len(), self.hash.len());
+            *unsafe { self.tags.get_unchecked_mut(h) } = tag;
         }
         debug_assert!(h < self.hash.len());
-        *unsafe { self.hash.get_unchecked_mut(h) } = (pos as u32).saturating_add(1);
+        debug_assert!(pos < u32::MAX as usize);
+        *unsafe { self.hash.get_unchecked_mut(h) } = (pos as u32) + 1;
     }
 
     /// Allocate the array form of the Fast tag filter (for callers with no
@@ -864,23 +877,26 @@ impl MatchTables {
     /// why this is byte-identical rather than a size-for-speed trade.
     #[inline(always)]
     #[allow(unsafe_code)]
-    fn get_h_tag(&self, h: usize, tag: u8, on: bool) -> Option<usize> {
+    fn get_h_tag(&self, h: usize, tag: u8, on: bool, packed: bool) -> Option<usize> {
+        debug_assert_eq!(packed, self.pack_tags);
         debug_assert!(h < self.hash.len());
         let v = *unsafe { self.hash.get_unchecked(h) };
         if v == 0 {
             return None;
         }
-        if self.pack_tags {
+        if packed {
             if (v >> 24) as u8 != tag {
                 return None;
             }
             return Some(((v & 0x00FF_FFFF) as usize) - 1);
         }
-        if on {
-            if let Some(&t) = self.tags.get(h) {
-                if t != tag {
-                    return None;
-                }
+        // W8: same provable bound as the store's -- per short-table PROBE.
+        if on && !self.tags.is_empty() {
+            debug_assert_eq!(self.tags.len(), self.hash.len());
+            #[allow(unsafe_code)]
+            let t = *unsafe { self.tags.get_unchecked(h) };
+            if t != tag {
+                return None;
             }
         }
         Some((v as usize) - 1)
@@ -1047,46 +1063,78 @@ impl MatchTables {
     /// leading bytes (`match_ok` with `max(4, ..)`), so a mismatch provably
     /// cannot hide a match. Representation follows `pack_tags`
     /// unconditionally (the 190ad8b rule); the arm gates only the COMPARE.
+    /// `packed` is the caller's HOISTED `pack_tags` (per frame). Reading the
+    /// field per call cost a load and a branch on every tag operation --
+    /// eleven per position in the dfast twin -- for a value that cannot
+    /// change inside a block. Same shape `find_fast_impl` uses for the short
+    /// table (`let pack = tables.pack_tags`).
     #[inline(always)]
     #[allow(unsafe_code)]
-    fn put_hl_tag(&mut self, h: usize, pos: usize, tag: u8) {
+    fn put_hl_tag(&mut self, h: usize, pos: usize, tag: u8, packed: bool) {
         debug_assert!(h < self.hash_long.len());
-        if self.pack_tags {
+        debug_assert_eq!(packed, self.pack_tags);
+        if packed {
+            // W5: `pack_tags` is set only when `len < 0x00FF_FFFF`, so
+            // `pos + 1` fits the 24-bit field with room to spare and the
+            // saturating form's cmov is unreachable. The mask stays: it is
+            // what splits the field from the tag.
+            debug_assert!(pos + 1 < 0x00FF_FFFF);
             *unsafe { self.hash_long.get_unchecked_mut(h) } =
-                (((pos as u32).saturating_add(1)) & 0x00FF_FFFF) | (u32::from(tag) << 24);
+                (((pos as u32) + 1) & 0x00FF_FFFF) | (u32::from(tag) << 24);
             return;
         }
         // Array route (>= 16 MiB / streaming): written UNCONDITIONALLY
         // whenever the array exists -- gating the store on the compare's flag
         // is what lets tags go stale (190ad8b).
-        if let Some(t) = self.ltags.get_mut(h) {
-            *t = tag;
+        // W3: same provable bound as `get_hl_tag`'s route, per STORE.
+        if !self.ltags.is_empty() {
+            debug_assert_eq!(self.ltags.len(), self.hash_long.len());
+            *unsafe { self.ltags.get_unchecked_mut(h) } = tag;
         }
-        *unsafe { self.hash_long.get_unchecked_mut(h) } = (pos as u32).saturating_add(1);
+        // W4: `saturating_add` is a cmov the encoder can never take. A
+        // position is an index into `src`, and a frame that reached this
+        // route has `len < u32::MAX`, so `pos + 1` cannot wrap -- the
+        // saturation was a per-store instruction guarding an impossible
+        // input. (The packed route is bounded harder still, by pack_tags'
+        // own `len < 0x00FF_FFFF`.)
+        debug_assert!(pos < u32::MAX as usize);
+        *unsafe { self.hash_long.get_unchecked_mut(h) } = (pos as u32) + 1;
     }
 
     /// 1a: tag-filtered long-table load. `on` gates the compare only; the
     /// unmask under `pack_tags` is unconditional, because the slot holds the
     /// packed form whenever the frame does.
+    /// `packed` is the caller's HOISTED `pack_tags` (per frame). Reading the
+    /// field per call cost a load and a branch on every tag operation --
+    /// eleven per position in the dfast twin -- for a value that cannot
+    /// change inside a block. Same shape `find_fast_impl` uses for the short
+    /// table (`let pack = tables.pack_tags`).
     #[inline(always)]
     #[allow(unsafe_code)]
-    fn get_hl_tag(&self, h: usize, tag: u8, on: bool) -> Option<usize> {
+    fn get_hl_tag(&self, h: usize, tag: u8, on: bool, packed: bool) -> Option<usize> {
         debug_assert!(h < self.hash_long.len());
+        debug_assert_eq!(packed, self.pack_tags);
         let v = *unsafe { self.hash_long.get_unchecked(h) };
         if v == 0 {
             return None;
         }
-        if self.pack_tags {
+        if packed {
             if on && (v >> 24) as u8 != tag {
                 return None;
             }
             return Some(((v & 0x00FF_FFFF) as usize) - 1);
         }
-        if on {
-            if let Some(&t) = self.ltags.get(h) {
-                if t != tag {
-                    return None;
-                }
+        // W2: `ltags` is allocated at EXACTLY `hash_long.len()` at both of
+        // its sites, and `h` already indexed `hash_long` above -- so the
+        // bounds test and its branch were provably dead on every long probe
+        // of the array route. The emptiness check stays: `lt_on` allows the
+        // array to be absent when `pack_tags` carries the tag instead.
+        if on && !self.ltags.is_empty() {
+            debug_assert_eq!(self.ltags.len(), self.hash_long.len());
+            #[allow(unsafe_code)]
+            let t = *unsafe { self.ltags.get_unchecked(h) };
+            if t != tag {
+                return None;
             }
         }
         Some((v as usize) - 1)
@@ -2033,6 +2081,8 @@ pub(crate) fn prime_tables(
     if payload_off == 0 {
         return;
     }
+    // Hoisted per call: see the tag accessors' `packed` doc.
+    let packed = tables.pack_tags;
     let mls = params.min_match.max(3) as usize;
     let from = payload_off.saturating_sub(window);
     let ilimit = payload_off.saturating_sub(8);
@@ -2213,13 +2263,13 @@ pub(crate) fn prime_tables(
                 let smask = if sk == 8 { u64::MAX } else { (1u64 << (8 * sk)) - 1 };
                 let tv = (load_u64le(src, p) & smask).wrapping_mul(FAST_HASH_PRIME64);
                 let g = (tv ^ (tv >> 29)) as u8;
-                tables.put_h_tag(h, p, g);
+                tables.put_h_tag(h, p, g, packed);
                 // 1a: prime the LONG tag too, or the filter rejects every
                 // primed long slot -- the exact -59.3% priming-poison class
                 // the short table was bitten by.
                 if do_long {
                     let hl = hash8(src, p, hash_log);
-                    tables.put_hl_tag(hl, p, g);
+                    tables.put_hl_tag(hl, p, g, packed);
                 }
             }
         }
@@ -7103,6 +7153,8 @@ fn fill_hash_after_match(
     hash_shift: u32,
     ilimit: usize,
 ) {
+    // Hoisted per call: see the tag accessors' `packed` doc.
+    let packed = tables.pack_tags;
     let (do_a, do_b) = ends;
     let mut n = 0u64;
     let a = match_ip.saturating_add(2);
@@ -7114,7 +7166,7 @@ fn fill_hash_after_match(
         // bits as part of the position -- which is exactly what it did, and it
         // moved output on 12 of 18 corpora.
         if tables.pack_tags {
-            tables.put_h_tag(h, a, g);
+            tables.put_h_tag(h, a, g, packed);
         } else {
             tables.store_fast(h, a, g);
         }
@@ -7125,7 +7177,7 @@ fn fill_hash_after_match(
         if b <= ilimit && b != a {
             let (h, g) = hash4_tag_mls(src, b, hash_shift, smask);
             if tables.pack_tags {
-                tables.put_h_tag(h, b, g);
+                tables.put_h_tag(h, b, g, packed);
             } else {
                 tables.store_fast(h, b, g);
             }
@@ -7155,20 +7207,23 @@ fn fill_hash_long_after_match(
     hash_shift: u32,
     ilimit: usize,
 ) {
+    // Hoisted per call: see the tag accessors' `packed` doc.
+    let packed = tables.pack_tags;
     let (do_a, do_b) = ends;
     let mut n = 0u64;
     let a = match_ip.saturating_add(2);
-    let ltag_live = tables.pack_tags || !tables.ltags.is_empty();
+    // W10: this re-read the struct field one line after `packed` hoisted it.
+    let ltag_live = packed || !tables.ltags.is_empty();
     if do_a && a <= ilimit {
         let g = if ltag_live { hash4_tag_mls(src, a, hash_shift, smask).1 } else { 0 };
-        tables.put_hl_tag(hash8(src, a, hash_log), a, g);
+        tables.put_hl_tag(hash8(src, a, hash_log), a, g, packed);
         n += 1;
     }
     if do_b && match_end >= 2 {
         let b = match_end - 2;
         if b <= ilimit && b != a {
             let g = if ltag_live { hash4_tag_mls(src, b, hash_shift, smask).1 } else { 0 };
-            tables.put_hl_tag(hash8(src, b, hash_log), b, g);
+            tables.put_hl_tag(hash8(src, b, hash_log), b, g, packed);
             n += 1;
         }
     }
@@ -7480,6 +7535,12 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     // statics ran during the arm-OFF pass too -- read counters out between
     // arms or the baseline contaminates the treatment 4:1.
     let lt_on = long_tag_enabled() && (tables.pack_tags || !tables.ltags.is_empty());
+    // W1: `pack_tags` is a per-FRAME constant that every tag accessor was
+    // re-reading from the struct -- the asm showed offset 523 loaded and
+    // tested ELEVEN times per position in one dfast twin. `find_fast_impl`
+    // has hoisted it since ffanat (`let pack = tables.pack_tags`); the whole
+    // dfast path, both fill helpers and the priming pass never did.
+    let packed = tables.pack_tags;
     // The mls-width short tag's byte mask (min(mls, 8) bytes).
     let sk = 8.min(mls);
     let smask = if sk == 8 { u64::MAX } else { (1u64 << (8 * sk)) - 1 };
@@ -7545,7 +7606,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
             }
             None => {
                 let (a, ga, b) = dfast_hash_pair(src, ip, dtag_shift, smask, hlog);
-                let m = tables.get_h_tag(a, ga, dtag_on);
+                let m = tables.get_h_tag(a, ga, dtag_on, packed);
                 // T1 ledger: a rejection is a candidate load AVOIDED. Counted
                 // only under `profile`, so the shipping loop is untouched.
                 if COUNT && dtag_on {
@@ -7556,7 +7617,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                         }
                     }
                 }
-                let ml8 = tables.get_hl_tag(b, ga, lt_on);
+                let ml8 = tables.get_hl_tag(b, ga, lt_on, packed);
                 // 1a ledger, THREE counters so the long table never inherits
                 // the short counters' split personality (see the tag audit):
                 // nonempty / rejected / FALSE (provably lost -- must be 0).
@@ -7587,8 +7648,8 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                 (a, ga, b, m, ml8)
             }
         };
-        tables.put_h_tag(h4, ip, g4);
-        tables.put_hl_tag(h8, ip, g4);
+        tables.put_h_tag(h4, ip, g4, packed);
+        tables.put_hl_tag(h8, ip, g4, packed);
         // Issue the NEXT position's two loads NOW, so they are in flight while
         // this position's match logic runs. The miss-advance does not depend on
         // the match result, so `nip` is knowable here; a match or a rep hit
@@ -7613,7 +7674,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                         None
                     }
                 } else {
-                    tables.get_h_tag(a, ga, dtag_on)
+                    tables.get_h_tag(a, ga, dtag_on, packed)
                 };
                 // The long hand-forward mirrors `get_hl_tag`: the store
                 // above wrote tag `g4` at `h8`, so a speculation landing on
@@ -7625,7 +7686,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                         None
                     }
                 } else {
-                    tables.get_hl_tag(b, ga, lt_on)
+                    tables.get_hl_tag(b, ga, lt_on, packed)
                 };
                 spec_made += 1;
                 carried = Some((a, ga, b, va, vb));
@@ -7696,7 +7757,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
             // computed a short hash. One mul+xor on a path already gated by
             // `best_ml < good_ml && nl_on`.
             let g8b = if lt_on { hash4_tag_mls(src, ip + 1, dtag_shift, smask).1 } else { 0 };
-            if let Some(m8b) = tables.get_hl_tag(h8b, g8b, lt_on) {
+            if let Some(m8b) = tables.get_hl_tag(h8b, g8b, lt_on, packed) {
                 if COUNT {
                     probes += 1;
                 }
@@ -7831,8 +7892,8 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                     // T1: same table, same representation. `store_fast` writes
                     // the slot unpacked, which a packed reader would decode as a
                     // bogus position.
-                    tables.put_h_tag(h, p, g);
-                    tables.put_hl_tag(hash8(src, p, hlog), p, g);
+                    tables.put_h_tag(h, p, g, packed);
+                    tables.put_hl_tag(hash8(src, p, hlog), p, g, packed);
                     #[cfg(feature = "profile")]
                     DF_FILL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     p += dfs;
