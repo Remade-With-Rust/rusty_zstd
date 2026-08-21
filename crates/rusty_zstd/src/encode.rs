@@ -7214,7 +7214,7 @@ fn find_dfast_impl<const HLOG: u32>(
             let mlx = 8.min(mls).max(4);
             if match_ok(src, m8, ip, window, block_start, mlx, tables.frame_start) {
                 // Count past match_ok's verified prefix (fast_probe_wide rule).
-                let ml = mlx + count_match(src, m8 + mlx, ip + mlx, block_end);
+                let ml = mlx + count_match_fast(src, m8 + mlx, ip + mlx, block_end);
                 if ml >= mls {
                     best_m = m8;
                     best_ml = ml;
@@ -7276,7 +7276,7 @@ fn find_dfast_impl<const HLOG: u32>(
                 let mlx = 8.min(mls).max(4);
                 if match_ok(src, m8b, ip + 1, window, block_start, mlx, tables.frame_start) {
                     // Count past match_ok's verified prefix.
-                    let ml = mlx + count_match(src, m8b + mlx, ip + 1 + mlx, block_end);
+                    let ml = mlx + count_match_fast(src, m8b + mlx, ip + 1 + mlx, block_end);
                     if ml >= mls && ml > best_ml {
                         // GATE 14 signal, measured only in the band the raise
                         // opens. Two adds on a path that fires a few thousand
@@ -7332,7 +7332,7 @@ fn find_dfast_impl<const HLOG: u32>(
                 let mut _acc = false;
                 if match_ok(src, m4, ip, window, block_start, mls, tables.frame_start) {
                     // Count past match_ok's verified prefix.
-                    let ml = mls + count_match(src, m4 + mls, ip + mls, block_end);
+                    let ml = mls + count_match_fast(src, m4 + mls, ip + mls, block_end);
                     _acc = ml >= mls;
                     if ml >= mls && ml > best_ml {
                         best_m = m4;
@@ -7882,7 +7882,7 @@ fn find_greedy(
                         if best_ml == 0 || pre_eq(src, m, ip, best_ml) {
                             // Count past mls_eq's verified prefix (see
                             // `chain_find_best`).
-                            let ml = mls + count_match(src, m + mls, ip + mls, block_end);
+                            let ml = mls + count_match_fast(src, m + mls, ip + mls, block_end);
                             if ml >= mls && ml > best_ml {
                                 if missed_before {
                                     if best_ml == 0 {
@@ -8070,7 +8070,7 @@ fn chain_find_best(
                     // Count from the byte AFTER what mls_eq just verified --
                     // restarting at 0 re-compared the first word of every
                     // candidate (the fast_probe_wide rule, applied here).
-                    let ml = mls + count_match(src, m + mls, ip + mls, block_end);
+                    let ml = mls + count_match_fast(src, m + mls, ip + mls, block_end);
                     if ml >= mls
                         && ml > best_ml
                         && offset_ok(ip - m, window)
@@ -10356,6 +10356,28 @@ fn match_ok(
         return mls == 4 || src[m + 4..m + mls] == src[ip + 4..ip + mls];
     }
     src[m..m + mls] == src[ip..ip + mls]
+}
+
+/// The per-candidate fast head of `count_match`: the first-word peek fully
+/// INLINE -- no call, no `has_avx2` atomic, no slice construction -- with
+/// the outlined routine only for the (rare) long tail. Value-identical to
+/// `count_match` at every input: the head fires only when all three
+/// 8-byte reads are in bounds and within `limit`, a first-word mismatch
+/// answers <= 7 <= max, and an equal first word makes the total exactly
+/// `8 + count_match(m+8, ip+8)`. The eqlen histogram says ~79% of calls
+/// end in the head.
+#[inline(always)]
+fn count_match_fast(src: &[u8], m: usize, ip: usize, limit: usize) -> usize {
+    if ip + 8 <= limit && ip + 8 <= src.len() && m + 8 <= src.len() {
+        let a = load_u64le(src, m);
+        let b = load_u64le(src, ip);
+        if a != b {
+            return ((a ^ b).trailing_zeros() as usize) >> 3;
+        }
+        8 + count_match(src, m + 8, ip + 8, limit)
+    } else {
+        count_match(src, m, ip, limit)
+    }
 }
 
 fn count_match(src: &[u8], m: usize, ip: usize, limit: usize) -> usize {
