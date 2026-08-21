@@ -415,8 +415,7 @@ pub(crate) struct MatchTables {
     opt_price: Vec<u32>,
     opt_prev: Vec<u32>,
 
-    opt_off: Vec<u32>,
-    opt_ml: Vec<u32>,
+    opt_om: Vec<u64>,
     /// GATE 6 @ L3: share of DFast positions where C's `_search_next_long`
     /// probe at `ip+1` actually BEAT the short-hash candidate, measured on the
     /// PREVIOUS block. Same self-calibrating shape as `rep_yield`: the probe
@@ -649,8 +648,7 @@ impl MatchTables {
             opt_ops: Vec::new(),
             opt_price: Vec::new(),
             opt_prev: Vec::new(),
-            opt_off: Vec::new(),
-            opt_ml: Vec::new(),
+            opt_om: Vec::new(),
             rep_run: 0,
             next_long_yield: 1.0,
             nl_off_worse: 0.0,
@@ -2116,7 +2114,7 @@ pub(crate) fn prime_tables(
         };
         let prime_attempts =
             bt_depth_apply(search_attempts(pparams), pparams, tables.opt_rep_rate);
-        let btf = bt_resolve(tables.hash_log, pparams.chain_log.min(24));
+        let btf = bt_resolve::<false>(tables.hash_log, pparams.chain_log.min(24));
         // EXTENT: the tree only over the most recent slice; heads below it.
         let ext = prime_bt_extent();
         let range = ilimit.saturating_sub(from);
@@ -8843,7 +8841,7 @@ fn bt_find_best(
 ) -> (usize, usize) {
     macro_rules! go {
         ($h:expr, $c:expr) => {
-            bt_find_best_impl::<$h, $c>(
+            bt_find_best_impl::<$h, $c, true>(
                 attempts,
                 src,
                 ip,
@@ -8932,6 +8930,7 @@ fn bt_find_best(
     // depend on, and the size axis was never varied.
     if !bt_spec_enabled() {
         return bt_find_best_runtime(
+            true,
             attempts,
             src,
             ip,
@@ -8948,6 +8947,7 @@ fn bt_find_best(
             match (tables.hash_log, params.chain_log.min(24)) {
                 $( ($h, $c) => go!($h, $c), )*
                 _ => bt_find_best_runtime(
+                    true,
                     attempts,
                     src,
                     ip,
@@ -8982,15 +8982,30 @@ type BtFn = fn(
     &mut MatchTables,
 ) -> (usize, usize);
 
-fn bt_resolve(hash_log: u32, chain_log: u32) -> BtFn {
+fn bt_rt_search(
+    a: usize, s: &[u8], i: usize, bs: usize, be: usize, w: usize, m: usize,
+    c: u32, t: &mut MatchTables,
+) -> (usize, usize) {
+    bt_find_best_runtime(true, a, s, i, bs, be, w, m, c, t)
+}
+
+fn bt_rt_insert(
+    a: usize, s: &[u8], i: usize, bs: usize, be: usize, w: usize, m: usize,
+    c: u32, t: &mut MatchTables,
+) -> (usize, usize) {
+    bt_find_best_runtime(false, a, s, i, bs, be, w, m, c, t)
+}
+
+fn bt_resolve<const SEARCH: bool>(hash_log: u32, chain_log: u32) -> BtFn {
+    let rt: BtFn = if SEARCH { bt_rt_search } else { bt_rt_insert };
     if !bt_spec_enabled() {
-        return bt_find_best_runtime;
+        return rt;
     }
     macro_rules! bt_spec_resolve {
         ($( ($h:literal, $c:literal) )*) => {
             match (hash_log, chain_log) {
-                $( ($h, $c) => bt_find_best_impl::<$h, $c>, )*
-                _ => bt_find_best_runtime,
+                $( ($h, $c) => bt_find_best_impl::<$h, $c, SEARCH>, )*
+                _ => rt,
             }
         };
     }
@@ -9013,7 +9028,7 @@ fn bt_resolve(hash_log: u32, chain_log: u32) -> BtFn {
 /// Byte-identical by construction: HLOG and CLOG take the values the runtime
 /// variables already held.
 #[inline(never)]
-fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
+fn bt_find_best_impl<const HLOG: u32, const CLOG: u32, const SEARCH: bool>(
     // Caller-hoisted once per block: `bt_depth_apply(search_attempts(..))`
     // reads an arm atomic, and this runs per position, per look-ahead step,
     // AND per fill insert (61.9% of all tree work at L13-L15).
@@ -9202,7 +9217,13 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
         // offset_ok and the frame_start floor are GUARANTEED by the node
         // validity above (m >= win_low => ip - m <= window; m >= bt_lowest >=
         // frame_start); re-checking per node was pure redundancy.
-        if ml >= mls && ml > best_ml {
+        //
+        // INSERT-ONLY copies (SEARCH = false) serve the three callers that
+        // DISCARD the return -- both fills (61.9% of all tree work at
+        // L13-L15) and the priming pass. The descent and every tree write
+        // are identical (the bt walk has NO best_ml-dependent break), so
+        // skipping the tracking is byte-identical for a discarded result.
+        if SEARCH && ml >= mls && ml > best_ml {
             best_ml = ml;
             best_m = m;
         }
@@ -9246,6 +9267,7 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
 
 #[inline(never)]
 fn bt_find_best_runtime(
+    search: bool,
     attempts: usize,
     src: &[u8],
     ip: usize,
@@ -9429,7 +9451,7 @@ fn bt_find_best_runtime(
         // offset_ok and the frame_start floor are GUARANTEED by the node
         // validity above (m >= win_low => ip - m <= window; m >= bt_lowest >=
         // frame_start); re-checking per node was pure redundancy.
-        if ml >= mls && ml > best_ml {
+        if search && ml >= mls && ml > best_ml {
             best_ml = ml;
             best_m = m;
         }
@@ -9520,7 +9542,8 @@ fn find_bt_lazy(
     // match.
     let attempts = bt_depth_apply(search_attempts(params), params, tables.opt_rep_rate);
     let clog = params.chain_log.min(24);
-    let btf = bt_resolve(tables.hash_log, clog);
+    let btf = bt_resolve::<true>(tables.hash_log, clog);
+    let btf_ins = bt_resolve::<false>(tables.hash_log, clog);
     let fill_on = lazy_fill_enabled();
     let bt_stride = bt_fill_stride();
     let use_rep = rep_search_on(tables.rep_yield, params.strategy);
@@ -9600,7 +9623,7 @@ fn find_bt_lazy(
                 // B2: the look-ahead already inserted up to `look_hi`.
                 let mut p = (best_ip + 1).max(look_hi + 1);
                 while p < end && p <= ilimit {
-                    let _ = btf(attempts, src, p, block_start, block_end, window, mls, clog, tables);
+                    let _ = btf_ins(attempts, src, p, block_start, block_end, window, mls, clog, tables);
                     p += stride;
                 }
             }
@@ -9938,8 +9961,10 @@ fn find_opt(
     // them per block. See `MatchTables::opt_price`.
     let mut price = std::mem::take(&mut tables.opt_price);
     let mut prev = std::mem::take(&mut tables.opt_prev);
-    let mut match_off = std::mem::take(&mut tables.opt_off);
-    let mut match_ml = std::mem::take(&mut tables.opt_ml);
+    // off and ml live in ONE u64 (off | ml << 32): one store per edge
+    // improvement and one load per parse step instead of two of each, and
+    // one scratch array fewer.
+    let mut match_om = std::mem::take(&mut tables.opt_om);
     reset_to(&mut price, n + 1, inf);
     // The other four arrays are NEVER read before written: every position j
     // in 1..=n is reachable through the literal chain (price[0] = 0 and the
@@ -9954,8 +9979,7 @@ fn find_opt(
     // improvement, one load per parse step).
     const OPT_MATCH_BIT: u32 = 1 << 31;
     ensure_len(&mut prev, n + 1, 0u32);
-    ensure_len(&mut match_off, n + 1, 0u32);
-    ensure_len(&mut match_ml, n + 1, 0u32);
+    ensure_len(&mut match_om, n + 1, 0u64);
     price[0] = 0;
     // BRICK 75: offer the REPCODE as a DP candidate (find_opt was the last
     // finder without repcode search).
@@ -9970,7 +9994,8 @@ fn find_opt(
     // per DP position here.
     let bt_attempts = bt_depth_apply(search_attempts(params), params, tables.opt_rep_rate);
     let clog = params.chain_log.min(24);
-    let btf = bt_resolve(tables.hash_log, clog);
+    let btf = bt_resolve::<true>(tables.hash_log, clog);
+    let btf_ins = bt_resolve::<false>(tables.hash_log, clog);
     let extra = match params.strategy {
         Strategy::BtUltra2 => 2u32,
         Strategy::BtUltra => 1,
@@ -10109,8 +10134,8 @@ fn find_opt(
                         if np < *price.get_unchecked(j) {
                             *price.get_unchecked_mut(j) = np;
                             *prev.get_unchecked_mut(j) = (i + 1) as u32 | OPT_MATCH_BIT;
-                            *match_off.get_unchecked_mut(j) = rep1 as u32;
-                            *match_ml.get_unchecked_mut(j) = rml as u32;
+                            *match_om.get_unchecked_mut(j) =
+                                rep1 as u64 | ((rml as u64) << 32);
                         }
                     }
                 }
@@ -10175,8 +10200,8 @@ fn find_opt(
                 if np < *price.get_unchecked(j) {
                     *price.get_unchecked_mut(j) = np;
                     *prev.get_unchecked_mut(j) = i as u32 | OPT_MATCH_BIT;
-                    *match_off.get_unchecked_mut(j) = (ip - bm) as u32;
-                    *match_ml.get_unchecked_mut(j) = len as u32;
+                    *match_om.get_unchecked_mut(j) =
+                        (ip - bm) as u64 | ((len as u64) << 32);
                 }
             }
             if len == bml {
@@ -10251,8 +10276,9 @@ fn find_opt(
                     if qp + 8 > block_end {
                         break;
                     }
-                    let _ =
-                        btf(bt_attempts, src, qp, block_start, block_end, window, mls, clog, tables);
+                    let _ = btf_ins(
+                        bt_attempts, src, qp, block_start, block_end, window, mls, clog, tables,
+                    );
                     #[cfg(feature = "profile")]
                     OPT_FILL_INS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     q += step;
@@ -10263,13 +10289,12 @@ fn find_opt(
         }
         i += 1;
     }
-    if price[n] >= inf {
-        tables.opt_price = price;
-        tables.opt_prev = prev;
-        tables.opt_off = match_off;
-        tables.opt_ml = match_ml;
-        return find_bt_lazy(src, block_start, block_end, window, params, tables, 2, reps);
-    }
+    // price[n] < inf is PROVEN: every position is reachable through the
+    // literal chain (price[0] = 0, the literal edge runs first at every
+    // priced i), and a sufficient_len jump prices its own endpoint (the
+    // length loop always includes len == bml). The old fallback to
+    // find_bt_lazy was unreachable.
+    debug_assert!(price[n] < inf);
     // GATE 6, one layer under the payload buffer: `ops` had the SAME defect,
     // and a much larger one.
     //
@@ -10322,7 +10347,11 @@ fn find_opt(
     //
     // Exact-fit is then strictly better than the upper bound -- same zero
     // copies, and it asks for what the parse actually uses.
-    if opt_ops_exact() {
+    // `k <= n`, so a capacity of n + 1 is PROOF the buffer cannot grow --
+    // and the frame-kept scratch converges there after the first blocks. The
+    // pre-walk (an O(steps) pointer chase over `prev`) then sizes nothing:
+    // it ran on EVERY block anyway. Skip it when capacity is the proof.
+    if opt_ops_exact() && ops.capacity() <= n {
         let mut k = 0usize;
         let mut j = n;
         // j <= n along the whole chain (prev entries are indices the DP
@@ -10360,13 +10389,8 @@ fn find_opt(
     while i > 0 {
         debug_assert!(i < prev.len());
         #[allow(unsafe_code)]
-        let (pr, off, ml) = unsafe {
-            (
-                *prev.get_unchecked(i),
-                *match_off.get_unchecked(i),
-                *match_ml.get_unchecked(i),
-            )
-        };
+        let (pr, om) = unsafe { (*prev.get_unchecked(i), *match_om.get_unchecked(i)) };
+        let (off, ml) = (om as u32, (om >> 32) as u32);
         let p = (pr & !OPT_MATCH_BIT) as usize;
         let m = pr & OPT_MATCH_BIT != 0;
         if m {
@@ -10493,8 +10517,7 @@ fn find_opt(
     tables.opt_ops = ops;
     tables.opt_price = price;
     tables.opt_prev = prev;
-    tables.opt_off = match_off;
-    tables.opt_ml = match_ml;
+    tables.opt_om = match_om;
     (seqs, lits)
 }
 
