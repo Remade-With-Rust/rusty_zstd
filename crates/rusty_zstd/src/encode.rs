@@ -5570,7 +5570,7 @@ fn try_rep1(src: &[u8], ip: usize, rep1: usize, lowest: usize, block_end: usize)
     if load_u32le(src, back) != load_u32le(src, at) {
         return None;
     }
-    Some(4 + count_match(src, back + 4, at + 4, block_end))
+    Some(4 + count_match_fast(src, back + 4, at + 4, block_end))
 }
 
 /// Base probe step for the Fast strategy when `target_length == 0`.
@@ -7858,12 +7858,13 @@ fn find_greedy(
         let mut best_ml = 0usize;
         if let Some(mut m) = prev {
             let mut mtag = head_tag;
-            if ip + mls <= src.len() {
+            // See `chain_find_best`: the three per-step validity tests fold
+            // to one monotone bound; `m >= ip` is entry-only.
+            let low = lowest_rep.max(ip.saturating_sub(window));
+            if m < ip && ip + mls <= src.len() {
                 let mut missed_before = false;
                 for _ in 0..attempts {
-                    // See `chain_find_best`: validity breaks, byte mismatches
-                    // step (walk-continue arm) or break (legacy).
-                    if m >= ip || ip - m > window || m < lowest_rep {
+                    if m < low {
                         break;
                     }
                     // Link-tag reject: the tag rode in on the load that
@@ -8056,12 +8057,16 @@ fn chain_find_best(
     };
     let mut mtag = head_tag;
     let lowest = block_start.saturating_sub(window).max(tables.frame_start);
+    // The walk's THREE per-step validity tests fold to ONE: `m >= ip` can
+    // only fire on ENTRY (afterwards m strictly decreases below ip), and the
+    // window and lowest checks are both lower bounds on m, merged into a
+    // per-walk constant. `ip - m > window  <=>  m < ip - window` for m < ip.
+    let low = lowest.max(ip.saturating_sub(window));
     let mut missed_before = false;
-    if ip + mls <= src.len() {
+    if m < ip && ip + mls <= src.len() {
         for _ in 0..attempts {
-            // Validity is monotone along the chain (m strictly decreases), so
-            // a failure here correctly ends the walk.
-            if m >= ip || ip - m > window || m < lowest {
+            // Monotone: m only decreases, so one bound test per step.
+            if m < low {
                 break;
             }
             // Link-tag reject: skip `mls_eq`'s src[m] load on a tag byte the
@@ -8103,11 +8108,11 @@ fn chain_find_best(
                     // restarting at 0 re-compared the first word of every
                     // candidate (the fast_probe_wide rule, applied here).
                     let ml = mls + count_match_fast(src, m + mls, ip + mls, block_end);
-                    if ml >= mls
-                        && ml > best_ml
-                        && offset_ok(ip - m, window)
-                        && m >= tables.frame_start
-                    {
+                    // offset_ok and the frame_start floor are GUARANTEED by
+                    // the walk bound (m >= low >= lowest >= frame_start,
+                    // m >= ip - window, m < ip); re-checking per accept was
+                    // pure redundancy.
+                    if ml >= mls && ml > best_ml {
                         if missed_before {
                             if best_ml == 0 {
                                 cls.0 += 1;
