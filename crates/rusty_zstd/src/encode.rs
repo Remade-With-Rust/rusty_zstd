@@ -2117,6 +2117,7 @@ pub(crate) fn prime_tables(
         };
         let prime_attempts =
             bt_depth_apply(search_attempts(pparams), pparams, tables.opt_rep_rate);
+        let btf = bt_resolve(tables.hash_log, pparams.chain_log.min(24));
         // EXTENT: the tree only over the most recent slice; heads below it.
         let ext = prime_bt_extent();
         let range = ilimit.saturating_sub(from);
@@ -2137,15 +2138,15 @@ pub(crate) fn prime_tables(
             p += stride;
         }
         while p <= ilimit && p + 8 <= src.len() {
-            let _ = bt_find_best(
+            let _ = btf(
+                prime_attempts,
                 src,
                 p,
                 payload_off,
                 payload_off,
                 window,
                 mls,
-                prime_attempts,
-                pparams,
+                pparams.chain_log.min(24),
                 tables,
             );
             iters += 1;
@@ -8076,7 +8077,6 @@ fn chain_find_best<const MLS: usize>(
     // Block-local (first-find, upgrade) accept counters past a collision --
     // the walk gate's own dispatch signal. Plain integers, never atomics.
     cls: &mut (u32, u32),
-    params: CompressionParameters,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
     // BRICK 52, COMPLETED: the AUTHORITATIVE clamped value, never `params`.
@@ -8370,8 +8370,7 @@ fn find_lazy_impl<const MLS: usize>(
         }
         searches += 1;
         let (mut best_m, mut best_ml) = chain_find_best::<MLS>(
-            src, ip, block_start, block_end, window, mls, attempts, walk_cont, &mut wcls, params,
-            tables,
+            src, ip, block_start, block_end, window, mls, attempts, walk_cont, &mut wcls, tables,
         );
         let mut best_ip = ip;
         let mut look_hi = ip; // PROBE: highest position the look-ahead inserted
@@ -8392,7 +8391,6 @@ fn find_lazy_impl<const MLS: usize>(
                     attempts,
                     walk_cont,
                     &mut wcls,
-                    params,
                     tables,
                 );
                 let take = if gain_cmp {
@@ -8826,6 +8824,7 @@ macro_rules! bt_spec_pairs_const {
 bt_spec_list!(bt_spec_pairs_const);
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn bt_find_best(
     src: &[u8],
     ip: usize,
@@ -8840,7 +8839,15 @@ fn bt_find_best(
     macro_rules! go {
         ($h:expr, $c:expr) => {
             bt_find_best_impl::<$h, $c>(
-                attempts, src, ip, block_start, block_end, window, mls, params, tables,
+                attempts,
+                src,
+                ip,
+                block_start,
+                block_end,
+                window,
+                mls,
+                params.chain_log.min(24),
+                tables,
             )
         };
     }
@@ -8919,19 +8926,70 @@ fn bt_find_best(
     // derived parameters must be proven across every axis those parameters
     // depend on, and the size axis was never varied.
     if !bt_spec_enabled() {
-        return bt_find_best_runtime(attempts, src, ip, block_start, block_end, window, mls, params, tables);
+        return bt_find_best_runtime(
+            attempts,
+            src,
+            ip,
+            block_start,
+            block_end,
+            window,
+            mls,
+            params.chain_log.min(24),
+            tables,
+        );
     }
     macro_rules! bt_spec_dispatch {
         ($( ($h:literal, $c:literal) )*) => {
             match (tables.hash_log, params.chain_log.min(24)) {
                 $( ($h, $c) => go!($h, $c), )*
                 _ => bt_find_best_runtime(
-                    attempts, src, ip, block_start, block_end, window, mls, params, tables,
+                    attempts,
+                    src,
+                    ip,
+                    block_start,
+                    block_end,
+                    window,
+                    mls,
+                    params.chain_log.min(24),
+                    tables,
                 ),
             }
         };
     }
     bt_spec_list!(bt_spec_dispatch)
+}
+
+/// The dispatch, RESOLVED ONCE PER BLOCK: `(hash_log, chain_log)` is
+/// loop-invariant in every caller, yet `bt_find_best` re-ran a jump-table
+/// dispatch (plus re-reading both fields) on every call -- per position,
+/// per look-ahead, per fill insert and per DP edge. Callers hoist a fn
+/// pointer instead; one predictable indirect call replaces the dance.
+/// Same arms, same runtime fallback, same bt_spec parity gate.
+type BtFn = fn(
+    usize,
+    &[u8],
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    u32,
+    &mut MatchTables,
+) -> (usize, usize);
+
+fn bt_resolve(hash_log: u32, chain_log: u32) -> BtFn {
+    if !bt_spec_enabled() {
+        return bt_find_best_runtime;
+    }
+    macro_rules! bt_spec_resolve {
+        ($( ($h:literal, $c:literal) )*) => {
+            match (hash_log, chain_log) {
+                $( ($h, $c) => bt_find_best_impl::<$h, $c>, )*
+                _ => bt_find_best_runtime,
+            }
+        };
+    }
+    bt_spec_list!(bt_spec_resolve)
 }
 
 /// GATE 4/5 EXTENDED TO THE BT PATH (L13-L22).
@@ -8961,7 +9019,10 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
     block_end: usize,
     window: usize,
     mls: usize,
-    params: CompressionParameters,
+    // The runtime arm's chain_log; the spec impls take CLOG and ignore it.
+    // This slot replaces a ~40-byte CompressionParameters BY-VALUE copy per
+    // call that the compiler itself flagged unused in the spec bodies.
+    chain_log: u32,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
     // Diagnostic ONLY -- gated. Unguarded this was one atomic read-modify-write
@@ -8973,6 +9034,7 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
         BT_SPEC_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     const fn btlog(c: u32) -> u32 { let c = if c > 24 { 24 } else { c }; let c = c.saturating_sub(1); if c < 1 { 1 } else { c } }
+    let _ = chain_log;
     let bt_log = btlog(CLOG);
     let bt_mask = (1usize << bt_log) - 1;
     // T2: guard the WORST CASE, not this `ip`.
@@ -9006,6 +9068,10 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
     // ~30M times per level across the corpus. The `tables.chain[..]` writes in
     // this same loop are what stop LLVM proving `frame_start` cannot change.
     let bt_lowest = block_start.saturating_sub(window).max(tables.frame_start);
+    // Hoisted: the per-node window test `ip - m > window` is `m < ip - window`
+    // (m < ip is tested first), one cmp against a per-call constant instead
+    // of sub+cmp per node.
+    let win_low = ip.saturating_sub(window);
     // GATE 14 DISPATCH -- the chain-walk depth.
     //
     // 4.33's "82-84% of walks end by exhausting `attempts`" is REFUTED and this
@@ -9046,7 +9112,7 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
             tables.chain_set(larger, 0);
             break;
         };
-        if m >= ip || ip - m > window {
+        if m >= ip || m < win_low {
             tables.chain_set(smaller, 0);
             tables.chain_set(larger, 0);
             break;
@@ -9054,10 +9120,11 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
         if m < bt_lowest {
             break;
         }
+        // The T2 ENTRY guard already proves the worst case:
+        // bt_idx + 1 <= (bt_mask << 1) | 1 < chain.len(). The per-node
+        // re-check it replaced had survived it as a dead branch.
         let bt_idx = (m & bt_mask) << 1;
-        if bt_idx + 1 >= tables.chain.len() {
-            break;
-        }
+        debug_assert!(bt_idx + 1 < tables.chain.len());
         if COUNT {
             probes += 1;
         }
@@ -9086,7 +9153,36 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
         // sort invariant only with C's full insert discipline; counting
         // from it here emitted matches longer than the data. The from-zero
         // count is load-bearing -- it is the tree's validity check.
-        let ml = count_match(src, m, ip, block_end);
+        // The count head OPEN-CODED (count_match_fast's shape) because the
+        // descent bytes ride in it: on a first-word mismatch, mb and ib are
+        // bytes OF the two words already in registers -- the separate
+        // `src.get(m + ml)` / `src.get(ip + ml)` loads and their two bounds
+        // branches vanish for that (majority) case. Value-exact: in the head
+        // case m + ml < m + 8 <= src.len(), so get() returns exactly the
+        // byte the word holds; the long path keeps the get()-based loads
+        // (bytes BEYOND block_end legitimately participate in routing).
+        let (ml, mb, ib) = if ip + 8 <= block_end && ip + 8 <= src.len() && m + 8 <= src.len() {
+            let a = load_u64le(src, m);
+            let b = load_u64le(src, ip);
+            if a != b {
+                let ml = ((a ^ b).trailing_zeros() as usize) >> 3;
+                (ml, (a >> (8 * ml)) as u8, (b >> (8 * ml)) as u8)
+            } else {
+                let ml = 8 + count_match(src, m + 8, ip + 8, block_end);
+                (
+                    ml,
+                    src.get(m + ml).copied().unwrap_or(0),
+                    src.get(ip + ml).copied().unwrap_or(0),
+                )
+            }
+        } else {
+            let ml = count_match(src, m, ip, block_end);
+            (
+                ml,
+                src.get(m + ml).copied().unwrap_or(0),
+                src.get(ip + ml).copied().unwrap_or(0),
+            )
+        };
         #[cfg(feature = "profile")]
         {
             BT_PROBE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -9097,12 +9193,13 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
                 BT_NOGAIN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
-        if ml >= mls && ml > best_ml && offset_ok(ip - m, window) && m >= tables.frame_start {
+        // offset_ok and the frame_start floor are GUARANTEED by the node
+        // validity above (m >= win_low => ip - m <= window; m >= bt_lowest >=
+        // frame_start); re-checking per node was pure redundancy.
+        if ml >= mls && ml > best_ml {
             best_ml = ml;
             best_m = m;
         }
-        let mb = src.get(m + ml).copied().unwrap_or(0);
-        let ib = src.get(ip + ml).copied().unwrap_or(0);
         if mb < ib {
             tables.chain_set(smaller, m as u32);
             // BYTE-IDENTICAL: if the store above targeted the slot we
@@ -9117,9 +9214,9 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
             larger = bt_idx;
             match_idx = if v == 0 { None } else { Some(v as usize) };
         }
-        if smaller >= tables.chain.len() || larger >= tables.chain.len() {
-            break;
-        }
+        // smaller/larger are bt_idx or bt_idx + 1: covered by the entry
+        // guard, same as above.
+        debug_assert!(smaller < tables.chain.len() && larger < tables.chain.len());
     }
     // Consumers are the g14/btdepth gate harnesses only; unguarded this was
     // THREE lock-prefixed RMWs per walk -- per POSITION across L13-L22 (the
@@ -9150,7 +9247,10 @@ fn bt_find_best_runtime(
     block_end: usize,
     window: usize,
     mls: usize,
-    params: CompressionParameters,
+    // The runtime arm's chain_log; the spec impls take CLOG and ignore it.
+    // This slot replaces a ~40-byte CompressionParameters BY-VALUE copy per
+    // call that the compiler itself flagged unused in the spec bodies.
+    chain_log: u32,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
     // Diagnostic ONLY -- gated. Unguarded this was one atomic read-modify-write
@@ -9162,7 +9262,7 @@ fn bt_find_best_runtime(
         BT_RUNTIME_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     let hash_log = tables.hash_log;
-    let bt_log = params.chain_log.min(24).saturating_sub(1).max(1);
+    let bt_log = chain_log.min(24).saturating_sub(1).max(1);
     let bt_mask = (1usize << bt_log) - 1;
     // T2: guard the WORST CASE, not this `ip`.
     //
@@ -9195,6 +9295,10 @@ fn bt_find_best_runtime(
     // ~30M times per level across the corpus. The `tables.chain[..]` writes in
     // this same loop are what stop LLVM proving `frame_start` cannot change.
     let bt_lowest = block_start.saturating_sub(window).max(tables.frame_start);
+    // Hoisted: the per-node window test `ip - m > window` is `m < ip - window`
+    // (m < ip is tested first), one cmp against a per-call constant instead
+    // of sub+cmp per node.
+    let win_low = ip.saturating_sub(window);
     // GATE 14 DISPATCH -- the chain-walk depth.
     //
     // 4.33's "82-84% of walks end by exhausting `attempts`" is REFUTED and this
@@ -9235,7 +9339,7 @@ fn bt_find_best_runtime(
             tables.chain_set(larger, 0);
             break;
         };
-        if m >= ip || ip - m > window {
+        if m >= ip || m < win_low {
             tables.chain_set(smaller, 0);
             tables.chain_set(larger, 0);
             break;
@@ -9243,10 +9347,11 @@ fn bt_find_best_runtime(
         if m < bt_lowest {
             break;
         }
+        // The T2 ENTRY guard already proves the worst case:
+        // bt_idx + 1 <= (bt_mask << 1) | 1 < chain.len(). The per-node
+        // re-check it replaced had survived it as a dead branch.
         let bt_idx = (m & bt_mask) << 1;
-        if bt_idx + 1 >= tables.chain.len() {
-            break;
-        }
+        debug_assert!(bt_idx + 1 < tables.chain.len());
         if COUNT {
             probes += 1;
         }
@@ -9275,7 +9380,36 @@ fn bt_find_best_runtime(
         // sort invariant only with C's full insert discipline; counting
         // from it here emitted matches longer than the data. The from-zero
         // count is load-bearing -- it is the tree's validity check.
-        let ml = count_match(src, m, ip, block_end);
+        // The count head OPEN-CODED (count_match_fast's shape) because the
+        // descent bytes ride in it: on a first-word mismatch, mb and ib are
+        // bytes OF the two words already in registers -- the separate
+        // `src.get(m + ml)` / `src.get(ip + ml)` loads and their two bounds
+        // branches vanish for that (majority) case. Value-exact: in the head
+        // case m + ml < m + 8 <= src.len(), so get() returns exactly the
+        // byte the word holds; the long path keeps the get()-based loads
+        // (bytes BEYOND block_end legitimately participate in routing).
+        let (ml, mb, ib) = if ip + 8 <= block_end && ip + 8 <= src.len() && m + 8 <= src.len() {
+            let a = load_u64le(src, m);
+            let b = load_u64le(src, ip);
+            if a != b {
+                let ml = ((a ^ b).trailing_zeros() as usize) >> 3;
+                (ml, (a >> (8 * ml)) as u8, (b >> (8 * ml)) as u8)
+            } else {
+                let ml = 8 + count_match(src, m + 8, ip + 8, block_end);
+                (
+                    ml,
+                    src.get(m + ml).copied().unwrap_or(0),
+                    src.get(ip + ml).copied().unwrap_or(0),
+                )
+            }
+        } else {
+            let ml = count_match(src, m, ip, block_end);
+            (
+                ml,
+                src.get(m + ml).copied().unwrap_or(0),
+                src.get(ip + ml).copied().unwrap_or(0),
+            )
+        };
         #[cfg(feature = "profile")]
         {
             BT_PROBE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -9286,12 +9420,13 @@ fn bt_find_best_runtime(
                 BT_NOGAIN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
-        if ml >= mls && ml > best_ml && offset_ok(ip - m, window) && m >= tables.frame_start {
+        // offset_ok and the frame_start floor are GUARANTEED by the node
+        // validity above (m >= win_low => ip - m <= window; m >= bt_lowest >=
+        // frame_start); re-checking per node was pure redundancy.
+        if ml >= mls && ml > best_ml {
             best_ml = ml;
             best_m = m;
         }
-        let mb = src.get(m + ml).copied().unwrap_or(0);
-        let ib = src.get(ip + ml).copied().unwrap_or(0);
         if mb < ib {
             tables.chain_set(smaller, m as u32);
             // BYTE-IDENTICAL: if the store above targeted the slot we
@@ -9306,9 +9441,9 @@ fn bt_find_best_runtime(
             larger = bt_idx;
             match_idx = if v == 0 { None } else { Some(v as usize) };
         }
-        if smaller >= tables.chain.len() || larger >= tables.chain.len() {
-            break;
-        }
+        // smaller/larger are bt_idx or bt_idx + 1: covered by the entry
+        // guard, same as above.
+        debug_assert!(smaller < tables.chain.len() && larger < tables.chain.len());
     }
     // Consumers are the g14/btdepth gate harnesses only; unguarded this was
     // THREE lock-prefixed RMWs per walk -- per POSITION across L13-L22 (the
@@ -9378,6 +9513,8 @@ fn find_bt_lazy(
     // position, per look-ahead AND per fill insert; the fill arms ran per
     // match.
     let attempts = bt_depth_apply(search_attempts(params), params, tables.opt_rep_rate);
+    let clog = params.chain_log.min(24);
+    let btf = bt_resolve(tables.hash_log, clog);
     let fill_on = lazy_fill_enabled();
     let bt_stride = bt_fill_stride();
     let use_rep = rep_search_on(tables.rep_yield, params.strategy);
@@ -9402,7 +9539,7 @@ fn find_bt_lazy(
             }
         }
         let (mut best_m, mut best_ml) =
-            bt_find_best(src, ip, block_start, block_end, window, mls, attempts, params, tables);
+            btf(attempts, src, ip, block_start, block_end, window, mls, clog, tables);
         let mut best_ip = ip;
         let mut look_hi = ip;
         if best_ml >= mls {
@@ -9412,17 +9549,8 @@ fn find_bt_lazy(
                     break;
                 }
                 look_hi = ip2;
-                let (m, ml) = bt_find_best(
-                    src,
-                    ip2,
-                    block_start,
-                    block_end,
-                    window,
-                    mls,
-                    attempts,
-                    params,
-                    tables,
-                );
+                let (m, ml) =
+                    btf(attempts, src, ip2, block_start, block_end, window, mls, clog, tables);
                 if ml > best_ml {
                     best_ml = ml;
                     best_m = m;
@@ -9466,9 +9594,7 @@ fn find_bt_lazy(
                 // B2: the look-ahead already inserted up to `look_hi`.
                 let mut p = (best_ip + 1).max(look_hi + 1);
                 while p < end && p <= ilimit {
-                    let _ = bt_find_best(
-                        src, p, block_start, block_end, window, mls, attempts, params, tables,
-                    );
+                    let _ = btf(attempts, src, p, block_start, block_end, window, mls, clog, tables);
                     p += stride;
                 }
             }
@@ -9825,6 +9951,8 @@ fn find_opt(
     // Hoisted once per block (the chain_find_best rule): bt_find_best runs
     // per DP position here.
     let bt_attempts = bt_depth_apply(search_attempts(params), params, tables.opt_rep_rate);
+    let clog = params.chain_log.min(24);
+    let btf = bt_resolve(tables.hash_log, clog);
     let extra = match params.strategy {
         Strategy::BtUltra2 => 2u32,
         Strategy::BtUltra => 1,
@@ -9958,9 +10086,8 @@ fn find_opt(
                 }
             }
         }
-        let (bm, bml) = bt_find_best(
-            src, ip, block_start, block_end, window, mls, bt_attempts, params, tables,
-        );
+        let (bm, bml) =
+            btf(bt_attempts, src, ip, block_start, block_end, window, mls, clog, tables);
         o_bt_calls += 1;
         if bml < mls {
             o_bt_dry += 1;
@@ -10093,9 +10220,8 @@ fn find_opt(
                     if qp + 8 > block_end {
                         break;
                     }
-                    let _ = bt_find_best(
-                        src, qp, block_start, block_end, window, mls, bt_attempts, params, tables,
-                    );
+                    let _ =
+                        btf(bt_attempts, src, qp, block_start, block_end, window, mls, clog, tables);
                     #[cfg(feature = "profile")]
                     OPT_FILL_INS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     q += step;
