@@ -8431,7 +8431,89 @@ fn find_greedy_impl<const MLS: usize>(
 // -> 1,753 (two inlined copies) with unknowable spill delta -- there is no
 // deterministic executed-instruction receipt for an inlining decision, and
 // brick 48 chose OUTLINING for exactly this shape. The call overhead stays.
+// Brick 48 REVISITED under the twin architecture: outlining is PRESERVED
+// (both arms carry #[inline(never)]), and the ISA choice moves to the caller
+// as a per-block `ChainFn` pointer -- the BtFn precedent. The plain arm's
+// work is unchanged; the twin arm compiles the same body with BMI2.
+type ChainFn = fn(
+    &[u8],
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    bool,
+    &mut (u32, u32),
+    &mut MatchTables,
+) -> (usize, usize);
+
+#[inline(never)]
 fn chain_find_best<const MLS: usize>(
+    src: &[u8],
+    ip: usize,
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    mls: usize,
+    attempts: usize,
+    walk_cont: bool,
+    cls: &mut (u32, u32),
+    tables: &mut MatchTables,
+) -> (usize, usize) {
+    chain_find_best_inner::<MLS>(
+        src, ip, block_start, block_end, window, mls, attempts, walk_cont, cls, tables,
+    )
+}
+
+/// Safe `ChainFn`-shaped wrapper; handed out only behind `has_bmi2()`.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+fn chain_find_best_bmi2_ptr<const MLS: usize>(
+    src: &[u8],
+    ip: usize,
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    mls: usize,
+    attempts: usize,
+    walk_cont: bool,
+    cls: &mut (u32, u32),
+    tables: &mut MatchTables,
+) -> (usize, usize) {
+    // SAFETY: only selected under the caller's CPUID guard.
+    #[allow(unsafe_code)]
+    unsafe {
+        chain_find_best_bmi2::<MLS>(
+            src, ip, block_start, block_end, window, mls, attempts, walk_cont, cls, tables,
+        )
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_code)]
+#[inline(never)]
+unsafe fn chain_find_best_bmi2<const MLS: usize>(
+    src: &[u8],
+    ip: usize,
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    mls: usize,
+    attempts: usize,
+    walk_cont: bool,
+    cls: &mut (u32, u32),
+    tables: &mut MatchTables,
+) -> (usize, usize) {
+    chain_find_best_inner::<MLS>(
+        src, ip, block_start, block_end, window, mls, attempts, walk_cont, cls, tables,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn chain_find_best_inner<const MLS: usize>(
     src: &[u8],
     ip: usize,
     block_start: usize,
@@ -8674,6 +8756,15 @@ fn find_lazy_impl<const MLS: usize>(
     let hash_log = tables.hash_log;
     let chain_mask = tables.chain.len() - 1;
     let attempts = search_attempts(params);
+    // Per-block ISA selection for the outlined walk (brick 48 + twin).
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    let cfb: ChainFn = if crate::simd::has_bmi2() {
+        chain_find_best_bmi2_ptr::<MLS>
+    } else {
+        chain_find_best::<MLS>
+    };
+    #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
+    let cfb: ChainFn = chain_find_best::<MLS>;
     // GATE 6 family, fourth instance: take the finder buffers from the FRAME.
     //
     // `find_fast_impl` was wired to `MatchTables::seq_scratch`/`lit_scratch`
@@ -8780,9 +8871,8 @@ fn find_lazy_impl<const MLS: usize>(
             }
         }
         searches += 1;
-        let (mut best_m, mut best_ml) = chain_find_best::<MLS>(
-            src, ip, block_start, block_end, window, mls, attempts, walk_cont, &mut wcls, tables,
-        );
+        let (mut best_m, mut best_ml) =
+            cfb(src, ip, block_start, block_end, window, mls, attempts, walk_cont, &mut wcls, tables);
         let mut best_ip = ip;
         let mut look_hi = ip; // PROBE: highest position the look-ahead inserted
         if best_ml >= mls {
@@ -8792,7 +8882,7 @@ fn find_lazy_impl<const MLS: usize>(
                     break;
                 }
                 look_hi = ip2;
-                let (m, ml) = chain_find_best::<MLS>(
+                let (m, ml) = cfb(
                     src,
                     ip2,
                     block_start,
