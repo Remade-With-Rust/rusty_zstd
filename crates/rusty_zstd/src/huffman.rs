@@ -203,6 +203,50 @@ impl HuffmanTable {
         d2: &mut [u8],
         d3: &mut [u8],
     ) -> Result<(), Error> {
+        // The seq-loop precedent (621a140): `avx2` does not imply BMI2, and
+        // this loop is made of variable shifts. The twin compiles the SAME
+        // body with shrx/shlx/bzhi available; byte-identity by construction.
+        #[cfg(all(target_arch = "x86_64", feature = "std"))]
+        if crate::simd::has_bmi2() {
+            // SAFETY: guarded by runtime CPUID; the body is identical.
+            #[allow(unsafe_code)]
+            return unsafe { self.decode_4x_bmi2(s0, s1, s2, s3, d0, d1, d2, d3) };
+        }
+        self.decode_4x_inner(s0, s1, s2, s3, d0, d1, d2, d3)
+    }
+
+    /// The BMI2-compiled twin of `decode_4x_inner`.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[target_feature(enable = "bmi2,lzcnt")]
+    #[allow(clippy::too_many_arguments)]
+    #[allow(unsafe_code)]
+    unsafe fn decode_4x_bmi2(
+        &self,
+        s0: &[u8],
+        s1: &[u8],
+        s2: &[u8],
+        s3: &[u8],
+        d0: &mut [u8],
+        d1: &mut [u8],
+        d2: &mut [u8],
+        d3: &mut [u8],
+    ) -> Result<(), Error> {
+        self.decode_4x_inner(s0, s1, s2, s3, d0, d1, d2, d3)
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn decode_4x_inner(
+        &self,
+        s0: &[u8],
+        s1: &[u8],
+        s2: &[u8],
+        s3: &[u8],
+        d0: &mut [u8],
+        d1: &mut [u8],
+        d2: &mut [u8],
+        d3: &mut [u8],
+    ) -> Result<(), Error> {
         if s0.is_empty() || s1.is_empty() || s2.is_empty() || s3.is_empty() {
             return Err(Error::Corruption);
         }
@@ -1530,9 +1574,7 @@ fn body_bytes_exact(ct: &HuffCTable, seg: &[[u32; 256]], n_streams: u32) -> Opti
 fn segment_histograms(lits: &[u8], n_streams: u32) -> Vec<[u32; 256]> {
     if n_streams != 4 {
         let mut h = [0u32; 256];
-        for &b in lits {
-            h[b as usize] += 1;
-        }
+        hist_count(lits, &mut h);
         return alloc::vec![h];
     }
     let chunk = lits.len().div_ceil(4);
@@ -1544,12 +1586,36 @@ fn segment_histograms(lits: &[u8], n_streams: u32) -> Vec<[u32; 256]> {
         } else {
             (off + chunk).min(lits.len())
         };
-        for &b in &lits[off..end] {
-            h[b as usize] += 1;
-        }
+        hist_count(&lits[off..end], h);
         off = end;
     }
     segs
+}
+
+/// C's `HIST_count_parallel` shape: a single count table serializes on the
+/// store-to-load forward of the SAME slot whenever bytes repeat -- on runs,
+/// every increment waits ~5 cycles for the previous one. Four independent
+/// sub-tables round-robin the increments so consecutive equal bytes hit
+/// different slots; the final fold is 256 adds x 3. Counts are IDENTICAL by
+/// commutativity, so this is byte-exact by construction.
+#[cfg(feature = "alloc")]
+fn hist_count(bytes: &[u8], h: &mut [u32; 256]) {
+    let mut h1 = [0u32; 256];
+    let mut h2 = [0u32; 256];
+    let mut h3 = [0u32; 256];
+    let mut it = bytes.chunks_exact(4);
+    for c in &mut it {
+        h[c[0] as usize] += 1;
+        h1[c[1] as usize] += 1;
+        h2[c[2] as usize] += 1;
+        h3[c[3] as usize] += 1;
+    }
+    for &b in it.remainder() {
+        h[b as usize] += 1;
+    }
+    for i in 0..256 {
+        h[i] += h1[i] + h2[i] + h3[i];
+    }
 }
 
 fn encode_4_streams(ct: &HuffCTable, src: &[u8]) -> Result<Vec<u8>, Error> {

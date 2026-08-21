@@ -2975,6 +2975,42 @@ fn write_sequences(
     strategy: Strategy,
     tables: &mut MatchTables,
 ) -> Result<(), Error> {
+    // The encode-side mirror of 621a140: the FSE flush loop and add_bits are
+    // variable-shift chains; the BMI2 twin compiles the same body with
+    // shrx/shlx available. Byte-identity by construction.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if crate::simd::has_bmi2() {
+        // SAFETY: guarded by runtime CPUID; the body is identical.
+        #[allow(unsafe_code)]
+        return unsafe { write_sequences_bmi2(dst, seqs, reps, entropy, strategy, tables) };
+    }
+    write_sequences_inner(dst, seqs, reps, entropy, strategy, tables)
+}
+
+/// The BMI2-compiled twin.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(unsafe_code)]
+unsafe fn write_sequences_bmi2(
+    dst: &mut Vec<u8>,
+    seqs: &[Seq],
+    reps: &mut [u32; 3],
+    entropy: &mut EntropyState,
+    strategy: Strategy,
+    tables: &mut MatchTables,
+) -> Result<(), Error> {
+    write_sequences_inner(dst, seqs, reps, entropy, strategy, tables)
+}
+
+#[inline(always)]
+fn write_sequences_inner(
+    dst: &mut Vec<u8>,
+    seqs: &[Seq],
+    reps: &mut [u32; 3],
+    entropy: &mut EntropyState,
+    strategy: Strategy,
+    tables: &mut MatchTables,
+) -> Result<(), Error> {
     write_nseq(dst, seqs.len() as u32);
     if seqs.is_empty() {
         return Ok(());
