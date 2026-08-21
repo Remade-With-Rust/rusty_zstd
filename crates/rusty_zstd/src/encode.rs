@@ -2110,6 +2110,15 @@ pub(crate) fn prime_tables(
         let prime_attempts =
             bt_depth_apply(search_attempts(pparams), pparams, tables.opt_rep_rate);
         let btf = bt_resolve::<false>(tables.hash_log, pparams.chain_log.min(24));
+        let prime_ctx = BtCtx {
+            src,
+            block_start: payload_off,
+            block_end: payload_off,
+            window,
+            mls,
+            attempts: prime_attempts,
+            chain_log: pparams.chain_log.min(24),
+        };
         // EXTENT: the tree only over the most recent slice; heads below it.
         let ext = prime_bt_extent();
         let range = ilimit.saturating_sub(from);
@@ -2130,17 +2139,7 @@ pub(crate) fn prime_tables(
             p += stride;
         }
         while p <= ilimit && p + 8 <= src.len() {
-            let _ = btf(
-                prime_attempts,
-                src,
-                p,
-                payload_off,
-                payload_off,
-                window,
-                mls,
-                pparams.chain_log.min(24),
-                tables,
-            );
+            let _ = btf(&prime_ctx, p, tables);
             iters += 1;
             p += stride;
         }
@@ -8831,143 +8830,6 @@ macro_rules! bt_spec_pairs_const {
 }
 bt_spec_list!(bt_spec_pairs_const);
 
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-fn bt_find_best(
-    src: &[u8],
-    ip: usize,
-    block_start: usize,
-    block_end: usize,
-    window: usize,
-    mls: usize,
-    attempts: usize,
-    params: CompressionParameters,
-    tables: &mut MatchTables,
-) -> (usize, usize) {
-    macro_rules! go {
-        ($h:expr, $c:expr) => {
-            bt_find_best_impl::<$h, $c, true>(
-                attempts,
-                src,
-                ip,
-                block_start,
-                block_end,
-                window,
-                mls,
-                params.chain_log.min(24),
-                tables,
-            )
-        };
-    }
-    // The (hash_log, chain_log) pairs the level table produces for the bt
-    // strategies: L13-L15 give (22,22) (23,22) (23,23); L16-L22 give (22,22)
-    // (22,23) (22,24) (23,24) (24,24). Anything else falls to the runtime arm.
-    // GATE 5: the COMPLETE set. Enumerated exhaustively over every input size
-    // 0..2^28 plus unknown-size, L13-L22 reach exactly these 12 pairs. The first
-    // cut listed only the seven LARGE-input pairs, so every small input fell
-    // through to the runtime arm and got no fold at all -- and the coverage
-    // check that "proved" 0 fallbacks used a 2 MiB file, which can only ever hit
-    // (22,24) and (24,24). A coverage proof is only as wide as its inputs.
-    // GATE 5 DISPATCH -- specialise the SHALLOW bt ladder; generic above it.
-    //
-    // THE FIRST JUSTIFICATION FOR THIS WAS INSTRUMENT ERROR. It claimed L19 lost
-    // stably on five corpora (nci +3.9..+5.6%, x-ray +5.1..+10.8%). Those
-    // numbers came from an estimator that pooled `min` across both phases of an
-    // A B B A sequence, which lets a monotonically warming box hand the win to
-    // whichever arm ran last. Measured against a TRUE NULL ARM -- the depth gate
-    // forcing identical code on both sides -- that estimator read up to +2.87%
-    // where the answer must be 0.
-    //
-    // Re-measured with a PAIRED estimator, mean of (B1-A1)/A1 and (B2-A2)/A2,
-    // which cancels monotone drift and reads ~0.1% on the same null arm:
-    //
-    //   L13 BtLazy2    spec 3, generic 0   nci -3.66%, xml -3.94%, webster -5.54%
-    //   L19 BtUltra2   spec 0, generic 0   NO SIGNAL, scatter -4.5..+0.6%
-    //
-    // So the dispatch is kept, on evidence rather than the original story: it
-    // specialises where a win is validated and takes the generic arm where
-    // nothing is measurable.
-    //
-    // Deterministically the specialisation is strictly cheaper per call (215
-    // instructions against 238, 1 variable shift against 4) and its extra code
-    // is COLD -- `hash_log` is fixed for a given input, so exactly one
-    // monomorphization ever executes and the other eleven are never entered.
-    // That is why the original I-cache argument for gating L16+ does not hold;
-    // the gate stays because no measurement supports removing it, not because
-    // the specialisation is harmful there.
-    //
-    // This is why instruction-count-per-call was the wrong measure on its own:
-    // it is correct about the call and silent about the code it adds.
-    // (An `RZSTD_BT_DEEP=1` escape hatch used to lift the depth gate so the arm
-    // could be MEASURED at L16+, because otherwise the dispatch forced generic
-    // there and any A/B was a null comparison -- which is exactly how the bogus
-    // L19 result was produced. The gate below is now lifted unconditionally, so
-    // the hatch had no caller and has been removed with its function.)
-    // GATE 8 @ L19/L22 -- DEPTH GATE LIFTED, decided DETERMINISTICALLY.
-    //
-    // The note above kept L16+ on the generic body because "no measurement
-    // supports removing it". That was never going to arrive: the L19/L22 timing
-    // instrument was measured against ITSELF -- same binary, two consecutive
-    // runs -- and disagrees by up to +43.24% (reymont), +13% on several others.
-    // It cannot resolve a per-call instruction delta, so "no signal" was a
-    // property of the stopwatch, not of the arm.
-    //
-    // Decided on the emitted assembly instead, which needs no quiet box:
-    //   specialised   225 instructions,  1 variable shift   (x12, only ONE of
-    //                                                        which ever runs)
-    //   runtime       249 instructions,  4 variable shifts
-    // 24 fewer instructions and 3 fewer variable shifts per call, on a body
-    // called ~15.7M times per level at L16-L22. `hash_log`/`chain_log` are fixed
-    // for a given input, so exactly one monomorphization executes and the other
-    // eleven are cold -- which is why the I-cache objection does not apply.
-    //
-    // Coverage was proven at ONE INPUT SIZE (the 2 MiB corpus prefix), and both
-    // `hash_log` and `chain_log` are derived from the size hint -- so the claim
-    // "runtime 0 at all ten levels" held only for 2 MiB inputs. Measured across
-    // the size axis, 24 of 64 (size, level) cells fell through to the runtime
-    // body: EVERY input at 64 KiB, 512 KiB and 1 MiB, at every bt level, ran the
-    // 249-instruction body with 4 variable shifts. Three absent pairs --
-    // (17,17), (20,20), (21,21) -- were the whole gap; with them the set covers
-    // 16 KiB through 32 MiB at L13-L22 with zero runtime calls.
-    //
-    // The lesson is the coverage PROOF, not the pairs: a dispatch keyed on
-    // derived parameters must be proven across every axis those parameters
-    // depend on, and the size axis was never varied.
-    if !bt_spec_enabled() {
-        return bt_find_best_runtime(
-            true,
-            attempts,
-            src,
-            ip,
-            block_start,
-            block_end,
-            window,
-            mls,
-            params.chain_log.min(24),
-            tables,
-        );
-    }
-    macro_rules! bt_spec_dispatch {
-        ($( ($h:literal, $c:literal) )*) => {
-            match (tables.hash_log, params.chain_log.min(24)) {
-                $( ($h, $c) => go!($h, $c), )*
-                _ => bt_find_best_runtime(
-                    true,
-                    attempts,
-                    src,
-                    ip,
-                    block_start,
-                    block_end,
-                    window,
-                    mls,
-                    params.chain_log.min(24),
-                    tables,
-                ),
-            }
-        };
-    }
-    bt_spec_list!(bt_spec_dispatch)
-}
 
 /// The dispatch, RESOLVED ONCE PER BLOCK: `(hash_log, chain_log)` is
 /// loop-invariant in every caller, yet `bt_find_best` re-ran a jump-table
@@ -8975,30 +8837,27 @@ fn bt_find_best(
 /// per look-ahead, per fill insert and per DP edge. Callers hoist a fn
 /// pointer instead; one predictable indirect call replaces the dance.
 /// Same arms, same runtime fallback, same bt_spec parity gate.
-type BtFn = fn(
-    usize,
-    &[u8],
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    u32,
-    &mut MatchTables,
-) -> (usize, usize);
-
-fn bt_rt_search(
-    a: usize, s: &[u8], i: usize, bs: usize, be: usize, w: usize, m: usize,
-    c: u32, t: &mut MatchTables,
-) -> (usize, usize) {
-    bt_find_best_runtime(true, a, s, i, bs, be, w, m, c, t)
+/// The per-block-constant arguments of every bt call, packed: the fn
+/// pointer previously re-marshaled NINE scalars per position, per
+/// look-ahead step, per fill insert and per DP edge.
+pub(crate) struct BtCtx<'a> {
+    src: &'a [u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    mls: usize,
+    attempts: usize,
+    chain_log: u32,
 }
 
-fn bt_rt_insert(
-    a: usize, s: &[u8], i: usize, bs: usize, be: usize, w: usize, m: usize,
-    c: u32, t: &mut MatchTables,
-) -> (usize, usize) {
-    bt_find_best_runtime(false, a, s, i, bs, be, w, m, c, t)
+type BtFn = for<'a> fn(&BtCtx<'a>, usize, &mut MatchTables) -> (usize, usize);
+
+fn bt_rt_search(ctx: &BtCtx, ip: usize, t: &mut MatchTables) -> (usize, usize) {
+    bt_find_best_runtime(true, ctx, ip, t)
+}
+
+fn bt_rt_insert(ctx: &BtCtx, ip: usize, t: &mut MatchTables) -> (usize, usize) {
+    bt_find_best_runtime(false, ctx, ip, t)
 }
 
 fn bt_resolve<const SEARCH: bool>(hash_log: u32, chain_log: u32) -> BtFn {
@@ -9034,22 +8893,11 @@ fn bt_resolve<const SEARCH: bool>(hash_log: u32, chain_log: u32) -> BtFn {
 /// variables already held.
 #[inline(never)]
 fn bt_find_best_impl<const HLOG: u32, const CLOG: u32, const SEARCH: bool>(
-    // Caller-hoisted once per block: `bt_depth_apply(search_attempts(..))`
-    // reads an arm atomic, and this runs per position, per look-ahead step,
-    // AND per fill insert (61.9% of all tree work at L13-L15).
-    attempts: usize,
-    src: &[u8],
+    ctx: &BtCtx,
     ip: usize,
-    block_start: usize,
-    block_end: usize,
-    window: usize,
-    mls: usize,
-    // The runtime arm's chain_log; the spec impls take CLOG and ignore it.
-    // This slot replaces a ~40-byte CompressionParameters BY-VALUE copy per
-    // call that the compiler itself flagged unused in the spec bodies.
-    chain_log: u32,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
+    let BtCtx { src, block_start, block_end, window, mls, attempts, chain_log } = *ctx;
     // Diagnostic ONLY -- gated. Unguarded this was one atomic read-modify-write
     // per `bt_find_best` CALL, i.e. per POSITION across the whole L13-L22
     // ladder (~15.7M per level per corpus set). Same defect class as the two
@@ -9273,19 +9121,11 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32, const SEARCH: bool>(
 #[inline(never)]
 fn bt_find_best_runtime(
     search: bool,
-    attempts: usize,
-    src: &[u8],
+    ctx: &BtCtx,
     ip: usize,
-    block_start: usize,
-    block_end: usize,
-    window: usize,
-    mls: usize,
-    // The runtime arm's chain_log; the spec impls take CLOG and ignore it.
-    // This slot replaces a ~40-byte CompressionParameters BY-VALUE copy per
-    // call that the compiler itself flagged unused in the spec bodies.
-    chain_log: u32,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
+    let BtCtx { src, block_start, block_end, window, mls, attempts, chain_log } = *ctx;
     // Diagnostic ONLY -- gated. Unguarded this was one atomic read-modify-write
     // per `bt_find_best` CALL, i.e. per POSITION across the whole L13-L22
     // ladder (~15.7M per level per corpus set). Same defect class as the two
@@ -9549,6 +9389,15 @@ fn find_bt_lazy(
     let clog = params.chain_log.min(24);
     let btf = bt_resolve::<true>(tables.hash_log, clog);
     let btf_ins = bt_resolve::<false>(tables.hash_log, clog);
+    let bt_ctx = BtCtx {
+        src,
+        block_start,
+        block_end,
+        window,
+        mls,
+        attempts,
+        chain_log: clog,
+    };
     let gain_cmp = lazy_gain_enabled_bt();
     let fill_on = lazy_fill_enabled();
     let bt_stride = bt_fill_stride();
@@ -9573,8 +9422,7 @@ fn find_bt_lazy(
                 continue;
             }
         }
-        let (mut best_m, mut best_ml) =
-            btf(attempts, src, ip, block_start, block_end, window, mls, clog, tables);
+        let (mut best_m, mut best_ml) = btf(&bt_ctx, ip, tables);
         let mut best_ip = ip;
         let mut look_hi = ip;
         if best_ml >= mls {
@@ -9584,8 +9432,7 @@ fn find_bt_lazy(
                     break;
                 }
                 look_hi = ip2;
-                let (m, ml) =
-                    btf(attempts, src, ip2, block_start, block_end, window, mls, clog, tables);
+                let (m, ml) = btf(&bt_ctx, ip2, tables);
                 // C's offset-priced look-ahead (`set_lazy_gain_arm`), wired
                 // here for its own board: refuted at L7-L12, untested at
                 // L13-L15 where BtLazy2's economics differ.
@@ -9642,7 +9489,7 @@ fn find_bt_lazy(
                 // B2: the look-ahead already inserted up to `look_hi`.
                 let mut p = (best_ip + 1).max(look_hi + 1);
                 while p < end && p <= ilimit {
-                    let _ = btf_ins(attempts, src, p, block_start, block_end, window, mls, clog, tables);
+                    let _ = btf_ins(&bt_ctx, p, tables);
                     p += stride;
                 }
             }
@@ -10013,7 +9860,11 @@ fn find_opt(
     const OPT_MATCH_BIT: u32 = 1 << 31;
     ensure_len(&mut prev, n + 1, 0u32);
     ensure_len(&mut match_om, n + 1, 0u64);
-    price[0] = 0;
+    debug_assert!(!price.is_empty());
+    #[allow(unsafe_code)]
+    unsafe {
+        *price.get_unchecked_mut(0) = 0;
+    }
     // BRICK 75: offer the REPCODE as a DP candidate (find_opt was the last
     // finder without repcode search).
     //
@@ -10029,6 +9880,15 @@ fn find_opt(
     let clog = params.chain_log.min(24);
     let btf = bt_resolve::<true>(tables.hash_log, clog);
     let btf_ins = bt_resolve::<false>(tables.hash_log, clog);
+    let bt_ctx = BtCtx {
+        src,
+        block_start,
+        block_end,
+        window,
+        mls,
+        attempts: bt_attempts,
+        chain_log: clog,
+    };
     let extra = match params.strategy {
         Strategy::BtUltra2 => 2u32,
         Strategy::BtUltra => 1,
@@ -10089,7 +9949,10 @@ fn find_opt(
     // hits are recorded, so any decay converges to zero and latches the gate
     // shut permanently. That is the Gate 6 defect, and the Gate 2 @ L3 one.
     let rep_min = opt_rep_min();
-    let opt_rep_on = opt_rep_enabled()
+    // `rep1 == 0` makes every try_rep1 return None; testing it per position
+    // inside the helper was a block-constant branch in the DP loop.
+    let opt_rep_on = rep1 != 0
+        && opt_rep_enabled()
         && (rep_min < 0.0 // sentinel: constant ON, the pre-dispatch behaviour
             || tables.opt_rep_seen < OPT_REP_WARMUP
             || tables.opt_rep_probe == 0
@@ -10106,6 +9969,9 @@ fn find_opt(
     let fill_step = opt_fill_stride();
     let fill_span_max = opt_fill_max();
     let mlb_on = opt_mlbits_enabled();
+    // Per-JUMP arm read hoisted (the OFF arm's deliberate env re-reads stay
+    // inside; only the selector atomic moves).
+    let hoisted_arm = opt_hoisted();
     while i < n {
         // T2/T4 SAFETY, for the literal edge below -- the ONLY part of this loop
         // that runs at EVERY position.
@@ -10182,8 +10048,7 @@ fn find_opt(
                 }
             }
         }
-        let (bm, bml) =
-            btf(bt_attempts, src, ip, block_start, block_end, window, mls, clog, tables);
+        let (bm, bml) = btf(&bt_ctx, ip, tables);
         o_bt_calls += 1;
         if bml < mls {
             o_bt_dry += 1;
@@ -10306,7 +10171,7 @@ fn find_opt(
             // only seen the 0.
             // The OFF arm re-reads the environment here, per jumped position,
             // exactly as the shipped code did before the hoist.
-            let hoisted = opt_hoisted();
+            let hoisted = hoisted_arm;
             let (g_on, g_rep) = if hoisted {
                 (fill_on, fill_rep_max)
             } else {
@@ -10327,9 +10192,7 @@ fn find_opt(
                     if qp + 8 > block_end {
                         break;
                     }
-                    let _ = btf_ins(
-                        bt_attempts, src, qp, block_start, block_end, window, mls, clog, tables,
-                    );
+                    let _ = btf_ins(&bt_ctx, qp, tables);
                     #[cfg(feature = "profile")]
                     OPT_FILL_INS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     q += step;
