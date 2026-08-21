@@ -2022,6 +2022,7 @@ fn g5_drift_min() -> f32 {
     if b == u32::MAX { G5_DRIFT_MIN } else { f32::from_bits(b) }
 }
 
+#[inline(always)]
 pub(crate) fn prime_tables(
     tables: &mut MatchTables,
     src: &[u8],
@@ -3363,6 +3364,48 @@ fn find_sequences(
     ldm_p: crate::ldm::LdmParams,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if crate::simd::has_bmi2() {
+        // SAFETY: runtime CPUID guard; identical body.
+        #[allow(unsafe_code)]
+        return unsafe {
+            find_sequences_bmi2(src, block_start, block_end, window, params, tables, ldm, ldm_p, reps)
+        };
+    }
+    find_sequences_inner(src, block_start, block_end, window, params, tables, ldm, ldm_p, reps)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_code)]
+unsafe fn find_sequences_bmi2(
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    ldm: Option<&mut crate::ldm::LdmTables>,
+    ldm_p: crate::ldm::LdmParams,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
+    find_sequences_inner(src, block_start, block_end, window, params, tables, ldm, ldm_p, reps)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn find_sequences_inner(
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    ldm: Option<&mut crate::ldm::LdmTables>,
+    ldm_p: crate::ldm::LdmParams,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
     let hits = if let Some(lt) = ldm {
         if ldm_p.enable {
             let rp = ldm_p.resolved(params.window_log);
@@ -3413,6 +3456,45 @@ fn find_sequences(
 }
 
 fn find_sequences_strategy(
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
+    // The DP drivers (find_opt / find_bt_lazy) inline HERE, so this twin is
+    // what puts the L13-L22 pricing loops under BMI2.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if crate::simd::has_bmi2() {
+        // SAFETY: runtime CPUID guard; identical body.
+        #[allow(unsafe_code)]
+        return unsafe {
+            find_sequences_strategy_bmi2(src, block_start, block_end, window, params, tables, reps)
+        };
+    }
+    find_sequences_strategy_sel(src, block_start, block_end, window, params, tables, reps)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_code)]
+unsafe fn find_sequences_strategy_bmi2(
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
+    find_sequences_strategy_sel(src, block_start, block_end, window, params, tables, reps)
+}
+
+#[inline(always)]
+fn find_sequences_strategy_sel(
     src: &[u8],
     block_start: usize,
     block_end: usize,
@@ -4114,6 +4196,71 @@ fn find_fast(
 /// which is where our ~3x per-probe cost was going. Splitting restores that.
 #[inline(never)]
 fn find_fast_impl<
+    const PACKED: bool,
+    const REP: bool,
+    const HLOG: u32,
+    const STEP: usize,
+    const PIPE: bool,
+    const WIDE: bool,
+>(
+    step_rt: usize,
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
+    // BMI2 twin per monomorphisation: the probe loop's runtime shifts (wide
+    // hash, tag mask, tail loads) become flag-free shrx/shlx. One branch per
+    // BLOCK; both wrappers stay separate frames, preserving brick 48's
+    // register isolation.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if crate::simd::has_bmi2() {
+        // SAFETY: runtime CPUID guard; identical body.
+        #[allow(unsafe_code)]
+        return unsafe {
+            find_fast_impl_bmi2::<PACKED, REP, HLOG, STEP, PIPE, WIDE>(
+                step_rt, src, block_start, block_end, window, params, tables, reps,
+            )
+        };
+    }
+    find_fast_impl_inner::<PACKED, REP, HLOG, STEP, PIPE, WIDE>(
+        step_rt, src, block_start, block_end, window, params, tables, reps,
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_code)]
+#[inline(never)]
+unsafe fn find_fast_impl_bmi2<
+    const PACKED: bool,
+    const REP: bool,
+    const HLOG: u32,
+    const STEP: usize,
+    const PIPE: bool,
+    const WIDE: bool,
+>(
+    step_rt: usize,
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
+    find_fast_impl_inner::<PACKED, REP, HLOG, STEP, PIPE, WIDE>(
+        step_rt, src, block_start, block_end, window, params, tables, reps,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn find_fast_impl_inner<
     const PACKED: bool,
     const REP: bool,
     const HLOG: u32,
@@ -6755,6 +6902,7 @@ fn ff_anchor_ml() -> usize {
 /// lazy treats wide-keyed and empty alike; the legacy arm's advantage is REAL
 /// inherited heads), then stay legacy for the frame. Called from both triggers:
 /// the rep_yield signal and the fast_lazy switch.
+#[inline(always)]
 fn fast_hash_relatch(
     tables: &mut MatchTables,
     src: &[u8],
@@ -6792,6 +6940,7 @@ fn fast_slot_raw(hash: &[u32], pack: bool, h: usize) -> u32 {
 /// and same instruments as `fill_hash_after_match`, writing through the shared
 /// `fast_slot_store` rule.
 #[inline]
+#[inline(always)]
 fn fill_fast_after_match<const PACKED: bool>(
     hash: &mut [u32],
     tags: &mut [u8],
@@ -6826,6 +6975,7 @@ fn fill_fast_after_match<const PACKED: bool>(
 }
 
 
+#[inline(always)]
 fn emit_fast_seq<const PACKED: bool>(
     src: &[u8],
     hash: &mut [u32],
@@ -7029,6 +7179,46 @@ fn find_dfast(
 /// Byte-identical by construction: `HLOG` takes the value the runtime variable
 /// already held, so every hash index is unchanged.
 fn find_dfast_impl<const HLOG: u32>(
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
+    // BMI2 twin per monomorphisation -- the DEFAULT level's finder. One
+    // branch per block.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if crate::simd::has_bmi2() {
+        // SAFETY: runtime CPUID guard; identical body.
+        #[allow(unsafe_code)]
+        return unsafe {
+            find_dfast_impl_bmi2::<HLOG>(src, block_start, block_end, window, params, tables, reps)
+        };
+    }
+    find_dfast_impl_inner::<HLOG>(src, block_start, block_end, window, params, tables, reps)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_code)]
+unsafe fn find_dfast_impl_bmi2<const HLOG: u32>(
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
+    find_dfast_impl_inner::<HLOG>(src, block_start, block_end, window, params, tables, reps)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn find_dfast_impl_inner<const HLOG: u32>(
     src: &[u8],
     block_start: usize,
     block_end: usize,
@@ -9078,10 +9268,54 @@ fn bt_rt_insert(ctx: &BtCtx, ip: usize, t: &mut MatchTables) -> (usize, usize) {
     bt_find_best_runtime(false, ctx, ip, t)
 }
 
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+fn bt_rt_search_bmi2(ctx: &BtCtx, ip: usize, t: &mut MatchTables) -> (usize, usize) {
+    // SAFETY: only reachable through `bt_resolve`'s CPUID guard.
+    #[allow(unsafe_code)]
+    unsafe {
+        bt_find_best_runtime_bmi2(true, ctx, ip, t)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+fn bt_rt_insert_bmi2(ctx: &BtCtx, ip: usize, t: &mut MatchTables) -> (usize, usize) {
+    // SAFETY: only reachable through `bt_resolve`'s CPUID guard.
+    #[allow(unsafe_code)]
+    unsafe {
+        bt_find_best_runtime_bmi2(false, ctx, ip, t)
+    }
+}
+
 fn bt_resolve<const SEARCH: bool>(hash_log: u32, chain_log: u32) -> BtFn {
+    // ISA selection happens HERE, once per block, so the per-position bt
+    // calls carry no dispatch of their own.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    let bmi2 = crate::simd::has_bmi2();
+    #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
+    let bmi2 = false;
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    let rt: BtFn = match (bmi2, SEARCH) {
+        (true, true) => bt_rt_search_bmi2,
+        (true, false) => bt_rt_insert_bmi2,
+        (false, true) => bt_rt_search,
+        (false, false) => bt_rt_insert,
+    };
+    #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
     let rt: BtFn = if SEARCH { bt_rt_search } else { bt_rt_insert };
     if !bt_spec_enabled() {
         return rt;
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if bmi2 {
+        macro_rules! bt_spec_resolve_bmi2 {
+            ($( ($h:literal, $c:literal) )*) => {
+                match (hash_log, chain_log) {
+                    $( ($h, $c) => bt_find_best_spec_bmi2::<$h, $c, SEARCH>, )*
+                    _ => rt,
+                }
+            };
+        }
+        return bt_spec_list!(bt_spec_resolve_bmi2);
     }
     macro_rules! bt_spec_resolve {
         ($( ($h:literal, $c:literal) )*) => {
@@ -9111,6 +9345,42 @@ fn bt_resolve<const SEARCH: bool>(hash_log: u32, chain_log: u32) -> BtFn {
 /// variables already held.
 #[inline(never)]
 fn bt_find_best_impl<const HLOG: u32, const CLOG: u32, const SEARCH: bool>(
+    ctx: &BtCtx,
+    ip: usize,
+    tables: &mut MatchTables,
+) -> (usize, usize) {
+    bt_find_best_impl_inner::<HLOG, CLOG, SEARCH>(ctx, ip, tables)
+}
+
+/// Safe `BtFn`-shaped wrapper for the BMI2 twin; `bt_resolve` hands this out
+/// only after its own `has_bmi2()` check, once per block.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+fn bt_find_best_spec_bmi2<const HLOG: u32, const CLOG: u32, const SEARCH: bool>(
+    ctx: &BtCtx,
+    ip: usize,
+    tables: &mut MatchTables,
+) -> (usize, usize) {
+    // SAFETY: only reachable through `bt_resolve`'s CPUID guard.
+    #[allow(unsafe_code)]
+    unsafe {
+        bt_find_best_impl_bmi2::<HLOG, CLOG, SEARCH>(ctx, ip, tables)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(unsafe_code)]
+#[inline(never)]
+unsafe fn bt_find_best_impl_bmi2<const HLOG: u32, const CLOG: u32, const SEARCH: bool>(
+    ctx: &BtCtx,
+    ip: usize,
+    tables: &mut MatchTables,
+) -> (usize, usize) {
+    bt_find_best_impl_inner::<HLOG, CLOG, SEARCH>(ctx, ip, tables)
+}
+
+#[inline(always)]
+fn bt_find_best_impl_inner<const HLOG: u32, const CLOG: u32, const SEARCH: bool>(
     ctx: &BtCtx,
     ip: usize,
     tables: &mut MatchTables,
@@ -9343,6 +9613,29 @@ fn bt_find_best_runtime(
     ip: usize,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
+    bt_find_best_runtime_inner(search, ctx, ip, tables)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(unsafe_code)]
+#[inline(never)]
+unsafe fn bt_find_best_runtime_bmi2(
+    search: bool,
+    ctx: &BtCtx,
+    ip: usize,
+    tables: &mut MatchTables,
+) -> (usize, usize) {
+    bt_find_best_runtime_inner(search, ctx, ip, tables)
+}
+
+#[inline(always)]
+fn bt_find_best_runtime_inner(
+    search: bool,
+    ctx: &BtCtx,
+    ip: usize,
+    tables: &mut MatchTables,
+) -> (usize, usize) {
     let BtCtx { src, block_start, block_end, window, mls, attempts, chain_log } = *ctx;
     // Diagnostic ONLY -- gated. Unguarded this was one atomic read-modify-write
     // per `bt_find_best` CALL, i.e. per POSITION across the whole L13-L22
@@ -9556,6 +9849,7 @@ fn bt_find_best_runtime(
     (best_m, best_ml)
 }
 
+#[inline(always)]
 fn find_bt_lazy(
     src: &[u8],
     block_start: usize,

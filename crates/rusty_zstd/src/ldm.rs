@@ -102,6 +102,7 @@ pub(crate) fn prime_ldm(
     }
 }
 
+#[inline(always)]
 pub(crate) fn collect_ldm(
     tables: &mut LdmTables,
     src: &[u8],
