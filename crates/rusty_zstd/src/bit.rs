@@ -15,6 +15,10 @@ pub(crate) struct BitRev<'a> {
 }
 
 impl<'a> BitRev<'a> {
+    // The bit-engine helpers are inline(always): outlined, they compile as
+    // baseline code even when called from a BMI2 twin (the shim-trap rule),
+    // and the twin call-graph trace caught exactly that.
+    #[inline(always)]
     pub(crate) fn new(src: &'a [u8]) -> Result<Self, Error> {
         if src.is_empty() {
             return Err(Error::Corruption);
@@ -87,6 +91,7 @@ impl<'a> BitRev<'a> {
 
     /// Resume after C `HUF_decompress4X2` fast loop: `ptr` is the loaded window,
     /// `bits_consumed` is `trailing_zeros` of the left-justified register.
+    #[inline(always)]
     pub(crate) fn from_window(
         src: &'a [u8],
         ptr: usize,
@@ -111,6 +116,7 @@ impl<'a> BitRev<'a> {
         behind + in_win
     }
 
+    #[inline(always)]
     pub(crate) fn reload(&mut self) -> Result<(), Error> {
         if self.bits_consumed > 64 {
             return Err(Error::Corruption);
@@ -267,6 +273,7 @@ impl BitCStream {
     }
 
     /// End mark `1` plus zero-pad, matching `BIT_closeCStream`.
+    #[inline(always)]
     pub(crate) fn close(mut self) -> alloc::vec::Vec<u8> {
         self.add_bits(1, 1);
         self.flush();
@@ -316,6 +323,7 @@ impl<'a> BitFwd<'a> {
         Ok((self.buf as u32) & ones(n))
     }
 
+    #[inline(always)]
     pub(crate) fn get(&mut self, n: u32) -> Result<u32, Error> {
         let v = self.peek(n)?;
         self.buf >>= n;

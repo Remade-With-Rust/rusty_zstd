@@ -4996,7 +4996,6 @@ fn find_fast_impl<
 ///
 /// SAFE mirrors `fast_hash_tag`: callers with `ip <= ilimit` prove `ip + 8 <=
 /// block_end`, and `m < ip` carries the same bound for the candidate side.
-#[inline(always)]
 fn fast_probe_wide<const SAFE: bool>(
     cand: &mut (u64, u64),
     src: &[u8],
@@ -6008,7 +6007,6 @@ fn fast_hash_tag<const SAFE: bool>(
 /// with `p + 8 <= len`), so the u64 load is in bounds.
 /// Soundness: acceptance verifies `mls` leading bytes, and the tag is a
 /// function of `min(mls, 8)` of them -- a mismatch cannot hide a match.
-#[inline(always)]
 fn hash4_tag_mls(src: &[u8], pos: usize, hash_shift: u32, smask: u64) -> (usize, u8) {
     let v = load_u64le(src, pos);
     let hv = (v as u32).wrapping_mul(HASH4_PRIME);
@@ -10400,7 +10398,7 @@ fn find_opt(
     // full pass over `ops`.
     let (mut w_short, mut w_mid) = (0usize, 0usize);
     let mut pending_start = usize::MAX;
-    let mut count_run = |run: usize, w_short: &mut usize, w_mid: &mut usize| {
+    let count_run = |run: usize, w_short: &mut usize, w_mid: &mut usize| {
         if run <= LIT_PUSH_WIDTH {
             *w_short += 1;
         } else if run <= LIT_PUSH_WIDTH_WIDE {

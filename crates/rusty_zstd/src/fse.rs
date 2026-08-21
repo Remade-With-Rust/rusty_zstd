@@ -35,6 +35,7 @@ impl FseTable {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn from_norm(norm: &[i16], accuracy_log: u8) -> Result<Self, Error> {
         if !(5..=9).contains(&accuracy_log) {
             return Err(Error::Corruption);
@@ -311,14 +312,17 @@ pub(crate) const DEFAULT_OF_NORM: [i16; 29] = [
     1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
 ];
 
+#[inline(always)]
 pub(crate) fn default_ll() -> Result<FseTable, Error> {
     FseTable::from_norm(&DEFAULT_LL_NORM, 6)
 }
 
+#[inline(always)]
 pub(crate) fn default_ml() -> Result<FseTable, Error> {
     FseTable::from_norm(&DEFAULT_ML_NORM, 6)
 }
 
+#[inline(always)]
 pub(crate) fn default_of() -> Result<FseTable, Error> {
     FseTable::from_norm(&DEFAULT_OF_NORM, 5)
 }
@@ -522,6 +526,7 @@ impl FseCTable {
             .into();
     }
 
+    #[inline(always)]
     pub(crate) fn flush(&self, state: u32, bits: &mut crate::bit::BitCStream) {
         bits.add_bits(u64::from(state), u32::from(self.table_log));
         bits.flush();

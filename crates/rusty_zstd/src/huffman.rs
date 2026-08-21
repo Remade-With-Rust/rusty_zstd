@@ -89,6 +89,7 @@ impl HuffmanTable {
         self.table_x2.len() == self.table.len() && select_x2(dst_size, src_size)
     }
 
+    #[inline(always)]
     fn decode_into_x1(&self, br: &mut BitRev<'_>, dst: &mut [u8]) -> Result<(), Error> {
         let max = u32::from(self.max_bits);
         let dt = self.table.as_slice();
@@ -971,6 +972,7 @@ impl HuffCTable {
     /// This is brick 69's argument -- `emit_fill` next door has used it since --
     /// and `emit_k5`/`emit_k` were simply never given it. Per LITERAL.
     #[allow(unsafe_code)]
+    #[inline(always)]
     fn emit_k5(&self, bits: &mut crate::bit::BitCStream, src: &[u8]) {
         let mut i = src.len();
         while i >= 5 {
@@ -1006,6 +1008,7 @@ impl HuffCTable {
     /// Pack the max-nbits K with no container check, then fill extras.
     /// After `flush`, leftover is ≤7 so `K*max + 7 < 64` is guaranteed.
     #[allow(unsafe_code)]
+    #[inline(always)]
     fn emit_fill(&self, bits: &mut crate::bit::BitCStream, src: &[u8]) {
         let k = k_from_max(self.max_nbits) as usize;
         let mut i = src.len();
