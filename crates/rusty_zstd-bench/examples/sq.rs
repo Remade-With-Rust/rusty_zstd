@@ -1,22 +1,20 @@
 fn main() {
-    let ids = ["versions-16m","jsonlog-16m","mozilla","webster","nci","samba"];
-    for lvl in [7i32, 12] {
-        let (mut ta, mut tb) = (0u64, 0u64);
-        let mut worst=(0.0f64,"-");
-        print!("L{lvl}: ");
-        for id in ids {
-            let f = std::fs::read(format!("corpora/data/generated/{id}"))
-                .or_else(|_| std::fs::read(format!("corpora/data/silesia/{id}"))).unwrap();
-            rusty_zstd::set_wide_chain_arm(false);
-            let za = rusty_zstd::compress_with(&f, rusty_zstd::CompressOptions { level: lvl, checksum: false }).unwrap();
-            rusty_zstd::set_wide_chain_arm(true);
-            let zb = rusty_zstd::compress_with(&f, rusty_zstd::CompressOptions { level: lvl, checksum: false }).unwrap();
-            assert!(rusty_zstd::decompress(&zb).unwrap() == f);
-            let d = 100.0*(zb.len() as f64 - za.len() as f64)/za.len() as f64;
-            if d > worst.0 { worst=(d,id); }
-            print!("{id} {d:+.3}%  ");
-            ta+=za.len() as u64; tb+=zb.len() as u64;
+    #[cfg(feature = "profile")]
+    {
+        let ids = ["jsonlog-16m","smallmsg-8m","versions-16m","mr","ooffice","osdb","reymont","sao",
+            "webster","dickens","mozilla","nci","samba","xml","x-ray","zeros-32m","text-32m","incomp-32m"];
+        for lvl in [1i32, 2, 5, 7, 9, 12, 13] {
+            let _ = rusty_zstd::take_bext();
+            for id in ids {
+                let f = std::fs::read(format!("corpora/data/generated/{id}"))
+                    .or_else(|_| std::fs::read(format!("corpora/data/silesia/{id}"))).unwrap();
+                let s = &f[..f.len().min(4 << 20)];
+                let _ = rusty_zstd::compress_with(s, rusty_zstd::CompressOptions { level: lvl, checksum: false }).unwrap();
+            }
+            let (m, n, b, ge8) = rusty_zstd::take_bext();
+            let mean = if n==0 {0.0} else {b as f64/n as f64};
+            println!("L{lvl:2}: matches {m:9}, extended {n:8} ({:4.1}%), bytes {b:9}, mean-ext {mean:5.2}, >=8 {ge8:7} ({:4.2}% of extended)",
+                if m==0 {0.0} else {100.0*n as f64/m as f64}, if n==0 {0.0} else {100.0*ge8 as f64/n as f64});
         }
-        println!("| TOTAL {:+.4}% worst {} {:+.3}%", 100.0*(tb as f64-ta as f64)/ta as f64, worst.1, worst.0);
     }
 }

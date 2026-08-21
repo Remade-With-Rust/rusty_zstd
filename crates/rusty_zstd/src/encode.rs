@@ -6722,11 +6722,15 @@ fn emit_fast_seq<const PACKED: bool>(
     // `ip >= 1`, `mm > frame_start` gives `mm >= 1`, both start below the block
     // end and only decrease. Seventh instance of a capability present in one
     // path and absent in its neighbour.
+    #[cfg(feature = "profile")]
+    let bext_from = ip;
     while ip > anchor && mm > frame_start && back_eq(src, ip, mm) {
         ip -= 1;
         mm -= 1;
         n += 1;
     }
+    #[cfg(feature = "profile")]
+    note_bext((bext_from - ip) as u64);
     crate::prof::note_back_ext((back_from - ip) as u64);
     push_literals(lits, src, anchor, ip, w);
     seqs.push(Seq {
@@ -8007,11 +8011,15 @@ fn find_greedy_impl<const MLS: usize>(
             let mut s = ip;
             let mut mm = best_m;
             let mut n = best_ml;
+            #[cfg(feature = "profile")]
+            let bext_from = s;
             while s > anchor && mm > tables.frame_start && back_eq(src, s, mm) {
                 s -= 1;
                 mm -= 1;
                 n += 1;
             }
+            #[cfg(feature = "profile")]
+            note_bext((bext_from - s) as u64);
             push_lits_range(&mut lits, src, anchor, s);
             seqs.push(Seq {
                 litlen: (s - anchor) as u32,
@@ -8409,11 +8417,15 @@ fn find_lazy_impl<const MLS: usize>(
             let mut s = best_ip;
             let mut mm = best_m;
             let mut n = best_ml;
+            #[cfg(feature = "profile")]
+            let bext_from = s;
             while s > anchor && mm > tables.frame_start && back_eq(src, s, mm) {
                 s -= 1;
                 mm -= 1;
                 n += 1;
             }
+            #[cfg(feature = "profile")]
+            note_bext((bext_from - s) as u64);
             push_lits_range(&mut lits, src, anchor, s);
             seqs.push(Seq {
                 litlen: (s - anchor) as u32,
@@ -9595,11 +9607,15 @@ fn find_bt_lazy(
             let mut s = best_ip;
             let mut mm = best_m;
             let mut n = best_ml;
+            #[cfg(feature = "profile")]
+            let bext_from = s;
             while s > anchor && mm > tables.frame_start && back_eq(src, s, mm) {
                 s -= 1;
                 mm -= 1;
                 n += 1;
             }
+            #[cfg(feature = "profile")]
+            note_bext((bext_from - s) as u64);
             push_lits_range(&mut lits, src, anchor, s);
             seqs.push(Seq {
                 litlen: (s - anchor) as u32,
@@ -10970,6 +10986,40 @@ pub fn take_walk_signals() -> (f32, f32, f32, u64, u64, u64) {
     )
 }
 
+/// Back-extension census for the SIMD question: (extensions > 0, total
+/// bytes, extensions >= 8 -- the class a u64 backward step would win).
+#[cfg(feature = "profile")]
+pub static BEXT_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static BEXT_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static BEXT_GE8: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static BEXT_MATCHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub fn take_bext() -> (u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        BEXT_MATCHES.swap(0, Relaxed),
+        BEXT_N.swap(0, Relaxed),
+        BEXT_BYTES.swap(0, Relaxed),
+        BEXT_GE8.swap(0, Relaxed),
+    )
+}
+
+#[cfg(feature = "profile")]
+fn note_bext(ext: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    BEXT_MATCHES.fetch_add(1, Relaxed);
+    if ext > 0 {
+        BEXT_N.fetch_add(1, Relaxed);
+        BEXT_BYTES.fetch_add(ext, Relaxed);
+        if ext >= 8 {
+            BEXT_GE8.fetch_add(1, Relaxed);
+        }
+    }
+}
+
 /// Chain-walk census: (candidates examined, byte-mismatch steps).
 #[cfg(feature = "profile")]
 pub static WALK_EXAM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -11132,6 +11182,16 @@ fn pre_eq(src: &[u8], m: usize, ip: usize, off: usize) -> bool {
 /// encoder to pay a bounds check.
 #[inline(always)]
 #[allow(unsafe_code)]
+/// SIMD/u64-WIDENING REFUTED BY CENSUS (2026-08-21, `take_bext`, 18
+/// corpora x L1..L13): only 7-13% of matches back-extend at all, the mean
+/// extension among those is 1.1-1.4 BYTES, and the >= 8-byte class a u64
+/// backward step would win is 0.39% of extensions at L1 and ~zero from L5
+/// up. A widened step pays two 8-byte loads, xor, lzcnt and two boundary
+/// guards to answer what is ~93% of the time a single byte compare --
+/// while reading 14 unneeded bytes backward across a possible extra cache
+/// line. The byte loop IS the right shape for this distribution. (The
+/// same census machinery stays under profile for re-adjudication if match
+/// geometry ever changes.)
 fn back_eq(src: &[u8], s: usize, mm: usize) -> bool {
     debug_assert!(s >= 1 && mm >= 1 && s - 1 < src.len() && mm - 1 < src.len());
     unsafe { *src.get_unchecked(s - 1) == *src.get_unchecked(mm - 1) }

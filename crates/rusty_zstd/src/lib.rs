@@ -91,6 +91,8 @@ pub use encode::take_link_tag;
 #[cfg(feature = "profile")]
 pub use encode::take_walk_signals;
 #[cfg(feature = "profile")]
+pub use encode::take_bext;
+#[cfg(feature = "profile")]
 pub use encode::take_ff_waste;
 #[cfg(feature = "profile")]
 pub use encode::FF_LATCH;
