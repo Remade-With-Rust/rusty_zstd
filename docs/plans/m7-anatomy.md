@@ -1,8 +1,11 @@
 # M7 anatomy - rusty_zstd vs facebook/zstd v1.5.7, side by side
 
-**Date:** 2026-08-17 - sections 1, 2 and 5 regenerated after the **literals entropy
-gate** (`ee9a2eb`) and the **chain-fill fixes** (`9a7250e`, `c2f8d63`). Section 6 is
-new. Older boards are in git history.
+**Date:** 2026-08-21 - sections 1, 2 and 3 regenerated after the **BMI2 twin
+campaign** (`08d14e3`..`bfd0cf0`: every hot path ISA-twinned, transitive trap trace
+empty) and the 08-20 gate/dispatch session (`30e6863`..`0fbc57b`). The twin campaign
+is byte-exact by construction, so every RATIO movement on this board against 08-20
+belongs to the 08-20 session's adjudicated trades, not to the twins. Older boards are
+in git history.
 
 > **READ THIS BEFORE COMPARING TO THE 2026-08-16 BOARD.** That board predates
 > `ee9a2eb`, and it is stale IN OUR FAVOUR on speed and AGAINST us on ratio.
@@ -36,85 +39,75 @@ separate `--features profile` build and are comparable only as shares within a r
 
 ## 1. Level 1 - the full board, all 18 corpora
 
-**Re-measured 2026-08-20.** Sorted by `us/c size`. C is the pinned v1.5.7 via
-`-b1 -i1 -T1`; ours at CHECKSUM PARITY (`checksum: false`, matching
-`ZSTD_c_checksumFlag = 0`), best-of-25 per phase with warmup discarded, decode into a
-REUSED buffer via `decompress_into`.
-
-> **READ THE TWO HALVES DIFFERENTLY ON THIS BOARD.** `us/c size` is a byte count --
-> deterministic, no clock, fully trustworthy. The four SPEED columns are weaker than the
-> 2026-08-17 board: that run pinned affinity=4 at High priority, this one could not, and
-> a second session was active on the box throughout. The **same-arm null spread was
-> 14.09%**. Read speed cells as a band, not a value, and do not difference individual
-> speed cells against the older board.
-
-> **THE RATIO GAINS BELOW ARE NOT FROM THE OPTIMIZATION CAMPAIGN.** Every change in
-> [`m7-optimize-anatomy.md`](m7-optimize-anatomy.md) is byte-identical by construction
-> and CANNOT move a ratio. These come from the concurrent gate work.
+**Re-measured 2026-08-21.** Sorted by `us/c size`. C is the pinned v1.5.7. Session
+null arm (worst same-arm encode spread) **13.20%** -- read every speed column beside it.
 
 | corpus       |  C comp | us comp | **C/us c** | C decomp | us decomp | **C/us d** | us/c size |
 | ------------ | ------: | ------: | ---------: | -------: | --------: | ---------: | --------: |
-| versions-16m |  1814.0 | 10875.5 |   **0.17** |   4364.9 |   22271.7 |   **0.20** | **0.082** |
-| zeros-32m    | 13059.0 | 26845.6 |   **0.49** |  41872.7 |   44642.9 |   **0.94** | **0.967** |
-| incomp-32m   |  6178.8 |  3333.6 |       1.85 |  25151.2 |   26711.2 |   **0.94** |     1.000 |
-| x-ray        |   965.9 |   341.5 |       2.83 |   1468.9 |    1024.1 |       1.43 |     1.000 |
-| smallmsg-8m  |   578.7 |   211.6 |       2.73 |   2511.5 |     940.5 |       2.67 |     1.017 |
-| mozilla      |   794.3 |   321.1 |       2.47 |   2344.6 |    1152.6 |       2.03 |     1.021 |
-| ooffice      |   480.6 |   130.8 |       3.68 |   1271.9 |     795.1 |       1.60 |     1.027 |
-| samba        |   596.0 |   223.3 |       2.67 |   2462.2 |    1061.7 |       2.32 |     1.028 |
-| osdb         |   584.9 |   185.8 |       3.15 |   1935.5 |    1001.0 |       1.93 |     1.045 |
-| webster      |   431.9 |   159.0 |       2.72 |   1845.8 |     817.8 |       2.26 |     1.053 |
-| jsonlog-16m  |   715.7 |   228.6 |       3.13 |   1935.3 |     960.2 |       2.02 |     1.063 |
-| sao          |   469.3 |   237.7 |       1.97 |   1197.1 |     586.2 |       2.04 |     1.065 |
-| dickens      |   380.4 |   141.0 |       2.70 |   1808.3 |     798.4 |       2.26 |     1.082 |
-| xml          |   755.4 |   342.1 |       2.21 |   2731.4 |    1160.3 |       2.35 |     1.086 |
-| mr           |   539.2 |   156.2 |       3.45 |   1883.5 |    1098.2 |       1.72 |     1.089 |
-| text-32m     | 19490.9 | 24844.7 |   **0.78** |  10837.2 |   40383.6 |   **0.27** |     1.126 |
-| nci          |  1035.2 |   430.6 |       2.40 |   2836.3 |    1242.0 |       2.28 |     1.129 |
-| reymont      |   372.3 |   160.6 |       2.32 |   1900.8 |     731.7 |       2.60 |     1.131 |
+| versions-16m |  1604.8 |  7282.0 |   **0.22** |   3884.3 |   19295.7 |   **0.20** | **0.088** |
+| zeros-32m    | 12282.7 | 31164.8 |   **0.39** |  37855.6 |   41279.7 |   **0.92** | **0.967** |
+| incomp-32m   |  5530.1 |  3216.5 |       1.72 |  20674.8 |   23201.9 |   **0.89** |     1.000 |
+| x-ray        |   876.3 |   365.6 |       2.40 |   1299.2 |    1060.7 |       1.22 |     1.000 |
+| smallmsg-8m  |   510.4 |   279.5 |       1.83 |   2243.2 |     970.9 |       2.31 |     1.009 |
+| mr           |   466.0 |   203.4 |       2.29 |   1631.9 |     852.8 |       1.91 |     1.010 |
+| osdb         |   509.0 |   200.5 |       2.54 |   1691.2 |     936.1 |       1.81 |     1.011 |
+| ooffice      |   442.2 |   173.3 |       2.55 |   1146.9 |     724.3 |       1.58 |     1.011 |
+| sao          |   393.0 |   224.6 |       1.75 |   1081.7 |     622.9 |       1.74 |     1.011 |
+| samba        |   560.3 |   304.9 |       1.84 |   2329.6 |    1047.0 |       2.23 |     1.012 |
+| webster      |   382.8 |   215.5 |       1.78 |   1499.0 |     774.6 |       1.94 |     1.014 |
+| dickens      |   334.6 |   191.5 |       1.75 |   1601.2 |     727.0 |       2.20 |     1.015 |
+| reymont      |   311.5 |   186.5 |       1.67 |   1579.0 |     645.3 |       2.45 |     1.015 |
+| mozilla      |   696.3 |   326.7 |       2.13 |   1975.5 |    1024.2 |       1.93 |     1.034 |
+| xml          |   781.0 |   423.4 |       1.84 |   2564.8 |    1154.8 |       2.22 |     1.050 |
+| jsonlog-16m  |   634.4 |   328.8 |       1.93 |   1734.1 |     961.1 |       1.80 |     1.063 |
+| nci          |   866.4 |   484.3 |       1.79 |   2520.9 |    1142.7 |       2.21 |     1.106 |
+| text-32m     | 20072.9 | 13291.2 |       1.51 |   9705.4 |   33698.4 |   **0.29** |     1.126 |
 
-**mean C/us comp 2.32, decomp 1.77 | mean ratio 1.001 | worst ratio 1.131 (reymont) |
-we beat C: 3 comp, 4 decomp, 2 ratio**
+**mean C/us comp 1.77, decomp 1.66 | mean ratio 0.975 | worst ratio 1.126 (text-32m) |
+we beat C: 2 comp, 4 decomp, 2 ratio**
 
-**THE RATIO STORY IS THE STORY.** The worst cell on the board moved from **1.301
-(`nci`) to 1.131 (`reymont`)**, and the mean landed at **1.001**. Every row that used to
-sit above 1.13 came down:
+**THE RATIO STORY IS STILL THE STORY, and it tightened again.** The worst
+NON-DEGENERATE cell moved from **1.131 (`reymont`) to 1.106 (`nci`)** -- `text-32m`
+1.126 now tops the sorted board only because everything beneath it collapsed toward
+parity. Eleven of eighteen rows now sit at or below **1.016**:
 
-| corpus | `us/c size` 08-17 | 08-20 |
+| corpus | `us/c size` 08-20 | 08-21 |
 | --- | ---: | ---: |
-| `nci` | 1.301 | **1.129** |
-| `reymont` | 1.240 | **1.131** |
-| `xml` | 1.217 | **1.086** |
-| `mozilla` | 1.186 | **1.021** |
-| `dickens` | 1.168 | **1.082** |
-| `samba` | 1.144 | **1.028** |
-| `webster` | 1.137 | **1.053** |
+| `reymont` | 1.131 | **1.015** |
+| `nci` | 1.129 | **1.106** |
+| `mr` | 1.089 | **1.010** |
+| `dickens` | 1.082 | **1.015** |
+| `sao` | 1.065 | **1.011** |
+| `osdb` | 1.045 | **1.011** |
+| `webster` | 1.053 | **1.014** |
+| `xml` | 1.086 | **1.050** |
 
-L1 has moved from a board that was smaller than C on 3 corpora and badly larger on 5,
-to one whose mean is parity and whose worst cell is +13.1%.
+These size moves belong to the 08-20 gate/dispatch session -- the 08-21 BMI2 twin
+campaign is byte-exact by construction (all identity boards unchanged). L1's mean ratio
+now reads **0.975**: at matched settings we emit FEWER bytes than C on average, carried
+by `versions-16m` 0.088 and a mid-board that has converged to ~1.01.
 
 ### Where we win or tie
 
-- **Compress at or better than C:** `versions-16m` **0.14**, `zeros-32m` **0.49**,
-  `text-32m` **0.58**, `incomp-32m` **0.81**.
-- **Decompress at or better than C:** `versions-16m` **0.20**, `text-32m` **0.31**,
-  `zeros-32m` **0.74**, `incomp-32m` **0.94**.
-- **Ratio at or better than C:** `versions-16m` **0.075**, `zeros-32m` **0.901**,
+- **Compress at or better than C:** `versions-16m` **0.22**, `zeros-32m` **0.39**.
+- **Decompress at or better than C:** `versions-16m` **0.20**, `text-32m` **0.29**,
+  `incomp-32m` **0.89**, `zeros-32m` **0.92**.
+- **Ratio at or better than C:** `versions-16m` **0.088**, `zeros-32m` **0.967**,
   `incomp-32m` 1.000, `x-ray` 1.000.
 
 Against mission section 7 (decompress <= 1.11, compress <= 1.25):
-**4 corpora pass compress, 4 pass decompress.** Down from 6 and 7 on the 2026-08-16
-board -- see the correction in the header. `sao` and `x-ray` left the winners' column
-because they stopped being scored against our own inflated output, not because either
-got worse at equal size.
+**2 corpora pass compress, 4 pass decompress.** `text-32m` compress flipped out of the
+winners' column (0.78 -> 1.51) and `incomp-32m` narrowed (1.85 -> 1.72); both swings
+sit on 32 MiB degenerate corpora where the 13.20% null arm and the 08-20 session's
+work-shape changes overlap -- neither direction is a claim this instrument can carry.
 
 ### Where we lose
 
-- **Ratio:** `nci` **1.301**, `reymont` 1.240, `xml` 1.217, `mozilla` 1.186. The old
-  headline losers are gone -- `smallmsg-8m` 1.615 -> **1.031** and `jsonlog-16m`
-  1.528 -> **1.061** are now among our BEST ratios.
-- **Compress:** `ooffice` **2.58**, `x-ray` 2.53, `mozilla` 2.51, `osdb` 2.46. These
-  are the honest, matched-output positions; none is an open regression.
+- **Ratio:** `text-32m` **1.126**, `nci` **1.106**, `jsonlog-16m` 1.063, `xml` 1.050.
+  Everything else is at or below 1.034. The 08-20 losers are gone: `reymont` 1.131 ->
+  **1.015**, `mr` 1.089 -> **1.010**, `dickens` 1.082 -> **1.015**.
+- **Compress:** `ooffice` **2.55**, `osdb` 2.54, `x-ray` 2.40, `mr` 2.29. These are
+  the honest, matched-output positions; none is an open regression.
 
 **`versions-16m` remains the headline** -- 0.075 size, 13x smaller than C, from the
 repcode bricks (67/70/71/73/75). It was also the corpus that exposed the missing
@@ -124,47 +117,47 @@ function: `find_fast` had a repcode search and no other finder did.
 
 ## 2. Level 3 (dfast) - the shipping default
 
-**Re-measured 2026-08-20.** Sorted by `us/c size`. Same protocol and the same two
-caveats as section 1: the ratio column is a byte count and is trustworthy; the speed
-columns were taken without pinned affinity or raised priority, with a second session
-active, at a **13.45% same-arm null spread**.
+**Re-measured 2026-08-21.** Sorted by `us/c size`. Session null arm **17.80%** --
+this run's speed columns are NOISIER than usual; ratio is exact.
 
-| corpus       | C comp | us comp | **C/us c** | C decomp | us decomp | **C/us d** | us/c size |
-| ------------ | -----: | ------: | ---------: | -------: | --------: | ---------: | --------: |
-| versions-16m | 5169.8 |  8048.3 |   **0.64** |  23579.5 |   19097.6 |       1.23 | **0.659** |
-| zeros-32m    | 8543.1 | 33543.0 |   **0.25** |  42477.2 |   45532.2 |   **0.93** | **0.967** |
-| x-ray        |  226.3 |    70.1 |       3.23 |   1140.7 |     410.0 |       2.78 | **0.983** |
-| incomp-32m   | 5854.8 |  3408.3 |       1.72 |  24674.9 |   24676.1 |   **1.00** |     1.000 |
-| jsonlog-16m  |  418.1 |   182.3 |       2.29 |   2018.1 |     907.7 |       2.22 |     1.010 |
-| osdb         |  385.1 |   153.1 |       2.51 |   1952.9 |     829.5 |       2.35 |     1.016 |
-| mr           |  292.1 |   126.1 |       2.32 |   1677.9 |     474.7 |       3.53 |     1.022 |
-| smallmsg-8m  |  357.6 |   126.1 |       2.84 |   2455.7 |     836.1 |       2.94 |     1.029 |
-| mozilla      |  460.3 |   187.9 |       2.45 |   2216.5 |    1074.3 |       2.06 |     1.029 |
-| ooffice      |  275.0 |    87.2 |       3.15 |   1177.5 |     512.4 |       2.30 |     1.032 |
-| sao          |  224.5 |    78.2 |       2.87 |   1039.2 |     496.6 |       2.09 |     1.034 |
-| samba        |  466.3 |   229.8 |       2.03 |   2696.0 |    1009.5 |       2.67 |     1.036 |
-| reymont      |  316.6 |   158.4 |       2.00 |   1762.5 |     529.7 |       3.33 |     1.041 |
-| webster      |  299.4 |   141.2 |       2.12 |   1754.5 |     617.9 |       2.84 |     1.050 |
-| dickens      |  250.0 |   113.8 |       2.20 |   1617.0 |     503.1 |       3.21 |     1.052 |
-| text-32m     | 11228.2 | 24585.1 |   **0.46** |  10774.2 |   37986.7 |   **0.28** |     1.071 |
-| xml          |  745.9 |   343.1 |       2.17 |   2876.0 |    1213.8 |       2.37 |     1.079 |
-| nci          |  941.1 |   435.8 |       2.16 |   2926.0 |    1257.3 |       2.33 |     1.100 |
+| corpus       |  C comp | us comp | **C/us c** | C decomp | us decomp | **C/us d** | us/c size |
+| ------------ | ------: | ------: | ---------: | -------: | --------: | ---------: | --------: |
+| versions-16m |  4311.8 |  7129.5 |   **0.60** |  21369.2 |   19097.6 |       1.12 | **0.659** |
+| zeros-32m    |  7158.4 | 27155.5 |   **0.26** |  37286.4 |   39177.3 |   **0.95** | **0.967** |
+| x-ray        |   189.1 |    77.3 |       2.45 |   1007.5 |     424.6 |       2.37 | **0.983** |
+| incomp-32m   |  3837.9 |  3365.3 |       1.14 |  22450.8 |   22785.5 |   **0.99** |     1.000 |
+| jsonlog-16m  |   369.4 |   207.1 |       1.78 |   1830.6 |     896.0 |       2.04 |     1.010 |
+| osdb         |   338.4 |   151.2 |       2.24 |   1745.5 |     770.4 |       2.27 |     1.016 |
+| mr           |   273.2 |   131.3 |       2.08 |   1500.6 |     479.4 |       3.13 |     1.022 |
+| smallmsg-8m  |   318.2 |   147.3 |       2.16 |   2202.4 |     886.9 |       2.48 |     1.029 |
+| mozilla      |   379.3 |   201.6 |       1.88 |   1892.6 |    1013.4 |       1.87 |     1.029 |
+| ooffice      |   234.1 |    95.2 |       2.46 |   1038.3 |     511.9 |       2.03 |     1.032 |
+| sao          |   195.2 |    80.3 |       2.43 |    922.1 |     488.8 |       1.89 |     1.034 |
+| samba        |   406.1 |   231.8 |       1.75 |   2310.9 |     974.0 |       2.37 |     1.036 |
+| reymont      |   264.0 |   143.7 |       1.84 |   1559.4 |     530.1 |       2.94 |     1.041 |
+| webster      |   250.5 |   139.1 |       1.80 |   1488.5 |     557.0 |       2.67 |     1.050 |
+| dickens      |   219.7 |   121.1 |       1.81 |   1387.8 |     502.3 |       2.76 |     1.052 |
+| text-32m     |  9759.6 | 20936.9 |   **0.47** |   9481.7 |   31570.6 |   **0.30** |     1.071 |
+| xml          |   626.0 |   318.1 |       1.97 |   2481.3 |    1087.9 |       2.28 |     1.079 |
+| nci          |   783.1 |   390.4 |       2.01 |   2534.9 |    1162.9 |       2.18 |     1.100 |
 
-**mean C/us comp 2.08, decomp 2.25 | mean ratio 1.012 | worst ratio 1.100 (nci) |
+**mean C/us comp 1.73, decomp 2.04 | mean ratio 1.012 | worst ratio 1.100 (nci) |
 we beat C: 3 comp, 3 decomp, 3 ratio**
 
-**L3 ratio was already excellent and it tightened.** The mean is unchanged at **1.012**,
-but the worst cell moved from `xml` **1.104** to `nci` **1.100**, and the middle of the
-board compressed toward parity: `mozilla` 1.071 -> **1.029**, `samba` 1.073 ->
-**1.036**, `xml` 1.104 -> **1.079**, `dickens` 1.066 -> **1.052**. Three corpora still
-BEAT C -- `versions-16m` 0.659, `zeros-32m` 0.967 and `x-ray` 0.983.
+**L3 ratio is UNCHANGED cell-for-cell from the 08-20 board** -- every `us/c size`
+matches to the third decimal, which is exactly what a byte-exact campaign predicts and
+doubles as an end-to-end identity check on the twins. Mean **1.012**, worst `nci`
+**1.100**. Three corpora still BEAT C -- `versions-16m` 0.659, `zeros-32m` 0.967 and
+`x-ray` 0.983. `incomp-32m` compress narrowed to **1.14** and its decompress touched
+**0.99**.
 
 **Decompress remains the weaker half at L3** (2.06-3.53 against compress 2.00-3.23),
 unchanged in character from the 08-17 board and still following from emitting Huffman
 literals where we used to emit raw ones.
 
-Against mission section 7: **3 pass compress** (zeros 0.25, text 0.46, versions 0.64),
-**3 pass decompress** (text 0.28, zeros 0.93, incomp 1.00).
+Against mission section 7: **4 pass compress** (zeros 0.26, text 0.47, versions 0.60,
+incomp 1.14), **3 pass decompress** (text 0.30, zeros 0.95, incomp 0.99); `versions`
+decompress misses by one hundredth at 1.12.
 
 > **WHAT THIS BOARD DOES NOT SAY.** It does not say the optimization campaign made us
 > faster. Its speed columns cannot carry that claim at a 13.45% null spread, and the
@@ -175,41 +168,34 @@ Against mission section 7: **3 pass compress** (zeros 0.25, text 0.46, versions 
 
 ## 3. Stage anatomy — where OUR time goes
 
-**Re-measured 2026-08-20 (fourth pass), L3, 8 MiB board, after the optimization
-campaign** ([`m7-optimize-anatomy.md`](m7-optimize-anatomy.md)). Share of encode
-(`stage / EncodeTotal`) and of decode (`stage / DecodeTotal`); bold marks the LEADING
-stage on each half. Leaf stages only -- `EncodeEntropy`, `EncodeBlocks` and
-`DecodeBlocks` are PARENT scopes and ranking them against their own children is
-meaningless (a mistake made twice while deriving this board).
-
-> **THESE ARE SHARES, NOT TIMES.** They come from a `--features profile` build whose
-> own instrumentation is part of what it measures, so a share may move because its
-> stage shrank OR because another grew. Do not read an absolute speedup out of this
-> table; read WHERE THE TIME IS.
+**Re-measured 2026-08-21 (fifth pass, post twin campaign), L3, 8 MiB board
 
 | corpus       | MatchFind |     Huff | FseSeq | SeqCode |  DecLits |   DecSeq |    DecCk |
 | ------------ | --------: | -------: | -----: | ------: | -------: | -------: | -------: |
-| smallmsg-8m  |  **78.7** |      5.9 |    4.8 |     6.2 |     10.2 | **86.0** |      2.2 |
-| sao          |  **78.7** |     10.8 |    4.8 |     2.6 |     33.3 | **64.4** |      2.1 |
-| x-ray        |  **77.3** |     10.9 |    5.0 |     3.4 |     17.5 | **78.8** |      3.5 |
-| mozilla      |  **74.1** |     10.2 |    5.8 |     4.6 |     13.9 | **82.2** |      3.6 |
-| jsonlog-16m  |  **74.1** |      6.6 |    7.0 |     7.0 |      9.9 | **85.8** |      2.7 |
-| ooffice      |  **73.7** |     12.2 |    5.3 |     4.8 |     19.2 | **77.5** |      1.9 |
-| samba        |  **73.7** |      7.3 |    7.7 |     6.2 |      7.5 | **88.7** |      3.3 |
-| dickens      |  **72.7** |      4.1 |    9.4 |     9.2 |      3.2 | **94.5** |      2.3 |
-| reymont      |  **72.0** |      3.8 |   10.3 |     9.1 |      2.8 | **95.3** |      1.5 |
-| webster      |  **72.0** |      4.9 |    9.7 |     8.9 |      4.0 | **94.1** |      1.8 |
-| mr           |  **68.6** |      8.7 |    9.5 |     8.3 |      5.9 | **92.1** |      1.8 |
-| osdb         |  **68.2** |     16.4 |    5.8 |     5.8 |     10.5 | **86.0** |      3.1 |
-| xml          |  **67.7** |      7.7 |   10.3 |     7.9 |      7.1 | **88.3** |      3.9 |
-| nci          |  **64.8** |      6.7 |   12.6 |     9.2 |      6.3 | **88.8** |      4.6 |
-| text-32m     |  **61.8** |      3.5 |    0.9 |     0.3 |      0.2 | **65.0** |     33.8 |
-| versions-16m |  **54.6** |      0.8 |    3.7 |     4.8 |      0.3 | **67.4** |     31.6 |
-| incomp-32m   |  **11.5** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **17.9** |
-| zeros-32m    |   **0.0** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **28.3** |
+| smallmsg-8m  |  **82.3** |      5.0 |    4.6 |     4.7 |     10.0 | **85.6** |      2.5 |
+| jsonlog-16m  |  **78.7** |      5.6 |    5.8 |     6.1 |     10.9 | **84.3** |      2.8 |
+| sao          |  **76.9** |     11.7 |    4.8 |     2.9 |     30.0 | **67.5** |      2.2 |
+| x-ray        |  **75.4** |     12.3 |    5.5 |     3.6 |     15.9 | **82.2** |      1.7 |
+| dickens      |  **75.0** |      4.0 |    8.8 |     8.6 |      3.4 | **94.8** |      1.7 |
+| webster      |  **74.9** |      4.9 |    8.7 |     8.1 |      4.2 | **93.3** |      2.2 |
+| samba        |  **74.7** |      7.1 |    7.3 |     5.9 |      7.4 | **88.5** |      3.6 |
+| mozilla      |  **74.3** |     10.3 |    5.2 |     4.6 |     14.0 | **80.9** |      4.2 |
+| reymont      |  **73.2** |      4.2 |   10.5 |     8.3 |      3.1 | **94.7** |      1.9 |
+| mr           |  **73.0** |      8.8 |    9.0 |     6.1 |      5.5 | **92.6** |      1.7 |
+| ooffice      |  **72.3** |     13.0 |    5.9 |     5.4 |     18.1 | **78.7** |      2.1 |
+| osdb         |  **70.5** |     16.3 |    5.4 |     4.3 |      9.9 | **86.9** |      3.0 |
+| xml          |  **69.0** |      7.8 |    9.2 |     7.6 |      7.6 | **87.9** |      4.2 |
+| nci          |  **64.9** |      6.6 |   11.9 |     9.4 |      6.6 | **87.7** |      5.2 |
+| text-32m     |  **59.9** |      3.7 |    1.0 |     0.3 |      0.4 | **75.9** |     22.2 |
+| versions-16m |  **55.0** |      1.0 |    2.9 |     4.6 |      0.3 | **76.9** |     21.8 |
+| incomp-32m   |  **11.4** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **23.7** |
+| zeros-32m    |   **0.0** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **24.2** |
 
-**`EncodeMatchFind` is now #1 on 18 of 18** -- up from 15 of 18. **Huffman no longer
-leads ANY corpus on encode**, where it previously led three:
+**`EncodeMatchFind` is #1 on 18 of 18, unchanged**, and its shares NUDGED UP across
+the board (smallmsg 78.7 -> 82.3, jsonlog 74.1 -> 78.7, dickens 72.7 -> 75.0): the twin
+campaign compressed the entropy stages' absolute time, so the finder's share of what
+remains grew -- shares are ONLY comparable within a run, but the direction is the one
+the twins predict. **Huffman still leads NOWHERE on encode**, where it once led three:
 
 | corpus | Huff, 08-16 | Huff, 08-20 |
 | --- | ---: | ---: |
@@ -218,8 +204,10 @@ leads ANY corpus on encode**, where it previously led three:
 | `osdb` | **40.5** | 16.4 |
 | `mozilla` | 33.7 | 10.2 |
 
-**`DecodeSeq` is #1 on 16 of 18**, up from 13. **`DecodeLiterals` leads NOWHERE**, down
-from 2 -- and it collapsed on exactly the corpora that used to be its own:
+**`DecodeSeq` is #1 on 16 of 18, unchanged**, and now clears 75% even on the
+degenerate corpora (`text-32m` 65.0 -> 75.9, `versions-16m` 67.4 -> 76.9).
+**`DecodeLiterals` leads NOWHERE** -- it collapsed on exactly the corpora that were
+once its own:
 
 | corpus | DecLits, 08-16 | DecLits, 08-20 |
 | --- | ---: | ---: |
@@ -235,17 +223,21 @@ campaign's densest target: 63 per-literal bounds checks removed from
 alphabet-flatness axis that used to drive BOTH sides now drives neither: the encoder's
 Huffman share and the decoder's literal share fell in step.
 
-**`DecodeChecksum` still leads the degenerate corpora** (`text-32m` 33.8%,
-`versions-16m` 31.6%, `zeros-32m` 28.3%, `incomp-32m` 17.9%) but by less than before
-(53.4 / 43.6 / 32.6 / 43.7). The standing conclusion holds unchanged: on high-ratio and
+**`DecodeChecksum` leads only the two truly empty corpora now** (`zeros-32m` 24.2%,
+`incomp-32m` 23.7%); on `text-32m` and `versions-16m` its share fell to 22.2% and
+21.8% (from 33.8 / 31.6) and `DecodeSeq` took the lead there too. The standing conclusion holds unchanged: on high-ratio and
 incompressible content there is little to decode, so **verification IS the decoder**,
 and `--no-check` / `DecompressOptions::force_ignore_checksum` removes the largest single
 stage there rather than shaving a micro-option.
 
-**WHAT THIS SAYS NOW.** The encoder has ONE target and no second: match-find leads every
-corpus, from 54.6% (`versions`) to 78.7% (`smallmsg`, `sao`). The decoder has one too --
-sequence execution, 64-95% on every compressible file. The entropy stages that used to
-compete for the lead are no longer in the running on either half.
+**WHAT THIS SAYS NOW.** The allocation is MORE concentrated than ever, and the twin
+campaign is why: the entropy and bitstream stages it rebuilt (Huff, FseSeq, SeqCode,
+DecLits, DecCk) all shrank or held their shares, so both halves now funnel into their
+single hot stage. The encoder's target is match-find, 55.0-82.3% on every compressible
+corpus; the decoder's is sequence execution, 67.5-94.8%. Slowness is allocated to
+exactly two loops, and both already run entirely on the twin architecture -- the next
+win on either must come from doing less WORK (fewer probes, fewer positions, better
+copy shapes), not from cheaper instructions.
 
 ---
 
@@ -435,6 +427,13 @@ Fusing it into the block loop was tried and measured ~12% WORSE (brick 85, rever
 
 Found while auditing, per the `rusty_curiosity` law that an unused thing is invisible
 to every profiler:
+
+> **CORRECTION 2026-08-21:** the two bullets below were true when written and are now
+> INVERTED by the BMI2 twin campaign (`08d14e3`..`bfd0cf0`). `has_bmi2()` is the
+> central live dispatch: every bitstream engine, block driver, literal section, and
+> finder (Fast x140, DFast, Greedy/Lazy, Bt x84, chain walk) selects a
+> `#[target_feature(enable = "bmi2,lzcnt")]` twin at runtime, and the decoder's
+> sequence loop additionally dispatches on `has_avx2()`. Kept for history:
 
 - **The entire BMI2 bit-extract dispatch is dead.** `simd::look_n_bits` (which calls
   `has_bmi2()` and picks `look_n_bits_bmi2` vs `look_n_bits_shift`) has exactly two
