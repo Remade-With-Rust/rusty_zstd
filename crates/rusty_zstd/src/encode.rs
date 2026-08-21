@@ -9544,6 +9544,7 @@ fn find_bt_lazy(
     let clog = params.chain_log.min(24);
     let btf = bt_resolve::<true>(tables.hash_log, clog);
     let btf_ins = bt_resolve::<false>(tables.hash_log, clog);
+    let gain_cmp = lazy_gain_enabled_bt();
     let fill_on = lazy_fill_enabled();
     let bt_stride = bt_fill_stride();
     let use_rep = rep_search_on(tables.rep_yield, params.strategy);
@@ -9580,7 +9581,16 @@ fn find_bt_lazy(
                 look_hi = ip2;
                 let (m, ml) =
                     btf(attempts, src, ip2, block_start, block_end, window, mls, clog, tables);
-                if ml > best_ml {
+                // C's offset-priced look-ahead (`set_lazy_gain_arm`), wired
+                // here for its own board: refuted at L7-L12, untested at
+                // L13-L15 where BtLazy2's economics differ.
+                let take = if gain_cmp {
+                    ml >= mls
+                        && lazy_gain(ml, ip2 - m) > lazy_gain(best_ml, best_ip - best_m) + 4
+                } else {
+                    ml > best_ml
+                };
+                if take {
                     best_ml = ml;
                     best_m = m;
                     best_ip = ip2;
@@ -9695,6 +9705,20 @@ fn opt_lit_cost(tables: &MatchTables) -> u32 {
 
 static OPT_LIT_ARM: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// The DP's match-length extra-bits pricing (Gate 19's other half).
+static OPT_MLBITS_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for ML-bits pricing.
+pub fn set_opt_mlbits_arm(on: bool) {
+    OPT_MLBITS_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn opt_mlbits_enabled() -> bool {
+    // DEFAULT ON -- adjudicated: L16 -0.007% / L19 -0.014% / L22 -0.014%
+    // totals, best nci -0.302%, worst jsonlog +0.097%. Small and real.
+    !matches!(OPT_MLBITS_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
+}
 
 /// Set the DP literal price in-process.
 pub fn set_opt_lit_arm(v: u32) {
@@ -10071,6 +10095,7 @@ fn find_opt(
     let fill_rep_max = opt_fill_rep_max();
     let fill_step = opt_fill_stride();
     let fill_span_max = opt_fill_max();
+    let mlb_on = opt_mlbits_enabled();
     while i < n {
         // T2/T4 SAFETY, for the literal edge below -- the ONLY part of this loop
         // that runs at EVERY position.
@@ -10130,7 +10155,13 @@ fn find_opt(
                 if j <= n {
                     #[allow(unsafe_code)]
                     unsafe {
-                        let np = *price.get_unchecked(i + 1) + rep_cost;
+                        let np = *price.get_unchecked(i + 1)
+                            + rep_cost
+                            + if mlb_on && rml > 34 {
+                                27 - ((rml - 3) as u32).leading_zeros()
+                            } else {
+                                0
+                            };
                         if np < *price.get_unchecked(j) {
                             *price.get_unchecked_mut(j) = np;
                             *prev.get_unchecked_mut(j) = (i + 1) as u32 | OPT_MATCH_BIT;
@@ -10188,13 +10219,23 @@ fn find_opt(
         // price[i] and seq_cost are PER-MATCH constants: the sum was
         // reloaded and re-added on every length step.
         #[allow(unsafe_code)]
-        let np = unsafe { *price.get_unchecked(i) } + seq_cost;
+        let np_base = unsafe { *price.get_unchecked(i) } + seq_cost;
+        // ADJUDICATED (the Gate 19 note's other half): the bitstream charges
+        // MATCH-LENGTH extra bits, but the DP priced every length of a match
+        // identically -- so the "optimal" parse over-preferred long matches
+        // whose tails cost real bits. RFC shape: lengths 3..=34 pay 0 extra
+        // bits; beyond that the extra bits grow ~log2(len - 3) - 4.
         let mut len = mls;
         loop {
             let j = i + len;
             if j > n {
                 break;
             }
+            let np = if mlb_on && len > 34 {
+                np_base + (27 - ((len - 3) as u32).leading_zeros())
+            } else {
+                np_base
+            };
             #[allow(unsafe_code)]
             unsafe {
                 if np < *price.get_unchecked(j) {
@@ -10602,7 +10643,16 @@ pub fn set_lazy_gain_arm(on: bool) {
 }
 
 fn lazy_gain_enabled() -> bool {
+    // find_lazy's default: OFF (refuted at L7-L12 -- not the loser
+    // mechanism there, and mixed-small on its own).
     matches!(LAZY_GAIN_ARM.load(core::sync::atomic::Ordering::Relaxed), 2)
+}
+
+fn lazy_gain_enabled_bt() -> bool {
+    // find_bt_lazy's default: ON -- adjudicated at L13-L15: totals -0.20%,
+    // best dickens -1.01%, worst smallmsg +0.48%. Same arm value overrides
+    // both ladders for A/Bs.
+    !matches!(LAZY_GAIN_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
 }
 
 /// C's lazy gain: `4*ml - highbit(offset + 1)`.
