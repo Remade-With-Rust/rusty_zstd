@@ -851,10 +851,27 @@ impl HuffCTable {
         // Each brick keeps its own byte-identity gate
         // (`encode_stream_unrolled_matches_scalar`) regardless of the switch.
         if crate::encode::huff_fast_enabled() {
+            // The last untwinned high-traffic bitstream loop: per-LITERAL
+            // add_bits chains at every level (the 621a140 pattern; same
+            // body, shrx/shlx available, runtime CPUID guard).
+            #[cfg(all(target_arch = "x86_64", feature = "std"))]
+            if crate::simd::has_bmi2() {
+                // SAFETY: guarded by runtime CPUID; the body is identical.
+                #[allow(unsafe_code)]
+                return unsafe { self.encode_stream_unrolled_bmi2(src) };
+            }
             self.encode_stream_unrolled(src)
         } else {
             self.encode_stream_scalar(src)
         }
+    }
+
+    /// The BMI2-compiled twin of `encode_stream_unrolled`.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[target_feature(enable = "bmi2,lzcnt")]
+    #[allow(unsafe_code)]
+    unsafe fn encode_stream_unrolled_bmi2(&self, src: &[u8]) -> Result<Vec<u8>, Error> {
+        self.encode_stream_unrolled(src)
     }
 
     /// True iff every byte in `src` has a code. Treeless reuse of `prev` must
@@ -891,6 +908,7 @@ impl HuffCTable {
 
     /// C `HUF_compress1X` body: flush, then K symbols without a container check.
     /// `K` from `max_nbits` so `K*max + 7 leftover < 64` (16/8/6/5 analog of 4×4/8×8/16×16).
+    #[inline(always)]
     fn encode_stream_unrolled(&self, src: &[u8]) -> Result<Vec<u8>, Error> {
         if src.is_empty() {
             return Err(Error::Corruption);
@@ -900,6 +918,7 @@ impl HuffCTable {
         Ok(bits.close())
     }
 
+    #[inline(always)]
     fn encode_rev_into(&self, bits: &mut crate::bit::BitCStream, src: &[u8]) {
         crate::prof::note_huff_path(if self.use_fill() {
             0
