@@ -3835,6 +3835,9 @@ fn find_fast(
     // (versions-16m L1: 820,848 -> 81,206 bytes). A global default cannot serve
     // both, so each block inherits the previous block's measured repcode yield.
     // `rep_yield` starts at 1.0, so the first block of every frame always probes.
+    // EIGHTH sighting of the un-gated per-block atomic class (959e0ae),
+    // caught by the whole-binary lock census.
+    #[cfg(feature = "profile")]
     FAST_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     // GATE 2, SECOND VARIABLE. `rep_yield` alone leaves real wins on the table:
     // always-on is -0.171% overall, with xml -3.708% and mozilla -1.107%, but it

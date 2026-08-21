@@ -123,6 +123,7 @@ impl HuffmanTable {
     }
 
     /// C `HUF_decodeStreamX2`: one peek can emit 1 or 2 symbols.
+    #[inline(always)]
     fn decode_into_x2(&self, br: &mut BitRev<'_>, dst: &mut [u8]) -> Result<(), Error> {
         let max = u32::from(self.max_bits);
         let dt = self.table_x2.as_slice();
@@ -325,6 +326,7 @@ impl HuffmanTable {
     /// C `HUF_decompress4X2_usingDTable_internal_fast_c_loop`.
     /// Left-justified container, peek `bits >> 53` (tableLog=11), reload via CTZ.
     /// `None` = use the BIT_DStream X2 loop (short streams / not 64-bit).
+    #[inline(always)]
     fn fast_4x2(
         &self,
         s0: &[u8],
