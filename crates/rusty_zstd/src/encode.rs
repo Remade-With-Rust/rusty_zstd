@@ -4418,6 +4418,8 @@ fn find_fast_impl_inner<
     // `tags_v` is provably untouched.
     debug_assert!(!WIDE || pack);
     let pack_eff = if WIDE { true } else { pack };
+    // W8: hoisted for the slot primitives -- see `fast_slot_swap`.
+    let tags_live = !tables.tags.is_empty();
     // BRICK 51: `probes`/`hits` feed ONLY `note_search`, which is a no-op
     // without the `profile` feature (their other consumers, `last_hit_rate` and
     // `tag_latch`, were write-only dead state left by the brick-41 revert).
@@ -4626,6 +4628,13 @@ fn find_fast_impl_inner<
     // the wide arm, so the off arm stays byte-identical.
     let veto_block = (WIDE || tables.fast_hash_legacy)
         && (bar_all || (tables.blocks_done > 0 && tables.rep_yield > fast_lazy_threshold()));
+    // W6: acceptance was `ml >= mls` INSIDE the probe plus a `.filter` for
+    // `!veto_block || ml >= ff_anchor_ml()` OUTSIDE it -- six instructions per
+    // accepted candidate (two compares, two setcc, an and and an or) for two
+    // PER-BLOCK constants. They are both lower bounds on the same value, so
+    // they compose into one bar tested once. `ff_anchor_ml()` is the constant
+    // 16 in release, so this is byte-identical by construction.
+    let accept_ml = if veto_block { mls.max(ff_anchor_ml()) } else { mls };
     // 2-WAY SOFTWARE PIPELINE (brick 39, `RZSTD_MF_PIPE=0` disables).
     //
     // Measured: 26 cycles per probe on webster, while we probe 0.259/byte
@@ -4675,7 +4684,7 @@ fn find_fast_impl_inner<
         let mut pipe_pos = 0u64;
         let (mut ff_made, mut ff_used) = (0u64, 0u64);
         let (mut h0, mut g0) = fast_hash_tag::<true>(src, ip, WIDE, f_mask, f_shift);
-        let mut m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h0, g0);
+        let mut m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, tags_live, h0, g0);
         loop {
             if COUNT {
                 pipe_pos += 1;
@@ -4688,13 +4697,13 @@ fn find_fast_impl_inner<
             if COUNT && PACKED {
                 let raw = fast_slot_raw(&hash_v, pack_eff, h0);
                 if m0 == 0 && raw != 0 {
-                    if fast_probe(&mut (0, 0), src, raw, ip, window, lowest, mls, block_end).is_some() {
+                    if fast_probe(&mut (0, 0), src, raw, ip, window, lowest, mls, mls, block_end).is_some() {
                         TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     }
                     TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
-            fast_slot_store(&mut hash_v, &mut tags_v, pack_eff, h0, ip, g0);
+            fast_slot_store(&mut hash_v, &mut tags_v, pack_eff, tags_live, h0, ip, g0);
             if REP {
                 // ffanat release-asm read: this unconditional per-position
                 // increment was one of six spilled u64 locals -- `incq (%rbp)`
@@ -4703,7 +4712,7 @@ fn find_fast_impl_inner<
                 if COUNT {
                     rep_probes += 1;
                 }
-                if let Some(ml) = try_rep1(src, ip, rep1, lowest, block_end) {
+                if let Some(ml) = try_rep1(src, ip, rep1, lowest, block_end, ilimit) {
                     rep_hits += 1;
                     rep_bytes += ml as u64;
                     if COUNT {
@@ -4742,7 +4751,7 @@ fn find_fast_impl_inner<
                     let (nh, ng) = fast_hash_tag::<true>(src, ip, WIDE, f_mask, f_shift);
                     h0 = nh;
                     g0 = ng;
-                    m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h0, g0);
+                    m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, tags_live, h0, g0);
                     continue;
                 }
             }
@@ -4776,18 +4785,17 @@ fn find_fast_impl_inner<
                         0
                     }
                 } else {
-                    fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h, g)
+                    fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, tags_live, h, g)
                 };
                 (h, g, v)
             } else {
                 (0usize, 0u8, 0u32)
             };
             if let Some((m, ml)) = (if WIDE {
-                fast_probe_wide::<true>(&mut cand, src, m0, ip, window, lowest, mls, f_mask, block_end)
+                fast_probe_wide::<true>(&mut cand, src, m0, ip, window, lowest, mls, accept_ml, f_mask, block_end)
             } else {
-                fast_probe(&mut cand, src, m0, ip, window, lowest, mls, block_end)
+                fast_probe(&mut cand, src, m0, ip, window, lowest, mls, accept_ml, block_end)
             })
-                .filter(|&(_, ml)| !veto_block || ml >= ff_anchor_ml())
             {
                 if COUNT {
                     if COUNT {
@@ -4813,6 +4821,7 @@ fn find_fast_impl_inner<
                     frame_start,
                     lp_copy,
                 
+                    tags_live,
                     f_ends,
                 );
                 anchor = ip;
@@ -4849,7 +4858,7 @@ fn find_fast_impl_inner<
                 let (nh, ng) = fast_hash_tag::<true>(src, ip, WIDE, f_mask, f_shift);
                 h0 = nh;
                 g0 = ng;
-                m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h0, g0);
+                m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, tags_live, h0, g0);
                 continue;
             }
             if nip > ilimit {
@@ -4940,20 +4949,22 @@ fn find_fast_impl_inner<
             }
         }
         let (h0, g0) = fast_hash_tag::<true>(src, ip, WIDE, f_mask, f_shift);
-        let m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h0, g0);
+        // W7: one slot touch instead of a load and a store that each branch
+        // on `pack`. The store's value and position are unchanged, and it
+        // still precedes the pair probe -- only the two `pack` tests merge.
+        let m0 = fast_slot_swap::<PACKED>(&mut hash_v, &mut tags_v, pack_eff, tags_live, h0, ip, g0);
         if COUNT && PACKED {
             // Gate 7 is recorded byte-identical: a tag mismatch should imply the
             // 4 bytes differ, so `fast_probe` would have rejected the candidate
             // anyway. Count the cases where it would NOT have.
             let raw = fast_slot_raw(&hash_v, pack_eff, h0);
             if m0 == 0 && raw != 0 {
-                if fast_probe(&mut (0, 0), src, raw, ip, window, lowest, mls, block_end).is_some() {
+                if fast_probe(&mut (0, 0), src, raw, ip, window, lowest, mls, mls, block_end).is_some() {
                     TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
-        fast_slot_store(&mut hash_v, &mut tags_v, pack_eff, h0, ip, g0);
         // GATE 6 SPEED: issue the PAIR probe's load HERE, next to the main
         // probe's, instead of after `fast_probe` has consumed `m0`.
         //
@@ -4970,7 +4981,7 @@ fn find_fast_impl_inner<
         // and match paths both `continue`. Only the issue order moves.
         let pair_pre = if pair && ip + 1 <= ilimit {
             let (h1, g1) = fast_hash_tag::<false>(src, ip + 1, WIDE, f_mask, f_shift);
-            Some((h1, g1, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h1, g1)))
+            Some((h1, g1, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, tags_live, h1, g1)))
         } else {
             None
         };
@@ -4978,7 +4989,7 @@ fn find_fast_impl_inner<
             if COUNT {
                 rep_probes += 1;
             }
-            if let Some(ml) = try_rep1(src, ip, rep1, lowest, block_end) {
+            if let Some(ml) = try_rep1(src, ip, rep1, lowest, block_end, ilimit) {
                 rep_hits += 1;
                 rep_bytes += ml as u64;
                 if COUNT {
@@ -5001,11 +5012,10 @@ fn find_fast_impl_inner<
             }
         }
         if let Some((m, ml)) = (if WIDE {
-                fast_probe_wide::<true>(&mut cand, src, m0, ip, window, lowest, mls, f_mask, block_end)
+                fast_probe_wide::<true>(&mut cand, src, m0, ip, window, lowest, mls, accept_ml, f_mask, block_end)
             } else {
-                fast_probe(&mut cand, src, m0, ip, window, lowest, mls, block_end)
+                fast_probe(&mut cand, src, m0, ip, window, lowest, mls, accept_ml, block_end)
             })
-                .filter(|&(_, ml)| !veto_block || ml >= ff_anchor_ml())
             {
             if COUNT {
                 hits += 1;
@@ -5029,6 +5039,7 @@ fn find_fast_impl_inner<
                 frame_start,
                 lp_copy,
             
+                    tags_live,
                     f_ends,
                 );
             anchor = ip;
@@ -5064,19 +5075,19 @@ fn find_fast_impl_inner<
                     Some(v) => v,
                     None => {
                         let (h, g) = fast_hash_tag::<false>(src, ip1, WIDE, f_mask, f_shift);
-                        (h, g, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, h, g))
+                        (h, g, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, tags_live, h, g))
                     }
                 };
                 if COUNT && PACKED {
                     let raw = fast_slot_raw(&hash_v, pack_eff, h1);
                     if m1 == 0 && raw != 0 {
-                        if fast_probe(&mut (0, 0), src, raw, ip1, window, lowest, mls, block_end).is_some() {
+                        if fast_probe(&mut (0, 0), src, raw, ip1, window, lowest, mls, mls, block_end).is_some() {
                             TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         }
                         TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                fast_slot_store(&mut hash_v, &mut tags_v, pack_eff, h1, ip1, g1);
+                fast_slot_store(&mut hash_v, &mut tags_v, pack_eff, tags_live, h1, ip1, g1);
                 // A THIRD VARIABLE WAS TESTED AND REJECTED: the pair match's
                 // LENGTH. `versions-16m` sits at exactly +10.55% for every
                 // minimum from 0 to 24, while the winners degrade badly (total
@@ -5088,9 +5099,9 @@ fn find_fast_impl_inner<
                 // (repcode already covers that span) and not of the candidate.
                 // That is why `rep_yield` is the right and sufficient variable.
                 if let Some((m, ml)) = (if WIDE {
-                    fast_probe_wide::<false>(&mut cand, src, m1, ip1, window, lowest, mls, f_mask, block_end)
+                    fast_probe_wide::<false>(&mut cand, src, m1, ip1, window, lowest, mls, accept_ml, f_mask, block_end)
                 } else {
-                    fast_probe(&mut cand, src, m1, ip1, window, lowest, mls, block_end)
+                    fast_probe(&mut cand, src, m1, ip1, window, lowest, mls, accept_ml, block_end)
                 })
                     .filter(|&(_, ml)| !veto_block || ml >= ff_anchor_ml())
                 {
@@ -5128,6 +5139,7 @@ fn find_fast_impl_inner<
                         frame_start,
                         lp_copy,
                     
+                    tags_live,
                     f_ends,
                 );
                     anchor = ip;
@@ -5252,6 +5264,7 @@ fn fast_probe_wide<const SAFE: bool>(
     window: usize,
     lowest: usize,
     mls: usize,
+    accept_ml: usize,
     mask: u64,
     block_end: usize,
 ) -> Option<(usize, usize)> {
@@ -5309,7 +5322,13 @@ fn fast_probe_wide<const SAFE: bool>(
     } else {
         8 + count_match_fast(src, m + 8, ip + 8, block_end)
     };
-    Some((m, ml))
+    // W6: the wide probe's mask already proves `ml >= mls`, so its only
+    // acceptance question is the veto bar -- now the same single compare.
+    if ml >= accept_ml {
+        Some((m, ml))
+    } else {
+        None
+    }
 }
 
 fn fast_probe(
@@ -5320,6 +5339,9 @@ fn fast_probe(
     window: usize,
     lowest: usize,
     mls: usize,
+    // W6: the composed acceptance bar -- `mls`, raised to the veto anchor on
+    // blocks that carry it. See its definition in `find_fast_impl`.
+    accept_ml: usize,
     block_end: usize,
 ) -> Option<(usize, usize)> {
     if match_slot == 0 {
@@ -5369,7 +5391,7 @@ fn fast_probe(
         FF_CAND4.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         4 + count_match(src, m + 4, ip + 4, block_end)
     };
-    if ml >= mls {
+    if ml >= accept_ml {
         #[cfg(feature = "profile")]
         FF_ACCEPT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Some((m, ml))
@@ -5987,11 +6009,28 @@ fn rep_search_on(rep_yield: f32, strategy: Strategy) -> bool {
 
 /// C `zstd_fast.c`: a repeat-offset match tested at `ip+1`. Returns its length.
 #[inline(always)]
-fn try_rep1(src: &[u8], ip: usize, rep1: usize, lowest: usize, block_end: usize) -> Option<usize> {
+fn try_rep1(
+    src: &[u8],
+    ip: usize,
+    rep1: usize,
+    lowest: usize,
+    block_end: usize,
+    // W3: the bound as the CALLER states it. Every one of the seven call
+    // sites sits inside `while ip <= ilimit` with
+    // `ilimit = block_end.saturating_sub(8)` and the `block_start >= ilimit`
+    // early-out above it, so `ip <= ilimit` -- and therefore `at + 4 <=
+    // block_end` -- is already proven where this runs. Phrasing the guard as
+    // the loop's OWN condition lets LLVM delete it outright at those sites
+    // (it was `lea`, `cmp`, `ja` plus a `block_end` reload, per POSITION on
+    // every ladder) while keeping a real guard for any caller that cannot
+    // prove it.
+    ilimit: usize,
+) -> Option<usize> {
     let at = ip + 1;
-    if rep1 == 0 || at + 4 > block_end || at < rep1 {
+    if rep1 == 0 || ip > ilimit || at < rep1 {
         return None;
     }
+    debug_assert!(at + 4 <= block_end);
     let back = at - rep1;
     if back < lowest {
         return None;
@@ -6964,7 +7003,17 @@ pub fn take_lit_push() -> (u64, u64) {
 /// `store_fast`/`load_fast`/`raw_fast` exactly, receipt counters included.
 #[inline(always)]
 #[allow(unsafe_code)]
-fn fast_slot_store(hash: &mut [u32], tags: &mut [u8], pack: bool, h: usize, pos: usize, tag: u8) {
+fn fast_slot_store(
+    hash: &mut [u32],
+    tags: &mut [u8],
+    pack: bool,
+    // W10: hoisted `!tags.is_empty()` -- see `fast_slot_swap`.
+    tags_live: bool,
+    h: usize,
+    pos: usize,
+    tag: u8,
+) {
+    debug_assert_eq!(tags_live, !tags.is_empty());
     debug_assert!(h < hash.len());
     if pack {
         *unsafe { hash.get_unchecked_mut(h) } =
@@ -6974,11 +7023,68 @@ fn fast_slot_store(hash: &mut [u32], tags: &mut [u8], pack: bool, h: usize, pos:
     // The array route's `tags` is allocated at EXACTLY `hash.len()`, and `h`
     // has already indexed `hash` above -- the bounds test and its branch were
     // dead on every unpacked store.
-    if !tags.is_empty() {
-        debug_assert_eq!(tags.len(), hash.len());
+    if tags_live {
+        debug_assert!(tags.len() == hash.len());
         *unsafe { tags.get_unchecked_mut(h) } = tag;
     }
     *unsafe { hash.get_unchecked_mut(h) } = (pos as u32).wrapping_add(1);
+}
+
+/// W7: LOAD THEN STORE OF THE SAME SLOT, fused. The main loop reads a slot
+/// and immediately overwrites it with the current position, and each half
+/// tested `pack` for itself -- the asm shows the flag spilled and re-tested
+/// TWICE per position. One branch now serves both, and the packed arm builds
+/// its stored word from the same registers it just decoded.
+#[inline(always)]
+#[allow(unsafe_code)]
+fn fast_slot_swap<const PACKED: bool>(
+    hash: &mut [u32],
+    tags: &mut [u8],
+    pack: bool,
+    tags_live: bool,
+    h: usize,
+    pos: usize,
+    tag: u8,
+) -> u32 {
+    debug_assert_eq!(tags_live, !tags.is_empty());
+    debug_assert!(h < hash.len());
+    // SAFETY: `h` is masked by `hash.len() - 1` at every caller (brick 50).
+    let slot = unsafe { hash.get_unchecked_mut(h) };
+    let e = *slot;
+    if pack {
+        *slot = (((pos as u32).wrapping_add(1)) & 0x00FF_FFFF) | (u32::from(tag) << 24);
+        if e == 0 {
+            return 0;
+        }
+        #[cfg(feature = "profile")]
+        PACKED_TAG_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if PACKED && (e >> 24) as u8 != tag {
+            return 0;
+        }
+        return e & 0x00FF_FFFF;
+    }
+    *slot = (pos as u32).wrapping_add(1);
+    // W8: `tags_live` is the caller's hoisted `!tags.is_empty()` -- a
+    // per-BLOCK fact that was a length load and a test on every slot touch.
+    if tags_live {
+        debug_assert!(!tags.is_empty() && tags.len() == hash.len());
+        let t = unsafe { *tags.get_unchecked(h) };
+        // SAFETY-neutral: the array route writes the tag unconditionally
+        // whenever the array exists (the 190ad8b rule).
+        unsafe { *tags.get_unchecked_mut(h) = tag };
+        if e == 0 {
+            return 0;
+        }
+        if PACKED {
+            #[cfg(feature = "profile")]
+            TAGARR_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if t != tag {
+                return 0;
+            }
+        }
+        return e;
+    }
+    if e == 0 { 0 } else { e }
 }
 
 #[inline(always)]
@@ -6987,9 +7093,14 @@ fn fast_slot_load<const PACKED: bool>(
     hash: &[u32],
     tags: &[u8],
     pack: bool,
+    // W9: the caller's hoisted `!tags.is_empty()` -- see `fast_slot_swap`.
+    // This load is the pipelined loop's FORWARD probe, so the length test it
+    // replaces ran once per position on that path.
+    tags_live: bool,
     h: usize,
     tag: u8,
 ) -> u32 {
+    debug_assert_eq!(tags_live, !tags.is_empty());
     debug_assert!(h < hash.len());
     let e = *unsafe { hash.get_unchecked(h) };
     if e == 0 {
@@ -7008,8 +7119,8 @@ fn fast_slot_load<const PACKED: bool>(
     }
     // Same provable bound as the store's -- per PROBE, on the hottest loop
     // in the encoder.
-    if !tags.is_empty() {
-        debug_assert_eq!(tags.len(), hash.len());
+    if tags_live {
+        debug_assert!(tags.len() == hash.len());
         #[allow(unsafe_code)]
         let t = *unsafe { tags.get_unchecked(h) };
         #[cfg(feature = "profile")]
@@ -7101,6 +7212,8 @@ fn fill_fast_after_match<const PACKED: bool>(
     match_ip: usize,
     match_end: usize,
     ilimit: usize,
+    // W10: hoisted `!tags.is_empty()` -- see `fast_slot_swap`.
+    tags_live: bool,
     // W1: this was `dfast_fill_ends()` INSIDE the helper -- an arm atomic load
     // and its match, per MATCH, on the Fast ladder. `find_dfast_impl` has
     // hoisted the same read per block since the brick-79 sweep; the Fast
@@ -7109,17 +7222,23 @@ fn fill_fast_after_match<const PACKED: bool>(
 ) {
     let (do_a, do_b) = ends;
     let mut n = 0u64;
-    let a = match_ip.saturating_add(2);
+    // W4/W5: `match_end` is `match_ip + n` with `n >= mls >= 4`, so the
+    // `>= 2` test is dead at every call -- and `match_ip` is an index into
+    // `src`, so the `saturating_add` guarding it is a cmov the encoder can
+    // never take. Both ran per MATCH, in all three fill helpers.
+    debug_assert!(match_ip < usize::MAX - 2);
+    let a = match_ip + 2;
     if do_a && a <= ilimit {
         let (h, g) = fast_hash_tag::<true>(src, a, f_wide, f_mask, f_shift);
-        fast_slot_store(hash, tags, pack, h, a, g);
+        fast_slot_store(hash, tags, pack, tags_live, h, a, g);
         n += 1;
     }
-    if do_b && match_end >= 2 {
+    debug_assert!(match_end >= 2);
+    if do_b {
         let b = match_end - 2;
         if b <= ilimit && b != a {
             let (h, g) = fast_hash_tag::<true>(src, b, f_wide, f_mask, f_shift);
-            fast_slot_store(hash, tags, pack, h, b, g);
+            fast_slot_store(hash, tags, pack, tags_live, h, b, g);
             n += 1;
         }
     }
@@ -7148,6 +7267,7 @@ fn emit_fast_seq<const PACKED: bool>(
     ilimit: usize,
     frame_start: usize,
     w: usize,
+    tags_live: bool,
     ends: (bool, bool),
 ) -> usize {
     let _ = mls;
@@ -7180,7 +7300,7 @@ fn emit_fast_seq<const PACKED: bool>(
     });
     let end = ip + n;
     fill_fast_after_match::<PACKED>(
-        hash, tags, pack, f_wide, f_mask, f_shift, src, found_ip, end, ilimit, ends,
+        hash, tags, pack, f_wide, f_mask, f_shift, src, found_ip, end, ilimit, tags_live, ends,
     );
     end
 }
@@ -7210,7 +7330,12 @@ fn fill_hash_after_match(
     let packed = tables.pack_tags;
     let (do_a, do_b) = ends;
     let mut n = 0u64;
-    let a = match_ip.saturating_add(2);
+    // W4/W5: `match_end` is `match_ip + n` with `n >= mls >= 4`, so the
+    // `>= 2` test is dead at every call -- and `match_ip` is an index into
+    // `src`, so the `saturating_add` guarding it is a cmov the encoder can
+    // never take. Both ran per MATCH, in all three fill helpers.
+    debug_assert!(match_ip < usize::MAX - 2);
+    let a = match_ip + 2;
     if do_a && a <= ilimit {
         let (h, g) = hash4_tag_mls(src, a, hash_shift, smask);
         // T1: this helper runs after EVERY match on the DFast path too, so it
@@ -7225,7 +7350,8 @@ fn fill_hash_after_match(
         }
         n += 1;
     }
-    if do_b && match_end >= 2 {
+    debug_assert!(match_end >= 2);
+    if do_b {
         let b = match_end - 2;
         if b <= ilimit && b != a {
             let (h, g) = hash4_tag_mls(src, b, hash_shift, smask);
@@ -7264,7 +7390,12 @@ fn fill_hash_long_after_match(
     let packed = tables.pack_tags;
     let (do_a, do_b) = ends;
     let mut n = 0u64;
-    let a = match_ip.saturating_add(2);
+    // W4/W5: `match_end` is `match_ip + n` with `n >= mls >= 4`, so the
+    // `>= 2` test is dead at every call -- and `match_ip` is an index into
+    // `src`, so the `saturating_add` guarding it is a cmov the encoder can
+    // never take. Both ran per MATCH, in all three fill helpers.
+    debug_assert!(match_ip < usize::MAX - 2);
+    let a = match_ip + 2;
     // W10: this re-read the struct field one line after `packed` hoisted it.
     let ltag_live = packed || !tables.ltags.is_empty();
     if do_a && a <= ilimit {
@@ -7272,7 +7403,8 @@ fn fill_hash_long_after_match(
         tables.put_hl_tag(hash8(src, a, hash_log), a, g, packed);
         n += 1;
     }
-    if do_b && match_end >= 2 {
+    debug_assert!(match_end >= 2);
+    if do_b {
         let b = match_end - 2;
         if b <= ilimit && b != a {
             let g = if ltag_live { hash4_tag_mls(src, b, hash_shift, smask).1 } else { 0 };
@@ -7619,7 +7751,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
             mm_total += 1;
         }
         if use_rep {
-            if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
+            if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end, ilimit) {
                 rep_hits += 1;
                 d_rep_bytes += ml as u64;
                 let mstart = ip + 1;
@@ -8413,7 +8545,7 @@ fn find_greedy_impl<const MLS: usize>(
     let mut ip = block_start;
     while ip <= ilimit {
         if use_rep {
-            if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
+            if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end, ilimit) {
                 rep_hits += 1;
                 let mstart = ip + 1;
                 push_lits_range(&mut lits, src, anchor, mstart);
@@ -9024,7 +9156,7 @@ fn find_lazy_impl<const MLS: usize>(
     let gain_cmp = lazy_gain_enabled();
     while ip <= ilimit {
         if use_rep {
-            if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
+            if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end, ilimit) {
                 rep_hits += 1;
                 let mstart = ip + 1;
                 push_lits_range(&mut lits, src, anchor, mstart);
@@ -10316,7 +10448,7 @@ fn find_bt_lazy(
     let mut ip = block_start;
     while ip <= ilimit {
         if use_rep {
-            if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
+            if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end, ilimit) {
                 rep_hits += 1;
                 let mstart = ip + 1;
                 push_lits_range(&mut lits, src, anchor, mstart);
@@ -10952,7 +11084,11 @@ fn find_opt(
         debug_assert!(price[i + 1] < inf);
         if opt_rep_on {
             o_rep_probes += 1;
-            if let Some(rml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
+            // The DP's own `i + 8 > n` continue above gives `ip + 8 <=
+            // block_end`, which is exactly the finders' `ip <= ilimit`.
+            if let Some(rml) =
+                try_rep1(src, ip, rep1, lowest_rep, block_end, block_end.saturating_sub(8))
+            {
                 o_rep_hits += 1;
                 o_rep_bytes += rml as u64;
                 let j = i + 1 + rml;
