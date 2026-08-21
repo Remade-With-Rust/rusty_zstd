@@ -886,36 +886,6 @@ impl MatchTables {
         Some((v as usize) - 1)
     }
 
-    /// `get_h_tag` in the table's OWN encoding: `pos + 1`, with 0 meaning
-    /// empty or tag-rejected. Exists so the DFast speculation pipeline can
-    /// carry a plain `usize` -- `Option<usize>` has no niche, so each one the
-    /// loop carries is TWO words of live state in a loop already past
-    /// sixteen GPRs. Accept/reject set is identical to `get_h_tag` by
-    /// construction (packed low bits are never 0, see `put_h_tag`).
-    #[inline]
-    #[allow(unsafe_code)]
-    fn get_h_tag_raw(&self, h: usize, tag: u8, on: bool) -> usize {
-        debug_assert!(h < self.hash.len());
-        let v = *unsafe { self.hash.get_unchecked(h) };
-        if v == 0 {
-            return 0;
-        }
-        if self.pack_tags {
-            if (v >> 24) as u8 != tag {
-                return 0;
-            }
-            return (v & 0x00FF_FFFF) as usize;
-        }
-        if on {
-            if let Some(&t) = self.tags.get(h) {
-                if t != tag {
-                    return 0;
-                }
-            }
-        }
-        v as usize
-    }
-
     #[inline(always)]
     #[allow(unsafe_code)]
     fn get_h(&self, h: usize) -> Option<usize> {
@@ -1120,32 +1090,6 @@ impl MatchTables {
             }
         }
         Some((v as usize) - 1)
-    }
-
-    /// `get_hl_tag` in the table's own encoding (`pos + 1`, 0 = none); the
-    /// long-table twin of `get_h_tag_raw`, for the same live-state reason.
-    #[inline]
-    #[allow(unsafe_code)]
-    fn get_hl_tag_raw(&self, h: usize, tag: u8, on: bool) -> usize {
-        debug_assert!(h < self.hash_long.len());
-        let v = *unsafe { self.hash_long.get_unchecked(h) };
-        if v == 0 {
-            return 0;
-        }
-        if self.pack_tags {
-            if on && (v >> 24) as u8 != tag {
-                return 0;
-            }
-            return (v & 0x00FF_FFFF) as usize;
-        }
-        if on {
-            if let Some(&t) = self.ltags.get(h) {
-                if t != tag {
-                    return 0;
-                }
-            }
-        }
-        v as usize
     }
 
     /// Diagnostic twin: the raw long-slot position with the mask honored
@@ -3676,8 +3620,6 @@ fn fast_lazy_enabled() -> bool {
         1 => false,
         2 => true,
         _ => {
-            // Cold resolve -- see `opt_fill_enabled`. This one is read on the
-            // find_fast path, i.e. per block at L1/L2.
             #[cfg(feature = "std")]
             {
                 let on = std::env::var("RZSTD_FASTLAZY")
@@ -3710,18 +3652,12 @@ fn fast_lazy_threshold() -> f32 {
         if c != u32::MAX {
             return f32::from_bits(c);
         }
-        // Cold resolve -- see `opt_fill_enabled`.
-        #[cold]
-        #[inline(never)]
-        fn resolve() -> f32 {
-            let v: f32 = std::env::var("RZSTD_FASTLAZY_T")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(0.7);
-            FASTLAZY_T_CACHE.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
-            v
-        }
-        resolve()
+        let v: f32 = std::env::var("RZSTD_FASTLAZY_T")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.7);
+        FASTLAZY_T_CACHE.store(v.to_bits(), Ordering::Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     0.7
@@ -4437,14 +4373,9 @@ fn find_fast_impl_inner<
     let mut rep_bytes = 0u64;
     // GATE 7 feedback, as LOCALS. These were two unconditional atomic fetch_adds
     // inside `fast_probe`, i.e. two read-modify-writes on shared cache lines in
-    // the hottest loop in the encoder, on EVERY probe. They were kept live in
-    // shipping builds "because `tag_yield` is a shipped dispatch input" -- true
-    // when written, stale since the Prometheus adjudication shipped
-    // `tag_min = 0.0` (m7-optimize-anatomy §3): the only non-profile consumer
-    // is `ut`'s `tag_yield >= tag_min()`, vacuously true at 0.0. The counts and
-    // the `tag_yield` refresh are now `profile`-only (where the content-signal
-    // dump and RZSTD_TAG_T sweeps live); shipping keeps `tag_yield` at its 1.0
-    // seed, which decides `ut` identically.
+    // the hottest loop in the encoder, on EVERY probe -- not gated behind COUNT,
+    // because `tag_yield` is a shipped dispatch input and genuinely needs them.
+    // As locals they cost a register add and are summarised once per block.
     let mut cand = (0u64, 0u64);
     // Probe density. The bit accountant showed our size gap vs C is entirely
     // LITERALS, because C finds more matches -- and we probe only ~0.259
@@ -4893,13 +4824,8 @@ fn find_fast_impl_inner<
         tables.rep_yield = y.max(tables.rep_yield * 0.5);
         // The pipelined loop returns HERE, before the main tail -- so before this
         // it never refreshed `tag_yield` at all and the old global counters just
-        // accumulated across blocks. Refresh is `profile`-only since the
-        // `cand` demotion (see the declaration): shipping's `tag_min = 0.0`
-        // reads the compare vacuously, so a frozen 1.0 seed decides `ut`
-        // identically.
-        if COUNT {
-            tables.tag_yield = cand_yield(cand);
-        }
+        // accumulated across blocks.
+        tables.tag_yield = cand_yield(cand);
         let (ls, lm) = lit_shares(&seqs);
         tables.lit_short_share = ls;
         tables.lit_mid_share = lm;
@@ -5174,10 +5100,7 @@ fn find_fast_impl_inner<
         }
     }
     // GATE 7: feed this block's measured reject share to the next block's gate.
-    // `profile`-only since the `cand` demotion (see the declaration).
-    if COUNT {
-        tables.tag_yield = cand_yield(cand);
-    }
+    tables.tag_yield = cand_yield(cand);
     // GATE 13: and this block's share of literal runs the fixed-width copy can catch.
     let (ls, lm) = lit_shares(&seqs);
     tables.lit_short_share = ls;
@@ -7470,25 +7393,10 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     let accel = if cfg!(feature = "profile") { accel_shift_for(params.strategy) } else { 8 };
     #[cfg(feature = "profile")]
     let mut mm_total = 0u64;
-    // PACKED COUNTER PAIRS. The loop's live set is past sixteen GPRs and the
-    // gates' telemetry is what it spends them on (ceiling probe: 1,530
-    // instructions / 318 stack reloads across the function's copies). Each
-    // pair lives in ONE u64 -- low half gets the hotter increment (an imm8
-    // add), high half the colder one. A block is <= 128 KiB, so each half
-    // counts <= 131,072: no low-half carry can reach bit 32 and the high
-    // half is nowhere near overflow. Unpacked once, after the loop.
-    const HI: u64 = 1 << 32;
-    // nl probes (low, per no-long-match position) | nl hits (high, per hit).
-    let mut nl_pk = 0u64;
-    // band hits (low) | band worse (high) -- both on the raised-band hit path.
-    let mut band_pk = 0u64;
-    // GATE 2 @ L3: repcode match bytes. Written for the length-ratio signal
-    // that dispatches Gate 2 at L1, but that signal was never wired at L3 --
-    // the only consumer is the `DFAST_REP_BYTES` publish, an instrument. So
-    // gated like `mm_total`: this loop's live set is already past sixteen
-    // GPRs (see the register-pressure note above the loop), and an
-    // instrument must not hold a register in shipping builds.
-    #[cfg(feature = "profile")]
+    let mut nl_probes = 0u64;
+    let mut nl_hits = 0u64;
+    // GATE 2 @ L3: repcode match bytes, for the same length-ratio signal that
+    // dispatches Gate 2 at L1.
     let mut d_rep_bytes = 0u64;
     let mut ip = block_start;
     // Speculated (short hash, long hash, short slot, long slot) for the NEXT
@@ -7538,23 +7446,9 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     };
     let dpipe = dfast_pipe_enabled()
         && (tables.dfast_probe == 0 || tables.dfast_spec_yield >= dfast_spec_min());
-    // `spec_used` is DERIVED, not counted: every made speculation is either
-    // consumed by `carried.take()`, discarded at one of the two
-    // `carried = None` sites (rep hit, match commit), or still in `carried`
-    // at loop exit -- so `used = made - discarded - leftover`, an exact
-    // identity. Counting the discards moves the increment from the
-    // once-per-iteration take path onto the per-match cold paths, which is
-    // one fewer accumulator the register-starved hot loop keeps hot (the
-    // ceiling probe prices ALL of this loop's telemetry at 1,530
-    // instructions / 318 stack reloads across the function's 7 copies).
-    // spec made (low, per pipelined iteration) | spec discarded (high, per
-    // match/rep commit) -- same u64 packing as `nl_pk`.
-    let mut spec_pk = 0u64;
+    let (mut spec_made, mut spec_used) = (0u64, 0u64);
     // T1: the speculation now carries the short tag beside the short index.
-    // The two slot values ride in the table's own `pos + 1` encoding (0 =
-    // none) via the `_raw` accessors: `Option<usize>` has no niche, so the
-    // Option form cost this loop four words of live state for two values.
-    let mut carried: Option<(usize, u8, usize, usize, usize)> = None;
+    let mut carried: Option<(usize, u8, usize, Option<usize>, Option<usize>)> = None;
     // Read ONCE per block. `hash4_tag`'s index is `(v * HASH4_PRIME) >> shift`,
     // which is exactly what `hash4` computes, so the tagged path indexes the
     // same slots as `hash_mls(src, ip, 4, hlog)` did.
@@ -7613,10 +7507,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
         if use_rep {
             if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
                 rep_hits += 1;
-                #[cfg(feature = "profile")]
-                {
-                    d_rep_bytes += ml as u64;
-                }
+                d_rep_bytes += ml as u64;
                 let mstart = ip + 1;
                 push_literals(&mut lits, src, anchor, mstart, if lp { LIT_PUSH_WIDTH } else { 0 });
                 seqs.push(Seq {
@@ -7626,9 +7517,6 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                 });
                 ip = mstart + ml;
                 anchor = ip;
-                // A speculation from the previous iteration dies unconsumed
-                // here -- count the discard (cold path; see `spec_pk`).
-                spec_pk += (carried.is_some() as u64) << 32;
                 carried = None;
                 continue;
             }
@@ -7651,22 +7539,24 @@ fn find_dfast_impl_inner<const HLOG: u32>(
         // byte-identity: an issue-order change must not be able to become an
         // algorithm change.
         let (h4, g4, h8, m4, m8) = match carried.take() {
-            // Consumed -- no counter: `spec_used` is derived after the loop.
-            Some(v) => v,
+            Some(v) => {
+                spec_used += 1;
+                v
+            }
             None => {
                 let (a, ga, b) = dfast_hash_pair(src, ip, dtag_shift, smask, hlog);
-                let m = tables.get_h_tag_raw(a, ga, dtag_on);
+                let m = tables.get_h_tag(a, ga, dtag_on);
                 // T1 ledger: a rejection is a candidate load AVOIDED. Counted
                 // only under `profile`, so the shipping loop is untouched.
                 if COUNT && dtag_on {
                     if tables.raw_fast(a) != 0 {
                         TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                        if m == 0 {
+                        if m.is_none() {
                             TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }
-                let ml8 = tables.get_hl_tag_raw(b, ga, lt_on);
+                let ml8 = tables.get_hl_tag(b, ga, lt_on);
                 // 1a ledger, THREE counters so the long table never inherits
                 // the short counters' split personality (see the tag audit):
                 // nonempty / rejected / FALSE (provably lost -- must be 0).
@@ -7676,7 +7566,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                     let raw = tables.raw_hl(b);
                     if raw != 0 {
                         LTAG_NONEMPTY.fetch_add(1, Relaxed);
-                        if ml8 == 0 {
+                        if ml8.is_none() {
                             LTAG_REJECT.fetch_add(1, Relaxed);
                             let mr = (raw as usize) - 1;
                             if match_ok(
@@ -7718,35 +7608,33 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                 // sees `ip` only when its own tag matches what is now stored.
                 let va = if a == h4 {
                     if !dtag_on || ga == g4 {
-                        ip + 1
+                        Some(ip)
                     } else {
-                        0
+                        None
                     }
                 } else {
-                    tables.get_h_tag_raw(a, ga, dtag_on)
+                    tables.get_h_tag(a, ga, dtag_on)
                 };
                 // The long hand-forward mirrors `get_hl_tag`: the store
                 // above wrote tag `g4` at `h8`, so a speculation landing on
                 // that slot sees `ip` only when its own short tag matches.
                 let vb = if b == h8 {
                     if !lt_on || ga == g4 {
-                        ip + 1
+                        Some(ip)
                     } else {
-                        0
+                        None
                     }
                 } else {
-                    tables.get_hl_tag_raw(b, ga, lt_on)
+                    tables.get_hl_tag(b, ga, lt_on)
                 };
-                spec_pk += 1;
+                spec_made += 1;
                 carried = Some((a, ga, b, va, vb));
             }
         }
 
         let mut best_m = 0usize;
         let mut best_ml = 0usize;
-        if m8 != 0 {
-            // decode from the table's `pos + 1` encoding
-            let m8 = m8 - 1;
+        if let Some(m8) = m8 {
             if COUNT {
                 probes += 1;
             }
@@ -7802,21 +7690,12 @@ fn find_dfast_impl_inner<const HLOG: u32>(
         // its neighbour" shape as the repcode and back-extension defects.
         let mut best_ip = ip;
         if best_ml < good_ml && nl_on && ip + 1 <= ilimit {
-            nl_pk += 1;
+            nl_probes += 1;
             let h8b = hash8(src, ip + 1, hlog);
             // The only long consumer without a free tag: `ip + 1` never
             // computed a short hash. One mul+xor on a path already gated by
             // `best_ml < good_ml && nl_on`.
             let g8b = if lt_on { hash4_tag_mls(src, ip + 1, dtag_shift, smask).1 } else { 0 };
-            // REFUTED (2026-08-21): `get_hl_tag_raw` here, mirroring the
-            // speculation tuple's win. Measured WORSE on the deterministic
-            // axis -- function +92 instructions, hot loop +62 / +23 reloads.
-            // The mechanism: an Option consumed immediately by `if let` never
-            // materializes (LLVM fuses discriminant and branch), while the
-            // raw form forces a real 0-or-pos value into a register before
-            // the compare. The `_raw` twins pay off only where the value is
-            // CARRIED across statements (the speculation tuple); in-place
-            // consumers keep the Option.
             if let Some(m8b) = tables.get_hl_tag(h8b, g8b, lt_on) {
                 if COUNT {
                     probes += 1;
@@ -7830,9 +7709,9 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                         // opens. Two adds on a path that fires a few thousand
                         // times per block -- not per position.
                         if best_ml >= 8 {
-                            band_pk += 1;
+                            band_hits += 1;
                             if ip + 1 - m8b > ip - best_m {
-                                band_pk += HI;
+                                band_worse += 1;
                             }
                         }
                         // GATE 14 study: the probe COMMITS at `ip + 1`, spending
@@ -7867,15 +7746,13 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                         best_m = m8b;
                         best_ml = ml;
                         best_ip = ip + 1;
-                        nl_pk += HI;
+                        nl_hits += 1;
                     }
                 }
             }
         }
         if best_ml < good_ml2 && best_ip == ip {
-            if m4 != 0 {
-                // decode from the table's `pos + 1` encoding
-                let m4 = m4 - 1;
+            if let Some(m4) = m4 {
                 if COUNT {
                     probes += 1;
                 }
@@ -7964,9 +7841,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
             ip = end;
             anchor = ip;
             // The two fills rewrite many entries, so anything speculated before
-            // them is stale. This iteration's speculation (made after the
-            // take) dies here -- count the discard (cold path).
-            spec_pk += (carried.is_some() as u64) << 32;
+            // them is stale.
             carried = None;
         } else {
             ip += dstep + ((ip - anchor) >> accel);
@@ -7997,13 +7872,6 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     // The DFast hot loop is only 151 instructions but carries 27 stack reloads,
     // 23 of them loop-invariant across 12 slots -- it is short of registers, and
     // what it is spending them on is the gates' own telemetry.
-    // Unpack the counter pairs (see `nl_pk`'s declaration for the layout).
-    let (spec_made, spec_disc) = (spec_pk & 0xFFFF_FFFF, spec_pk >> 32);
-    let (nl_probes, nl_hits) = (nl_pk & 0xFFFF_FFFF, nl_pk >> 32);
-    let (band_hits, band_worse) = (band_pk & 0xFFFF_FFFF, band_pk >> 32);
-    // The exact identity the loop maintains (see `spec_pk`'s declaration):
-    // a made speculation not discarded and not left in `carried` was consumed.
-    let spec_used = spec_made - spec_disc - carried.is_some() as u64;
     #[cfg(feature = "profile")]
     {
         use core::sync::atomic::Ordering::Relaxed;
@@ -8047,6 +7915,8 @@ fn find_dfast_impl_inner<const HLOG: u32>(
             DFAST_REP_POS.fetch_add((block_end - block_start) as u64, Relaxed);
         }
     }
+    #[cfg(not(feature = "profile"))]
+    let _ = d_rep_bytes;
     // EWMA so one atypical block cannot flip the route -- the Gate 6 lesson.
     {
         let now = if seqs.is_empty() {
@@ -9410,20 +9280,14 @@ fn bt_depth_rep_max() -> f32 {
     if c != u32::MAX && bt_depth_cached() {
         return f32::from_bits(c);
     }
-    // Cold resolve -- see `opt_fill_enabled`.
     #[cfg(feature = "std")]
     {
-        #[cold]
-        #[inline(never)]
-        fn resolve() -> f32 {
-            let v: f32 = std::env::var("RZSTD_BT_DEPTH_REP")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(50.0);
-            BT_DEPTH_REP_C.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
-            v
-        }
-        resolve()
+        let v: f32 = std::env::var("RZSTD_BT_DEPTH_REP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(50.0);
+        BT_DEPTH_REP_C.store(v.to_bits(), Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     50.0
@@ -9438,20 +9302,14 @@ fn bt_depth_min_slog() -> u32 {
     if c != u32::MAX && bt_depth_cached() {
         return c;
     }
-    // Cold resolve -- see `opt_fill_enabled`.
     #[cfg(feature = "std")]
     {
-        #[cold]
-        #[inline(never)]
-        fn resolve() -> u32 {
-            let v = std::env::var("RZSTD_BT_DEPTH_SLOG")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(7);
-            BT_DEPTH_SLOG_C.store(v, core::sync::atomic::Ordering::Relaxed);
-            v
-        }
-        resolve()
+        let v = std::env::var("RZSTD_BT_DEPTH_SLOG")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(7);
+        BT_DEPTH_SLOG_C.store(v, Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     7
@@ -9464,20 +9322,14 @@ fn bt_depth_steps() -> u32 {
     if c != u32::MAX && bt_depth_cached() {
         return c;
     }
-    // Cold resolve -- see `opt_fill_enabled`.
     #[cfg(feature = "std")]
     {
-        #[cold]
-        #[inline(never)]
-        fn resolve() -> u32 {
-            let v = std::env::var("RZSTD_BT_DEPTH")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(1);
-            BT_DEPTH_STEPS_C.store(v, core::sync::atomic::Ordering::Relaxed);
-            v
-        }
-        resolve()
+        let v = std::env::var("RZSTD_BT_DEPTH")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1);
+        BT_DEPTH_STEPS_C.store(v, Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     1
@@ -10408,18 +10260,12 @@ fn opt_rep_min() -> f32 {
         if c != u32::MAX {
             return f32::from_bits(c);
         }
-        // Cold resolve -- see `opt_fill_enabled`.
-        #[cold]
-        #[inline(never)]
-        fn resolve() -> f32 {
-            let v: f32 = std::env::var("RZSTD_OPT_REP_MIN")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(50.0);
-            OPT_REP_MIN_C.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
-            v
-        }
-        resolve()
+        let v: f32 = std::env::var("RZSTD_OPT_REP_MIN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(50.0);
+        OPT_REP_MIN_C.store(v.to_bits(), Ordering::Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     50.0
@@ -10512,19 +10358,9 @@ fn opt_fill_enabled() -> bool {
         if c != 0 {
             return c == 2;
         }
-        // COLD RESOLVE (the hub's env-inlining defect, x8): the `env::var`
-        // arm allocates a String, parses, deallocs and needs a landing pad.
-        // Inlined it put all of that -- and `raw_vec::handle_error` -- inside
-        // `find_sequences_strategy`'s own body for a process constant. The
-        // hot path is now a load and a compare.
-        #[cold]
-        #[inline(never)]
-        fn resolve() -> bool {
-            let v = std::env::var("RZSTD_OPT_FILL").map(|v| v.trim() != "0").unwrap_or(true);
-            OPT_FILL_C.store(if v { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
-            v
-        }
-        resolve()
+        let v = std::env::var("RZSTD_OPT_FILL").map(|v| v.trim() != "0").unwrap_or(true);
+        OPT_FILL_C.store(if v { 2 } else { 1 }, Ordering::Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     false
@@ -10544,18 +10380,12 @@ fn opt_fill_rep_max() -> f32 {
         if c != u32::MAX {
             return f32::from_bits(c);
         }
-        // Cold resolve -- see `opt_fill_enabled`.
-        #[cold]
-        #[inline(never)]
-        fn resolve() -> f32 {
-            let v: f32 = std::env::var("RZSTD_OPT_FILL_REP")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(50.0);
-            OPT_FILL_REP_C.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
-            v
-        }
-        resolve()
+        let v: f32 = std::env::var("RZSTD_OPT_FILL_REP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(50.0);
+        OPT_FILL_REP_C.store(v.to_bits(), Ordering::Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     50.0
@@ -10566,16 +10396,6 @@ static OPT_FILL_REP_C: core::sync::atomic::AtomicU32 =
 
 /// Longest span the back-fill will walk. Beyond this the jump is a single huge
 /// repeat and its interior is not worth inserting.
-///
-/// Env read cached (the `tag_min` pattern): this and `opt_fill_stride` were
-/// the last two per-block accessors still calling `std::env::var` -- 115.6 ns
-/// and a String allocation each, 361 reads per 32 MiB at L19/L22. 0 = still
-/// unresolved (the default resolves to `usize::MAX`, so 0 only persists if a
-/// user forces `RZSTD_OPT_FILL_MAX=0`, which degenerates to the old per-call
-/// read).
-static OPT_FILL_MAX_ENV: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
 fn opt_fill_max() -> usize {
     #[cfg(feature = "profile")]
     ENVHIT[9].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -10585,23 +10405,10 @@ fn opt_fill_max() -> usize {
     }
     #[cfg(feature = "std")]
     {
-        use core::sync::atomic::Ordering;
-        let c = OPT_FILL_MAX_ENV.load(Ordering::Relaxed);
-        if c != 0 {
-            return c;
-        }
-        // Cold resolve -- see `opt_fill_enabled`.
-        #[cold]
-        #[inline(never)]
-        fn resolve() -> usize {
-            let v = std::env::var("RZSTD_OPT_FILL_MAX")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(usize::MAX);
-            OPT_FILL_MAX_ENV.store(v, core::sync::atomic::Ordering::Relaxed);
-            v
-        }
-        resolve()
+        std::env::var("RZSTD_OPT_FILL_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(usize::MAX)
     }
     #[cfg(not(feature = "std"))]
     usize::MAX
@@ -10649,11 +10456,6 @@ fn opt_hoisted() -> bool {
     OPT_HOIST_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
 }
 
-/// Env read cached (the `tag_min` pattern; see `opt_fill_max`). The `>= 1`
-/// filter makes 0 an airtight unresolved sentinel here.
-static OPT_FILL_S_ENV: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
 fn opt_fill_stride() -> usize {
     #[cfg(feature = "profile")]
     ENVHIT[10].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -10663,24 +10465,11 @@ fn opt_fill_stride() -> usize {
     }
     #[cfg(feature = "std")]
     {
-        use core::sync::atomic::Ordering;
-        let c = OPT_FILL_S_ENV.load(Ordering::Relaxed);
-        if c != 0 {
-            return c;
-        }
-        // Cold resolve -- see `opt_fill_enabled`.
-        #[cold]
-        #[inline(never)]
-        fn resolve() -> usize {
-            let v = std::env::var("RZSTD_OPT_FILL_S")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .filter(|v| *v >= 1)
-                .unwrap_or(1);
-            OPT_FILL_S_ENV.store(v, core::sync::atomic::Ordering::Relaxed);
-            v
-        }
-        resolve()
+        std::env::var("RZSTD_OPT_FILL_S")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or(1)
     }
     #[cfg(not(feature = "std"))]
     1
