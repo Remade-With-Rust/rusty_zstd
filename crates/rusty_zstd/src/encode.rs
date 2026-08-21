@@ -4496,7 +4496,7 @@ fn find_fast_impl<
             m0 = m1;
         }
         crate::prof::note_huff_path(12);
-        lits.extend_from_slice(&src[anchor..block_end]);
+        push_lits_range(&mut lits, src, anchor, block_end);
         let match_bytes: u64 = if cfg!(feature = "profile") {
             seqs.iter().map(|s| u64::from(s.matchlen)).sum()
         } else {
@@ -4825,7 +4825,7 @@ fn find_fast_impl<
     }
 
     crate::prof::note_huff_path(12);
-    lits.extend_from_slice(&src[anchor..block_end]);
+    push_lits_range(&mut lits, src, anchor, block_end);
     let match_bytes: u64 = if cfg!(feature = "profile") {
         seqs.iter().map(|s| u64::from(s.matchlen)).sum()
     } else {
@@ -7559,7 +7559,7 @@ fn find_dfast_impl<const HLOG: u32>(
     } else {
         (nl_hits as f32 / nl_probes as f32).max(tables.next_long_yield * 0.5)
     };
-    lits.extend_from_slice(&src[anchor..block_end]);
+    push_lits_range(&mut lits, src, anchor, block_end);
     // GATE 13 @ L3 FOLLOW-UP: `find_dfast` READ `last_nseq` to size its `seqs`
     // reservation but never WROTE it -- only `find_fast` did, and L3 never calls
     // `find_fast`. So the field sat at its initial 0 for the whole frame and the
@@ -7836,7 +7836,7 @@ fn find_greedy(
             if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
                 rep_hits += 1;
                 let mstart = ip + 1;
-                lits.extend_from_slice(&src[anchor..mstart]);
+                push_lits_range(&mut lits, src, anchor, mstart);
                 seqs.push(Seq {
                     litlen: (mstart - anchor) as u32,
                     matchlen: ml as u32,
@@ -7965,7 +7965,7 @@ fn find_greedy(
                 mm -= 1;
                 n += 1;
             }
-            lits.extend_from_slice(&src[anchor..s]);
+            push_lits_range(&mut lits, src, anchor, s);
             seqs.push(Seq {
                 litlen: (s - anchor) as u32,
                 matchlen: n as u32,
@@ -7997,7 +7997,7 @@ fn find_greedy(
         (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
     };
     update_walk_first_share(tables, walk_cont, wcls);
-    lits.extend_from_slice(&src[anchor..block_end]);
+    push_lits_range(&mut lits, src, anchor, block_end);
     note_finder_work(COUNT, probes, hits, &seqs, &lits);
     (seqs, lits)
 }
@@ -8274,7 +8274,7 @@ fn find_lazy(
             if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
                 rep_hits += 1;
                 let mstart = ip + 1;
-                lits.extend_from_slice(&src[anchor..mstart]);
+                push_lits_range(&mut lits, src, anchor, mstart);
                 seqs.push(Seq {
                     litlen: (mstart - anchor) as u32,
                     matchlen: ml as u32,
@@ -8337,7 +8337,7 @@ fn find_lazy(
                 mm -= 1;
                 n += 1;
             }
-            lits.extend_from_slice(&src[anchor..s]);
+            push_lits_range(&mut lits, src, anchor, s);
             seqs.push(Seq {
                 litlen: (s - anchor) as u32,
                 matchlen: n as u32,
@@ -8407,7 +8407,7 @@ fn find_lazy(
         (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
     };
     update_walk_first_share(tables, walk_cont, wcls);
-    lits.extend_from_slice(&src[anchor..block_end]);
+    push_lits_range(&mut lits, src, anchor, block_end);
     let span = (block_end - block_start).max(1) as f32;
     tables.last_search_per_byte = searches as f32 / span;
     // `searches` is SEARCH POSITIONS, not candidate examinations -- reporting it
@@ -9290,7 +9290,7 @@ fn find_bt_lazy(
             if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
                 rep_hits += 1;
                 let mstart = ip + 1;
-                lits.extend_from_slice(&src[anchor..mstart]);
+                push_lits_range(&mut lits, src, anchor, mstart);
                 seqs.push(Seq {
                     litlen: (mstart - anchor) as u32,
                     matchlen: ml as u32,
@@ -9340,7 +9340,7 @@ fn find_bt_lazy(
                 mm -= 1;
                 n += 1;
             }
-            lits.extend_from_slice(&src[anchor..s]);
+            push_lits_range(&mut lits, src, anchor, s);
             seqs.push(Seq {
                 litlen: (s - anchor) as u32,
                 matchlen: n as u32,
@@ -9383,7 +9383,7 @@ fn find_bt_lazy(
     } else {
         (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
     };
-    lits.extend_from_slice(&src[anchor..block_end]);
+    push_lits_range(&mut lits, src, anchor, block_end);
     // Probes reported by `bt_find_best`.
     note_finder_work(cfg!(feature = "profile"), 0, seqs.len() as u64, &seqs, &lits);
     (seqs, lits)
@@ -10390,6 +10390,17 @@ pub static LINK_FALSE: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 pub fn take_link_tag() -> (u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
     (LINK_SKIPS.swap(0, Relaxed), LINK_FALSE.swap(0, Relaxed))
+}
+
+/// Append `src[from..to]` to `lits` with the range proof supplied by the
+/// caller: every finder emit site maintains anchor <= from <= to <=
+/// block_end <= src.len(). The checked slice op compiled to a bounds test
+/// plus a panic branch per SEQUENCE in each finder.
+#[inline(always)]
+#[allow(unsafe_code)]
+fn push_lits_range(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize) {
+    debug_assert!(from <= to && to <= src.len());
+    lits.extend_from_slice(unsafe { src.get_unchecked(from..to) });
 }
 
 /// Attribute only when the walk RAN and produced enough samples -- a block
