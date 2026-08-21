@@ -7755,7 +7755,28 @@ fn find_greedy(
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    let mls = params.min_match.max(3) as usize;
+    // GATE 4/5 for the chain ladder, NARROW: mls = 5 serves every default
+    // row L5-L12 (clevels.h min_match), so ONE spec copy folds smask, the
+    // mls_eq mask, the mls-branches and the hash path to constants. MLS = 0
+    // is the runtime arm, served by the SAME body (the find_dfast_runtime
+    // drift lesson).
+    if params.min_match.max(3) == 5 {
+        find_greedy_impl::<5>(src, block_start, block_end, window, params, tables, reps)
+    } else {
+        find_greedy_impl::<0>(src, block_start, block_end, window, params, tables, reps)
+    }
+}
+
+fn find_greedy_impl<const MLS: usize>(
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
+    let mls = if MLS == 0 { params.min_match.max(3) as usize } else { MLS };
     // BRICK 52, COMPLETED: the AUTHORITATIVE clamped value, never `params`.
     // `params.hash_log` is USER-SETTABLE with no upper bound (`hlog` in the
     // advanced-parameter setter does only `value.max(6)`), while the table is
@@ -8008,7 +8029,7 @@ fn find_greedy(
 // -> 1,753 (two inlined copies) with unknowable spill delta -- there is no
 // deterministic executed-instruction receipt for an inlining decision, and
 // brick 48 chose OUTLINING for exactly this shape. The call overhead stays.
-fn chain_find_best(
+fn chain_find_best<const MLS: usize>(
     src: &[u8],
     ip: usize,
     block_start: usize,
@@ -8034,6 +8055,7 @@ fn chain_find_best(
     // with `index out of bounds: the len is 16777216 but the index is
     // 28488790`. Brick 52 fixed `find_fast` and `find_dfast` and left the
     // chain-walking finders on the raw value.
+    let mls = if MLS == 0 { mls } else { MLS };
     let hash_log = tables.hash_log;
     let chain_mask = tables.chain.len() - 1;
     let cp = tables.chain_pack;
@@ -8175,7 +8197,26 @@ fn find_lazy(
     depth: usize,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    let mls = params.min_match.max(3) as usize;
+    // See `find_greedy`: narrow MLS spec, runtime arm from the same body.
+    if params.min_match.max(3) == 5 {
+        find_lazy_impl::<5>(src, block_start, block_end, window, params, tables, depth, reps)
+    } else {
+        find_lazy_impl::<0>(src, block_start, block_end, window, params, tables, depth, reps)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_lazy_impl<const MLS: usize>(
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    depth: usize,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
+    let mls = if MLS == 0 { params.min_match.max(3) as usize } else { MLS };
     // BRICK 52, COMPLETED: the AUTHORITATIVE clamped value, never `params`.
     // `params.hash_log` is USER-SETTABLE with no upper bound (`hlog` in the
     // advanced-parameter setter does only `value.max(6)`), while the table is
@@ -8291,7 +8332,7 @@ fn find_lazy(
             }
         }
         searches += 1;
-        let (mut best_m, mut best_ml) = chain_find_best(
+        let (mut best_m, mut best_ml) = chain_find_best::<MLS>(
             src, ip, block_start, block_end, window, mls, attempts, walk_cont, &mut wcls, params,
             tables,
         );
@@ -8304,7 +8345,7 @@ fn find_lazy(
                     break;
                 }
                 look_hi = ip2;
-                let (m, ml) = chain_find_best(
+                let (m, ml) = chain_find_best::<MLS>(
                     src,
                     ip2,
                     block_start,
