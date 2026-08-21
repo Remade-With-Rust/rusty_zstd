@@ -28,7 +28,7 @@ TAGS ARE AWFUL FOR ISSUES.
 | `find_greedy`                                                        |      1 |     685 |        23 |        153 | per position, L5                       |
 | `find_lazy`                                                          |      1 |   1,202 |        38 |        278 | per position, L6–L12                   |
 | `find_bt_lazy`                                                       |      1 |     711 |        27 |        172 | per position, L13–L15                  |
-| `bt_find_best_impl`                                                  |     21 |   7,079 |       126 |        672 | per position ×30M, L13–L22             |
+| `bt_find_best_impl` *(2026-08-22: 22 syms / ~4,600 after the ten-win break-open — dead branches, fused count+descent, fn-ptr dispatch, u32 ABI)* | 22 | 4,600 | — | — | per position ×30M, L13–L22 |
 | `bt_find_best_runtime`                                               |      1 |     381 |         6 |         49 | fallback copy                          |
 | `chain_find_best`                                                    |      1 |     168 |         3 |         20 | per position (lazy path)               |
 | `find_sequences_strategy`                                            |      1 |   4,391 |       217 |      1,553 | per block (carries `find_opt` inlined) |
