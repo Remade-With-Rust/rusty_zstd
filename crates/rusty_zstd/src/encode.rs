@@ -2100,6 +2100,8 @@ pub(crate) fn prime_tables(
         } else {
             CompressionParameters { search_log: d, ..params }
         };
+        let prime_attempts =
+            bt_depth_apply(search_attempts(pparams), pparams, tables.opt_rep_rate);
         // EXTENT: the tree only over the most recent slice; heads below it.
         let ext = prime_bt_extent();
         let range = ilimit.saturating_sub(from);
@@ -2120,7 +2122,17 @@ pub(crate) fn prime_tables(
             p += stride;
         }
         while p <= ilimit && p + 8 <= src.len() {
-            let _ = bt_find_best(src, p, payload_off, payload_off, window, mls, pparams, tables);
+            let _ = bt_find_best(
+                src,
+                p,
+                payload_off,
+                payload_off,
+                window,
+                mls,
+                prime_attempts,
+                pparams,
+                tables,
+            );
             iters += 1;
             p += stride;
         }
@@ -7975,6 +7987,10 @@ fn find_greedy(
 }
 
 #[allow(clippy::too_many_arguments)]
+// REFUTED (2026-08-22): #[inline(always)] into find_lazy. Static size 1,000
+// -> 1,753 (two inlined copies) with unknowable spill delta -- there is no
+// deterministic executed-instruction receipt for an inlining decision, and
+// brick 48 chose OUTLINING for exactly this shape. The call overhead stays.
 fn chain_find_best(
     src: &[u8],
     ip: usize,
@@ -8701,12 +8717,15 @@ fn bt_find_best(
     block_end: usize,
     window: usize,
     mls: usize,
+    attempts: usize,
     params: CompressionParameters,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
     macro_rules! go {
         ($h:expr, $c:expr) => {
-            bt_find_best_impl::<$h, $c>(src, ip, block_start, block_end, window, mls, params, tables)
+            bt_find_best_impl::<$h, $c>(
+                attempts, src, ip, block_start, block_end, window, mls, params, tables,
+            )
         };
     }
     // The (hash_log, chain_log) pairs the level table produces for the bt
@@ -8784,14 +8803,14 @@ fn bt_find_best(
     // derived parameters must be proven across every axis those parameters
     // depend on, and the size axis was never varied.
     if !bt_spec_enabled() {
-        return bt_find_best_runtime(src, ip, block_start, block_end, window, mls, params, tables);
+        return bt_find_best_runtime(attempts, src, ip, block_start, block_end, window, mls, params, tables);
     }
     macro_rules! bt_spec_dispatch {
         ($( ($h:literal, $c:literal) )*) => {
             match (tables.hash_log, params.chain_log.min(24)) {
                 $( ($h, $c) => go!($h, $c), )*
                 _ => bt_find_best_runtime(
-                    src, ip, block_start, block_end, window, mls, params, tables,
+                    attempts, src, ip, block_start, block_end, window, mls, params, tables,
                 ),
             }
         };
@@ -8816,6 +8835,10 @@ fn bt_find_best(
 /// variables already held.
 #[inline(never)]
 fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
+    // Caller-hoisted once per block: `bt_depth_apply(search_attempts(..))`
+    // reads an arm atomic, and this runs per position, per look-ahead step,
+    // AND per fill insert (61.9% of all tree work at L13-L15).
+    attempts: usize,
     src: &[u8],
     ip: usize,
     block_start: usize,
@@ -8894,7 +8917,6 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
     // versions-16m, +4.00%. That is the constant-stride content Gates 1, 2 and 6
     // all veto on `rep_yield`, and the same veto serves here -- a near-copy file
     // needs the depth to walk past its many equal-prefix candidates.
-    let attempts = bt_depth_apply(search_attempts(params), params, tables.opt_rep_rate);
     // P0/gg-matchfind: work counter -- see `chain_find_best`.
     const COUNT: bool = cfg!(feature = "profile");
     let mut probes = 0u64;
@@ -9005,6 +9027,7 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
 
 #[inline(never)]
 fn bt_find_best_runtime(
+    attempts: usize,
     src: &[u8],
     ip: usize,
     block_start: usize,
@@ -9083,7 +9106,6 @@ fn bt_find_best_runtime(
     // versions-16m, +4.00%. That is the constant-stride content Gates 1, 2 and 6
     // all veto on `rep_yield`, and the same veto serves here -- a near-copy file
     // needs the depth to walk past its many equal-prefix candidates.
-    let attempts = bt_depth_apply(search_attempts(params), params, tables.opt_rep_rate);
     // P0/gg-matchfind: work counter -- see `chain_find_best`.
     const COUNT: bool = cfg!(feature = "profile");
     let mut probes = 0u64;
@@ -9235,6 +9257,13 @@ fn find_bt_lazy(
         return (seqs, lits);
     }
     // BRICK 73: repcode-1 in BtLazy2 (L13-L14) -- the last finder without it.
+    // Per-call arm reads hoisted to once per block (the chain_find_best rule):
+    // attempts (an arm atomic inside bt_depth_apply/search_attempts) ran per
+    // position, per look-ahead AND per fill insert; the fill arms ran per
+    // match.
+    let attempts = bt_depth_apply(search_attempts(params), params, tables.opt_rep_rate);
+    let fill_on = lazy_fill_enabled();
+    let bt_stride = bt_fill_stride();
     let use_rep = rep_search_on(tables.rep_yield, params.strategy);
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
@@ -9257,7 +9286,7 @@ fn find_bt_lazy(
             }
         }
         let (mut best_m, mut best_ml) =
-            bt_find_best(src, ip, block_start, block_end, window, mls, params, tables);
+            bt_find_best(src, ip, block_start, block_end, window, mls, attempts, params, tables);
         let mut best_ip = ip;
         let mut look_hi = ip;
         if best_ml >= mls {
@@ -9274,6 +9303,7 @@ fn find_bt_lazy(
                     block_end,
                     window,
                     mls,
+                    attempts,
                     params,
                     tables,
                 );
@@ -9307,7 +9337,7 @@ fn find_bt_lazy(
             // walking the covered span re-uses it rather than duplicating the
             // insertion logic.
             let end = best_ip + best_ml;
-            if lazy_fill_enabled() {
+            if fill_on {
                 // GATE 11/12 @ L13-L15: this loop inserts EVERY position a match
                 // covers, and it is 61.9% of all binary-tree work at these levels
                 // (28,776,361 calls with it, 10,977,025 without). `find_lazy`'s
@@ -9316,12 +9346,13 @@ fn find_bt_lazy(
                 // It EARNS its place -- removing it entirely costs +2.41% size
                 // (reymont +8.48%, webster +7.83%, nci +7.15%) -- so the question
                 // is not whether to fill but how densely.
-                let stride = bt_fill_stride();
+                let stride = bt_stride;
                 // B2: the look-ahead already inserted up to `look_hi`.
                 let mut p = (best_ip + 1).max(look_hi + 1);
                 while p < end && p <= ilimit {
-                    let _ =
-                        bt_find_best(src, p, block_start, block_end, window, mls, params, tables);
+                    let _ = bt_find_best(
+                        src, p, block_start, block_end, window, mls, attempts, params, tables,
+                    );
                     p += stride;
                 }
             }
@@ -9646,6 +9677,9 @@ fn find_opt(
     // WHERE the match starts and what it costs.
     let rep1 = reps[0] as usize;
     let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
+    // Hoisted once per block (the chain_find_best rule): bt_find_best runs
+    // per DP position here.
+    let bt_attempts = bt_depth_apply(search_attempts(params), params, tables.opt_rep_rate);
     let extra = match params.strategy {
         Strategy::BtUltra2 => 2u32,
         Strategy::BtUltra => 1,
@@ -9779,7 +9813,9 @@ fn find_opt(
                 }
             }
         }
-        let (bm, bml) = bt_find_best(src, ip, block_start, block_end, window, mls, params, tables);
+        let (bm, bml) = bt_find_best(
+            src, ip, block_start, block_end, window, mls, bt_attempts, params, tables,
+        );
         o_bt_calls += 1;
         if bml < mls {
             o_bt_dry += 1;
@@ -9913,7 +9949,7 @@ fn find_opt(
                         break;
                     }
                     let _ = bt_find_best(
-                        src, qp, block_start, block_end, window, mls, params, tables,
+                        src, qp, block_start, block_end, window, mls, bt_attempts, params, tables,
                     );
                     #[cfg(feature = "profile")]
                     OPT_FILL_INS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
