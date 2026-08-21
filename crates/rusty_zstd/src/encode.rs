@@ -4662,6 +4662,8 @@ fn find_fast_impl_inner<
     } else {
         7
     };
+    // W1: hoisted for `fill_fast_after_match` -- see its `ends` parameter.
+    let f_ends = dfast_fill_ends();
     if PIPE && !pair && ip <= ilimit {
         if COUNT {
             FF_PIPE_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -4810,6 +4812,8 @@ fn find_fast_impl_inner<
                     ilimit,
                     frame_start,
                     lp_copy,
+                
+                    f_ends,
                 );
                 anchor = ip;
                 // The non-pipelined loop does this after EVERY emitted match;
@@ -5024,7 +5028,9 @@ fn find_fast_impl_inner<
                 ilimit,
                 frame_start,
                 lp_copy,
-            );
+            
+                    f_ends,
+                );
             anchor = ip;
             // Same decision as the pipelined loop -- see GATE 8 above. Guarding
             // only ONE loop would make the heuristic a property of which loop
@@ -5121,7 +5127,9 @@ fn find_fast_impl_inner<
                         ilimit,
                         frame_start,
                         lp_copy,
-                    );
+                    
+                    f_ends,
+                );
                     anchor = ip;
                     continue;
                 }
@@ -5266,7 +5274,8 @@ fn fast_probe_wide<const SAFE: bool>(
     } else {
         load_u64le_tail(src, m)
     };
-    if (a ^ b) & mask != 0 {
+    let x = a ^ b;
+    if x & mask != 0 {
         // Prometheus adjudication (m7-optimize-anatomy §3): `tag_yield`'s only
         // shipped consumer is `ut`'s compare against `tag_min`, which ships
         // 0.0 -- the value gates nothing. Maintained under `profile` only,
@@ -5285,7 +5294,22 @@ fn fast_probe_wide<const SAFE: bool>(
     FF_CAND4.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "profile")]
     FF_ACCEPT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    Some((m, mls + count_match_fast(src, m + mls, ip + mls, block_end)))
+    // W2: the FUSED HEAD, which `fast_probe` has had since the first-word
+    // pass and this twin never got. The acceptance test already computed
+    // `a ^ b`, and the mask proves bytes 0..mls are equal -- so when the xor
+    // is non-zero the first differing byte IS the match length, in a register,
+    // with no second load and no call. `mask` covers at most 8 bytes (WIDE
+    // requires mls in 5..=8) and `ip <= ilimit = block_end - 8`, so the length
+    // is bounded by the block without a clamp. Identical to
+    // `mls + count_match_fast(m + mls, ip + mls)` on both arms: a non-zero xor
+    // puts the difference at index >= mls, and a zero xor means all eight
+    // bytes matched, which is exactly where the continuation starts.
+    let ml = if x != 0 {
+        (x.trailing_zeros() as usize) >> 3
+    } else {
+        8 + count_match_fast(src, m + 8, ip + 8, block_end)
+    };
+    Some((m, ml))
 }
 
 fn fast_probe(
@@ -7077,8 +7101,13 @@ fn fill_fast_after_match<const PACKED: bool>(
     match_ip: usize,
     match_end: usize,
     ilimit: usize,
+    // W1: this was `dfast_fill_ends()` INSIDE the helper -- an arm atomic load
+    // and its match, per MATCH, on the Fast ladder. `find_dfast_impl` has
+    // hoisted the same read per block since the brick-79 sweep; the Fast
+    // ladder's own fill never did.
+    ends: (bool, bool),
 ) {
-    let (do_a, do_b) = dfast_fill_ends();
+    let (do_a, do_b) = ends;
     let mut n = 0u64;
     let a = match_ip.saturating_add(2);
     if do_a && a <= ilimit {
@@ -7119,6 +7148,7 @@ fn emit_fast_seq<const PACKED: bool>(
     ilimit: usize,
     frame_start: usize,
     w: usize,
+    ends: (bool, bool),
 ) -> usize {
     let _ = mls;
     let mut ip = found_ip;
@@ -7149,7 +7179,9 @@ fn emit_fast_seq<const PACKED: bool>(
         offset: (ip - mm) as u32,
     });
     let end = ip + n;
-    fill_fast_after_match::<PACKED>(hash, tags, pack, f_wide, f_mask, f_shift, src, found_ip, end, ilimit);
+    fill_fast_after_match::<PACKED>(
+        hash, tags, pack, f_wide, f_mask, f_shift, src, found_ip, end, ilimit, ends,
+    );
     end
 }
 
@@ -11889,6 +11921,14 @@ fn count_match_fast(src: &[u8], m: usize, ip: usize, limit: usize) -> usize {
         if a != b {
             return ((a ^ b).trailing_zeros() as usize) >> 3;
         }
+        // SECOND-WORD PEEK MEASURED AND REJECTED (2026-08-21): inlining a
+        // second register pair here covers matches of 8..15 without a call
+        // (32.6% of counts land in 8..31), but it costs +156 instrs in EVERY
+        // one of the 140 fast copies -- +12,931 across the family, in the
+        // hottest function in the encoder -- and splits count_match's call
+        // sites 12 -> 17. The executed-path saving is real; the I-cache cost
+        // is real and this campaign's instruments cannot adjudicate it, so
+        // the head stays one word deep.
         8 + count_match(src, m + 8, ip + 8, limit)
     } else {
         count_match(src, m, ip, limit)
