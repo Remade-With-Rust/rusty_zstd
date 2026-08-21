@@ -9053,16 +9053,17 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
         return (0, 0);
     }
     let h = hash_mls(src, ip, mls, HLOG);
-    if h >= tables.hash.len() {
-        return (0, 0);
-    }
+    // SPEC arm: `h < 2^HLOG` by the hash shift, and the resolve dispatch
+    // guarantees tables.hash_log == HLOG, so hash.len() == 1 << HLOG.
+    // `larger <= (bt_mask << 1) | 1` is the T2 entry guard's bound. Both
+    // per-call checks were provably dead here (the runtime arm keeps its
+    // own).
+    debug_assert!(h < tables.hash.len());
     let mut match_idx = tables.get_h(h);
     tables.put_h(h, ip);
     let mut smaller = (ip & bt_mask) << 1;
     let mut larger = smaller + 1;
-    if larger >= tables.chain.len() {
-        return (0, 0);
-    }
+    debug_assert!(larger < tables.chain.len());
     // Loop-INVARIANT, recomputed on every node of every walk: a saturating_sub,
     // a max and a field load through `&mut MatchTables`, on a loop that runs
     // ~30M times per level across the corpus. The `tables.chain[..]` writes in
@@ -10068,20 +10069,27 @@ fn find_opt(
         // GATE 10 @ L19 -- the L3 question, transferred. `try_rep1` runs at EVERY
         // position here too, unconditionally. Count what it earns before gating
         // it: probes issued, hits, and the bytes those hits cover.
-        if opt_rep_on && i + 1 <= n && price[i + 1] < inf {
+        // DP arrays are len n + 1 and every index below is guarded <= n;
+        // the checked ops compiled to a bounds test + panic branch PER DP
+        // EDGE (and per length step in the loop below).
+        #[allow(unsafe_code)]
+        if opt_rep_on && i + 1 <= n && unsafe { *price.get_unchecked(i + 1) } < inf {
             o_rep_probes += 1;
             if let Some(rml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
                 o_rep_hits += 1;
                 o_rep_bytes += rml as u64;
                 let j = i + 1 + rml;
                 if j <= n {
-                    let np = price[i + 1].saturating_add(rep_cost);
-                    if np < price[j] {
-                        price[j] = np;
-                        prev[j] = i + 1;
-                        is_match[j] = true;
-                        match_off[j] = rep1 as u32;
-                        match_ml[j] = rml as u32;
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        let np = price.get_unchecked(i + 1).saturating_add(rep_cost);
+                        if np < *price.get_unchecked(j) {
+                            *price.get_unchecked_mut(j) = np;
+                            *prev.get_unchecked_mut(j) = i + 1;
+                            *is_match.get_unchecked_mut(j) = true;
+                            *match_off.get_unchecked_mut(j) = rep1 as u32;
+                            *match_ml.get_unchecked_mut(j) = rml as u32;
+                        }
                     }
                 }
             }
@@ -10140,13 +10148,16 @@ fn find_opt(
             if j > n {
                 break;
             }
-            let np = price[i].saturating_add(seq_cost);
-            if np < price[j] {
-                price[j] = np;
-                prev[j] = i;
-                is_match[j] = true;
-                match_off[j] = (ip - bm) as u32;
-                match_ml[j] = len as u32;
+            #[allow(unsafe_code)]
+            unsafe {
+                let np = price.get_unchecked(i).saturating_add(seq_cost);
+                if np < *price.get_unchecked(j) {
+                    *price.get_unchecked_mut(j) = np;
+                    *prev.get_unchecked_mut(j) = i;
+                    *is_match.get_unchecked_mut(j) = true;
+                    *match_off.get_unchecked_mut(j) = (ip - bm) as u32;
+                    *match_ml.get_unchecked_mut(j) = len as u32;
+                }
             }
             if len == bml {
                 break;
@@ -10369,6 +10380,10 @@ fn find_opt(
         }
     }
     lits.extend_from_slice(&src[block_start + anchor..block_end]);
+    // Consumers are take_opt_rep / take_opt_bt gate harnesses only --
+    // SEVEN un-cfg'd lock-prefixed RMWs per block in shipping, the 959e0ae
+    // class, fifth sighting.
+    #[cfg(feature = "profile")]
     {
         use core::sync::atomic::Ordering::Relaxed;
         OPT_REP_PROBES.fetch_add(o_rep_probes, Relaxed);
@@ -10383,6 +10398,8 @@ fn find_opt(
         OPT_SKIP_JUMP.fetch_add(o_skip_jump, Relaxed);
         OPT_SKIP_JUMPS.fetch_add(o_skip_jumps, Relaxed);
     }
+    #[cfg(not(feature = "profile"))]
+    let _ = (o_rep_probes, o_rep_hits, o_rep_bytes, o_bt_calls, o_bt_dry, o_bt_len);
     if opt_rep_on && o_rep_probes > 0 {
         let now = o_rep_bytes as f32 / o_rep_probes as f32;
         tables.opt_rep_peak = tables.opt_rep_peak.max(now);
