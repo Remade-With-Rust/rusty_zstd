@@ -934,6 +934,31 @@ impl MatchTables {
         }
     }
 
+    /// Brick 50 for the chain arrays: `i` always arrives masked by
+    /// `chain.len() - 1` (a power of two), so it is provably in bounds --
+    /// LLVM cannot see it because the mask spills, and emitted a bounds
+    /// check plus a panic branch on EVERY walk step and insert.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn chain_masked(&self, i: usize) -> u32 {
+        debug_assert!(i < self.chain.len());
+        *unsafe { self.chain.get_unchecked(i) }
+    }
+
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn chain_masked_set(&mut self, i: usize, v: u32) {
+        debug_assert!(i < self.chain.len());
+        *unsafe { self.chain.get_unchecked_mut(i) } = v;
+    }
+
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn ctags_masked(&self, i: usize) -> u8 {
+        debug_assert!(i < self.ctags.len());
+        *unsafe { self.ctags.get_unchecked(i) }
+    }
+
     /// Lazy-ladder insert, all representations: writes the chain link (and
     /// its tag, packed or array), the head (and its tag), and returns the
     /// OLD head's (pos, tag) for the walk. `ca` = array route.
@@ -948,17 +973,26 @@ impl MatchTables {
         chain_mask: usize,
     ) -> (Option<usize>, u8) {
         let raw = self.lz_head_raw(h);
+        // `h < hash.len()` by the hash shift (brick 50/52); `tags` and
+        // `ctags`, when allocated, share `hash`/`chain` lengths by
+        // construction.
         let old_tag = if cp {
             Self::lz_head_tag(raw)
         } else if ca {
-            self.tags[h]
+            debug_assert!(h < self.tags.len());
+            #[allow(unsafe_code)]
+            *unsafe { self.tags.get_unchecked(h) }
         } else {
             0
         };
-        self.chain[ip & chain_mask] = Self::lz_link_from_head(raw, cp);
+        self.chain_masked_set(ip & chain_mask, Self::lz_link_from_head(raw, cp));
         if ca {
-            self.ctags[ip & chain_mask] = old_tag;
-            self.tags[h] = gtag;
+            debug_assert!((ip & chain_mask) < self.ctags.len() && h < self.tags.len());
+            #[allow(unsafe_code)]
+            unsafe {
+                *self.ctags.get_unchecked_mut(ip & chain_mask) = old_tag;
+                *self.tags.get_unchecked_mut(h) = gtag;
+            }
         }
         self.lz_head_put(h, ip, gtag, cp);
         (Self::lz_head_pos(raw, cp), old_tag)
@@ -7743,7 +7777,15 @@ fn find_greedy(
     // BRICK 71: repcode-1 search in find_greedy -- L5-L6 had none
     // C checks `offset_1` at every position in `_greedy`/`_lazy` exactly as in
     // `_fast`/`_doubleFast`. Same dispatch on measured yield as bricks 67/70.
-    let use_rep = rep_search_on(tables.rep_yield, params.strategy);
+    let use_rep = rep_search_on(tables.rep_yield, params.strategy)
+        || (rep_reprobe_enabled() && tables.rep_probe == 0);
+    if rep_reprobe_enabled() {
+        tables.rep_probe = if tables.rep_probe == 0 {
+            REP_PROBE_PERIOD
+        } else {
+            tables.rep_probe - 1
+        };
+    }
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
     let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
@@ -7817,12 +7859,12 @@ fn find_greedy(
                         if !walk_cont {
                             break;
                         }
-                        let link = tables.chain[m & chain_mask];
+                        let link = tables.chain_masked(m & chain_mask);
                         let next = if cp { (link & 0x00FF_FFFF) as usize } else { link as usize };
                         if next >= m {
                             break;
                         }
-                        mtag = if cp { (link >> 24) as u8 } else { tables.ctags[m & chain_mask] };
+                        mtag = if cp { (link >> 24) as u8 } else { tables.ctags_masked(m & chain_mask) };
                         m = next;
                         continue;
                     }
@@ -7867,12 +7909,12 @@ fn find_greedy(
                             break;
                         }
                     }
-                    let link = tables.chain[m & chain_mask];
+                    let link = tables.chain_masked(m & chain_mask);
                     let next = if cp { (link & 0x00FF_FFFF) as usize } else { link as usize };
                     if next >= m {
                         break;
                     }
-                    mtag = if cp { (link >> 24) as u8 } else if ca { tables.ctags[m & chain_mask] } else { 0 };
+                    mtag = if cp { (link >> 24) as u8 } else if ca { tables.ctags_masked(m & chain_mask) } else { 0 };
                     m = next;
                 }
             }
@@ -8008,12 +8050,12 @@ fn chain_find_best(
                 if !walk_cont {
                     break;
                 }
-                let link = tables.chain[m & chain_mask];
+                let link = tables.chain_masked(m & chain_mask);
                 let next = if cp { (link & 0x00FF_FFFF) as usize } else { link as usize };
                 if next >= m {
                     break;
                 }
-                mtag = if cp { (link >> 24) as u8 } else { tables.ctags[m & chain_mask] };
+                mtag = if cp { (link >> 24) as u8 } else { tables.ctags_masked(m & chain_mask) };
                 m = next;
                 continue;
             }
@@ -8069,12 +8111,12 @@ fn chain_find_best(
                     break;
                 }
             }
-            let link = tables.chain[m & chain_mask];
+            let link = tables.chain_masked(m & chain_mask);
             let next = if cp { (link & 0x00FF_FFFF) as usize } else { link as usize };
             if next >= m {
                 break;
             }
-            mtag = if cp { (link >> 24) as u8 } else if ca { tables.ctags[m & chain_mask] } else { 0 };
+            mtag = if cp { (link >> 24) as u8 } else if ca { tables.ctags_masked(m & chain_mask) } else { 0 };
             m = next;
         }
     }
@@ -8143,7 +8185,15 @@ fn find_lazy(
     // BRICK 71: repcode-1 search in find_lazy -- L7-L12 had none
     // C checks `offset_1` at every position in `_greedy`/`_lazy` exactly as in
     // `_fast`/`_doubleFast`. Same dispatch on measured yield as bricks 67/70.
-    let use_rep = rep_search_on(tables.rep_yield, params.strategy);
+    let use_rep = rep_search_on(tables.rep_yield, params.strategy)
+        || (rep_reprobe_enabled() && tables.rep_probe == 0);
+    if rep_reprobe_enabled() {
+        tables.rep_probe = if tables.rep_probe == 0 {
+            REP_PROBE_PERIOD
+        } else {
+            tables.rep_probe - 1
+        };
+    }
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
     let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
@@ -10061,13 +10111,20 @@ fn find_opt(
 /// remaining chain at the first collision.
 #[inline(always)]
 fn mls_eq(src: &[u8], m: usize, ip: usize, mls: usize) -> bool {
-    if mls >= 4 {
-        if load_u32le(src, m) != load_u32le(src, ip) {
-            return false;
-        }
-        return mls == 4 || src[m + 4..m + mls] == src[ip + 4..ip + mls];
+    // The census found the tail slice-eq compiled to a LIBC MEMCMP CALL per
+    // candidate -- for mls = 5, a memcmp of ONE byte. Every caller sits in a
+    // walk that has proven `m < ip <= len - 8` (ip <= ilimit and validity),
+    // so for mls <= 8 the whole test is one masked u64 xor -- fewer loads
+    // than the old u32-head + tail, and no call.
+    if mls <= 8 {
+        debug_assert!(m < ip && ip + 8 <= src.len());
+        let mask = if mls == 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
+        return (load_u64le(src, m) ^ load_u64le(src, ip)) & mask == 0;
     }
-    src[m..m + mls] == src[ip..ip + mls]
+    if load_u32le(src, m) != load_u32le(src, ip) {
+        return false;
+    }
+    src[m + 4..m + mls] == src[ip + 4..ip + mls]
 }
 
 /// WALK-CONTINUE arm: C-parity chain walk (step past byte mismatches).
@@ -10171,6 +10228,27 @@ fn walk_first_max(attempts: usize) -> f32 {
 /// Re-probe period for the walk gate (the Gate-2 shut-and-re-probe rule: an
 /// immediate shut needs a scheduled reopen, or it is a one-way latch).
 const WALK_PROBE_PERIOD: u32 = 16;
+
+/// GREEDY/LAZY REP RE-PROBE arm: `rep_yield` halves on every rep-less block
+/// and `rep_search_on` has no reopen on this ladder (DFast got Gate 2's
+/// re-probe; greedy/lazy never did), so rep-quiet openings latch the rep
+/// search off for the whole frame. Byte-CHANGING; ships on its board.
+static REP_REPROBE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for the greedy/lazy rep re-probe.
+pub fn set_rep_reprobe_arm(on: bool) {
+    REP_REPROBE_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn rep_reprobe_enabled() -> bool {
+    // DEFAULT OFF -- REFUTED on its board (repro, 18 corpora x L5-L12):
+    // totals -0.04% / +0.01% / +0.00% / +0.03%, worst xml +1.57% at L12.
+    // The latch DFast paid for costs nothing here: the chain walk finds the
+    // same matches the reopened rep search would, and reopening on
+    // rep-hostile blocks trades offset economy for nothing. Arm kept for
+    // study.
+    matches!(REP_REPROBE_ARM.load(core::sync::atomic::Ordering::Relaxed), 2)
+}
 
 /// CHAIN-LINK TAG (win 5 of the chain-walk arc): pack the hash4 rejection
 /// tag into the lazy ladder's hash HEADS ((pos+1) | tag << 24) and CHAIN
