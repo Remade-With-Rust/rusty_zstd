@@ -131,6 +131,55 @@ pub(crate) fn decode_compressed_block(
     frame_start: usize,
     frame_skipped: usize,
 ) -> Result<(), Error> {
+    // Wholesale BMI2 twin -- the decode-side analog of encode_block: the
+    // block driver carried 100 variable shifts of its own (section headers,
+    // direct-weights table reads) outside every finer-grained twin.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if crate::simd::has_bmi2() {
+        // SAFETY: runtime CPUID guard; identical body.
+        #[allow(unsafe_code)]
+        return unsafe {
+            decode_compressed_block_bmi2(
+                payload, out, window_size, block_max, state, dict, frame_start, frame_skipped,
+            )
+        };
+    }
+    decode_compressed_block_inner(
+        payload, out, window_size, block_max, state, dict, frame_start, frame_skipped,
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_code)]
+unsafe fn decode_compressed_block_bmi2(
+    payload: &[u8],
+    out: &mut Vec<u8>,
+    window_size: u64,
+    block_max: u32,
+    state: &mut BlockState,
+    dict: &[u8],
+    frame_start: usize,
+    frame_skipped: usize,
+) -> Result<(), Error> {
+    decode_compressed_block_inner(
+        payload, out, window_size, block_max, state, dict, frame_start, frame_skipped,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn decode_compressed_block_inner(
+    payload: &[u8],
+    out: &mut Vec<u8>,
+    window_size: u64,
+    block_max: u32,
+    state: &mut BlockState,
+    dict: &[u8],
+    frame_start: usize,
+    frame_skipped: usize,
+) -> Result<(), Error> {
     let mut r = Reader::new(payload);
     let before = r.remaining();
     let literals = {
@@ -712,6 +761,7 @@ pub(crate) fn debug_seq_codes(
     Ok((nseq, modes, out))
 }
 
+#[inline(always)]
 fn seq_table(
     src: &[u8],
     mode: u8,

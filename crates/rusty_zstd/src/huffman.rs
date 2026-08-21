@@ -416,6 +416,7 @@ impl HuffmanTable {
         }))
     }
 
+    #[inline(always)]
     fn decode_4x_x1(
         &self,
         s0: &[u8],

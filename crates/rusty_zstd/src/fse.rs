@@ -179,6 +179,7 @@ impl FseTable {
 }
 
 /// Read an FSE NCount header. Returns (table, bytes_consumed).
+#[inline(always)]
 pub(crate) fn read_ncount(
     src: &[u8],
     max_symbol: usize,
@@ -202,6 +203,9 @@ pub(crate) fn read_ncount_ctable(
     Ok((dt, ct, consumed))
 }
 
+// inline(always) so callers compiled with BMI2 (the decode twin) get this
+// bit-reading loop in their own ISA context -- the shim-trap rule.
+#[inline(always)]
 fn parse_ncount(
     src: &[u8],
     max_symbol: usize,
@@ -751,6 +755,26 @@ pub(crate) fn write_ncount(norm: &[i16], table_log: u8) -> Result<Vec<u8>, Error
 /// Matches libzstd `FSE_compress_usingCTable` on a 64-bit `BIT_CStream`.
 #[cfg(feature = "alloc")]
 pub(crate) fn compress_using_ctable(src: &[u8], table: &FseCTable) -> Result<Vec<u8>, Error> {
+    // Its own BMI2 twin (the 621a140 pattern): this is the Huffman tree
+    // header's FSE bitstream, a variable-shift loop outside every other twin.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if crate::simd::has_bmi2() {
+        // SAFETY: runtime CPUID guard; identical body.
+        #[allow(unsafe_code)]
+        return unsafe { compress_using_ctable_bmi2(src, table) };
+    }
+    compress_using_ctable_inner(src, table)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(unsafe_code)]
+unsafe fn compress_using_ctable_bmi2(src: &[u8], table: &FseCTable) -> Result<Vec<u8>, Error> {
+    compress_using_ctable_inner(src, table)
+}
+
+#[inline(always)]
+fn compress_using_ctable_inner(src: &[u8], table: &FseCTable) -> Result<Vec<u8>, Error> {
     if src.len() <= 2 {
         return Err(Error::Corruption);
     }
@@ -874,6 +898,26 @@ impl FseCTable {
 
 /// FSE-decompress Huffman weights (two interleaved states).
 pub(crate) fn decompress_weights(src: &[u8], max_out: usize) -> Result<(Vec<u8>, usize), Error> {
+    // Own BMI2 twin: the Huffman weights FSE decode (per new-table block on
+    // the literal decode path) sits outside every other twin.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if crate::simd::has_bmi2() {
+        // SAFETY: runtime CPUID guard; identical body.
+        #[allow(unsafe_code)]
+        return unsafe { decompress_weights_bmi2(src, max_out) };
+    }
+    decompress_weights_inner(src, max_out)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(unsafe_code)]
+unsafe fn decompress_weights_bmi2(src: &[u8], max_out: usize) -> Result<(Vec<u8>, usize), Error> {
+    decompress_weights_inner(src, max_out)
+}
+
+#[inline(always)]
+fn decompress_weights_inner(src: &[u8], max_out: usize) -> Result<(Vec<u8>, usize), Error> {
     let (table, n) = read_ncount(src, 255, 6)?;
     if n >= src.len() {
         return Err(Error::Corruption);

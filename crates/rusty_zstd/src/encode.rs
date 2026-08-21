@@ -2246,6 +2246,63 @@ pub(crate) fn encode_block(
     ldm: Option<&mut crate::ldm::LdmTables>,
     ldm_p: crate::ldm::LdmParams,
 ) -> Result<(), Error> {
+    // Wholesale BMI2 twin: the per-block section packing carried 34
+    // variable shifts of its own, outside every finer-grained twin.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if crate::simd::has_bmi2() {
+        // SAFETY: runtime CPUID guard; identical body.
+        #[allow(unsafe_code)]
+        return unsafe {
+            encode_block_bmi2(
+                out, src, block_start, block_end, window, params, tables, reps, entropy, last,
+                ldm, ldm_p,
+            )
+        };
+    }
+    encode_block_inner(
+        out, src, block_start, block_end, window, params, tables, reps, entropy, last, ldm, ldm_p,
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_code)]
+unsafe fn encode_block_bmi2(
+    out: &mut Vec<u8>,
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    reps: &mut [u32; 3],
+    entropy: &mut EntropyState,
+    last: bool,
+    ldm: Option<&mut crate::ldm::LdmTables>,
+    ldm_p: crate::ldm::LdmParams,
+) -> Result<(), Error> {
+    encode_block_inner(
+        out, src, block_start, block_end, window, params, tables, reps, entropy, last, ldm, ldm_p,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn encode_block_inner(
+    out: &mut Vec<u8>,
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    reps: &mut [u32; 3],
+    entropy: &mut EntropyState,
+    last: bool,
+    ldm: Option<&mut crate::ldm::LdmTables>,
+    ldm_p: crate::ldm::LdmParams,
+) -> Result<(), Error> {
     let block = &src[block_start..block_end];
     if block.is_empty() {
         crate::prof::note_raw_block();
@@ -5881,9 +5938,20 @@ fn load_u64le_tail(src: &[u8], pos: usize) -> u64 {
     if pos + 8 <= src.len() {
         return crate::simd::load_u64_le(src, pos);
     }
+    // BACKOFF LOAD: one aligned-window load at len - 8, shifted right by the
+    // overhang, replaces the up-to-7-iteration byte-assembly loop (a load,
+    // an or and a variable shift PER BYTE). Value-exact: little-endian, the
+    // shift discards exactly the bytes below `pos` and zero-fills the high
+    // end, which is what the loop produced. The loop survives only for
+    // sub-8-byte inputs.
+    let len = src.len();
+    if len >= 8 && pos < len {
+        let over = (pos + 8 - len) as u32;
+        return crate::simd::load_u64_le(src, len - 8) >> (8 * over);
+    }
     let mut v = 0u64;
     let mut i = 0;
-    while pos + i < src.len() {
+    while pos + i < len {
         v |= u64::from(src[pos + i]) << (8 * i);
         i += 1;
     }
@@ -10973,6 +11041,15 @@ fn match_ok(
         let mask = if mls == 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
         return (load_u64le(src, m) ^ load_u64le(src, ip)) & mask == 0;
     }
+    match_ok_cold_tail(src, m, ip, mls)
+}
+
+/// The mls > 8 arm, outlined and cold: inlining match_ok replicated this
+/// slice-eq (a static memcmp site) at every caller for a branch no real
+/// level reaches.
+#[cold]
+#[inline(never)]
+fn match_ok_cold_tail(src: &[u8], m: usize, ip: usize, mls: usize) -> bool {
     if mls >= 4 {
         if load_u32le(src, m) != load_u32le(src, ip) {
             return false;
