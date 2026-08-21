@@ -10676,6 +10676,16 @@ fn find_opt(
     let fill_step = opt_fill_stride();
     let fill_span_max = opt_fill_max();
     let mlb_on = opt_mlbits_enabled();
+    // W8: the DP's length loop compared `params.strategy == BtUltra2` on every
+    // LENGTH STEP of every priced match -- a per-BLOCK constant read from a
+    // by-value struct field inside the innermost loop in the encoder.
+    let ultra2 = params.strategy == Strategy::BtUltra2;
+    // W11: `mlb_on && len > 34` is a flag test AND a bound test on every
+    // length step. The flag is per-BLOCK, so fold it into the bound: with the
+    // arm off, no length can exceed the sentinel and the whole ML-bits term
+    // (an lzcnt, a sub and two cmovs) never enters the loop's dependency
+    // chain. One compare replaces compare + compare + cmov.
+    let mlb_over = if mlb_on { 34usize } else { usize::MAX };
     // Per-JUMP arm read hoisted (the OFF arm's deliberate env re-reads stay
     // inside; only the selector atomic moves).
     let hoisted_arm = opt_hoisted();
@@ -10701,13 +10711,22 @@ fn find_opt(
         // constant, so saturation is unreachable -- the saturating form paid
         // a cmov per position for nothing.
         let np = pi + lit_cost;
+        // W13: keep what the literal edge already read. `price[i + 1]` is
+        // loaded here for the compare and was loaded AGAIN a few lines down
+        // as the rep edge's base -- the same slot, with only this edge's own
+        // store in between, so its post-state is known without a reload.
         #[allow(unsafe_code)]
-        unsafe {
-            if np < *price.get_unchecked(i + 1) {
-                *price.get_unchecked_mut(i + 1) = np;
+        let p_next = unsafe {
+            let q = price.as_mut_ptr().add(i + 1);
+            let cur = *q;
+            if np < cur {
+                *q = np;
                 *prev.get_unchecked_mut(i + 1) = i as u32;
+                np
+            } else {
+                cur
             }
-        }
+        };
         if i + 8 > n {
             i += 1;
             continue;
@@ -10738,9 +10757,9 @@ fn find_opt(
                 if j <= n {
                     #[allow(unsafe_code)]
                     unsafe {
-                        let np = *price.get_unchecked(i + 1)
+                        let np = p_next
                             + rep_cost
-                            + if mlb_on && rml > 34 {
+                            + if rml > mlb_over {
                                 27 - ((rml - 3) as u32).leading_zeros()
                             } else {
                                 0
@@ -10807,37 +10826,51 @@ fn find_opt(
         // identically -- so the "optimal" parse over-preferred long matches
         // whose tails cost real bits. RFC shape: lengths 3..=34 pay 0 extra
         // bits; beyond that the extra bits grow ~log2(len - 3) - 4.
+        // W9: the `i + len > n` exit is a bound on `len`, and both terms are
+        // loop-invariant -- so it is one `min` before the loop instead of an
+        // add and a compare on every length step. The set of lengths priced is
+        // identical: the old loop ran while `len <= bml` AND `i + len <= n`.
+        let lmax = bml.min(n - i);
+        // W12: the length loop reloaded the price base from the stack for the
+        // compare and AGAIN for the store -- LLVM cannot prove a `Vec`'s data
+        // pointer survives the writes next door. The three DP arrays are
+        // frame-scratch and nothing resizes them inside the parse, so take
+        // their bases once per match.
+        #[allow(unsafe_code)]
+        let (pp, pv, pm) = (price.as_mut_ptr(), prev.as_mut_ptr(), match_om.as_mut_ptr());
         let mut len = mls;
-        loop {
-            let j = i + len;
-            if j > n {
-                break;
-            }
-            let np = if mlb_on && len > 34 {
-                np_base + (27 - ((len - 3) as u32).leading_zeros())
-            } else {
-                np_base
-            };
-            #[allow(unsafe_code)]
-            unsafe {
-                if np < *price.get_unchecked(j) {
-                    *price.get_unchecked_mut(j) = np;
-                    *prev.get_unchecked_mut(j) = i as u32 | OPT_MATCH_BIT;
-                    *match_om.get_unchecked_mut(j) =
-                        (ip - bm) as u64 | ((len as u64) << 32);
+        if len <= lmax {
+            loop {
+                let j = i + len;
+                let np = if len > mlb_over {
+                    np_base + (27 - ((len - 3) as u32).leading_zeros())
+                } else {
+                    np_base
+                };
+                // SAFETY: `j = i + len <= i + lmax <= n` and every array is
+                // `n + 1` long; the bases are the ones taken above.
+                #[allow(unsafe_code)]
+                unsafe {
+                    let pj = pp.add(j);
+                    if np < *pj {
+                        *pj = np;
+                        *pv.add(j) = i as u32 | OPT_MATCH_BIT;
+                        *pm.add(j) = (ip - bm) as u64 | ((len as u64) << 32);
+                    }
                 }
+                if len == lmax {
+                    break;
+                }
+                // W10: BtUltra2's step is the constant 1, so `step.max(
+                // floor_step)` is just `floor_step` (which is >= 1) -- the
+                // clamp chain and the max collapse to an add for the levels
+                // that run every length.
+                len = if ultra2 {
+                    (len + floor_step).min(lmax)
+                } else {
+                    (len + (bml - len).clamp(1, 4).max(floor_step)).min(lmax)
+                };
             }
-            if len == bml {
-                break;
-            }
-            let step = if params.strategy == Strategy::BtUltra2 {
-                1
-            } else {
-                (bml - len).clamp(1, 4)
-            };
-            // `.min(bml)` guarantees the longest match is always priced, which
-            // a larger step would otherwise skip past.
-            len = (len + step.max(floor_step)).min(bml);
         }
         // C's immediate encoding: this match already exceeds `targetLength`, so
         // commit it and jump the DP past the span it covers instead of pricing
@@ -10893,16 +10926,21 @@ fn find_opt(
                 // interior buys nothing -- those positions are reachable through
                 // the repeat itself.
                 let span = bml.min(if hoisted { fill_span_max } else { opt_fill_max() });
+                // W14: the fill walked POSITIONS but addressed BYTES, so each
+                // inserted position paid `block_start + q` and `qp + 8 >
+                // block_end` -- two adds and a compare for a walk whose stride
+                // is constant. Both become induction: `qp` advances by the
+                // stride and the bound is subtracted once. (`block_end >= 8`
+                // wherever a match was priced, so the bound cannot wrap.)
+                let qp_end = block_end - 8;
+                let mut qp = block_start + i + 1;
                 let mut q = i + 1;
-                while q < i + span {
-                    let qp = block_start + q;
-                    if qp + 8 > block_end {
-                        break;
-                    }
+                while q < i + span && qp <= qp_end {
                     let _ = btf_ins(&bt_ctx, qp, tables);
                     #[cfg(feature = "profile")]
                     OPT_FILL_INS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     q += step;
+                    qp += step;
                 }
             }
             i += bml;
