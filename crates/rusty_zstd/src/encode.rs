@@ -8889,6 +8889,15 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32>(
         // silently broke Gate 4's byte-identity.
         let c_lo = tables.chain_at(bt_idx);
         let c_hi = tables.chain_at(bt_idx + 1);
+        // REFUTED (2026-08-21): C's commonLengthSmaller/Larger floor
+        // (count from the BST-invariant shared prefix instead of 0).
+        // Corrupted the ROUNDTRIP on the first board: our tree tolerates
+        // stale and aliased structure (bt slots alias at chain_log-1, and
+        // the early breaks leave dangling subtree links) PRECISELY BECAUSE
+        // this count re-verifies every byte from 0. The floor inherits C's
+        // sort invariant only with C's full insert discipline; counting
+        // from it here emitted matches longer than the data. The from-zero
+        // count is load-bearing -- it is the tree's validity check.
         let ml = count_match(src, m, ip, block_end);
         #[cfg(feature = "profile")]
         {
@@ -9063,6 +9072,15 @@ fn bt_find_best_runtime(
         // silently broke Gate 4's byte-identity.
         let c_lo = tables.chain_at(bt_idx);
         let c_hi = tables.chain_at(bt_idx + 1);
+        // REFUTED (2026-08-21): C's commonLengthSmaller/Larger floor
+        // (count from the BST-invariant shared prefix instead of 0).
+        // Corrupted the ROUNDTRIP on the first board: our tree tolerates
+        // stale and aliased structure (bt slots alias at chain_log-1, and
+        // the early breaks leave dangling subtree links) PRECISELY BECAUSE
+        // this count re-verifies every byte from 0. The floor inherits C's
+        // sort invariant only with C's full insert discipline; counting
+        // from it here emitted matches longer than the data. The from-zero
+        // count is load-bearing -- it is the tree's validity check.
         let ml = count_match(src, m, ip, block_end);
         #[cfg(feature = "profile")]
         {
