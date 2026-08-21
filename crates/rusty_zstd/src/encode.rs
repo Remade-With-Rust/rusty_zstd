@@ -356,6 +356,10 @@ pub(crate) struct MatchTables {
     /// See `set_chain_tag_arm`: lazy-ladder heads and links carry the hash4
     /// tag in their high 8 bits this frame.
     chain_pack: bool,
+    /// Array route for the same filter where the packed form is refused
+    /// (>= 16 MiB, streaming): link tags beside `chain`, head tags in
+    /// `tags`. Mirrors the ltags story exactly.
+    ctags: Vec<u8>,
     /// Blocks whose finder has actually RUN and written back its signals.
     ///
     /// GATE 1 @ L1 needs this because `rep_yield` starts OPTIMISTIC at 1.0 so
@@ -628,6 +632,7 @@ impl MatchTables {
             walk_first_share: 0.0,
             walk_probe: 0,
             chain_pack: false,
+            ctags: Vec::new(),
             blocks_done: 0,
             payload_scratch: Vec::new(),
             seq_scratch: Vec::new(),
@@ -674,6 +679,7 @@ impl MatchTables {
         self.hash_long.fill(0);
         self.ltags.fill(0);
         self.chain.fill(0);
+        self.ctags.fill(0);
     }
 
     /// Store `pos + 1` so slot 0 stays "empty" (C window index never uses 0).
@@ -813,6 +819,21 @@ impl MatchTables {
         {
             self.ltags = alloc::vec![0u8; self.hash_long.len()];
         }
+        // Chain-link tag, streaming leg (no length proof -> array route).
+        if matches!(
+            params.strategy,
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
+        ) && chain_tag_enabled()
+            && (params.min_match.max(3) as usize) < 8
+            && !self.chain.is_empty()
+        {
+            if self.ctags.is_empty() {
+                self.ctags = alloc::vec![0u8; self.chain.len()];
+            }
+            if self.tags.is_empty() {
+                self.tags = alloc::vec![0u8; self.hash.len()];
+            }
+        }
     }
 
     /// Enable packed tags for this frame, but only when every position the
@@ -911,6 +932,36 @@ impl MatchTables {
         } else {
             raw - 1
         }
+    }
+
+    /// Lazy-ladder insert, all representations: writes the chain link (and
+    /// its tag, packed or array), the head (and its tag), and returns the
+    /// OLD head's (pos, tag) for the walk. `ca` = array route.
+    #[inline(always)]
+    fn lz_insert(
+        &mut self,
+        h: usize,
+        ip: usize,
+        gtag: u8,
+        cp: bool,
+        ca: bool,
+        chain_mask: usize,
+    ) -> (Option<usize>, u8) {
+        let raw = self.lz_head_raw(h);
+        let old_tag = if cp {
+            Self::lz_head_tag(raw)
+        } else if ca {
+            self.tags[h]
+        } else {
+            0
+        };
+        self.chain[ip & chain_mask] = Self::lz_link_from_head(raw, cp);
+        if ca {
+            self.ctags[ip & chain_mask] = old_tag;
+            self.tags[h] = gtag;
+        }
+        self.lz_head_put(h, ip, gtag, cp);
+        (Self::lz_head_pos(raw, cp), old_tag)
     }
 
     /// T2: binary-tree slot read.
@@ -1093,6 +1144,23 @@ pub(crate) fn encode_oneshot(
     ) && chain_tag_enabled()
         && (params.min_match.max(3) as usize) < 8
         && (hist_prefix.len() + src.len()) < 0x00FF_FFFF;
+    // Array route where the 24-bit proof fails (>= 16 MiB): link tags in
+    // `ctags`, head tags in `tags` (same hash index). Priced by `linkbig`.
+    if matches!(
+        params.strategy,
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
+    ) && chain_tag_enabled()
+        && (params.min_match.max(3) as usize) < 8
+        && !tables.chain_pack
+        && !tables.chain.is_empty()
+    {
+        if tables.ctags.is_empty() {
+            tables.ctags = alloc::vec![0u8; tables.chain.len()];
+        }
+        if tables.tags.is_empty() {
+            tables.tags = alloc::vec![0u8; tables.hash.len()];
+        }
+    }
     // 1a array route: the LONG table's filter for the same frames. Priced by
     // `ltagbig` on the same instrument.
     if params.strategy == Strategy::DFast
@@ -2036,16 +2104,23 @@ pub(crate) fn prime_tables(
                 fast_hash_tag::<true>(src, p, fhp.wide, fhp.mask, fhp.shift);
             tables.store_fast(h, p, tag);
         } else {
-            // Chain-pack frames prime in the finder's own packed format --
-            // the -59.3% priming-poison rule, third application.
-            if tables.chain_pack {
+            // Chain-tag frames prime in the finder's own format (packed or
+            // array) -- the -59.3% priming-poison rule, third application.
+            if tables.chain_pack || !tables.ctags.is_empty() {
+                let cp = tables.chain_pack;
+                let ca = !tables.ctags.is_empty();
                 let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
                 let (hh, gt) = hash4_link_tag(src, p, hash_log, smask);
-                let raw = tables.lz_head_raw(hh);
                 if write_chain {
-                    tables.chain[p & chain_mask] = MatchTables::lz_link_from_head(raw, true);
+                    let _ = tables.lz_insert(hh, p, gt, cp, ca, chain_mask);
+                } else {
+                    let raw = tables.lz_head_raw(hh);
+                    let _ = raw;
+                    if ca {
+                        tables.tags[hh] = gt;
+                    }
+                    tables.lz_head_put(hh, p, gt, cp);
                 }
-                tables.lz_head_put(hh, p, gt, true);
                 if do_long {
                     let hl = hash8(src, p, hash_log);
                     tables.put_hl(hl, p);
@@ -7683,6 +7758,7 @@ fn find_greedy(
     };
     let mut wcls = (0u32, 0u32);
     let cp = tables.chain_pack;
+    let ca = !tables.ctags.is_empty();
     let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
     let mut ip = block_start;
     while ip <= ilimit {
@@ -7706,15 +7782,12 @@ fn find_greedy(
         } else {
             hash4_link_tag(src, ip, hash_log, smask)
         };
-        let head_raw = tables.lz_head_raw(h);
-        tables.chain[ip & chain_mask] = MatchTables::lz_link_from_head(head_raw, cp);
-        tables.lz_head_put(h, ip, gtag, cp);
-        let prev = MatchTables::lz_head_pos(head_raw, cp);
+        let (prev, head_tag) = tables.lz_insert(h, ip, gtag, cp, ca, chain_mask);
 
         let mut best_m = 0usize;
         let mut best_ml = 0usize;
         if let Some(mut m) = prev {
-            let mut mtag = MatchTables::lz_head_tag(head_raw);
+            let mut mtag = head_tag;
             if ip + mls <= src.len() {
                 let mut missed_before = false;
                 for _ in 0..attempts {
@@ -7731,7 +7804,7 @@ fn find_greedy(
                     // fabricated tag is 0), and legacy walks probe position 0
                     // through it -- never tag-filter it (the 2-FALSE-skips
                     // catch on mozilla L5).
-                    if cp && m != 0 && mtag != gtag {
+                    if (cp || ca) && m != 0 && mtag != gtag {
                         #[cfg(feature = "profile")]
                         if COUNT {
                             use core::sync::atomic::Ordering::Relaxed;
@@ -7745,12 +7818,12 @@ fn find_greedy(
                             break;
                         }
                         let link = tables.chain[m & chain_mask];
-                        let next = (link & 0x00FF_FFFF) as usize;
+                        let next = if cp { (link & 0x00FF_FFFF) as usize } else { link as usize };
                         if next >= m {
                             break;
                         }
+                        mtag = if cp { (link >> 24) as u8 } else { tables.ctags[m & chain_mask] };
                         m = next;
-                        mtag = (link >> 24) as u8;
                         continue;
                     }
                     if COUNT {
@@ -7799,8 +7872,8 @@ fn find_greedy(
                     if next >= m {
                         break;
                     }
+                    mtag = if cp { (link >> 24) as u8 } else if ca { tables.ctags[m & chain_mask] } else { 0 };
                     m = next;
-                    mtag = (link >> 24) as u8;
                 }
             }
         }
@@ -7839,9 +7912,7 @@ fn find_greedy(
                 } else {
                     hash4_link_tag(src, p, hash_log, smask)
                 };
-                let raw = tables.lz_head_raw(hh);
-                tables.chain[p & chain_mask] = MatchTables::lz_link_from_head(raw, cp);
-                tables.lz_head_put(hh, p, gt, cp);
+                let _ = tables.lz_insert(hh, p, gt, cp, ca, chain_mask);
                 p += 1;
             }
             ip = end;
@@ -7891,16 +7962,14 @@ fn chain_find_best(
     let hash_log = tables.hash_log;
     let chain_mask = tables.chain.len() - 1;
     let cp = tables.chain_pack;
+    let ca = !tables.ctags.is_empty();
     let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
     let (h, gtag) = if mls >= 8 && ip + 8 <= src.len() {
         (hash8(src, ip, hash_log), 0u8)
     } else {
         hash4_link_tag(src, ip, hash_log, smask)
     };
-    let head_raw = tables.lz_head_raw(h);
-    tables.chain[ip & chain_mask] = MatchTables::lz_link_from_head(head_raw, cp);
-    tables.lz_head_put(h, ip, gtag, cp);
-    let prev = MatchTables::lz_head_pos(head_raw, cp);
+    let (prev, head_tag) = tables.lz_insert(h, ip, gtag, cp, ca, chain_mask);
     // P0/gg-matchfind: candidate examinations are the WORK COUNTER, the primary
     // evidence under the Great Gate 2026-08-06 law. Compiled out entirely when
     // the profile feature is off.
@@ -7911,7 +7980,7 @@ fn chain_find_best(
     let Some(mut m) = prev else {
         return (0, 0);
     };
-    let mut mtag = MatchTables::lz_head_tag(head_raw);
+    let mut mtag = head_tag;
     let lowest = block_start.saturating_sub(window).max(tables.frame_start);
     let mut missed_before = false;
     if ip + mls <= src.len() {
@@ -7926,7 +7995,7 @@ fn chain_find_best(
             // equal => tags equal.
             // See the greedy walk: position 0 is sentinel-ambiguous, never
             // tag-filtered.
-            if cp && m != 0 && mtag != gtag {
+            if (cp || ca) && m != 0 && mtag != gtag {
                 #[cfg(feature = "profile")]
                 if COUNT {
                     use core::sync::atomic::Ordering::Relaxed;
@@ -7940,12 +8009,12 @@ fn chain_find_best(
                     break;
                 }
                 let link = tables.chain[m & chain_mask];
-                let next = (link & 0x00FF_FFFF) as usize;
+                let next = if cp { (link & 0x00FF_FFFF) as usize } else { link as usize };
                 if next >= m {
                     break;
                 }
+                mtag = if cp { (link >> 24) as u8 } else { tables.ctags[m & chain_mask] };
                 m = next;
-                mtag = (link >> 24) as u8;
                 continue;
             }
             if COUNT {
@@ -8005,8 +8074,8 @@ fn chain_find_best(
             if next >= m {
                 break;
             }
+            mtag = if cp { (link >> 24) as u8 } else if ca { tables.ctags[m & chain_mask] } else { 0 };
             m = next;
-            mtag = (link >> 24) as u8;
         }
     }
     if COUNT {
@@ -8115,6 +8184,7 @@ fn find_lazy(
     };
     let mut wcls = (0u32, 0u32);
     let cp = tables.chain_pack;
+    let ca = !tables.ctags.is_empty();
     let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
     let gain_cmp = lazy_gain_enabled();
     while ip <= ilimit {
@@ -8239,9 +8309,7 @@ fn find_lazy(
                     } else {
                         hash4_link_tag(src, p, hash_log, smask)
                     };
-                    let raw = tables.lz_head_raw(hh);
-                    tables.chain[p & chain_mask] = MatchTables::lz_link_from_head(raw, cp);
-                    tables.lz_head_put(hh, p, gt, cp);
+                    let _ = tables.lz_insert(hh, p, gt, cp, ca, chain_mask);
                     p += stride;
                 }
             }
