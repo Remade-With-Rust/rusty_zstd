@@ -800,8 +800,9 @@ impl MatchTables {
     /// lets tags go stale (190ad8b, and again in `prime_tables`).
     #[inline(always)]
     #[allow(unsafe_code)]
-    fn put_h_tag(&mut self, h: usize, pos: usize, tag: u8, packed: bool) {
+    fn put_h_tag(&mut self, h: usize, pos: usize, tag: u8, packed: bool, live: bool) {
         debug_assert_eq!(packed, self.pack_tags);
+        debug_assert_eq!(live, !self.tags.is_empty());
         if packed {
             // `pos + 1` is guaranteed < 2^24 by `enable_packed_tags`, so the
             // mask cannot truncate a live position, and the low bits are never
@@ -814,11 +815,12 @@ impl MatchTables {
                 (((pos as u32) + 1) & 0x00FF_FFFF) | (u32::from(tag) << 24);
             return;
         }
-        // W7: `tags` is allocated at EXACTLY `hash.len()` at all four of its
-        // sites and `h` indexes `hash` below, so the bounds test and branch
-        // were dead on every short-table store.
-        if !self.tags.is_empty() {
-            debug_assert_eq!(self.tags.len(), self.hash.len());
+        // W7 (fast ladder) + W8 (dfast): `tags` is allocated at EXACTLY
+        // `hash.len()` at all four of its sites, so the bounds test was dead;
+        // and its EMPTINESS is a per-BLOCK fact the caller now hoists, so the
+        // length load and test leave the per-position path too.
+        if live {
+            debug_assert!(!self.tags.is_empty() && self.tags.len() == self.hash.len());
             *unsafe { self.tags.get_unchecked_mut(h) } = tag;
         }
         debug_assert!(h < self.hash.len());
@@ -1082,9 +1084,10 @@ impl MatchTables {
     /// table (`let pack = tables.pack_tags`).
     #[inline(always)]
     #[allow(unsafe_code)]
-    fn put_hl_tag(&mut self, h: usize, pos: usize, tag: u8, packed: bool) {
+    fn put_hl_tag(&mut self, h: usize, pos: usize, tag: u8, packed: bool, live: bool) {
         debug_assert!(h < self.hash_long.len());
         debug_assert_eq!(packed, self.pack_tags);
+        debug_assert_eq!(live, !self.ltags.is_empty());
         if packed {
             // W5: `pack_tags` is set only when `len < 0x00FF_FFFF`, so
             // `pos + 1` fits the 24-bit field with room to spare and the
@@ -1098,9 +1101,10 @@ impl MatchTables {
         // Array route (>= 16 MiB / streaming): written UNCONDITIONALLY
         // whenever the array exists -- gating the store on the compare's flag
         // is what lets tags go stale (190ad8b).
-        // W3: same provable bound as `get_hl_tag`'s route, per STORE.
-        if !self.ltags.is_empty() {
-            debug_assert_eq!(self.ltags.len(), self.hash_long.len());
+        // W3 + W8: dead bound, and the emptiness is now the caller's hoisted
+        // per-block fact.
+        if live {
+            debug_assert!(!self.ltags.is_empty() && self.ltags.len() == self.hash_long.len());
             *unsafe { self.ltags.get_unchecked_mut(h) } = tag;
         }
         // W4: `saturating_add` is a cmov the encoder can never take. A
@@ -2095,6 +2099,8 @@ pub(crate) fn prime_tables(
     }
     // Hoisted per call: see the tag accessors' `packed` doc.
     let packed = tables.pack_tags;
+    let stag_live = !tables.tags.is_empty();
+    let ltag_live = !tables.ltags.is_empty();
     let mls = params.min_match.max(3) as usize;
     let from = payload_off.saturating_sub(window);
     let ilimit = payload_off.saturating_sub(8);
@@ -2275,13 +2281,13 @@ pub(crate) fn prime_tables(
                 let smask = if sk == 8 { u64::MAX } else { (1u64 << (8 * sk)) - 1 };
                 let tv = (load_u64le(src, p) & smask).wrapping_mul(FAST_HASH_PRIME64);
                 let g = (tv ^ (tv >> 29)) as u8;
-                tables.put_h_tag(h, p, g, packed);
+                tables.put_h_tag(h, p, g, packed, stag_live);
                 // 1a: prime the LONG tag too, or the filter rejects every
                 // primed long slot -- the exact -59.3% priming-poison class
                 // the short table was bitten by.
                 if do_long {
                     let hl = hash8(src, p, hash_log);
-                    tables.put_hl_tag(hl, p, g, packed);
+                    tables.put_hl_tag(hl, p, g, packed, ltag_live);
                 }
             }
         }
@@ -7328,6 +7334,8 @@ fn fill_hash_after_match(
 ) {
     // Hoisted per call: see the tag accessors' `packed` doc.
     let packed = tables.pack_tags;
+    let stag_live = !tables.tags.is_empty();
+    let ltag_live = !tables.ltags.is_empty();
     let (do_a, do_b) = ends;
     let mut n = 0u64;
     // W4/W5: `match_end` is `match_ip + n` with `n >= mls >= 4`, so the
@@ -7343,11 +7351,12 @@ fn fill_hash_after_match(
         // using. Writing it unpacked while the reader is packed decodes the tag
         // bits as part of the position -- which is exactly what it did, and it
         // moved output on 12 of 18 corpora.
-        if tables.pack_tags {
-            tables.put_h_tag(h, a, g, packed);
-        } else {
-            tables.store_fast(h, a, g, packed);
-        }
+        // W10: this re-read `pack_tags` from the struct one line after
+        // `packed` hoisted it, to choose between two helpers whose bodies are
+        // exactly the two arms `put_h_tag` already branches on -- the packed
+        // word, or the tag-array write plus the plain slot. One call does
+        // both, with the flag already in a register.
+        tables.put_h_tag(h, a, g, packed, stag_live);
         n += 1;
     }
     debug_assert!(match_end >= 2);
@@ -7355,11 +7364,8 @@ fn fill_hash_after_match(
         let b = match_end - 2;
         if b <= ilimit && b != a {
             let (h, g) = hash4_tag_mls(src, b, hash_shift, smask);
-            if tables.pack_tags {
-                tables.put_h_tag(h, b, g, packed);
-            } else {
-                tables.store_fast(h, b, g, packed);
-            }
+            // W10: see the `a` store above.
+            tables.put_h_tag(h, b, g, packed, stag_live);
             n += 1;
         }
     }
@@ -7388,6 +7394,8 @@ fn fill_hash_long_after_match(
 ) {
     // Hoisted per call: see the tag accessors' `packed` doc.
     let packed = tables.pack_tags;
+    let stag_live = !tables.tags.is_empty();
+    let ltag_live = !tables.ltags.is_empty();
     let (do_a, do_b) = ends;
     let mut n = 0u64;
     // W4/W5: `match_end` is `match_ip + n` with `n >= mls >= 4`, so the
@@ -7400,7 +7408,7 @@ fn fill_hash_long_after_match(
     let ltag_live = packed || !tables.ltags.is_empty();
     if do_a && a <= ilimit {
         let g = if ltag_live { hash4_tag_mls(src, a, hash_shift, smask).1 } else { 0 };
-        tables.put_hl_tag(hash8(src, a, hash_log), a, g, packed);
+        tables.put_hl_tag(hash8(src, a, hash_log), a, g, packed, ltag_live);
         n += 1;
     }
     debug_assert!(match_end >= 2);
@@ -7408,7 +7416,7 @@ fn fill_hash_long_after_match(
         let b = match_end - 2;
         if b <= ilimit && b != a {
             let g = if ltag_live { hash4_tag_mls(src, b, hash_shift, smask).1 } else { 0 };
-            tables.put_hl_tag(hash8(src, b, hash_log), b, g, packed);
+            tables.put_hl_tag(hash8(src, b, hash_log), b, g, packed, ltag_live);
             n += 1;
         }
     }
@@ -7624,6 +7632,17 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
     let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
+    // W1/W2/W3: three PER-BLOCK values the loop recomputed per CANDIDATE.
+    // `mlx` is a min/max over `mls` (four sites); `frame_start` was a struct
+    // load through `&mut MatchTables`, which LLVM must re-prove after every
+    // table write in between (six sites); and `lowest` is literally
+    // `lowest_rep`'s expression, recomputed at two more.
+    let frame_start_c = tables.frame_start;
+    let mlx_c = 8.min(mls).max(4);
+    let lowest_c = lowest_rep;
+    // W4: the literal-copy width, re-selected from a per-block flag on every
+    // emitted match.
+    let lp_w = if lp { LIT_PUSH_WIDTH } else { 0 };
     // GATE 6 @ L3 DISPATCH: run C's next-long probe only while it is EARNING.
     let nl_on = next_long_enabled() && tables.next_long_yield >= next_long_min();
     // `accel_shift_for(DFast)` is the constant 8 unless the RZSTD_ACCEL bench
@@ -7686,9 +7705,50 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     };
     let dpipe = dfast_pipe_enabled()
         && (tables.dfast_probe == 0 || tables.dfast_spec_yield >= dfast_spec_min());
-    let (mut spec_made, mut spec_used) = (0u64, 0u64);
+    // W8: `spec_used` used to be incremented on EVERY position that consumed
+    // a speculation -- a memory read-modify-write per position, visible as
+    // `incq <slot>` in the emitted loop, feeding only the ratio
+    // `spec_used / spec_made`. Every speculation issued is either CONSUMED,
+    // DROPPED (the position ended in a match or a rep hit, which clears the
+    // carry) or still live at block end, so counting the far rarer drops
+    // gives the same ratio exactly:
+    //     spec_used = spec_made - spec_dropped - (carried.live at exit)
+    let (mut spec_made, mut spec_dropped) = (0u64, 0u64);
     // T1: the speculation now carries the short tag beside the short index.
-    let mut carried: Option<(usize, u8, usize, Option<usize>, Option<usize>)> = None;
+    // W6: the carried speculation was
+    // `Option<(usize, u8, usize, Option<usize>, Option<usize>)>` -- an outer
+    // discriminant, two 8-byte hash indices and TWO nested `Option<usize>`
+    // (16 bytes each), about 56 bytes that the loop head wrote to the stack
+    // on every position (six spills per iteration in the emitted spec copy).
+    //
+    // Hash indices are `< 1 << hlog <= 2^24` and the candidates are carried in
+    // the TABLE's OWN encoding -- `pos + 1`, with 0 meaning "no candidate",
+    // exactly what the slots hold -- so nothing is lost, including position 0,
+    // which the decoded `Option` form could not have expressed either. The
+    // outer `Option` becomes the `live` flag. 56 bytes -> 20.
+    #[derive(Clone, Copy)]
+    struct Carried {
+        h4: u32,
+        h8: u32,
+        v4: u32,
+        v8: u32,
+        g4: u8,
+        live: bool,
+    }
+    let mut carried = Carried { h4: 0, h8: 0, v4: 0, v8: 0, g4: 0, live: false };
+    // Decode a carried slot value back to the `Option<usize>` the match logic
+    // expects: identical to `get_h_tag`/`get_hl_tag`'s own tail.
+    #[inline(always)]
+    fn dec(v: u32) -> Option<usize> {
+        if v == 0 { None } else { Some((v as usize) - 1) }
+    }
+    #[inline(always)]
+    fn enc(m: Option<usize>) -> u32 {
+        match m {
+            Some(p) => (p as u32) + 1,
+            None => 0,
+        }
+    }
     // Read ONCE per block. `hash4_tag`'s index is `(v * HASH4_PRIME) >> shift`,
     // which is exactly what `hash4` computes, so the tagged path indexes the
     // same slots as `hash_mls(src, ip, 4, hlog)` did.
@@ -7726,6 +7786,8 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     // has hoisted it since ffanat (`let pack = tables.pack_tags`); the whole
     // dfast path, both fill helpers and the priming pass never did.
     let packed = tables.pack_tags;
+    let stag_live = !tables.tags.is_empty();
+    let ltag_live = !tables.ltags.is_empty();
     // The mls-width short tag's byte mask (min(mls, 8) bytes).
     let sk = 8.min(mls);
     let smask = if sk == 8 { u64::MAX } else { (1u64 << (8 * sk)) - 1 };
@@ -7753,9 +7815,14 @@ fn find_dfast_impl_inner<const HLOG: u32>(
         if use_rep {
             if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end, ilimit) {
                 rep_hits += 1;
-                d_rep_bytes += ml as u64;
+                // W5: profile-only -- its one reader is a `#[cfg(profile)]`
+                // publish, and the shipping build already says
+                // `let _ = d_rep_bytes`. A u64 add per rep HIT for nothing.
+                if COUNT {
+                    d_rep_bytes += ml as u64;
+                }
                 let mstart = ip + 1;
-                push_literals(&mut lits, src, anchor, mstart, if lp { LIT_PUSH_WIDTH } else { 0 });
+                push_literals(&mut lits, src, anchor, mstart, lp_w);
                 seqs.push(Seq {
                     litlen: (mstart - anchor) as u32,
                     matchlen: ml as u32,
@@ -7763,7 +7830,9 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                 });
                 ip = mstart + ml;
                 anchor = ip;
-                carried = None;
+                // W8: see `spec_dropped`.
+                spec_dropped += u64::from(carried.live);
+                carried.live = false;
                 continue;
             }
         }
@@ -7784,12 +7853,17 @@ fn find_dfast_impl_inner<const HLOG: u32>(
         // `find_dfast_runtime` drifted until Gate 6 silently broke Gate 4's
         // byte-identity: an issue-order change must not be able to become an
         // algorithm change.
-        let (h4, g4, h8, m4, m8) = match carried.take() {
-            Some(v) => {
-                spec_used += 1;
-                v
-            }
-            None => {
+        let (h4, g4, h8, m4, m8) = if carried.live {
+            carried.live = false;
+            (
+                carried.h4 as usize,
+                carried.g4,
+                carried.h8 as usize,
+                dec(carried.v4),
+                dec(carried.v8),
+            )
+        } else {
+            {
                 let (a, ga, b) = dfast_hash_pair(src, ip, dtag_shift, smask, hlog);
                 let m = tables.get_h_tag(a, ga, dtag_on, packed);
                 // T1 ledger: a rejection is a candidate load AVOIDED. Counted
@@ -7821,8 +7895,8 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                                 ip,
                                 window,
                                 block_start,
-                                8.min(mls).max(4),
-                                tables.frame_start,
+                                mlx_c,
+                                frame_start_c,
                             ) && count_match(src, mr, ip, block_end) >= mls
                             {
                                 LTAG_FALSE.fetch_add(1, Relaxed);
@@ -7833,8 +7907,8 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                 (a, ga, b, m, ml8)
             }
         };
-        tables.put_h_tag(h4, ip, g4, packed);
-        tables.put_hl_tag(h8, ip, g4, packed);
+        tables.put_h_tag(h4, ip, g4, packed, stag_live);
+        tables.put_hl_tag(h8, ip, g4, packed, ltag_live);
         // Issue the NEXT position's two loads NOW, so they are in flight while
         // this position's match logic runs. The miss-advance does not depend on
         // the match result, so `nip` is knowable here; a match or a rep hit
@@ -7874,7 +7948,14 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                     tables.get_hl_tag(b, ga, lt_on, packed)
                 };
                 spec_made += 1;
-                carried = Some((a, ga, b, va, vb));
+                carried = Carried {
+                    h4: a as u32,
+                    h8: b as u32,
+                    v4: enc(va),
+                    v8: enc(vb),
+                    g4: ga,
+                    live: true,
+                };
             }
         }
 
@@ -7884,8 +7965,8 @@ fn find_dfast_impl_inner<const HLOG: u32>(
             if COUNT {
                 probes += 1;
             }
-            let mlx = 8.min(mls).max(4);
-            if match_ok(src, m8, ip, window, block_start, mlx, tables.frame_start) {
+            let mlx = mlx_c;
+            if match_ok(src, m8, ip, window, block_start, mlx, frame_start_c) {
                 // Count past match_ok's verified prefix (fast_probe_wide rule).
                 let ml = mlx + count_match_fast(src, m8 + mlx, ip + mlx, block_end);
                 if ml >= mls {
@@ -7905,8 +7986,8 @@ fn find_dfast_impl_inner<const HLOG: u32>(
             if COUNT {
                 use core::sync::atomic::Ordering::Relaxed;
                 if best_ml == 0 {
-                    let mlx = 8.min(mls).max(4);
-                    let lowest = block_start.saturating_sub(window).max(tables.frame_start);
+                    let mlx = mlx_c;
+                    let lowest = lowest_c;
                     let cheap = m8 >= ip
                         || ip - m8 > window
                         || m8 < lowest
@@ -7946,8 +8027,8 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                 if COUNT {
                     probes += 1;
                 }
-                let mlx = 8.min(mls).max(4);
-                if match_ok(src, m8b, ip + 1, window, block_start, mlx, tables.frame_start) {
+                let mlx = mlx_c;
+                if match_ok(src, m8b, ip + 1, window, block_start, mlx, frame_start_c) {
                     // Count past match_ok's verified prefix.
                     let ml = mlx + count_match_fast(src, m8b + mlx, ip + 1 + mlx, block_end);
                     if ml >= mls && ml > best_ml {
@@ -8003,7 +8084,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                     probes += 1;
                 }
                 let mut _acc = false;
-                if match_ok(src, m4, ip, window, block_start, mls, tables.frame_start) {
+                if match_ok(src, m4, ip, window, block_start, mls, frame_start_c) {
                     // Count past match_ok's verified prefix.
                     let ml = mls + count_match_fast(src, m4 + mls, ip + mls, block_end);
                     _acc = ml >= mls;
@@ -8026,7 +8107,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                         STAG_SURV_ACC.fetch_add(1, Relaxed);
                     } else {
                         let lowest =
-                            block_start.saturating_sub(window).max(tables.frame_start);
+                            lowest_c;
                         let cheap = m4 >= ip
                             || ip - m4 > window
                             || m4 < lowest
@@ -8043,7 +8124,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
         }
         if best_ml >= mls {
             // commit at `best_ip`, which is `ip+1` when the next-long probe won
-            push_literals(&mut lits, src, anchor, best_ip, if lp { LIT_PUSH_WIDTH } else { 0 });
+            push_literals(&mut lits, src, anchor, best_ip, lp_w);
             seqs.push(Seq {
                 litlen: (best_ip - anchor) as u32,
                 matchlen: best_ml as u32,
@@ -8072,23 +8153,55 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                 let hash_shift = dtag_shift;
                 let stop = end.saturating_sub(2).min(ilimit + 1);
                 let mut p = best_ip + 2 + dfs;
-                while p < stop {
-                    let (h, g) = hash4_tag_mls(src, p, hash_shift, smask);
-                    // T1: same table, same representation. `store_fast` writes
-                    // the slot unpacked, which a packed reader would decode as a
-                    // bogus position.
-                    tables.put_h_tag(h, p, g, packed);
-                    tables.put_hl_tag(hash8(src, p, hlog), p, g, packed);
-                    #[cfg(feature = "profile")]
-                    DF_FILL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    p += dfs;
+                // W9: the accessors reach both tables THROUGH `&mut
+                // MatchTables`, so this loop reloaded the struct pointer and
+                // then three field pointers from it on EVERY stored position
+                // -- four loads per fill. The bases cannot move inside the
+                // loop (nothing here resizes a table), so take them once.
+                // The stores below are `put_h_tag`/`put_hl_tag` inlined
+                // verbatim, same representation and same 190ad8b rule.
+                if p < stop {
+                    let hp = tables.hash.as_mut_ptr();
+                    let hlp = tables.hash_long.as_mut_ptr();
+                    let tp = tables.tags.as_mut_ptr();
+                    let ltp = tables.ltags.as_mut_ptr();
+                    while p < stop {
+                        let (h, g) = hash4_tag_mls(src, p, hash_shift, smask);
+                        let h8 = hash8(src, p, hlog);
+                        debug_assert!(h < tables.hash.len() && h8 < tables.hash_long.len());
+                        // SAFETY: `h` and `h8` are the hash shifts' own outputs,
+                        // bounded by the table lengths exactly as the accessors
+                        // assert; the bases are those tables'.
+                        #[allow(unsafe_code)]
+                        unsafe {
+                            let v = (p as u32) + 1;
+                            if packed {
+                                let w = (v & 0x00FF_FFFF) | (u32::from(g) << 24);
+                                *hp.add(h) = w;
+                                *hlp.add(h8) = w;
+                            } else {
+                                if stag_live {
+                                    *tp.add(h) = g;
+                                }
+                                *hp.add(h) = v;
+                                if ltag_live {
+                                    *ltp.add(h8) = g;
+                                }
+                                *hlp.add(h8) = v;
+                            }
+                        }
+                        #[cfg(feature = "profile")]
+                        DF_FILL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        p += dfs;
+                    }
                 }
             }
             ip = end;
             anchor = ip;
             // The two fills rewrite many entries, so anything speculated before
             // them is stale.
-            carried = None;
+            spec_dropped += u64::from(carried.live);
+            carried.live = false;
         } else {
             ip += dstep + ((ip - anchor) >> accel);
         }
@@ -8129,6 +8242,9 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     // nothing measures nothing, and scoring it 1.0 would make the gate
     // oscillate on/off every block. EWMA for the same reason Gate 6 needs one --
     // one cold or atypical block must not decide the whole frame.
+    let spec_used = spec_made
+        .saturating_sub(spec_dropped)
+        .saturating_sub(u64::from(carried.live));
     if dpipe && spec_made > 0 {
         let now = spec_used as f32 / spec_made as f32;
         tables.dfast_spec_yield = 0.75 * tables.dfast_spec_yield + 0.25 * now;
