@@ -698,7 +698,8 @@ impl MatchTables {
     /// Store a Fast-strategy slot (packed with its tag, or plain).
     #[inline(always)]
     #[allow(unsafe_code)]
-    fn store_fast(&mut self, h: usize, pos: usize, tag: u8) {
+    fn store_fast(&mut self, h: usize, pos: usize, tag: u8, packed: bool) {
+        debug_assert_eq!(packed, self.pack_tags);
         // BRICK 50 -- SAFETY: `h` always arrives from `hash4_tag`, which returns
         // `(hv >> hash_shift) as usize & hash_mask`, and `hash_mask` is
         // `self.hash.len() - 1` where the length is `1 << hash_log` (a non-zero
@@ -726,13 +727,15 @@ impl MatchTables {
         // waste in the hottest store in the encoder. The 190ad8b rule ("written
         // unconditionally whenever the array exists") still holds in the
         // else-path: packing removes the array, it does not gate the store.
-        if self.pack_tags {
+        if packed {
             *unsafe { self.hash.get_unchecked_mut(h) } =
                 (((pos as u32).wrapping_add(1)) & 0x00FF_FFFF) | (u32::from(tag) << 24);
             return;
         }
-        if let Some(t) = self.tags.get_mut(h) {
-            *t = tag;
+        // Same provable bound as `fast_slot_store`'s.
+        if !self.tags.is_empty() {
+            debug_assert_eq!(self.tags.len(), self.hash.len());
+            *unsafe { self.tags.get_unchecked_mut(h) } = tag;
         }
         *unsafe { self.hash.get_unchecked_mut(h) } = {
             // BRICK 57: `wrapping_add`, not `saturating_add`. The slot holds
@@ -929,10 +932,16 @@ impl MatchTables {
     #[allow(unsafe_code)]
     fn lz_head_put(&mut self, h: usize, pos: usize, tag: u8, cp: bool) {
         debug_assert!(h < self.hash.len());
+        // Same unreachable saturation as the fast/tag stores: `pos` indexes
+        // `src`, and the packed route is bounded harder still by
+        // `pack_tags`' `len < 0x00FF_FFFF`. Two cmovs per chain insert, i.e.
+        // per POSITION across L5-L12, guarding an input no frame produces.
+        debug_assert!(pos < u32::MAX as usize);
         let v = if cp {
-            (((pos as u32).saturating_add(1)) & 0x00FF_FFFF) | (u32::from(tag) << 24)
+            debug_assert!(pos + 1 < 0x00FF_FFFF);
+            (((pos as u32) + 1) & 0x00FF_FFFF) | (u32::from(tag) << 24)
         } else {
-            (pos as u32).saturating_add(1)
+            (pos as u32) + 1
         };
         *unsafe { self.hash.get_unchecked_mut(h) } = v;
     }
@@ -1051,7 +1060,10 @@ impl MatchTables {
     #[allow(unsafe_code)]
     fn put_hl(&mut self, h: usize, pos: usize) {
         debug_assert!(h < self.hash_long.len());
-        *unsafe { self.hash_long.get_unchecked_mut(h) } = (pos as u32).saturating_add(1);
+        // Last of the position-encoding saturations (see `put_h`): `pos`
+        // indexes `src`, so `pos + 1` cannot wrap and the cmov is dead.
+        debug_assert!(pos < u32::MAX as usize);
+        *unsafe { self.hash_long.get_unchecked_mut(h) } = (pos as u32) + 1;
     }
 
 
@@ -2160,7 +2172,7 @@ pub(crate) fn prime_tables(
         };
         let prime_attempts =
             bt_depth_apply(search_attempts(pparams), pparams, tables.opt_rep_rate);
-        let btf = bt_resolve::<false>(tables.hash_log, pparams.chain_log.min(24));
+        let btf = bt_resolve_ins(tables.hash_log, pparams.chain_log.min(24));
         let prime_ctx = BtCtx {
             src,
             block_start: payload_off,
@@ -2190,7 +2202,7 @@ pub(crate) fn prime_tables(
             p += stride;
         }
         while p <= ilimit && p + 8 <= src.len() {
-            let _ = btf(&prime_ctx, p, tables);
+            btf(&prime_ctx, p, tables);
             iters += 1;
             p += stride;
         }
@@ -2209,7 +2221,7 @@ pub(crate) fn prime_tables(
             let fhp = fast_hash_spec(mls, hash_log);
             let (h, tag) =
                 fast_hash_tag::<true>(src, p, fhp.wide, fhp.mask, fhp.shift);
-            tables.store_fast(h, p, tag);
+            tables.store_fast(h, p, tag, packed);
         } else {
             // Chain-tag frames prime in the finder's own format (packed or
             // array) -- the -59.3% priming-poison rule, third application.
@@ -6935,8 +6947,12 @@ fn fast_slot_store(hash: &mut [u32], tags: &mut [u8], pack: bool, h: usize, pos:
             (((pos as u32).wrapping_add(1)) & 0x00FF_FFFF) | (u32::from(tag) << 24);
         return;
     }
-    if let Some(t) = tags.get_mut(h) {
-        *t = tag;
+    // The array route's `tags` is allocated at EXACTLY `hash.len()`, and `h`
+    // has already indexed `hash` above -- the bounds test and its branch were
+    // dead on every unpacked store.
+    if !tags.is_empty() {
+        debug_assert_eq!(tags.len(), hash.len());
+        *unsafe { tags.get_unchecked_mut(h) } = tag;
     }
     *unsafe { hash.get_unchecked_mut(h) } = (pos as u32).wrapping_add(1);
 }
@@ -6966,7 +6982,12 @@ fn fast_slot_load<const PACKED: bool>(
     if !PACKED {
         return e;
     }
-    if let Some(&t) = tags.get(h) {
+    // Same provable bound as the store's -- per PROBE, on the hottest loop
+    // in the encoder.
+    if !tags.is_empty() {
+        debug_assert_eq!(tags.len(), hash.len());
+        #[allow(unsafe_code)]
+        let t = *unsafe { tags.get_unchecked(h) };
         #[cfg(feature = "profile")]
         TAGARR_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if t != tag {
@@ -7168,7 +7189,7 @@ fn fill_hash_after_match(
         if tables.pack_tags {
             tables.put_h_tag(h, a, g, packed);
         } else {
-            tables.store_fast(h, a, g);
+            tables.store_fast(h, a, g, packed);
         }
         n += 1;
     }
@@ -7179,7 +7200,7 @@ fn fill_hash_after_match(
             if tables.pack_tags {
                 tables.put_h_tag(h, b, g, packed);
             } else {
-                tables.store_fast(h, b, g);
+                tables.store_fast(h, b, g, packed);
             }
             n += 1;
         }
@@ -9427,8 +9448,15 @@ fn search_attempts(params: CompressionParameters) -> usize {
 macro_rules! bt_spec_list {
     ($cb:ident) => {
         $cb! {
+            // DEAD-COPY CENSUS 2026-08-21 (`deadcopy.rs`): every clevel x
+            // every input-size decade x the streaming case produces exactly
+            // 20 (hash_log, chain_log) pairs across the four Bt strategies.
+            // (18, 18) was shipped and is in NONE of them -- no input can
+            // reach it. Culled: it was 4 symbols (SEARCH x plain/BMI2) of
+            // code no frame can execute. The other 20 are all reachable, so
+            // this list is now exactly the reachable set.
             (11, 11) (12, 12) (13, 13) (14, 14) (14, 15) (15, 15) (16, 16)
-            (17, 17) (17, 18) (18, 18) (19, 18) (19, 19) (20, 20) (21, 21)
+            (17, 17) (17, 18) (19, 18) (19, 19) (20, 20) (21, 21)
             (22, 22) (22, 23) (22, 24) (23, 22) (23, 23) (23, 24) (24, 24)
         }
     };
@@ -9465,6 +9493,14 @@ pub(crate) struct BtCtx<'a> {
 
 type BtFn = for<'a> fn(&BtCtx<'a>, usize, &mut MatchTables) -> (usize, usize);
 
+/// The INSERT dispatch's own type. Insert callers discard the result -- both
+/// fills and the priming pass -- but the `BtFn` signature forced every insert
+/// trampoline to MATERIALISE one: the emitted wrapper built a 40-byte frame,
+/// made a real call, then zeroed `rax`/`rdx` to return `(0, 0)`, on 61.9% of
+/// all tree work at L13-L15. Returning `()` lets the same wrapper compile to
+/// a bare tail `jmp`, which is what the SEARCH side already gets.
+type BtInsFn = for<'a> fn(&BtCtx<'a>, usize, &mut MatchTables);
+
 fn bt_rt_search(ctx: &BtCtx, ip: usize, t: &mut MatchTables) -> (usize, usize) {
     bt_find_best_runtime(true, ctx, ip, t)
 }
@@ -9489,6 +9525,42 @@ fn bt_rt_insert_bmi2(ctx: &BtCtx, ip: usize, t: &mut MatchTables) -> (usize, usi
     unsafe {
         bt_find_best_runtime_bmi2(false, ctx, ip, t)
     }
+}
+
+/// `bt_resolve` for the insert side -- same table, `BtInsFn` shape.
+fn bt_resolve_ins(hash_log: u32, chain_log: u32) -> BtInsFn {
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    let bmi2 = crate::simd::has_bmi2();
+    #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
+    let bmi2 = false;
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    let rt: BtInsFn = if bmi2 { bt_rt_ins_bmi2 } else { bt_rt_ins_plain };
+    #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
+    let rt: BtInsFn = bt_rt_ins_plain;
+    if !bt_spec_enabled() {
+        return rt;
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if bmi2 {
+        macro_rules! ins_resolve_bmi2 {
+            ($( ($h:literal, $c:literal) )*) => {
+                match (hash_log, chain_log) {
+                    $( ($h, $c) => bt_ins_spec_bmi2::<$h, $c>, )*
+                    _ => rt,
+                }
+            };
+        }
+        return bt_spec_list!(ins_resolve_bmi2);
+    }
+    macro_rules! ins_resolve {
+        ($( ($h:literal, $c:literal) )*) => {
+            match (hash_log, chain_log) {
+                $( ($h, $c) => bt_ins_spec::<$h, $c>, )*
+                _ => rt,
+            }
+        };
+    }
+    bt_spec_list!(ins_resolve)
 }
 
 fn bt_resolve<const SEARCH: bool>(hash_log: u32, chain_log: u32) -> BtFn {
@@ -9559,6 +9631,43 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32, const SEARCH: bool>(
 
 /// Safe `BtFn`-shaped wrapper for the BMI2 twin; `bt_resolve` hands this out
 /// only after its own `has_bmi2()` check, once per block.
+/// Insert-only twin of `bt_find_best_spec_bmi2`, returning `()` -- see
+/// `BtInsFn`.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+fn bt_ins_spec_bmi2<const HLOG: u32, const CLOG: u32>(
+    ctx: &BtCtx,
+    ip: usize,
+    tables: &mut MatchTables,
+) {
+    // SAFETY: only reachable through `bt_resolve_ins`'s CPUID guard.
+    #[allow(unsafe_code)]
+    unsafe {
+        bt_find_best_impl_bmi2::<HLOG, CLOG, false>(ctx, ip, tables);
+    }
+}
+
+/// Insert-only, plain-ISA.
+fn bt_ins_spec<const HLOG: u32, const CLOG: u32>(
+    ctx: &BtCtx,
+    ip: usize,
+    tables: &mut MatchTables,
+) {
+    bt_find_best_impl_inner::<HLOG, CLOG, false>(ctx, ip, tables);
+}
+
+fn bt_rt_ins_plain(ctx: &BtCtx, ip: usize, t: &mut MatchTables) {
+    bt_find_best_runtime(false, ctx, ip, t);
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+fn bt_rt_ins_bmi2(ctx: &BtCtx, ip: usize, t: &mut MatchTables) {
+    // SAFETY: only reachable through `bt_resolve_ins`'s CPUID guard.
+    #[allow(unsafe_code)]
+    unsafe {
+        bt_find_best_runtime_bmi2(false, ctx, ip, t);
+    }
+}
+
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 fn bt_find_best_spec_bmi2<const HLOG: u32, const CLOG: u32, const SEARCH: bool>(
     ctx: &BtCtx,
@@ -10155,7 +10264,7 @@ fn find_bt_lazy(
     let attempts = bt_depth_apply(search_attempts(params), params, tables.opt_rep_rate);
     let clog = params.chain_log.min(24);
     let btf = bt_resolve::<true>(tables.hash_log, clog);
-    let btf_ins = bt_resolve::<false>(tables.hash_log, clog);
+    let btf_ins = bt_resolve_ins(tables.hash_log, clog);
     let bt_ctx = BtCtx {
         src,
         block_start,
@@ -10256,7 +10365,7 @@ fn find_bt_lazy(
                 // B2: the look-ahead already inserted up to `look_hi`.
                 let mut p = (best_ip + 1).max(look_hi + 1);
                 while p < end && p <= ilimit {
-                    let _ = btf_ins(&bt_ctx, p, tables);
+                    btf_ins(&bt_ctx, p, tables);
                     p += stride;
                 }
             }
@@ -10647,7 +10756,7 @@ fn find_opt(
     let bt_attempts = bt_depth_apply(search_attempts(params), params, tables.opt_rep_rate);
     let clog = params.chain_log.min(24);
     let btf = bt_resolve::<true>(tables.hash_log, clog);
-    let btf_ins = bt_resolve::<false>(tables.hash_log, clog);
+    let btf_ins = bt_resolve_ins(tables.hash_log, clog);
     let bt_ctx = BtCtx {
         src,
         block_start,
@@ -10997,7 +11106,7 @@ fn find_opt(
                 let mut qp = block_start + i + 1;
                 let mut q = i + 1;
                 while q < i + span && qp <= qp_end {
-                    let _ = btf_ins(&bt_ctx, qp, tables);
+                    btf_ins(&bt_ctx, qp, tables);
                     #[cfg(feature = "profile")]
                     OPT_FILL_INS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     q += step;
