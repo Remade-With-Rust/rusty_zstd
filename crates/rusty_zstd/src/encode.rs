@@ -10421,6 +10421,7 @@ fn opt_fill_stride() -> usize {
     1
 }
 
+#[inline(always)]
 fn find_opt(
     src: &[u8],
     block_start: usize,
