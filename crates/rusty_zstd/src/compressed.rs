@@ -360,7 +360,7 @@ pub(crate) fn decode_sequences(
     frame_skipped: usize,
 ) -> Result<(), Error> {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if seqloop_avx2_on() && crate::simd::has_avx2() {
+    if seqloop_avx2_on() && crate::simd::has_avx2() && crate::simd::has_bmi2() {
         // SAFETY: guarded by a runtime AVX2 check; the body is identical.
         #[allow(unsafe_code)]
         return unsafe {
@@ -378,7 +378,13 @@ pub(crate) fn decode_sequences(
 /// The AVX2-compiled twin. Everything `decode_sequences_inner` does -- including
 /// the 16- and 32-byte fixed-width copies -- is emitted with AVX2 available.
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "avx2")]
+// BMI2 + LZCNT added to the twin: `enable = "avx2"` does NOT imply them,
+// so the bitstream's variable shifts still compiled to shl/shr-through-CL
+// chains here. With bmi2 LLVM emits single-uop, flag-free shrx/shlx/bzhi --
+// exactly the instruction class the sequence decode loop lives on (DecSeq
+// is the m7 decode leader in 16/18 corpora). Runtime guard extended to
+// has_bmi2; the body is unchanged, so this is byte-identical by construction.
+#[target_feature(enable = "avx2,bmi2,lzcnt")]
 #[allow(clippy::too_many_arguments)]
 #[allow(unsafe_code)]
 unsafe fn decode_sequences_avx2(

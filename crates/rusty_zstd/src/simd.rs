@@ -260,7 +260,6 @@ pub(crate) fn has_avx2() -> bool {
     }
 }
 
-#[cfg(test)]
 #[inline(always)]
 pub(crate) fn has_bmi2() -> bool {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
