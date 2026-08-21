@@ -399,7 +399,7 @@ pub(crate) struct MatchTables {
     /// GATE 6, deeper: `find_opt`'s parse-backtrace buffer, kept for the same
     /// reason as `payload_scratch` and worth far more -- this one carried the
     /// bulk of the 340 MB L19 was pushing through `realloc` on a 2 MiB board.
-    opt_ops: Vec<(usize, usize, bool, u32, u32)>,
+    opt_ops: Vec<(usize, bool, u32, u32)>,
     /// T2: `find_opt`'s DP arrays, kept on the frame.
     ///
     /// Sized `n + 1` for a block of `n`, they were built fresh EVERY block:
@@ -9920,6 +9920,8 @@ fn find_opt(
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
+    // Sixth sighting of the un-gated per-block atomic class (959e0ae).
+    #[cfg(feature = "profile")]
     OPT_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let n = block_end - block_start;
     let mls = params.min_match.max(3) as usize;
@@ -9935,10 +9937,17 @@ fn find_opt(
     let mut match_off = std::mem::take(&mut tables.opt_off);
     let mut match_ml = std::mem::take(&mut tables.opt_ml);
     reset_to(&mut price, n + 1, inf);
-    reset_to(&mut prev, n + 1, 0usize);
-    reset_to(&mut is_match, n + 1, false);
-    reset_to(&mut match_off, n + 1, 0u32);
-    reset_to(&mut match_ml, n + 1, 0u32);
+    // The other four arrays are NEVER read before written: every position j
+    // in 1..=n is reachable through the literal chain (price[0] = 0 and the
+    // literal edge runs first at every i), and the FIRST improvement at j --
+    // from price[j] == inf -- writes prev/is_match (and match_off/match_ml
+    // together under is_match). The backtrace only visits priced positions.
+    // Their per-block resets were ~17 bytes of memset PER INPUT BYTE doing
+    // nothing; only the LENGTH must be ensured (stale contents are dead).
+    ensure_len(&mut prev, n + 1, 0usize);
+    ensure_len(&mut is_match, n + 1, false);
+    ensure_len(&mut match_off, n + 1, 0u32);
+    ensure_len(&mut match_ml, n + 1, 0u32);
     price[0] = 0;
     // BRICK 75: offer the REPCODE as a DP candidate (find_opt was the last
     // finder without repcode search).
@@ -10072,8 +10081,9 @@ fn find_opt(
         // DP arrays are len n + 1 and every index below is guarded <= n;
         // the checked ops compiled to a bounds test + panic branch PER DP
         // EDGE (and per length step in the loop below).
+        // `i + 1 <= n` is the loop condition (i < n) restated -- dead test.
         #[allow(unsafe_code)]
-        if opt_rep_on && i + 1 <= n && unsafe { *price.get_unchecked(i + 1) } < inf {
+        if opt_rep_on && unsafe { *price.get_unchecked(i + 1) } < inf {
             o_rep_probes += 1;
             if let Some(rml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
                 o_rep_hits += 1;
@@ -10099,14 +10109,10 @@ fn find_opt(
         o_bt_calls += 1;
         if bml < mls {
             o_bt_dry += 1;
-        }
-        if bml >= mls {
-            o_bt_len += bml as u64;
-        }
-        if bml < mls {
             i += 1;
             continue;
         }
+        o_bt_len += bml as u64;
         // BRICK 72: price a sequence by its OFFSET, not a flat constant.
         //
         // This was a flat `24 - extra` for EVERY match, so the dynamic program
@@ -10142,6 +10148,10 @@ fn find_opt(
         // with very long matches take a different path.
         const OPT_MAX_LENGTHS: usize = 64;
         let floor_step = (bml.saturating_sub(mls) / OPT_MAX_LENGTHS).max(1);
+        // price[i] and seq_cost are PER-MATCH constants: the sum was
+        // reloaded and re-added on every length step.
+        #[allow(unsafe_code)]
+        let np = unsafe { price.get_unchecked(i) }.saturating_add(seq_cost);
         let mut len = mls;
         loop {
             let j = i + len;
@@ -10150,7 +10160,6 @@ fn find_opt(
             }
             #[allow(unsafe_code)]
             unsafe {
-                let np = price.get_unchecked(i).saturating_add(seq_cost);
                 if np < *price.get_unchecked(j) {
                     *price.get_unchecked_mut(j) = np;
                     *prev.get_unchecked_mut(j) = i;
@@ -10267,7 +10276,7 @@ fn find_opt(
     //
     // Same remedy as the payload: the vector never escapes `find_opt`, so keep
     // it on the frame and let it converge on its own high-water mark.
-    let mut ops: Vec<(usize, usize, bool, u32, u32)> = std::mem::take(&mut tables.opt_ops);
+    let mut ops: Vec<(usize, bool, u32, u32)> = std::mem::take(&mut tables.opt_ops);
     ops.clear();
     // The reuse above leaves exactly ONE growth ladder per frame: the first
     // block still climbs from nothing to its high-water mark. It is removable,
@@ -10304,9 +10313,16 @@ fn find_opt(
     if opt_ops_exact() {
         let mut k = 0usize;
         let mut j = n;
+        // j <= n along the whole chain (prev entries are indices the DP
+        // wrote, all <= n); the checked op was a bounds branch per parse
+        // step.
         while j > 0 {
             k += 1;
-            j = prev[j];
+            debug_assert!(j < prev.len());
+            #[allow(unsafe_code)]
+            {
+                j = *unsafe { prev.get_unchecked(j) };
+            }
         }
         if ops.capacity() < k {
             ops = Vec::with_capacity(k);
@@ -10315,9 +10331,24 @@ fn find_opt(
         ops = Vec::with_capacity(n + 1);
     }
     let mut i = n;
+    let mut nmatched = 0usize;
+    // Same proof as the count walk; also: the tuple's `end` field (= i) was
+    // DEAD at every consumer (`let _ = end`), so it is gone -- 24-byte parse
+    // steps instead of 32 -- and `nmatched` is counted here instead of a
+    // separate pass over `ops`.
     while i > 0 {
-        let p = prev[i];
-        ops.push((p, i, is_match[i], match_off[i], match_ml[i]));
+        debug_assert!(i < prev.len());
+        #[allow(unsafe_code)]
+        let (p, m, off, ml) = unsafe {
+            (
+                *prev.get_unchecked(i),
+                *is_match.get_unchecked(i),
+                *match_off.get_unchecked(i),
+                *match_ml.get_unchecked(i),
+            )
+        };
+        nmatched += usize::from(m);
+        ops.push((p, m, off, ml));
         i = p;
     }
     ops.reverse();
@@ -10330,7 +10361,6 @@ fn find_opt(
     // `ops` is already built, so the sequence count and the literal-run shares
     // are known before a single byte is appended -- no `last_nseq` guess, no
     // previous-block signal, and therefore no warm-up block.
-    let nmatched = ops.iter().filter(|o| o.2).count();
     let block_len = block_end - block_start;
     let mut seqs = Vec::with_capacity(nmatched + 1);
     let mut lits = Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX);
@@ -10339,7 +10369,7 @@ fn find_opt(
     let opt_w = {
         let (mut short, mut mid) = (0usize, 0usize);
         let mut a = 0usize;
-        for &(start, _, matched, _, ml) in &ops {
+        for &(start, matched, _, ml) in &ops {
             if matched {
                 let l = start - a;
                 if l <= LIT_PUSH_WIDTH {
@@ -10361,7 +10391,7 @@ fn find_opt(
         }
     };
     let mut anchor = 0usize;
-    for &(start, end, matched, off, ml) in &ops {
+    for &(start, matched, off, ml) in &ops {
         if matched {
             push_literals(
                 &mut lits,
@@ -10375,11 +10405,10 @@ fn find_opt(
                 matchlen: ml,
                 offset: off,
             });
-            let _ = end;
             anchor = start + ml as usize;
         }
     }
-    lits.extend_from_slice(&src[block_start + anchor..block_end]);
+    push_lits_range(&mut lits, src, block_start + anchor, block_end);
     // Consumers are take_opt_rep / take_opt_bt gate harnesses only --
     // SEVEN un-cfg'd lock-prefixed RMWs per block in shipping, the 959e0ae
     // class, fifth sighting.
@@ -10939,6 +10968,13 @@ fn load_u64le(src: &[u8], i: usize) -> u64 {
 /// memcpy a buffer holding nothing live -- the defect that made the first
 /// `opt_ops` attempt cost more than it saved. Replacing instead copies nothing.
 #[inline(always)]
+/// Grow-only sizing for write-before-read scratch: never refills.
+fn ensure_len<T: Clone>(v: &mut Vec<T>, n: usize, val: T) {
+    if v.len() < n {
+        v.resize(n, val);
+    }
+}
+
 fn reset_to<T: Clone>(v: &mut Vec<T>, n: usize, val: T) {
     if v.capacity() < n {
         *v = Vec::with_capacity(n);
