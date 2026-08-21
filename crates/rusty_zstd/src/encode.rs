@@ -399,7 +399,7 @@ pub(crate) struct MatchTables {
     /// GATE 6, deeper: `find_opt`'s parse-backtrace buffer, kept for the same
     /// reason as `payload_scratch` and worth far more -- this one carried the
     /// bulk of the 340 MB L19 was pushing through `realloc` on a 2 MiB board.
-    opt_ops: Vec<(usize, bool, u32, u32)>,
+    opt_ops: Vec<(u32, u32, u32, bool)>,
     /// T2: `find_opt`'s DP arrays, kept on the frame.
     ///
     /// Sized `n + 1` for a block of `n`, they were built fresh EVERY block:
@@ -413,8 +413,8 @@ pub(crate) struct MatchTables {
     /// 1 MiB: 392 us fresh against 33 us reused, +1078%, the OS zero-filling
     /// pages the heap has stopped recycling. `prev` sits exactly there.
     opt_price: Vec<u32>,
-    opt_prev: Vec<usize>,
-    opt_is_match: Vec<bool>,
+    opt_prev: Vec<u32>,
+
     opt_off: Vec<u32>,
     opt_ml: Vec<u32>,
     /// GATE 6 @ L3: share of DFast positions where C's `_search_next_long`
@@ -649,7 +649,6 @@ impl MatchTables {
             opt_ops: Vec::new(),
             opt_price: Vec::new(),
             opt_prev: Vec::new(),
-            opt_is_match: Vec::new(),
             opt_off: Vec::new(),
             opt_ml: Vec::new(),
             rep_run: 0,
@@ -2152,7 +2151,10 @@ pub(crate) fn prime_tables(
             iters += 1;
             p += stride;
         }
+        #[cfg(feature = "profile")]
         PRIME_ITERS.fetch_add(iters, core::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "profile"))]
+        let _ = iters;
         return;
     }
     let mut p = from;
@@ -2231,7 +2233,10 @@ pub(crate) fn prime_tables(
         iters += 1;
         p += stride;
     }
+    #[cfg(feature = "profile")]
     PRIME_ITERS.fetch_add(iters, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "profile"))]
+    let _ = iters;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9933,7 +9938,6 @@ fn find_opt(
     // them per block. See `MatchTables::opt_price`.
     let mut price = std::mem::take(&mut tables.opt_price);
     let mut prev = std::mem::take(&mut tables.opt_prev);
-    let mut is_match = std::mem::take(&mut tables.opt_is_match);
     let mut match_off = std::mem::take(&mut tables.opt_off);
     let mut match_ml = std::mem::take(&mut tables.opt_ml);
     reset_to(&mut price, n + 1, inf);
@@ -9944,8 +9948,12 @@ fn find_opt(
     // together under is_match). The backtrace only visits priced positions.
     // Their per-block resets were ~17 bytes of memset PER INPUT BYTE doing
     // nothing; only the LENGTH must be ensured (stale contents are dead).
-    ensure_len(&mut prev, n + 1, 0usize);
-    ensure_len(&mut is_match, n + 1, false);
+    // `prev` shrank from usize (8 B/position of DP write+backtrace traffic)
+    // to u32 -- positions are < 2^24 -- and `is_match` PACKED into its spare
+    // bit 31, deleting that whole array (alloc, sizing, one store per edge
+    // improvement, one load per parse step).
+    const OPT_MATCH_BIT: u32 = 1 << 31;
+    ensure_len(&mut prev, n + 1, 0u32);
     ensure_len(&mut match_off, n + 1, 0u32);
     ensure_len(&mut match_ml, n + 1, 0u32);
     price[0] = 0;
@@ -10056,20 +10064,22 @@ fn find_opt(
             i += 1;
             continue;
         }
-        let np = pi.saturating_add(lit_cost);
+        // Range-proven plain add: pi < inf = MAX/4 and lit_cost is a small
+        // constant, so saturation is unreachable -- the saturating form paid
+        // a cmov per position for nothing.
+        let np = pi + lit_cost;
         #[allow(unsafe_code)]
         unsafe {
             if np < *price.get_unchecked(i + 1) {
                 *price.get_unchecked_mut(i + 1) = np;
-                *prev.get_unchecked_mut(i + 1) = i;
-                *is_match.get_unchecked_mut(i + 1) = false;
+                *prev.get_unchecked_mut(i + 1) = i as u32;
             }
         }
-        let ip = block_start + i;
-        if ip + 8 > block_end {
+        if i + 8 > n {
             i += 1;
             continue;
         }
+        let ip = block_start + i;
         // `try_rep1` matches at ip+1: a rep0 code requires litlen >= 1. So the DP
         // edge must ORIGINATE AT i+1 (after that literal), not at i. Basing it on
         // `price[i]` was the first attempt and it emitted every sequence with
@@ -10081,9 +10091,12 @@ fn find_opt(
         // DP arrays are len n + 1 and every index below is guarded <= n;
         // the checked ops compiled to a bounds test + panic branch PER DP
         // EDGE (and per length step in the loop below).
-        // `i + 1 <= n` is the loop condition (i < n) restated -- dead test.
-        #[allow(unsafe_code)]
-        if opt_rep_on && unsafe { *price.get_unchecked(i + 1) } < inf {
+        // `i + 1 <= n` was the loop condition restated, and
+        // `price[i + 1] < inf` is ALWAYS true here: pi < inf (checked above)
+        // and the literal edge just wrote price[i+1] <= pi + lit_cost < inf.
+        // Both tests were dead.
+        debug_assert!(price[i + 1] < inf);
+        if opt_rep_on {
             o_rep_probes += 1;
             if let Some(rml) = try_rep1(src, ip, rep1, lowest_rep, block_end) {
                 o_rep_hits += 1;
@@ -10092,11 +10105,10 @@ fn find_opt(
                 if j <= n {
                     #[allow(unsafe_code)]
                     unsafe {
-                        let np = price.get_unchecked(i + 1).saturating_add(rep_cost);
+                        let np = *price.get_unchecked(i + 1) + rep_cost;
                         if np < *price.get_unchecked(j) {
                             *price.get_unchecked_mut(j) = np;
-                            *prev.get_unchecked_mut(j) = i + 1;
-                            *is_match.get_unchecked_mut(j) = true;
+                            *prev.get_unchecked_mut(j) = (i + 1) as u32 | OPT_MATCH_BIT;
                             *match_off.get_unchecked_mut(j) = rep1 as u32;
                             *match_ml.get_unchecked_mut(j) = rml as u32;
                         }
@@ -10151,7 +10163,7 @@ fn find_opt(
         // price[i] and seq_cost are PER-MATCH constants: the sum was
         // reloaded and re-added on every length step.
         #[allow(unsafe_code)]
-        let np = unsafe { price.get_unchecked(i) }.saturating_add(seq_cost);
+        let np = unsafe { *price.get_unchecked(i) } + seq_cost;
         let mut len = mls;
         loop {
             let j = i + len;
@@ -10162,8 +10174,7 @@ fn find_opt(
             unsafe {
                 if np < *price.get_unchecked(j) {
                     *price.get_unchecked_mut(j) = np;
-                    *prev.get_unchecked_mut(j) = i;
-                    *is_match.get_unchecked_mut(j) = true;
+                    *prev.get_unchecked_mut(j) = i as u32 | OPT_MATCH_BIT;
                     *match_off.get_unchecked_mut(j) = (ip - bm) as u32;
                     *match_ml.get_unchecked_mut(j) = len as u32;
                 }
@@ -10253,11 +10264,10 @@ fn find_opt(
         i += 1;
     }
     if price[n] >= inf {
-    tables.opt_price = price;
-    tables.opt_prev = prev;
-    tables.opt_is_match = is_match;
-    tables.opt_off = match_off;
-    tables.opt_ml = match_ml;
+        tables.opt_price = price;
+        tables.opt_prev = prev;
+        tables.opt_off = match_off;
+        tables.opt_ml = match_ml;
         return find_bt_lazy(src, block_start, block_end, window, params, tables, 2, reps);
     }
     // GATE 6, one layer under the payload buffer: `ops` had the SAME defect,
@@ -10276,7 +10286,9 @@ fn find_opt(
     //
     // Same remedy as the payload: the vector never escapes `find_opt`, so keep
     // it on the frame and let it converge on its own high-water mark.
-    let mut ops: Vec<(usize, bool, u32, u32)> = std::mem::take(&mut tables.opt_ops);
+    // (start, off, ml, matched): 16 bytes -- start fits u32 (positions
+    // < 2^24), and the bool packs into the 4-aligned layout. Was 24.
+    let mut ops: Vec<(u32, u32, u32, bool)> = std::mem::take(&mut tables.opt_ops);
     ops.clear();
     // The reuse above leaves exactly ONE growth ladder per frame: the first
     // block still climbs from nothing to its high-water mark. It is removable,
@@ -10321,7 +10333,7 @@ fn find_opt(
             debug_assert!(j < prev.len());
             #[allow(unsafe_code)]
             {
-                j = *unsafe { prev.get_unchecked(j) };
+                j = (*unsafe { prev.get_unchecked(j) } & !OPT_MATCH_BIT) as usize;
             }
         }
         if ops.capacity() < k {
@@ -10332,26 +10344,46 @@ fn find_opt(
     }
     let mut i = n;
     let mut nmatched = 0usize;
-    // Same proof as the count walk; also: the tuple's `end` field (= i) was
-    // DEAD at every consumer (`let _ = end`), so it is gone -- 24-byte parse
-    // steps instead of 32 -- and `nmatched` is counted here instead of a
-    // separate pass over `ops`.
+    // opt_w's literal-run histogram is ALSO computed here (the pending-start
+    // trick: walking backward, the run before match k is start_k minus the
+    // end of the match seen NEXT in this walk), removing what was a separate
+    // full pass over `ops`.
+    let (mut w_short, mut w_mid) = (0usize, 0usize);
+    let mut pending_start = usize::MAX;
+    let mut count_run = |run: usize, w_short: &mut usize, w_mid: &mut usize| {
+        if run <= LIT_PUSH_WIDTH {
+            *w_short += 1;
+        } else if run <= LIT_PUSH_WIDTH_WIDE {
+            *w_mid += 1;
+        }
+    };
     while i > 0 {
         debug_assert!(i < prev.len());
         #[allow(unsafe_code)]
-        let (p, m, off, ml) = unsafe {
+        let (pr, off, ml) = unsafe {
             (
                 *prev.get_unchecked(i),
-                *is_match.get_unchecked(i),
                 *match_off.get_unchecked(i),
                 *match_ml.get_unchecked(i),
             )
         };
-        nmatched += usize::from(m);
-        ops.push((p, m, off, ml));
+        let p = (pr & !OPT_MATCH_BIT) as usize;
+        let m = pr & OPT_MATCH_BIT != 0;
+        if m {
+            nmatched += 1;
+            if pending_start != usize::MAX {
+                count_run(pending_start - (p + ml as usize), &mut w_short, &mut w_mid);
+            }
+            pending_start = p;
+        }
+        ops.push((p as u32, off, ml, m));
         i = p;
     }
-    ops.reverse();
+    if pending_start != usize::MAX {
+        count_run(pending_start, &mut w_short, &mut w_mid);
+    }
+    // `ops` is in REVERSE parse order; consumers iterate `.rev()` instead of
+    // paying an O(steps) reversal pass.
     // GATE 13 @ L22 -- the capability find_fast has had since brick 38 and
     // find_dfast since 4.46, absent from the whole Bt ladder. `find_opt` grew
     // both vectors by repeated realloc and appended every literal run through a
@@ -10362,26 +10394,24 @@ fn find_opt(
     // are known before a single byte is appended -- no `last_nseq` guess, no
     // previous-block signal, and therefore no warm-up block.
     let block_len = block_end - block_start;
-    let mut seqs = Vec::with_capacity(nmatched + 1);
-    let mut lits = Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX);
+    // GATE 6/13 for find_opt, at last: every other finder takes its output
+    // buffers from the frame; this one allocated BOTH fresh per block.
+    // Capacity stays EXACT (ops is built, so the counts are known).
+    let mut seqs = std::mem::take(&mut tables.seq_scratch);
+    seqs.clear();
+    if seqs.capacity() < nmatched + 1 {
+        seqs = Vec::with_capacity(nmatched + 1);
+    }
+    let mut lits = std::mem::take(&mut tables.lit_scratch);
+    lits.clear();
+    if lits.capacity() < block_len + LIT_PUSH_WIDTH_MAX {
+        lits = Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX);
+    }
     // Width chosen from THIS block's own runs, by the asm-derived rule:
     // widen when mid_share > short_share * (fast32 - fast16) / (slow - fast32).
     let opt_w = {
-        let (mut short, mut mid) = (0usize, 0usize);
-        let mut a = 0usize;
-        for &(start, matched, _, ml) in &ops {
-            if matched {
-                let l = start - a;
-                if l <= LIT_PUSH_WIDTH {
-                    short += 1;
-                } else if l <= LIT_PUSH_WIDTH_WIDE {
-                    mid += 1;
-                }
-                a = start + ml as usize;
-            }
-        }
         let n = nmatched.max(1) as f32;
-        let (sh, md) = (short as f32 / n, mid as f32 / n);
+        let (sh, md) = (w_short as f32 / n, w_mid as f32 / n);
         if sh < lit_short_min() {
             0
         } else if md > sh * WIDEN_RATIO {
@@ -10391,7 +10421,8 @@ fn find_opt(
         }
     };
     let mut anchor = 0usize;
-    for &(start, matched, off, ml) in &ops {
+    for &(start, off, ml, matched) in ops.iter().rev() {
+        let start = start as usize;
         if matched {
             push_literals(
                 &mut lits,
@@ -10462,7 +10493,6 @@ fn find_opt(
     tables.opt_ops = ops;
     tables.opt_price = price;
     tables.opt_prev = prev;
-    tables.opt_is_match = is_match;
     tables.opt_off = match_off;
     tables.opt_ml = match_ml;
     (seqs, lits)
