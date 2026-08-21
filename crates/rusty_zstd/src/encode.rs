@@ -9578,6 +9578,10 @@ fn bt_find_best_impl_inner<const HLOG: u32, const CLOG: u32, const SEARCH: bool>
     // (m < ip is tested first), one cmp against a per-call constant instead
     // of sub+cmp per node.
     let win_low = ip.saturating_sub(window);
+    // W1: the count head's only non-`m` precondition, hoisted out of the walk.
+    // See the head itself for why the other two tests are implied.
+    debug_assert!(block_end <= src.len());
+    let head_ok = ip + 8 <= block_end;
     // GATE 14 DISPATCH -- the chain-walk depth.
     //
     // 4.33's "82-84% of walks end by exhausting `attempts`" is REFUTED and this
@@ -9667,27 +9671,48 @@ fn bt_find_best_impl_inner<const HLOG: u32, const CLOG: u32, const SEARCH: bool>
         // case m + ml < m + 8 <= src.len(), so get() returns exactly the
         // byte the word holds; the long path keeps the get()-based loads
         // (bytes BEYOND block_end legitimately participate in routing).
-        let (ml, mb, ib) = if ip + 8 <= block_end && ip + 8 <= src.len() && m + 8 <= src.len() {
+        // W1 GUARD COLLAPSE: the three-test head was two loop-INVARIANT
+        // tests plus one redundant one. `block_end <= src.len()` (it is a
+        // position in `src`) makes `ip + 8 <= src.len()` follow from
+        // `ip + 8 <= block_end`, and `m < ip` -- proven by the break above --
+        // makes `m + 8 <= src.len()` follow too. What is left does not depend
+        // on `m`, so it leaves the loop entirely: `head_ok`, computed once
+        // per walk.
+        //
+        // W2 DIRECTION BY BSWAP: the descent needs the ORDER of the two byte
+        // strings, and `mb < ib` at the first differing byte IS lexicographic
+        // order -- which big-endian u64 comparison gives directly. Two
+        // `bswap`+`cmp` replace `and`+two `shrx`+`cmp`, and, more importantly,
+        // the branch no longer waits on `bsf`: direction and length are now
+        // INDEPENDENT chains instead of one serial dependency.
+        //
+        // W3 INSERT-ONLY LENGTH ELISION falls out of W2: with direction no
+        // longer derived from `ml`, the SEARCH = false copies (both fills and
+        // the priming pass -- 61.9% of all tree work at L13-L15) have no
+        // reader for the head path's `ml` at all, so the whole
+        // `bsf`/`shr` chain dead-codes away in those monomorphisations.
+        //
+        // Byte-identical on every path: same `ml` where `ml` is read, and the
+        // same direction bit.
+        let (ml, go_smaller) = if head_ok {
             let a = load_u64le(src, m);
             let b = load_u64le(src, ip);
             if a != b {
-                let ml = ((a ^ b).trailing_zeros() as usize) >> 3;
-                (ml, (a >> (8 * ml)) as u8, (b >> (8 * ml)) as u8)
+                (
+                    ((a ^ b).trailing_zeros() as usize) >> 3,
+                    a.swap_bytes() < b.swap_bytes(),
+                )
             } else {
                 let ml = 8 + count_match_fast(src, m + 8, ip + 8, block_end);
-                (
-                    ml,
-                    src.get(m + ml).copied().unwrap_or(0),
-                    src.get(ip + ml).copied().unwrap_or(0),
-                )
+                let mb = src.get(m + ml).copied().unwrap_or(0);
+                let ib = src.get(ip + ml).copied().unwrap_or(0);
+                (ml, mb < ib)
             }
         } else {
             let ml = count_match(src, m, ip, block_end);
-            (
-                ml,
-                src.get(m + ml).copied().unwrap_or(0),
-                src.get(ip + ml).copied().unwrap_or(0),
-            )
+            let mb = src.get(m + ml).copied().unwrap_or(0);
+            let ib = src.get(ip + ml).copied().unwrap_or(0);
+            (ml, mb < ib)
         };
         #[cfg(feature = "profile")]
         {
@@ -9712,7 +9737,7 @@ fn bt_find_best_impl_inner<const HLOG: u32, const CLOG: u32, const SEARCH: bool>
             best_ml = ml;
             best_m = m;
         }
-        if mb < ib {
+        if go_smaller {
             tables.chain_set(smaller, m as u32);
             // BYTE-IDENTICAL: if the store above targeted the slot we
             // pre-loaded, forward the stored value by hand -- the original read
@@ -9827,6 +9852,10 @@ fn bt_find_best_runtime_inner(
     // (m < ip is tested first), one cmp against a per-call constant instead
     // of sub+cmp per node.
     let win_low = ip.saturating_sub(window);
+    // W1: the count head's only non-`m` precondition, hoisted out of the walk.
+    // See the head itself for why the other two tests are implied.
+    debug_assert!(block_end <= src.len());
+    let head_ok = ip + 8 <= block_end;
     // GATE 14 DISPATCH -- the chain-walk depth.
     //
     // 4.33's "82-84% of walks end by exhausting `attempts`" is REFUTED and this
@@ -9916,27 +9945,48 @@ fn bt_find_best_runtime_inner(
         // case m + ml < m + 8 <= src.len(), so get() returns exactly the
         // byte the word holds; the long path keeps the get()-based loads
         // (bytes BEYOND block_end legitimately participate in routing).
-        let (ml, mb, ib) = if ip + 8 <= block_end && ip + 8 <= src.len() && m + 8 <= src.len() {
+        // W1 GUARD COLLAPSE: the three-test head was two loop-INVARIANT
+        // tests plus one redundant one. `block_end <= src.len()` (it is a
+        // position in `src`) makes `ip + 8 <= src.len()` follow from
+        // `ip + 8 <= block_end`, and `m < ip` -- proven by the break above --
+        // makes `m + 8 <= src.len()` follow too. What is left does not depend
+        // on `m`, so it leaves the loop entirely: `head_ok`, computed once
+        // per walk.
+        //
+        // W2 DIRECTION BY BSWAP: the descent needs the ORDER of the two byte
+        // strings, and `mb < ib` at the first differing byte IS lexicographic
+        // order -- which big-endian u64 comparison gives directly. Two
+        // `bswap`+`cmp` replace `and`+two `shrx`+`cmp`, and, more importantly,
+        // the branch no longer waits on `bsf`: direction and length are now
+        // INDEPENDENT chains instead of one serial dependency.
+        //
+        // W3 INSERT-ONLY LENGTH ELISION falls out of W2: with direction no
+        // longer derived from `ml`, the SEARCH = false copies (both fills and
+        // the priming pass -- 61.9% of all tree work at L13-L15) have no
+        // reader for the head path's `ml` at all, so the whole
+        // `bsf`/`shr` chain dead-codes away in those monomorphisations.
+        //
+        // Byte-identical on every path: same `ml` where `ml` is read, and the
+        // same direction bit.
+        let (ml, go_smaller) = if head_ok {
             let a = load_u64le(src, m);
             let b = load_u64le(src, ip);
             if a != b {
-                let ml = ((a ^ b).trailing_zeros() as usize) >> 3;
-                (ml, (a >> (8 * ml)) as u8, (b >> (8 * ml)) as u8)
+                (
+                    ((a ^ b).trailing_zeros() as usize) >> 3,
+                    a.swap_bytes() < b.swap_bytes(),
+                )
             } else {
                 let ml = 8 + count_match_fast(src, m + 8, ip + 8, block_end);
-                (
-                    ml,
-                    src.get(m + ml).copied().unwrap_or(0),
-                    src.get(ip + ml).copied().unwrap_or(0),
-                )
+                let mb = src.get(m + ml).copied().unwrap_or(0);
+                let ib = src.get(ip + ml).copied().unwrap_or(0);
+                (ml, mb < ib)
             }
         } else {
             let ml = count_match(src, m, ip, block_end);
-            (
-                ml,
-                src.get(m + ml).copied().unwrap_or(0),
-                src.get(ip + ml).copied().unwrap_or(0),
-            )
+            let mb = src.get(m + ml).copied().unwrap_or(0);
+            let ib = src.get(ip + ml).copied().unwrap_or(0);
+            (ml, mb < ib)
         };
         #[cfg(feature = "profile")]
         {
@@ -9955,7 +10005,7 @@ fn bt_find_best_runtime_inner(
             best_ml = ml;
             best_m = m;
         }
-        if mb < ib {
+        if go_smaller {
             tables.chain_set(smaller, m as u32);
             // BYTE-IDENTICAL: if the store above targeted the slot we
             // pre-loaded, forward the stored value by hand -- the original read
