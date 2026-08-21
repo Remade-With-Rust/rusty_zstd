@@ -1038,17 +1038,6 @@ impl MatchTables {
         *unsafe { self.hash_long.get_unchecked_mut(h) } = (pos as u32).saturating_add(1);
     }
 
-    #[inline(always)]
-    #[allow(unsafe_code)]
-    fn get_hl(&self, h: usize) -> Option<usize> {
-        debug_assert!(h < self.hash_long.len());
-        let v = *unsafe { self.hash_long.get_unchecked(h) };
-        if v == 0 {
-            None
-        } else {
-            Some((v as usize) - 1)
-        }
-    }
 
     /// 1a: long-table stores carry the SHORT tag (`hash4_tag`'s byte) in the
     /// high 8 bits on packed frames -- the same representation and < 16 MiB
@@ -1105,6 +1094,7 @@ impl MatchTables {
 
     /// Diagnostic twin: the raw long-slot position with the mask honored
     /// (COUNT paths only -- the false-reject re-probe).
+    #[cfg(feature = "profile")]
     #[inline(always)]
     fn raw_hl(&self, h: usize) -> u32 {
         let e = self.hash_long[h];
@@ -2091,7 +2081,6 @@ pub(crate) fn prime_tables(
     // would otherwise prime hash8 slots the finder never reads.
     let is_fast =
         params.strategy == Strategy::Fast && (tables.pack_tags || !tables.tags.is_empty());
-    let hash_shift = 32u32.saturating_sub(hash_log.min(32));
     let mut iters = 0u64;
     // FINDING 2: on the Bt ladder, INSERT each position into the tree rather
     // than only writing its hash head. `bt_find_best` performs the insertion as
@@ -6652,22 +6641,6 @@ fn fast_hash_relatch(
     FF_LATCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// The probe-veto wrapper: a vetoed block reads NO candidates (m = 0 makes
-/// `fast_probe` return `None` in one test) while stores continue unchanged.
-#[inline(always)]
-fn ff_cand_load<const PACKED: bool>(
-    hash: &[u32],
-    tags: &[u8],
-    pack: bool,
-    probe_on: bool,
-    h: usize,
-    tag: u8,
-) -> u32 {
-    if !probe_on {
-        return 0;
-    }
-    fast_slot_load::<PACKED>(hash, tags, pack, h, tag)
-}
 
 /// Diagnostic twin of `raw_fast` for the local-table loop (COUNT paths only).
 #[inline(always)]
@@ -6774,6 +6747,9 @@ fn fill_hash_after_match(
     src: &[u8],
     match_ip: usize,
     match_end: usize,
+    // Block-hoisted: the arm atomic ran per call, twice per match across
+    // both DFast fill helpers.
+    ends: (bool, bool),
     smask: u64,
     // Shift from the table's OWN clamped hash_log -- never from `params`.
     // Passed IN rather than recomputed from the struct field: the caller's
@@ -6784,7 +6760,7 @@ fn fill_hash_after_match(
     hash_shift: u32,
     ilimit: usize,
 ) {
-    let (do_a, do_b) = dfast_fill_ends();
+    let (do_a, do_b) = ends;
     let mut n = 0u64;
     let a = match_ip.saturating_add(2);
     if do_a && a <= ilimit {
@@ -6828,6 +6804,7 @@ fn fill_hash_long_after_match(
     match_ip: usize,
     match_end: usize,
     hash_log: u32,
+    ends: (bool, bool),
     smask: u64,
     // 1a: the short-tag shift, for the packed long store. Passed in like
     // `fill_hash_after_match`'s -- never re-derived from the struct field
@@ -6835,7 +6812,7 @@ fn fill_hash_long_after_match(
     hash_shift: u32,
     ilimit: usize,
 ) {
-    let (do_a, do_b) = dfast_fill_ends();
+    let (do_a, do_b) = ends;
     let mut n = 0u64;
     let a = match_ip.saturating_add(2);
     let ltag_live = tables.pack_tags || !tables.ltags.is_empty();
@@ -7126,6 +7103,7 @@ fn find_dfast_impl<const HLOG: u32>(
     // Loop-invariant arm reads, hoisted from the MATCH path to once per block.
     let fill_anchor_c = dfast_fill_anchor_c();
     let fill_stride = dfast_fill_stride();
+    let fill_ends = dfast_fill_ends();
     // REFUTED (2026-08-20): the Fast loop's mem::take table surgery, applied
     // here -- take hash/hash_long/tags into locals, slice-based slot twins,
     // slice-signature fill helpers. Byte-identical (dfid L1-L4 exact) but
@@ -7183,8 +7161,7 @@ fn find_dfast_impl<const HLOG: u32>(
                 v
             }
             None => {
-                let (a, ga) = hash4_tag_mls(src, ip, dtag_shift, smask);
-                let b = hash8(src, ip, hlog);
+                let (a, ga, b) = dfast_hash_pair(src, ip, dtag_shift, smask, hlog);
                 let m = tables.get_h_tag(a, ga, dtag_on);
                 // T1 ledger: a rejection is a candidate load AVOIDED. Counted
                 // only under `profile`, so the shipping loop is untouched.
@@ -7242,8 +7219,7 @@ fn find_dfast_impl<const HLOG: u32>(
         if dpipe {
             let nip = ip + dstep + ((ip - anchor) >> accel);
             if nip <= ilimit {
-                let (a, ga) = hash4_tag_mls(src, nip, dtag_shift, smask);
-                let b = hash8(src, nip, hlog);
+                let (a, ga, b) = dfast_hash_pair(src, nip, dtag_shift, smask, hlog);
                 // The hand-forward has to respect the filter: `put_h_tag` just
                 // wrote `g4` at slot `h4`, so a speculation landing on that slot
                 // sees `ip` only when its own tag matches what is now stored.
@@ -7450,12 +7426,12 @@ fn find_dfast_impl<const HLOG: u32>(
             }
             let end = best_ip + best_ml;
             // DFast never sets `packed` (it is gated on Strategy::Fast).
-            fill_hash_after_match(tables, src, best_ip, end, smask, dtag_shift, ilimit);
+            fill_hash_after_match(tables, src, best_ip, end, fill_ends, smask, dtag_shift, ilimit);
             // GATE 12 @ L3: `ip` here is the PRE-probe position; when the
             // next-long probe won, `best_ip == ip + 1` and the two tables index
             // different positions for one match. See `dfast_fill_anchor_c`.
             let long_anchor = if fill_anchor_c { best_ip } else { ip };
-            fill_hash_long_after_match(tables, src, long_anchor, end, hlog, smask, dtag_shift, ilimit);
+            fill_hash_long_after_match(tables, src, long_anchor, end, hlog, fill_ends, smask, dtag_shift, ilimit);
             // GATE 12 @ L3: the density knob DFast never had. Off by default.
             let dfs = fill_stride;
             if dfs != 0 {
@@ -10085,6 +10061,7 @@ fn find_opt(
     // GATE 11 @ L19: are there positions the DP never inserts? Two paths skip
     // without calling bt_find_best.
     let (mut o_skip_inf, mut o_skip_jump, mut o_skip_jumps) = (0u64, 0u64, 0u64);
+    #[cfg(feature = "profile")]
     let o_positions = n as u64;
     // GATE 10 @ L19 DISPATCH. The candidate costs a `try_rep1` at every position
     // and EARNS almost nowhere: 12 of 18 corpora are SMALLER without it, and
@@ -10760,6 +10737,19 @@ fn chain_tag_enabled() -> bool {
     !matches!(CHAIN_TAG_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
 }
 
+/// The DFast position hash pair from ONE u64 load: short index (bit-exact
+/// hash4), mls-width short tag, and long index (bit-exact hash8) all derive
+/// from the same 8 bytes -- `hash4_tag_mls` and `hash8` each loaded them
+/// separately, an optimizer-mood CSE (the 4a30eb4 rule: own the fold).
+#[inline(always)]
+fn dfast_hash_pair(src: &[u8], pos: usize, dtag_shift: u32, smask: u64, hlog: u32) -> (usize, u8, usize) {
+    let v = load_u64le(src, pos);
+    let hv4 = (v as u32).wrapping_mul(HASH4_PRIME);
+    let tv = (v & smask).wrapping_mul(FAST_HASH_PRIME64);
+    let h8 = (v.wrapping_mul(0xCF1B_BCDC_B7A5_6463) >> (64u32.saturating_sub(hlog.min(32)))) as usize;
+    ((hv4 >> dtag_shift) as usize, (tv ^ (tv >> 29)) as u8, h8)
+}
+
 /// hash4 index + the lazy ladder's link tag. The tag is MLS-WIDTH
 /// (`hash4_tag_mls`), not 4-byte: chain buckets are keyed by the 4-byte
 /// gram, so colliding candidates mostly SHARE those 4 bytes and die at byte
@@ -11002,6 +10992,7 @@ pub fn take_walk_census() -> (u64, u64) {
     (WALK_EXAM.swap(0, Relaxed), WALK_BYTEMISS.swap(0, Relaxed))
 }
 
+#[inline(always)]
 fn match_ok(
     src: &[u8],
     m: usize,
@@ -11020,6 +11011,15 @@ fn match_ok(
     }
     if ip + mls > src.len() || m + mls > src.len() {
         return false;
+    }
+    // The tail slice-eq compiled to a LIBC MEMCMP CALL per candidate (for
+    // mls = 5, comparing ONE byte) -- the mls_eq lesson, applied to the
+    // shared validity helper. Self-proving: the u64 path runs only when its
+    // own 8-byte reads are in bounds (m < ip from the order check above).
+    if mls <= 8 && ip + 8 <= src.len() {
+        debug_assert!(m + 8 <= src.len());
+        let mask = if mls == 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
+        return (load_u64le(src, m) ^ load_u64le(src, ip)) & mask == 0;
     }
     if mls >= 4 {
         if load_u32le(src, m) != load_u32le(src, ip) {
@@ -11149,9 +11149,6 @@ fn hash8(src: &[u8], ip: usize, hash_log: u32) -> usize {
     (v.wrapping_mul(0xCF1B_BCDC_B7A5_6463) >> shift) as usize
 }
 
-fn offset_ok(offset: usize, window: usize) -> bool {
-    offset > 0 && offset <= window
-}
 
 #[inline(always)]
 fn hash_mls(src: &[u8], ip: usize, mls: usize, hash_log: u32) -> usize {
