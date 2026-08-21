@@ -3530,15 +3530,31 @@ fn rep_decay() -> f32 {
 static REP_DECAY_CACHE: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
 
+#[cfg(feature = "std")]
+static REPMIN_OVR: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
 fn rep_yield_min_for(strategy: Strategy) -> f32 {
     #[cfg(feature = "profile")]
     ENVHIT[3].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // The RZSTD_REPMIN override resolved ONCE (it was an env::var -- a
+    // GetEnvironmentVariableW plus a String -- per BLOCK in every finder's
+    // rep_search_on). u32::MAX = unchecked, MAX-1 = no override.
     #[cfg(feature = "std")]
-    if let Some(v) = std::env::var("RZSTD_REPMIN")
-        .ok()
-        .and_then(|v| v.trim().parse::<f32>().ok())
     {
-        return v;
+        use core::sync::atomic::Ordering;
+        let mut c = REPMIN_OVR.load(Ordering::Relaxed);
+        if c == u32::MAX {
+            c = std::env::var("RZSTD_REPMIN")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .map(f32::to_bits)
+                .unwrap_or(u32::MAX - 1);
+            REPMIN_OVR.store(c, Ordering::Relaxed);
+        }
+        if c != u32::MAX - 1 {
+            return f32::from_bits(c);
+        }
     }
     match strategy {
         // GATE 2 @ L3 -- was a flat 0.0, i.e. the repcode search CONSTANT ON and
@@ -9448,14 +9464,24 @@ fn opt_rep_min() -> f32 {
     ENVHIT[6].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
-        std::env::var("RZSTD_OPT_REP_MIN")
+        use core::sync::atomic::Ordering;
+        let c = OPT_REP_MIN_C.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_OPT_REP_MIN")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(50.0)
+            .unwrap_or(50.0);
+        OPT_REP_MIN_C.store(v.to_bits(), Ordering::Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     50.0
 }
+#[cfg(feature = "std")]
+static OPT_REP_MIN_C: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Measurement arm for the opt DP's repcode candidate.
 static OPT_REP_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
@@ -9536,11 +9562,20 @@ fn opt_fill_enabled() -> bool {
     ENVHIT[7].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
-        std::env::var("RZSTD_OPT_FILL").map(|v| v.trim() != "0").unwrap_or(true)
+        use core::sync::atomic::Ordering;
+        let c = OPT_FILL_C.load(Ordering::Relaxed);
+        if c != 0 {
+            return c == 2;
+        }
+        let v = std::env::var("RZSTD_OPT_FILL").map(|v| v.trim() != "0").unwrap_or(true);
+        OPT_FILL_C.store(if v { 2 } else { 1 }, Ordering::Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     false
 }
+#[cfg(feature = "std")]
+static OPT_FILL_C: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Above this bytes-per-rep-probe the content is rep-dominated and the jumped
 /// span's interior is not worth inserting.
@@ -9549,14 +9584,24 @@ fn opt_fill_rep_max() -> f32 {
     ENVHIT[8].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "std")]
     {
-        std::env::var("RZSTD_OPT_FILL_REP")
+        use core::sync::atomic::Ordering;
+        let c = OPT_FILL_REP_C.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_OPT_FILL_REP")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(50.0)
+            .unwrap_or(50.0);
+        OPT_FILL_REP_C.store(v.to_bits(), Ordering::Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     50.0
 }
+#[cfg(feature = "std")]
+static OPT_FILL_REP_C: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Longest span the back-fill will walk. Beyond this the jump is a single huge
 /// repeat and its interior is not worth inserting.
