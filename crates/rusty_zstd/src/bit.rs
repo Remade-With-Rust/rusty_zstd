@@ -194,6 +194,16 @@ impl BitCStream {
         }
     }
 
+    /// Frame-scratch constructor: reuse a caller-kept buffer (cleared here)
+    /// so the per-block bitstream costs no allocation after warm-up.
+    pub(crate) fn from_vec(mut buf: alloc::vec::Vec<u8>, want: usize) -> Self {
+        buf.clear();
+        if buf.capacity() < want {
+            buf = alloc::vec::Vec::with_capacity(want);
+        }
+        Self { buf, container: 0, bit_pos: 0 }
+    }
+
     pub(crate) fn add_bits(&mut self, value: u64, nb_bits: u32) {
         if nb_bits == 0 {
             return;

@@ -364,6 +364,10 @@ pub(crate) struct MatchTables {
     /// (>= 16 MiB, streaming): link tags beside `chain`, head tags in
     /// `tags`. Mirrors the ltags story exactly.
     ctags: Vec<u8>,
+    /// Frame scratch for the per-block sequence coding (the GATE 6 family):
+    /// `coded` and the bitstream buffer were fresh allocations per block.
+    coded_scratch: Vec<CodedSeq>,
+    bits_scratch: Vec<u8>,
     /// See `set_wide_chain_arm`.
     chain_wide: bool,
     /// Blocks whose finder has actually RUN and written back its signals.
@@ -641,6 +645,8 @@ impl MatchTables {
             chain_pack: false,
             ctags: Vec::new(),
             chain_wide: false,
+            coded_scratch: Vec::new(),
+            bits_scratch: Vec::new(),
             blocks_done: 0,
             payload_scratch: Vec::new(),
             seq_scratch: Vec::new(),
@@ -2456,7 +2462,7 @@ pub(crate) fn encode_block(
                 tables.opt_lit_price = measured_lit_bits(lit_end, literals.len());
             }
             crate::prof::note_emit_lit(lit_end as u64);
-            write_sequences(&mut payload, &seqs, reps, entropy, params.strategy)?;
+            write_sequences(&mut payload, &seqs, reps, entropy, params.strategy, tables)?;
             crate::prof::note_emit_seq((payload.len() - lit_end) as u64);
         }
     }
@@ -2979,20 +2985,31 @@ fn write_sequences(
     reps: &mut [u32; 3],
     entropy: &mut EntropyState,
     strategy: Strategy,
+    tables: &mut MatchTables,
 ) -> Result<(), Error> {
     write_nseq(dst, seqs.len() as u32);
     if seqs.is_empty() {
         return Ok(());
     }
 
-    let (coded, ll_count, of_count, ml_count) = {
+    let (coded, ll_count, of_count, ml_count, of_max) = {
         let _sc = crate::prof::scope(crate::prof::Stage::EncodeSeqCode);
         // T4/brick-79: hoist the LUT arm out of the per-sequence loop. It was
         // read inside `ll_code` AND `ml_code`, i.e. two atomic loads per
         // sequence, while the two copy arms beside it are both resolved once
         // per block.
         let lut_arm = crate::compressed::lut_on();
-        let mut coded: Vec<CodedSeq> = Vec::with_capacity(seqs.len());
+        let mut coded: Vec<CodedSeq> = std::mem::take(&mut tables.coded_scratch);
+        coded.clear();
+        if coded.capacity() < seqs.len() {
+            coded = Vec::with_capacity(seqs.len());
+        }
+        // The code histograms and the of_needs_comp scan were SEPARATE full
+        // passes over `coded`; both fold into this loop.
+        let mut ll_count = [0u32; 36];
+        let mut of_count = [0u32; 32];
+        let mut ml_count = [0u32; 53];
+        let mut of_max = 0u8;
         for s in seqs {
             let ov = offset_value_for(s.offset, s.litlen, reps);
             // BRICK 62: advance the repcodes directly instead of calling the
@@ -3026,6 +3043,10 @@ fn write_sequences(
             if ofc > 31 {
                 return Err(Error::Corruption);
             }
+            ll_count[llc as usize] += 1;
+            of_count[ofc as usize] += 1;
+            ml_count[mlc as usize] += 1;
+            of_max = of_max.max(ofc);
             coded.push(CodedSeq {
                 llc,
                 mlc,
@@ -3038,16 +3059,7 @@ fn write_sequences(
             });
         }
 
-        let mut ll_count = [0u32; 36];
-        let mut of_count = [0u32; 32];
-        let mut ml_count = [0u32; 53];
-        for c in &coded {
-            ll_count[c.llc as usize] += 1;
-            of_count[c.ofc as usize] += 1;
-            ml_count[c.mlc as usize] += 1;
-        }
-
-        (coded, ll_count, of_count, ml_count)
+        (coded, ll_count, of_count, ml_count, of_max)
     };
     let use_low = strategy.id() >= Strategy::Lazy.id();
     let last_i = coded.len() - 1;
@@ -3064,9 +3076,7 @@ fn write_sequences(
             false,
             coded[last_i].llc as usize,
         )?;
-        let of_needs_comp = coded
-            .iter()
-            .any(|c| c.ofc as usize >= fse::DEFAULT_OF_NORM.len());
+        let of_needs_comp = of_max as usize >= fse::DEFAULT_OF_NORM.len();
         let (of_mode, of_t, of_hdr) = select_seq_table(
             &of_count,
             32,
@@ -3108,7 +3118,10 @@ fn write_sequences(
     let mut of_s = of_t.init_state2(coded[last].ofc as usize);
     let mut ll_s = ll_t.init_state2(coded[last].llc as usize);
 
-    let mut bits = BitCStream::with_capacity(coded.len() * 4 + 16);
+    let mut bits = BitCStream::from_vec(
+        std::mem::take(&mut tables.bits_scratch),
+        coded.len() * 4 + 16,
+    );
     bits.add_bits(u64::from(coded[last].llx), u32::from(coded[last].llb));
     bits.add_bits(u64::from(coded[last].mlx), u32::from(coded[last].mlb));
     bits.add_bits(u64::from(coded[last].ofx), u32::from(coded[last].ofc));
@@ -3129,7 +3142,10 @@ fn write_sequences(
     ml_t.flush(ml_s, &mut bits);
     of_t.flush(of_s, &mut bits);
     ll_t.flush(ll_s, &mut bits);
-    dst.extend_from_slice(&bits.close());
+    let out = bits.close();
+    dst.extend_from_slice(&out);
+    tables.bits_scratch = out;
+    tables.coded_scratch = coded;
     entropy.ll = Some(ll_t);
     entropy.of = Some(of_t);
     entropy.ml = Some(ml_t);
@@ -3211,6 +3227,7 @@ fn select_seq_table(
     Ok((best_mode, best_table.unwrap_or(basic), best_hdr))
 }
 
+#[derive(Clone, Copy)]
 struct CodedSeq {
     llc: u8,
     mlc: u8,
