@@ -5205,15 +5205,25 @@ fn fast_probe_wide<const SAFE: bool>(
         load_u64le_tail(src, m)
     };
     if (a ^ b) & mask != 0 {
-        cand.0 += 1;
+        // Prometheus adjudication (m7-optimize-anatomy §3): `tag_yield`'s only
+        // shipped consumer is `ut`'s compare against `tag_min`, which ships
+        // 0.0 -- the value gates nothing. Maintained under `profile` only,
+        // where the content-signal dump and the RZSTD_TAG_T sweep arms (both
+        // profile machinery) still see it. Two register-held u64 adds leave
+        // the hottest loop in the encoder.
+        if cfg!(feature = "profile") {
+            cand.0 += 1;
+        }
         return None;
     }
-    cand.1 += 1;
+    if cfg!(feature = "profile") {
+        cand.1 += 1;
+    }
     #[cfg(feature = "profile")]
     FF_CAND4.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "profile")]
     FF_ACCEPT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    Some((m, mls + count_match(src, m + mls, ip + mls, block_end)))
+    Some((m, mls + count_match_fast(src, m + mls, ip + mls, block_end)))
 }
 
 fn fast_probe(
@@ -5233,14 +5243,46 @@ fn fast_probe(
     if m < lowest || m >= ip || ip - m > window {
         return None;
     }
-    if load_u32le(src, m) != load_u32le(src, ip) {
-        cand.0 += 1;
-        return None;
-    }
-    cand.1 += 1;
-    #[cfg(feature = "profile")]
-    FF_CAND4.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let ml = 4 + count_match(src, m + 4, ip + 4, block_end);
+    // FUSED FIRST-WORD HEAD: with 8-byte room under block_end, ONE u64 pair
+    // both gates the candidate (low 32 bits -- the same test the u32 pair
+    // made) and answers lengths 4..7 from its high bits, so the commonest
+    // accept class never calls out at all. `m + 8` is in bounds because
+    // `m < ip` and `block_end <= src.len()`. Byte-identical: the gate is the
+    // same equality, and a high-bits length equals 4 + the old tail count.
+    let ml = if ip + 8 <= block_end {
+        let x = load_u64le(src, m) ^ load_u64le(src, ip);
+        if x as u32 != 0 {
+            // Profile-only for the same reason as `fast_probe_wide`'s counts:
+            // `tag_yield` gates nothing at the shipped `tag_min = 0.0`.
+            if cfg!(feature = "profile") {
+                cand.0 += 1;
+            }
+            return None;
+        }
+        if cfg!(feature = "profile") {
+            cand.1 += 1;
+        }
+        #[cfg(feature = "profile")]
+        FF_CAND4.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if x != 0 {
+            (x.trailing_zeros() as usize) >> 3
+        } else {
+            8 + count_match(src, m + 8, ip + 8, block_end)
+        }
+    } else {
+        if load_u32le(src, m) != load_u32le(src, ip) {
+            if cfg!(feature = "profile") {
+                cand.0 += 1;
+            }
+            return None;
+        }
+        if cfg!(feature = "profile") {
+            cand.1 += 1;
+        }
+        #[cfg(feature = "profile")]
+        FF_CAND4.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        4 + count_match(src, m + 4, ip + 4, block_end)
+    };
     if ml >= mls {
         #[cfg(feature = "profile")]
         FF_ACCEPT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -5867,6 +5909,18 @@ fn try_rep1(src: &[u8], ip: usize, rep1: usize, lowest: usize, block_end: usize)
     let back = at - rep1;
     if back < lowest {
         return None;
+    }
+    // Same fused head as `fast_probe`: one u64 pair gates AND answers 4..7.
+    if at + 8 <= block_end {
+        let x = load_u64le(src, back) ^ load_u64le(src, at);
+        if x as u32 != 0 {
+            return None;
+        }
+        return Some(if x != 0 {
+            (x.trailing_zeros() as usize) >> 3
+        } else {
+            8 + count_match(src, back + 8, at + 8, block_end)
+        });
     }
     if load_u32le(src, back) != load_u32le(src, at) {
         return None;
@@ -9620,7 +9674,7 @@ fn bt_find_best_impl_inner<const HLOG: u32, const CLOG: u32, const SEARCH: bool>
                 let ml = ((a ^ b).trailing_zeros() as usize) >> 3;
                 (ml, (a >> (8 * ml)) as u8, (b >> (8 * ml)) as u8)
             } else {
-                let ml = 8 + count_match(src, m + 8, ip + 8, block_end);
+                let ml = 8 + count_match_fast(src, m + 8, ip + 8, block_end);
                 (
                     ml,
                     src.get(m + ml).copied().unwrap_or(0),
@@ -9869,7 +9923,7 @@ fn bt_find_best_runtime_inner(
                 let ml = ((a ^ b).trailing_zeros() as usize) >> 3;
                 (ml, (a >> (8 * ml)) as u8, (b >> (8 * ml)) as u8)
             } else {
-                let ml = 8 + count_match(src, m + 8, ip + 8, block_end);
+                let ml = 8 + count_match_fast(src, m + 8, ip + 8, block_end);
                 (
                     ml,
                     src.get(m + ml).copied().unwrap_or(0),
@@ -11595,8 +11649,18 @@ fn count_match(src: &[u8], m: usize, ip: usize, limit: usize) -> usize {
     let max = limit - ip;
     let a = &src[m..m + max];
     let b = &src[ip..limit];
-    // Sub-8 boundary tails answer HERE, without the dispatch or the call.
+    // Sub-8 boundary tails answer HERE, without the dispatch or the call --
+    // and as ONE masked compare when the frame has 8-byte room past `ip`
+    // (`m + 8 <= ip + 8 <= len` via `m < ip`); the byte loop survives only
+    // at the true frame edge.
     if max < 8 {
+        if ip + 8 <= src.len() {
+            let x = load_u64le(src, m) ^ load_u64le(src, ip);
+            let n = if x == 0 { max } else { ((x.trailing_zeros() as usize) >> 3).min(max) };
+            #[cfg(feature = "profile")]
+            crate::simd::note_eqlen(n);
+            return n;
+        }
         let mut n = 0usize;
         while n < max && a[n] == b[n] {
             n += 1;
