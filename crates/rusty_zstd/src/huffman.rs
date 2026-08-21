@@ -24,6 +24,7 @@ pub(crate) struct HuffmanTable {
 }
 
 impl HuffmanTable {
+    #[inline(always)]
     pub(crate) fn decode_stream(&self, src: &[u8], dst: &mut [u8]) -> Result<(), Error> {
         if dst.is_empty() {
             return Ok(());
@@ -38,6 +39,7 @@ impl HuffmanTable {
 
     /// Per-symbol reload + look + read. Oracle for the unroll / skip_bits path.
     #[cfg(test)]
+    #[inline(always)]
     pub(crate) fn decode_stream_scalar(&self, src: &[u8], dst: &mut [u8]) -> Result<(), Error> {
         if dst.is_empty() {
             return Ok(());
@@ -488,6 +490,7 @@ impl HuffmanTable {
 }
 
 /// Parse Huffman_Tree_Description at the start of `src`. Returns (table, bytes used).
+#[inline(always)]
 pub(crate) fn read_table(src: &[u8]) -> Result<(HuffmanTable, usize), Error> {
     if src.is_empty() {
         return Err(Error::Corruption);
@@ -521,6 +524,7 @@ pub(crate) fn read_table(src: &[u8]) -> Result<(HuffmanTable, usize), Error> {
     Ok((table, used))
 }
 
+#[inline(always)]
 fn table_from_weights(weights_wo_last: &[u8]) -> Result<HuffmanTable, Error> {
     if weights_wo_last.is_empty() {
         return Err(Error::Corruption);
@@ -653,6 +657,7 @@ fn table_from_weights(weights_wo_last: &[u8]) -> Result<HuffmanTable, Error> {
     })
 }
 
+#[inline(always)]
 fn upsample_dtable(table: Vec<u16>, table_log: u8) -> (Vec<u16>, u8) {
     if table_log >= FAST_TABLELOG {
         return (table, table_log);
@@ -693,6 +698,7 @@ struct Fast4x2 {
 }
 
 /// C `HUF_initFastDStream`: left-justify, sentinel `1` in the LSB after the shift.
+#[inline(always)]
 fn init_fast_dstream(src: &[u8], ip: usize) -> u64 {
     debug_assert!(ip + 8 <= src.len());
     let last = src[ip + 7];
@@ -780,6 +786,7 @@ const ALGO_TIME: [(u32, u32, u32, u32); 16] = [
 
 /// C `HUF_DEltX2` composed from the X1 DTable: one peek of `table_log` bits can
 /// emit two symbols when `n1 + n2 <= table_log`. Pack: `seq16 | nbits<<16 | length<<24`.
+#[inline(always)]
 fn x2_from_x1(table: &[u16], table_log: u8) -> Vec<u32> {
     let n = table.len();
     let log = u32::from(table_log);
@@ -1063,6 +1070,7 @@ impl HuffCTable {
 }
 
 #[cfg(feature = "alloc")]
+#[inline(always)]
 fn huffman_nbits(freq: &[u32; 256]) -> Result<[u8; 256], Error> {
     let present: Vec<u8> = (0..256u16)
         .filter(|&s| freq[s as usize] > 0)
@@ -1150,6 +1158,7 @@ fn huffman_nbits(freq: &[u32; 256]) -> Result<[u8; 256], Error> {
 }
 
 #[cfg(feature = "alloc")]
+#[inline(always)]
 fn limit_nbits(nbits: &mut [u8; 256], present: &[u8], max_bits: u8) {
     let max = i32::from(max_bits);
     let mut kraft = 0i32;
@@ -1195,6 +1204,7 @@ fn limit_nbits(nbits: &mut [u8; 256], present: &[u8], max_bits: u8) {
 }
 
 #[cfg(feature = "alloc")]
+#[inline(always)]
 fn ctable_from_nbits(nbits: &[u8; 256], freq: Option<&[u32; 256]>) -> Result<HuffCTable, Error> {
     let max_symbol = nbits
         .iter()
@@ -1334,6 +1344,7 @@ pub(crate) fn build_ctable(src: &[u8]) -> Result<HuffCTable, Error> {
 }
 
 #[cfg(feature = "alloc")]
+#[inline(always)]
 pub(crate) fn build_ctable_from_freq(freq: &[u32; 256]) -> Result<HuffCTable, Error> {
     let nbits = huffman_nbits(freq)?;
     ctable_from_nbits(&nbits, Some(freq))
@@ -1430,6 +1441,7 @@ fn finish_ctable(
 }
 
 #[cfg(feature = "alloc")]
+#[inline(always)]
 fn write_tree_raw(weights: &[u8]) -> Result<Vec<u8>, Error> {
     if weights.is_empty() || weights.len() > 128 {
         return Err(Error::Corruption);
@@ -1451,6 +1463,7 @@ fn write_tree_raw(weights: &[u8]) -> Result<Vec<u8>, Error> {
 }
 
 #[cfg(feature = "alloc")]
+#[inline(always)]
 fn write_tree_fse(weights: &[u8]) -> Result<Vec<u8>, Error> {
     if weights.len() <= 2 {
         return Err(Error::Corruption);
@@ -1489,6 +1502,7 @@ fn write_tree_fse(weights: &[u8]) -> Result<Vec<u8>, Error> {
 /// Pick the shorter of direct 4-bit weights (header >= 128) and FSE-compressed
 /// weights (header < 128), matching libzstd `HUF_writeCTable`.
 #[cfg(feature = "alloc")]
+#[inline(always)]
 pub(crate) fn write_tree(ct: &HuffCTable) -> Result<Vec<u8>, Error> {
     let weights = &ct.weights_wo_last;
     let raw = write_tree_raw(weights).ok();
@@ -1809,6 +1823,7 @@ pub(crate) fn lit_sample_peak(lits: &[u8]) -> u32 {
 /// Returns the RFC 8878 literals header+payload and whether a new Huffman table
 /// should be remembered for later treeless blocks.
 #[cfg(feature = "alloc")]
+#[inline(always)]
 pub(crate) fn encode_literals_section(
     lits: &[u8],
     prev: Option<&HuffCTable>,
@@ -1867,9 +1882,15 @@ pub(crate) fn encode_literals_section(
             freq[s] += c;
         }
     }
-    let new_tbl = build_ctable_from_freq(&freq)
-        .ok()
-        .and_then(|ct| write_tree(&ct).ok().map(|t| (ct, t)));
+    // Explicit match, not `.and_then(closure)`: the closure outlines and
+    // carries write_tree's shifts as baseline code inside the twin.
+    let new_tbl = match build_ctable_from_freq(&freq) {
+        Ok(ct) => match write_tree(&ct) {
+            Ok(t) => Some((ct, t)),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
 
     if let Some(prev_ct) = prev {
         if prev_ct.covers(lits) {

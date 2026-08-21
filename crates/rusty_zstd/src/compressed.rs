@@ -206,6 +206,8 @@ fn decode_compressed_block_inner(
     )
 }
 
+// The literal chain is inline(always) into the twinned block driver -- outlined, it ran baseline (transitive trap trace).
+#[inline(always)]
 pub(crate) fn decode_literals(
     r: &mut Reader<'_>,
     state: &mut BlockState,
@@ -306,6 +308,7 @@ pub(crate) fn decode_literals(
     }
 }
 
+#[inline(always)]
 fn decode_huff_streams(
     table: &HuffmanTable,
     src: &[u8],

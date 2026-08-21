@@ -346,6 +346,7 @@ pub(crate) struct FseCTable {
 
 #[cfg(feature = "alloc")]
 impl FseCTable {
+    #[inline(always)]
     pub(crate) fn from_norm(norm: &[i16], table_log: u8) -> Result<Self, Error> {
         // T4: `max_sv` is `norm.len().saturating_sub(1)`, which SILENTLY yields
         // 0 for an empty `norm` and then indexes `norm[0]`. Rejecting it here
@@ -569,6 +570,7 @@ pub(crate) fn optimal_table_log(max_log: u8, src_size: usize, max_symbol: usize)
 
 /// FSE_normalizeCount (primary path + simple fallback).
 #[cfg(feature = "alloc")]
+#[inline(always)]
 pub(crate) fn normalize_count(
     count: &[u32],
     table_log: u8,
@@ -671,6 +673,7 @@ pub(crate) fn normalize_count(
 
 /// FSE_writeNCount.
 #[cfg(feature = "alloc")]
+#[inline(always)]
 pub(crate) fn write_ncount(norm: &[i16], table_log: u8) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     let mut bit_stream: u32 = 0;
@@ -835,6 +838,7 @@ fn compress_using_ctable_inner(src: &[u8], table: &FseCTable) -> Result<Vec<u8>,
 
 /// Build an NCount header + CTable from symbol counts (`max_log` 5..=9).
 #[cfg(feature = "alloc")]
+#[inline(always)]
 pub(crate) fn ncount_and_ctable(
     count: &[u32],
     max_log: u8,

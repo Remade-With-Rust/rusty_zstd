@@ -2997,6 +2997,35 @@ fn write_literals(
     lits: &[u8],
     entropy: &mut EntropyState,
 ) -> Result<bool, Error> {
+    // The literal-section table builders (histogram, ctable, tree write,
+    // normalize, ncount) all carry variable shifts; the BMI2 twin compiles
+    // the whole section in its own ISA context.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if crate::simd::has_bmi2() {
+        // SAFETY: runtime CPUID guard; identical body.
+        #[allow(unsafe_code)]
+        return unsafe { write_literals_bmi2(dst, lits, entropy) };
+    }
+    write_literals_inner(dst, lits, entropy)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(unsafe_code)]
+unsafe fn write_literals_bmi2(
+    dst: &mut Vec<u8>,
+    lits: &[u8],
+    entropy: &mut EntropyState,
+) -> Result<bool, Error> {
+    write_literals_inner(dst, lits, entropy)
+}
+
+#[inline(always)]
+fn write_literals_inner(
+    dst: &mut Vec<u8>,
+    lits: &[u8],
+    entropy: &mut EntropyState,
+) -> Result<bool, Error> {
     let _h = crate::prof::scope(crate::prof::Stage::EncodeHuff);
     let (sec, upd) = huffman::encode_literals_section(lits, entropy.huff.as_ref())?;
     let reused = matches!(upd, HuffUpdate::Unchanged);
@@ -3234,6 +3263,7 @@ fn write_sequences_inner(
 }
 
 /// libzstd `ZSTD_buildCTable`: last sequence is `FSE_initCState2` only.
+#[inline(always)]
 fn ncount_seq_table(
     counts: &[u32],
     last_sym: usize,
@@ -3251,6 +3281,7 @@ fn ncount_seq_table(
 
 /// Select Predefined / RLE / FSE-compressed / Repeat. Returns (mode, table, header bytes).
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn select_seq_table(
     counts: &[u32],
     _alphabet: usize,
@@ -7879,6 +7910,45 @@ fn find_greedy(
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
+    // The chain-ladder hot loops hash with RUNTIME hash_log -- per-position
+    // CL-shifts. The twin compiles the same selector and impls with BMI2.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if crate::simd::has_bmi2() {
+        // SAFETY: runtime CPUID guard; identical body.
+        #[allow(unsafe_code)]
+        return unsafe {
+            find_greedy_bmi2(src, block_start, block_end, window, params, tables, reps)
+        };
+    }
+    find_greedy_sel(src, block_start, block_end, window, params, tables, reps)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_code)]
+unsafe fn find_greedy_bmi2(
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
+    find_greedy_sel(src, block_start, block_end, window, params, tables, reps)
+}
+
+#[inline(always)]
+fn find_greedy_sel(
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
     // GATE 4/5 for the chain ladder, NARROW: mls = 5 serves every default
     // row L5-L12 (clevels.h min_match), so ONE spec copy folds smask, the
     // mls_eq mask, the mls-branches and the hash path to constants. MLS = 0
@@ -7891,6 +7961,7 @@ fn find_greedy(
     }
 }
 
+#[inline(always)]
 fn find_greedy_impl<const MLS: usize>(
     src: &[u8],
     block_start: usize,
@@ -8340,6 +8411,47 @@ fn find_lazy(
     depth: usize,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
+    // See `find_greedy`: the twin covers the runtime-hash_log CL-shifts.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if crate::simd::has_bmi2() {
+        // SAFETY: runtime CPUID guard; identical body.
+        #[allow(unsafe_code)]
+        return unsafe {
+            find_lazy_bmi2(src, block_start, block_end, window, params, tables, depth, reps)
+        };
+    }
+    find_lazy_sel(src, block_start, block_end, window, params, tables, depth, reps)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_code)]
+unsafe fn find_lazy_bmi2(
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    depth: usize,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
+    find_lazy_sel(src, block_start, block_end, window, params, tables, depth, reps)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn find_lazy_sel(
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    depth: usize,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
     // See `find_greedy`: narrow MLS spec, runtime arm from the same body.
     if params.min_match.max(3) == 5 {
         find_lazy_impl::<5>(src, block_start, block_end, window, params, tables, depth, reps)
@@ -8349,6 +8461,7 @@ fn find_lazy(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn find_lazy_impl<const MLS: usize>(
     src: &[u8],
     block_start: usize,
@@ -10816,6 +10929,7 @@ fn wide_first_max(attempts: usize) -> f32 {
 /// isolation experiment behind the bar: smallmsg loses ~+4.9% under the
 /// wide key with walk-continue ON OR OFF -- the key itself is the loser
 /// there -- while dickens wins ~-4% both ways.
+#[inline(always)]
 fn maybe_latch_wide_chain(
     tables: &mut MatchTables,
     src: &[u8],
