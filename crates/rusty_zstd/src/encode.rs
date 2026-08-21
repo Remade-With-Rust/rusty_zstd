@@ -7872,6 +7872,10 @@ fn find_greedy_impl<const MLS: usize>(
     let ca = !tables.ctags.is_empty();
     let wchain = tables.chain_wide;
     let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
+    // The searches/byte signal feeds the wide latch's second route; greedy
+    // never maintained it, so at L5 the field held its 1.0 INIT and the
+    // route always passed (smallmsg +1.62% leak).
+    let mut searches = 0u64;
     let mut ip = block_start;
     while ip <= ilimit {
         if use_rep {
@@ -7889,6 +7893,7 @@ fn find_greedy_impl<const MLS: usize>(
                 continue;
             }
         }
+        searches += 1;
         let (h, gtag) = if mls >= 8 && ip + 8 <= src.len() {
             (hash8(src, ip, hash_log), 0u8)
         } else if wchain {
@@ -8044,6 +8049,8 @@ fn find_greedy_impl<const MLS: usize>(
         (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
     };
     update_walk_first_share(tables, walk_cont, wcls, attempts);
+    let span = (block_end - block_start).max(1) as f32;
+    tables.last_search_per_byte = searches as f32 / span;
     push_lits_range(&mut lits, src, anchor, block_end);
     note_finder_work(COUNT, probes, hits, &seqs, &lits);
     (seqs, lits)
@@ -10501,6 +10508,22 @@ pub fn set_wide_first_max_arm(v: f32) {
     WIDE_FIRST_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
 }
 
+static WIDE_SPB_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Bench hook: the searches-per-byte floor for the latch's second route.
+pub fn set_wide_spb_min_arm(v: f32) {
+    WIDE_SPB_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
+}
+
+fn wide_spb_min() -> f32 {
+    let c = WIDE_SPB_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if c != u32::MAX {
+        return f32::from_bits(c);
+    }
+    0.50
+}
+
 fn wide_first_max(attempts: usize) -> f32 {
     let c = WIDE_FIRST_ARM.load(core::sync::atomic::Ordering::Relaxed);
     if c != u32::MAX {
@@ -10511,15 +10534,13 @@ fn wide_first_max(attempts: usize) -> f32 {
     if attempts <= 16 { 0.65 } else { 0.60 }
 }
 
-/// UNLATCHED WINNERS, recorded so the next digger starts here: sao leaves
-/// -3.65% on the table at L9 (ooffice/osdb/mr smaller amounts) because its
-/// first-share ~0.81 sits above every bar -- alongside smallmsg (+2.1) and
-/// x-ray (+0.3), which MUST stay excluded. The signal census (sq probe,
-/// take_walk_signals) found no clean second separator among the maintained
-/// signals: mean-offset-log splits sao 15.66 from smallmsg 15.91 by a
-/// razor's edge with overlaps everywhere else. Capturing the sao class
-/// needs a new signal (its distinguishing mark: spb 0.66, twice anyone
-/// else's -- nearly every position searches), left as future work.
+/// The sao class is CAPTURED by the latch's second route (searches/byte
+/// >= 0.50: sao 0.66 against every first-heavy loser <= 0.36 -- content
+/// where nearly every position searches has almost no literal+rep economy
+/// for the wide key to disturb). Still unlatched, deliberately: ooffice
+/// (-0.43), osdb (-0.77), mr (-0.69) -- first-heavy winners whose spb sits
+/// AMONG the losers'; no maintained signal separates them, recorded as the
+/// residual.
 ///
 /// The wide-chain LATCH: at a block boundary, once walk_first_share has
 /// been measured (on narrow blocks) and says upgrade-rich, re-seed the
@@ -10626,7 +10647,15 @@ fn update_walk_first_share(tables: &mut MatchTables, walked: bool, cls: (u32, u3
     // The wide-chain latch is ONE-WAY per frame, so a TRANSIENT dip must not
     // fire it (jsonlog's EWMA dips under any bar at L12 and latched wide for
     // +3.3%). Require the signal to HOLD.
-    if tables.walk_first_share <= wide_first_max(attempts) {
+    // Second admission route (the sao capture): among first-heavy content
+    // the census separates the wide-key winners' king by SEARCH DENSITY --
+    // sao runs 0.66 searches/byte, twice any first-heavy loser (smallmsg
+    // 0.29, jsonlog 0.18, x-ray 0.36). Nearly every position searching
+    // means the literal+rep economy the wide key would disturb barely
+    // exists.
+    if tables.walk_first_share <= wide_first_max(attempts)
+        || tables.last_search_per_byte >= wide_spb_min()
+    {
         tables.wide_ok_blocks = tables.wide_ok_blocks.saturating_add(1);
     } else {
         tables.wide_ok_blocks = 0;
