@@ -4428,7 +4428,16 @@ fn find_fast_impl_inner<
     debug_assert!(!WIDE || pack);
     let pack_eff = if WIDE { true } else { pack };
     // W8: hoisted for the slot primitives -- see `fast_slot_swap`.
-    let tags_live = !tables.tags.is_empty();
+    // W8 -- CORRECTNESS, found by the debug suite. `tags_v` is `mem::take`n
+    // out of `tables.tags` ABOVE, so `tables.tags` is empty from that line on
+    // and this read answered `false` unconditionally. The slot helpers then
+    // skipped the tag array on every frame that uses it -- the >= 16 MiB and
+    // STREAMING route -- silently disabling Gate 7's filter there. The 8 MiB
+    // identity boards could not see it: every frame they compress is under
+    // the packed bound, where the array is legitimately absent.
+    //
+    // Ask the array that is actually in play.
+    let tags_live = !tags_v.is_empty();
     // BRICK 51: `probes`/`hits` feed ONLY `note_search`, which is a no-op
     // without the `profile` feature (their other consumers, `last_hit_rate` and
     // `tag_latch`, were write-only dead state left by the brick-41 revert).
@@ -4567,13 +4576,34 @@ fn find_fast_impl_inner<
     // per-position mode branch is gone and specialised copies emit the shift
     // as an immediate. Only the mask (a function of runtime `mls`) stays in a
     // register.
-    debug_assert!(fh.wide == WIDE);
+    // W7 -- A LATENT SHIFT-OVERFLOW, found by running the DEBUG suite.
+    //
+    // `fh` is built from `fast_hash_spec`, whose `wide` is
+    // `enabled && (5..=8).contains(&mls)`. `WIDE` -- the monomorphisation
+    // axis -- is that AND `!fast_hash_legacy` AND `tables.pack_tags`. The
+    // `pack_tags` term is missing from `fh`, so on any frame without a
+    // pledged length (streaming, prefix) with `mls` in 5..=8, `fh.wide` is
+    // TRUE while `WIDE` is FALSE.
+    //
+    // `f_mask` and `f_wide` already take `WIDE`, so they were fine. `f_shift`
+    // did not: on the runtime-`hash_log` arm it took `fh.shift`, which in
+    // that state is `64 - hash_log`. The non-wide hash path then evaluates
+    // `u32 >> (64 - hash_log)` -- a shift of 32 or more on a 32-bit value,
+    // which is UB in Rust and poison in LLVM IR. It has been invisible
+    // because x86 masks shift counts to 5 bits, and
+    // `(64 - hash_log) & 31 == 32 - hash_log` for every reachable
+    // `hash_log`, so the hardware silently computed the right index.
+    //
+    // Taking the shift from `WIDE`, like its two siblings, is byte-identical
+    // on x86 by that same identity -- and defined everywhere.
+    debug_assert!(fh.wide == WIDE || !tables.pack_tags);
     let f_wide = WIDE;
     let f_mask = if WIDE { fh.mask } else { 0 };
-    let f_shift = if HLOG != 0 {
-        if WIDE { 64 - HLOG } else { 32 - HLOG }
+    let hlog_eff = if HLOG != 0 { HLOG } else { tables.hash_log };
+    let f_shift = if WIDE {
+        64u32.saturating_sub(hlog_eff)
     } else {
-        fh.shift
+        32u32.saturating_sub(hlog_eff)
     };
     // THE versions PROTECTION, found where Gate 6 found it for the pair search
     // and step-1: on rep-dominated content, hash matches do not add coverage --
