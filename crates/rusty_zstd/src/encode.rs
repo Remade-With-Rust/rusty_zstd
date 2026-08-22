@@ -2187,6 +2187,9 @@ pub(crate) fn prime_tables(
             mls,
             attempts: prime_attempts,
             chain_log: pparams.chain_log.min(24),
+            bt_lowest: payload_off.saturating_sub(window).max(tables.frame_start),
+            chain_len: tables.chain.len(),
+            wide_hash: mls >= 8,
         };
         // EXTENT: the tree only over the most recent slice; heads below it.
         let ext = prime_bt_extent();
@@ -7405,9 +7408,16 @@ fn fill_hash_long_after_match(
     debug_assert!(match_ip < usize::MAX - 2);
     let a = match_ip + 2;
     // W10: this re-read the struct field one line after `packed` hoisted it.
-    let ltag_live = packed || !tables.ltags.is_empty();
+    //
+    // NAMES SEPARATED (debug-assert catch): `ltag_wanted` asks whether a tag
+    // is worth COMPUTING -- true on packed frames, where the tag rides in the
+    // slot and no array exists. The accessors' `live` asks whether the tag
+    // ARRAY is non-empty. Passing the first as the second made them disagree
+    // on exactly the packed case; harmless in release (the packed arm returns
+    // before touching the array) but wrong, and the assert said so.
+    let ltag_wanted = packed || ltag_live;
     if do_a && a <= ilimit {
-        let g = if ltag_live { hash4_tag_mls(src, a, hash_shift, smask).1 } else { 0 };
+        let g = if ltag_wanted { hash4_tag_mls(src, a, hash_shift, smask).1 } else { 0 };
         tables.put_hl_tag(hash8(src, a, hash_log), a, g, packed, ltag_live);
         n += 1;
     }
@@ -7415,7 +7425,7 @@ fn fill_hash_long_after_match(
     if do_b {
         let b = match_end - 2;
         if b <= ilimit && b != a {
-            let g = if ltag_live { hash4_tag_mls(src, b, hash_shift, smask).1 } else { 0 };
+            let g = if ltag_wanted { hash4_tag_mls(src, b, hash_shift, smask).1 } else { 0 };
             tables.put_hl_tag(hash8(src, b, hash_log), b, g, packed, ltag_live);
             n += 1;
         }
@@ -7631,7 +7641,9 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     let use_rep = rep_search_on(tables.rep_yield, params.strategy) || tables.rep_probe == 0;
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
-    let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
+    // W5: hoisted for the back-extension loop -- see its use.
+    let fstart_c = tables.frame_start;
+    let lowest_rep = block_start.saturating_sub(window).max(fstart_c);
     // W1/W2/W3: three PER-BLOCK values the loop recomputed per CANDIDATE.
     // `mlx` is a min/max over `mls` (four sites); `frame_start` was a struct
     // load through `&mut MatchTables`, which LLVM must re-prove after every
@@ -8231,13 +8243,6 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     // The DFast hot loop is only 151 instructions but carries 27 stack reloads,
     // 23 of them loop-invariant across 12 slots -- it is short of registers, and
     // what it is spending them on is the gates' own telemetry.
-    #[cfg(feature = "profile")]
-    {
-        use core::sync::atomic::Ordering::Relaxed;
-        MM_TOTAL.fetch_add(mm_total, Relaxed);
-        DFAST_SPEC_MADE.fetch_add(spec_made, Relaxed);
-        DFAST_SPEC_USED.fetch_add(spec_used, Relaxed);
-    }
     // Attribute only when the pipeline actually RAN: a block that speculated
     // nothing measures nothing, and scoring it 1.0 would make the gate
     // oscillate on/off every block. EWMA for the same reason Gate 6 needs one --
@@ -8245,6 +8250,13 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     let spec_used = spec_made
         .saturating_sub(spec_dropped)
         .saturating_sub(u64::from(carried.live));
+    #[cfg(feature = "profile")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        MM_TOTAL.fetch_add(mm_total, Relaxed);
+        DFAST_SPEC_MADE.fetch_add(spec_made, Relaxed);
+        DFAST_SPEC_USED.fetch_add(spec_used, Relaxed);
+    }
     if dpipe && spec_made > 0 {
         let now = spec_used as f32 / spec_made as f32;
         tables.dfast_spec_yield = 0.75 * tables.dfast_spec_yield + 0.25 * now;
@@ -8638,7 +8650,9 @@ fn find_greedy_impl<const MLS: usize>(
     }
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
-    let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
+    // W5: hoisted for the back-extension loop -- see its use.
+    let fstart_c = tables.frame_start;
+    let lowest_rep = block_start.saturating_sub(window).max(fstart_c);
     // WALK-CONTINUE dispatch: see `walk_rep_max`.
     let walk_cont = walk_cont_enabled()
         && tables.rep_yield <= walk_rep_max()
@@ -8794,7 +8808,11 @@ fn find_greedy_impl<const MLS: usize>(
             let mut n = best_ml;
             #[cfg(feature = "profile")]
             let bext_from = s;
-            while s > anchor && mm > tables.frame_start && back_eq(src, s, mm) {
+            // W5: `frame_start` is a per-FRAME constant, and this is the
+            // back-extension loop -- the struct load ran on every extended
+            // BYTE, through `&mut MatchTables`, so LLVM had to re-prove it
+            // after each table write the match path performs.
+            while s > anchor && mm > fstart_c && back_eq(src, s, mm) {
                 s -= 1;
                 mm -= 1;
                 n += 1;
@@ -9227,7 +9245,9 @@ fn find_lazy_impl<const MLS: usize>(
     }
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
-    let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
+    // W5: hoisted for the back-extension loop -- see its use.
+    let fstart_c = tables.frame_start;
+    let lowest_rep = block_start.saturating_sub(window).max(fstart_c);
     let mut ip = block_start;
     let mut searches = 0u64;
     // GATE 3 @ L1 -- CONSTANT OFF when the caller is the Fast ladder.
@@ -9332,7 +9352,11 @@ fn find_lazy_impl<const MLS: usize>(
             let mut n = best_ml;
             #[cfg(feature = "profile")]
             let bext_from = s;
-            while s > anchor && mm > tables.frame_start && back_eq(src, s, mm) {
+            // W5: `frame_start` is a per-FRAME constant, and this is the
+            // back-extension loop -- the struct load ran on every extended
+            // BYTE, through `&mut MatchTables`, so LLVM had to re-prove it
+            // after each table write the match path performs.
+            while s > anchor && mm > fstart_c && back_eq(src, s, mm) {
                 s -= 1;
                 mm -= 1;
                 n += 1;
@@ -9769,6 +9793,23 @@ pub(crate) struct BtCtx<'a> {
     mls: usize,
     attempts: usize,
     chain_log: u32,
+    /// W1/W2/W3: three values the walk's PROLOGUE recomputed on every call --
+    /// and this function is called per position, per look-ahead step AND per
+    /// fill insert (61.9% of all tree work at L13-L15), so "per call" is the
+    /// hottest unit in the Bt ladder.
+    ///
+    /// `bt_lowest` is `block_start.saturating_sub(window).max(frame_start)`: a
+    /// saturating sub, a max, and a struct load through `&mut MatchTables`
+    /// that LLVM must re-prove after every `chain` write. `chain_len` served
+    /// the entry guard, another struct load. Both are fixed for the block.
+    bt_lowest: usize,
+    chain_len: usize,
+    /// W6: `hash_mls`'s `mls >= 8` question, answered once per BLOCK. The walk
+    /// loaded `mls` from the context and compared it on EVERY call. Kept as a
+    /// flag rather than deleted: the advanced API can set `min_match` to 8,
+    /// which other guards in this file already respect, even though every
+    /// shipping Bt row uses 3..=5.
+    wide_hash: bool,
 }
 
 type BtFn = for<'a> fn(&BtCtx<'a>, usize, &mut MatchTables) -> (usize, usize);
@@ -9979,7 +10020,24 @@ fn bt_find_best_impl_inner<const HLOG: u32, const CLOG: u32, const SEARCH: bool>
     ip: usize,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
-    let BtCtx { src, block_start, block_end, window, mls, attempts, chain_log } = *ctx;
+    let BtCtx {
+        src,
+        block_start,
+        block_end,
+        window,
+        mls,
+        attempts,
+        chain_log,
+        bt_lowest,
+        chain_len,
+        wide_hash,
+    } = *ctx;
+    debug_assert_eq!(wide_hash, mls >= 8);
+    debug_assert_eq!(chain_len, tables.chain.len());
+    debug_assert_eq!(
+        bt_lowest,
+        block_start.saturating_sub(window).max(tables.frame_start)
+    );
     // Diagnostic ONLY -- gated. Unguarded this was one atomic read-modify-write
     // per `bt_find_best` CALL, i.e. per POSITION across the whole L13-L22
     // ladder (~15.7M per level per corpus set). Same defect class as the two
@@ -10004,10 +10062,15 @@ fn bt_find_best_impl_inner<const HLOG: u32, const CLOG: u32, const SEARCH: bool>
     // rather than from the table, and `btlog` floors at 1, so `bt_mask >= 1` and
     // the tree needs `chain.len() >= 4` -- with `chain_log = 1`, reachable
     // through the advanced API, it addressed index 3 of a 2-entry table.
-    if (bt_mask << 1) | 1 >= tables.chain.len() {
+    if (bt_mask << 1) | 1 >= chain_len {
         return (0, 0);
     }
-    let h = hash_mls(src, ip, mls, HLOG);
+    // W6: `hash_mls`'s own `mls >= 8` test, answered per block instead.
+    let h = if wide_hash && ip + 8 <= src.len() {
+        hash8(src, ip, HLOG)
+    } else {
+        hash4(load_u32le(src, ip), HLOG)
+    };
     // SPEC arm: `h < 2^HLOG` by the hash shift, and the resolve dispatch
     // guarantees tables.hash_log == HLOG, so hash.len() == 1 << HLOG.
     // `larger <= (bt_mask << 1) | 1` is the T2 entry guard's bound. Both
@@ -10023,11 +10086,13 @@ fn bt_find_best_impl_inner<const HLOG: u32, const CLOG: u32, const SEARCH: bool>
     // a max and a field load through `&mut MatchTables`, on a loop that runs
     // ~30M times per level across the corpus. The `tables.chain[..]` writes in
     // this same loop are what stop LLVM proving `frame_start` cannot change.
-    let bt_lowest = block_start.saturating_sub(window).max(tables.frame_start);
+    // W3: hoisted into `BtCtx` -- see its definition.
     // Hoisted: the per-node window test `ip - m > window` is `m < ip - window`
     // (m < ip is tested first), one cmp against a per-call constant instead
     // of sub+cmp per node.
     let win_low = ip.saturating_sub(window);
+    // W4: the single hot-path lower bound (see the walk's break).
+    let low = if win_low > bt_lowest { win_low } else { bt_lowest };
     // W1: the count head's only non-`m` precondition, hoisted out of the walk.
     // See the head itself for why the other two tests are implied.
     debug_assert!(block_end <= src.len());
@@ -10072,12 +10137,21 @@ fn bt_find_best_impl_inner<const HLOG: u32, const CLOG: u32, const SEARCH: bool>
             tables.chain_set(larger, 0);
             break;
         };
-        if m >= ip || m < win_low {
-            tables.chain_set(smaller, 0);
-            tables.chain_set(larger, 0);
-            break;
-        }
-        if m < bt_lowest {
+        // W4 RETRIED: the walk tested TWO lower bounds per node, and both were
+        // SPILLED -- two stack reloads and two compares on the hottest path in
+        // the Bt ladder. They collapse to one compare against their max, with
+        // the disambiguation moved into the break (taken once per walk).
+        //
+        // This was tried once before and REVERTED: it destabilised the
+        // register allocator and the node path came back at 60 instructions.
+        // The blocker was live-set pressure, and the prologue hoist above has
+        // since removed `chain_len` and `frame_start` from it -- so the trade
+        // is re-measured, not re-assumed.
+        if m >= ip || m < low {
+            if m >= ip || m < win_low {
+                tables.chain_set(smaller, 0);
+                tables.chain_set(larger, 0);
+            }
             break;
         }
         // The T2 ENTRY guard already proves the worst case:
@@ -10255,7 +10329,24 @@ fn bt_find_best_runtime_inner(
     ip: usize,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
-    let BtCtx { src, block_start, block_end, window, mls, attempts, chain_log } = *ctx;
+    let BtCtx {
+        src,
+        block_start,
+        block_end,
+        window,
+        mls,
+        attempts,
+        chain_log,
+        bt_lowest,
+        chain_len,
+        wide_hash,
+    } = *ctx;
+    debug_assert_eq!(wide_hash, mls >= 8);
+    debug_assert_eq!(chain_len, tables.chain.len());
+    debug_assert_eq!(
+        bt_lowest,
+        block_start.saturating_sub(window).max(tables.frame_start)
+    );
     // Diagnostic ONLY -- gated. Unguarded this was one atomic read-modify-write
     // per `bt_find_best` CALL, i.e. per POSITION across the whole L13-L22
     // ladder (~15.7M per level per corpus set). Same defect class as the two
@@ -10279,10 +10370,15 @@ fn bt_find_best_runtime_inner(
     // rather than from the table, and `btlog` floors at 1, so `bt_mask >= 1` and
     // the tree needs `chain.len() >= 4` -- with `chain_log = 1`, reachable
     // through the advanced API, it addressed index 3 of a 2-entry table.
-    if (bt_mask << 1) | 1 >= tables.chain.len() {
+    if (bt_mask << 1) | 1 >= chain_len {
         return (0, 0);
     }
-    let h = hash_mls(src, ip, mls, hash_log);
+    // W6: see the spec impl.
+    let h = if wide_hash && ip + 8 <= src.len() {
+        hash8(src, ip, hash_log)
+    } else {
+        hash4(load_u32le(src, ip), hash_log)
+    };
     if h >= tables.hash.len() {
         return (0, 0);
     }
@@ -10297,11 +10393,13 @@ fn bt_find_best_runtime_inner(
     // a max and a field load through `&mut MatchTables`, on a loop that runs
     // ~30M times per level across the corpus. The `tables.chain[..]` writes in
     // this same loop are what stop LLVM proving `frame_start` cannot change.
-    let bt_lowest = block_start.saturating_sub(window).max(tables.frame_start);
+    // W3: hoisted into `BtCtx` -- see its definition.
     // Hoisted: the per-node window test `ip - m > window` is `m < ip - window`
     // (m < ip is tested first), one cmp against a per-call constant instead
     // of sub+cmp per node.
     let win_low = ip.saturating_sub(window);
+    // W4: the single hot-path lower bound (see the walk's break).
+    let low = if win_low > bt_lowest { win_low } else { bt_lowest };
     // W1: the count head's only non-`m` precondition, hoisted out of the walk.
     // See the head itself for why the other two tests are implied.
     debug_assert!(block_end <= src.len());
@@ -10346,12 +10444,21 @@ fn bt_find_best_runtime_inner(
             tables.chain_set(larger, 0);
             break;
         };
-        if m >= ip || m < win_low {
-            tables.chain_set(smaller, 0);
-            tables.chain_set(larger, 0);
-            break;
-        }
-        if m < bt_lowest {
+        // W4 RETRIED: the walk tested TWO lower bounds per node, and both were
+        // SPILLED -- two stack reloads and two compares on the hottest path in
+        // the Bt ladder. They collapse to one compare against their max, with
+        // the disambiguation moved into the break (taken once per walk).
+        //
+        // This was tried once before and REVERTED: it destabilised the
+        // register allocator and the node path came back at 60 instructions.
+        // The blocker was live-set pressure, and the prologue hoist above has
+        // since removed `chain_len` and `frame_start` from it -- so the trade
+        // is re-measured, not re-assumed.
+        if m >= ip || m < low {
+            if m >= ip || m < win_low {
+                tables.chain_set(smaller, 0);
+                tables.chain_set(larger, 0);
+            }
             break;
         }
         // The T2 ENTRY guard already proves the worst case:
@@ -10553,6 +10660,9 @@ fn find_bt_lazy(
         mls,
         attempts,
         chain_log: clog,
+        bt_lowest: block_start.saturating_sub(window).max(tables.frame_start),
+        chain_len: tables.chain.len(),
+        wide_hash: mls >= 8,
     };
     let gain_cmp = lazy_gain_enabled_bt();
     let fill_on = lazy_fill_enabled();
@@ -10560,7 +10670,9 @@ fn find_bt_lazy(
     let use_rep = rep_search_on(tables.rep_yield, params.strategy);
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
-    let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
+    // W5: hoisted for the back-extension loop -- see its use.
+    let fstart_c = tables.frame_start;
+    let lowest_rep = block_start.saturating_sub(window).max(fstart_c);
     let mut ip = block_start;
     while ip <= ilimit {
         if use_rep {
@@ -10612,7 +10724,11 @@ fn find_bt_lazy(
             let mut n = best_ml;
             #[cfg(feature = "profile")]
             let bext_from = s;
-            while s > anchor && mm > tables.frame_start && back_eq(src, s, mm) {
+            // W5: `frame_start` is a per-FRAME constant, and this is the
+            // back-extension loop -- the struct load ran on every extended
+            // BYTE, through `&mut MatchTables`, so LLVM had to re-prove it
+            // after each table write the match path performs.
+            while s > anchor && mm > fstart_c && back_eq(src, s, mm) {
                 s -= 1;
                 mm -= 1;
                 n += 1;
@@ -11030,7 +11146,9 @@ fn find_opt(
     // using the real rep state at emit time. What the DP must get right is
     // WHERE the match starts and what it costs.
     let rep1 = reps[0] as usize;
-    let lowest_rep = block_start.saturating_sub(window).max(tables.frame_start);
+    // W5: hoisted for the back-extension loop -- see its use.
+    let fstart_c = tables.frame_start;
+    let lowest_rep = block_start.saturating_sub(window).max(fstart_c);
     // Hoisted once per block (the chain_find_best rule): bt_find_best runs
     // per DP position here.
     let bt_attempts = bt_depth_apply(search_attempts(params), params, tables.opt_rep_rate);
@@ -11045,6 +11163,9 @@ fn find_opt(
         mls,
         attempts: bt_attempts,
         chain_log: clog,
+        bt_lowest: block_start.saturating_sub(window).max(tables.frame_start),
+        chain_len: tables.chain.len(),
+        wide_hash: mls >= 8,
     };
     let extra = match params.strategy {
         Strategy::BtUltra2 => 2u32,
@@ -12166,7 +12287,10 @@ fn count_match_fast(src: &[u8], m: usize, ip: usize, limit: usize) -> usize {
     // which is a position in `src`, and `m` is a candidate strictly below
     // `ip`. So `ip + 8 <= limit` implies both slice tests that used to sit
     // beside it -- three compares collapse to one, per candidate.
-    debug_assert!(limit <= src.len() && m < ip);
+    // `m <= ip` (not `<`) is what the min-elimination needs: with `limit <=
+    // src.len()`, `len - m >= len - ip >= limit - ip`, so `max` is `limit -
+    // ip` either way. The oracle test exercises `m == ip` directly.
+    debug_assert!(limit <= src.len() && m <= ip);
     if ip + 8 <= limit {
         let a = load_u64le(src, m);
         let b = load_u64le(src, ip);
@@ -12192,7 +12316,10 @@ fn count_match(src: &[u8], m: usize, ip: usize, limit: usize) -> usize {
     // `len - m > len - ip >= limit - ip`, so max IS `limit - ip`, and the
     // three range guards collapse to `ip >= limit`. The slice constructions
     // keep memory safety: a violated invariant panics, it cannot read wild.
-    debug_assert!(limit <= src.len() && m < ip);
+    // `m <= ip` (not `<`) is what the min-elimination needs: with `limit <=
+    // src.len()`, `len - m >= len - ip >= limit - ip`, so `max` is `limit -
+    // ip` either way. The oracle test exercises `m == ip` directly.
+    debug_assert!(limit <= src.len() && m <= ip);
     if ip >= limit {
         return 0;
     }
