@@ -1040,6 +1040,32 @@ impl MatchTables {
         (Self::lz_head_pos(raw, cp), old_tag)
     }
 
+    /// W10: `lz_insert` for callers that DISCARD the result -- the back-fills.
+    /// Identical writes; it just does not decode the old head into the
+    /// `Option<usize>` nobody reads.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn lz_insert_only(&mut self, h: usize, ip: usize, gtag: u8, cp: bool, ca: bool, chain_mask: usize) {
+        let raw = self.lz_head_raw(h);
+        let old_tag = if cp {
+            Self::lz_head_tag(raw)
+        } else if ca {
+            debug_assert!(h < self.tags.len());
+            *unsafe { self.tags.get_unchecked(h) }
+        } else {
+            0
+        };
+        self.chain_masked_set(ip & chain_mask, Self::lz_link_from_head(raw, cp));
+        if ca {
+            debug_assert!((ip & chain_mask) < self.ctags.len() && h < self.tags.len());
+            unsafe {
+                *self.ctags.get_unchecked_mut(ip & chain_mask) = old_tag;
+                *self.tags.get_unchecked_mut(h) = gtag;
+            }
+        }
+        self.lz_head_put(h, ip, gtag, cp);
+    }
+
     /// T2: binary-tree slot read.
     ///
     /// SAFETY: every caller indexes `(x & bt_mask) << 1` or that `+ 1`, and
@@ -8630,7 +8656,7 @@ fn find_greedy(
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "avx2,bmi2,lzcnt")]
+#[target_feature(enable = "bmi2,lzcnt")]
 #[allow(clippy::too_many_arguments)]
 #[allow(unsafe_code)]
 unsafe fn find_greedy_bmi2(
@@ -8704,14 +8730,17 @@ fn find_greedy_impl<const MLS: usize>(
     //
     // `encode_block` already hands these back at all four of its exits, so the
     // plumbing was in place and only these finders were missing from it.
-    let mut seqs = if finder_scratch_enabled() {
+    // W4: `finder_scratch_enabled()` is an arm read, and it was read TWICE
+    // -- once per output buffer -- for one per-block answer.
+    let keep = finder_scratch_enabled();
+    let mut seqs = if keep {
         let mut v = std::mem::take(&mut tables.seq_scratch);
         v.clear();
         v
     } else {
         Vec::new()
     };
-    let mut lits = if finder_scratch_enabled() {
+    let mut lits = if keep {
         let mut v = std::mem::take(&mut tables.lit_scratch);
         v.clear();
         v
@@ -8724,7 +8753,28 @@ fn find_greedy_impl<const MLS: usize>(
         lits.extend_from_slice(&src[block_start..block_end]);
         return (seqs, lits);
     }
-    // BRICK 71: repcode-1 search in find_greedy -- L5-L6 had none
+
+    // W5: GATE 6 for Greedy. Both output buffers came from the frame but with
+    // NO RESERVE, so they grew by repeated `realloc` with LIVE contents --
+    // every growth a real memcpy. `find_fast` has had this since brick 38.
+    let block_len = block_end - block_start;
+    if lits.capacity() < block_len + LIT_PUSH_WIDTH_MAX {
+        lits = Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX);
+    }
+    let seq_guess = (tables.last_nseq + tables.last_nseq / 4 + 64).min(block_len / mls + 16);
+    if seqs.capacity() < seq_guess {
+        seqs = Vec::with_capacity(seq_guess);
+    }
+    // W6: GATE 13 for Greedy. Literals went out through `push_lits_range` -- a
+    // runtime-length `extend_from_slice` -- while find_fast has used the
+    // fixed-width `copy_nonoverlapping` since brick 38. W5 is its
+    // precondition: the fast path declines unless spare capacity proves the
+    // wide store in bounds. Byte-identical -- only `n` bytes are published.
+    let lp_copy = if tables.blocks_done == 0 || tables.lit_short_share >= lit_short_min() {
+        lit_width_for(tables)
+    } else {
+        0
+    };    // BRICK 71: repcode-1 search in find_greedy -- L5-L6 had none
     // C checks `offset_1` at every position in `_greedy`/`_lazy` exactly as in
     // `_fast`/`_doubleFast`. Same dispatch on measured yield as bricks 67/70.
     let use_rep = rep_search_on(tables.rep_yield, params.strategy)
@@ -8756,6 +8806,14 @@ fn find_greedy_impl<const MLS: usize>(
     let ca = !tables.ctags.is_empty();
     let wchain = tables.chain_wide;
     let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
+    // W1: `cp || ca` -- whether ANY link-tag filter is active -- was re-OR'd on
+    // every step of the chain chase.
+    let tag_filter = cp || ca;
+    // W2: `mls >= 8` is the hash-width question, and it was re-asked per
+    // POSITION (the head hash) and per FILLED POSITION, for one per-block
+    // answer. `src.len()` beside it is a slice field re-read the same way.
+    let wide_h = mls >= 8;
+    let src_len = src.len();
     // The searches/byte signal feeds the wide latch's second route; greedy
     // never maintained it, so at L5 the field held its 1.0 INIT and the
     // route always passed (smallmsg +1.62% leak).
@@ -8766,7 +8824,7 @@ fn find_greedy_impl<const MLS: usize>(
             if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end, ilimit) {
                 rep_hits += 1;
                 let mstart = ip + 1;
-                push_lits_range(&mut lits, src, anchor, mstart);
+                push_literals(&mut lits, src, anchor, mstart, lp_copy);
                 seqs.push(Seq {
                     litlen: (mstart - anchor) as u32,
                     matchlen: ml as u32,
@@ -8778,7 +8836,7 @@ fn find_greedy_impl<const MLS: usize>(
             }
         }
         searches += 1;
-        let (h, gtag) = if mls >= 8 && ip + 8 <= src.len() {
+        let (h, gtag) = if wide_h && ip + 8 <= src_len {
             (hash8(src, ip, hash_log), 0u8)
         } else if wchain {
             hash_wide_link_tag(src, ip, hash_log, smask)
@@ -8789,6 +8847,9 @@ fn find_greedy_impl<const MLS: usize>(
 
         let mut best_m = 0usize;
         let mut best_ml = 0usize;
+        // W3: `best_ml` is 0 or a value that already cleared `mls`, so the
+        // accept pair folds to one compare against a running bar.
+        let mut bar = mls;
         if let Some(mut m) = prev {
             let mut mtag = head_tag;
             // See `chain_find_best`: the three per-step validity tests fold
@@ -8808,7 +8869,7 @@ fn find_greedy_impl<const MLS: usize>(
                     // fabricated tag is 0), and legacy walks probe position 0
                     // through it -- never tag-filter it (the 2-FALSE-skips
                     // catch on mozilla L5).
-                    if (cp || ca) && m != 0 && mtag != gtag {
+                    if tag_filter && m != 0 && mtag != gtag {
                         #[cfg(feature = "profile")]
                         if COUNT {
                             use core::sync::atomic::Ordering::Relaxed;
@@ -8821,12 +8882,16 @@ fn find_greedy_impl<const MLS: usize>(
                         if !walk_cont {
                             break;
                         }
-                        let link = tables.chain_masked(m & chain_mask);
+                        // W9: `m & chain_mask` is the slot index for BOTH the
+                        // link and its tag; it was masked twice per rejected
+                        // link, on the path the tag filter exists to make cheap.
+                        let slot = m & chain_mask;
+                        let link = tables.chain_masked(slot);
                         let next = if cp { (link & 0x00FF_FFFF) as usize } else { link as usize };
                         if next >= m {
                             break;
                         }
-                        mtag = if cp { (link >> 24) as u8 } else { tables.ctags_masked(m & chain_mask) };
+                        mtag = if cp { (link >> 24) as u8 } else { tables.ctags_masked(slot) };
                         m = next;
                         continue;
                     }
@@ -8845,7 +8910,7 @@ fn find_greedy_impl<const MLS: usize>(
                             // Count past mls_eq's verified prefix (see
                             // `chain_find_best`).
                             let ml = mls + count_match_fast(src, m + mls, ip + mls, block_end);
-                            if ml >= mls && ml > best_ml {
+                            if ml >= bar {
                                 if missed_before {
                                     if best_ml == 0 {
                                         wcls.0 += 1;
@@ -8854,6 +8919,7 @@ fn find_greedy_impl<const MLS: usize>(
                                     }
                                 }
                                 best_ml = ml;
+                                bar = ml + 1;
                                 best_m = m;
                                 // Reaches the block end -- nothing can be longer.
                                 if ip + best_ml >= block_end {
@@ -8907,7 +8973,7 @@ fn find_greedy_impl<const MLS: usize>(
             }
             #[cfg(feature = "profile")]
             note_bext((bext_from - s) as u64);
-            push_lits_range(&mut lits, src, anchor, s);
+            push_literals(&mut lits, src, anchor, s, lp_copy);
             seqs.push(Seq {
                 litlen: (s - anchor) as u32,
                 matchlen: n as u32,
@@ -8917,16 +8983,23 @@ fn find_greedy_impl<const MLS: usize>(
             let end = ip + best_ml;
             // Positions `s..=ip` were ALREADY inserted as the loop walked to
             // `ip`; re-inserting them would self-loop the chain (see B2).
+            // W7: `end` and `ilimit` are both fixed for this fill, so the
+            // two bounds it tested on every inserted position fold to one.
+            let stop = end.min(ilimit + 1);
             let mut p = ip + 1;
-            while p < end && p <= ilimit {
-                let (hh, gt) = if mls >= 8 && p + 8 <= src.len() {
+            while p < stop {
+                let (hh, gt) = if wide_h && p + 8 <= src_len {
                     (hash8(src, p, hash_log), 0u8)
                 } else if wchain {
                     hash_wide_link_tag(src, p, hash_log, smask)
                 } else {
                     hash4_link_tag(src, p, hash_log, smask)
                 };
-                let _ = tables.lz_insert(hh, p, gt, cp, ca, chain_mask);
+                // W10: the fill DISCARDS the insert's result, but `lz_insert`
+                // still built it -- unmasking the old head and wrapping it in
+                // an `Option` -- on every covered position, and this fill
+                // strides ONE byte, so that is once per matched byte.
+                tables.lz_insert_only(hh, p, gt, cp, ca, chain_mask);
                 p += 1;
             }
             ip = end;
