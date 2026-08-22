@@ -8902,47 +8902,57 @@ fn find_greedy_impl<const MLS: usize>(
 // (both arms carry #[inline(never)]), and the ISA choice moves to the caller
 // as a per-block `ChainFn` pointer -- the BtFn precedent. The plain arm's
 // work is unchanged; the twin arm compiles the same body with BMI2.
-type ChainFn = fn(
-    &[u8],
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    bool,
-    &mut (u32, u32),
-    &mut MatchTables,
-) -> (usize, usize);
-
-#[inline(never)]
-fn chain_find_best<const MLS: usize>(
-    src: &[u8],
-    ip: usize,
+/// W1: the walk's per-call PROLOGUE, hoisted. `chain_find_best` is called per
+/// position AND per look-ahead step across L5-L12, and every one of those
+/// calls re-derived the same six per-BLOCK values from `&mut MatchTables`:
+/// `hash_log`, `chain.len() - 1`, `chain_pack`, `!ctags.is_empty()`,
+/// `chain_wide` and the `mls` byte mask. Struct reads through a `&mut` that
+/// LLVM must re-prove after every table write the walk performs.
+///
+/// Same shape `BtCtx` uses for the tree walk.
+pub(crate) struct ChainCtx<'a> {
+    src: &'a [u8],
     block_start: usize,
     block_end: usize,
     window: usize,
     mls: usize,
     attempts: usize,
+    hash_log: u32,
+    chain_mask: usize,
+    smask: u64,
+    cp: bool,
+    ca: bool,
+    wchain: bool,
+    /// W2: `mls >= 8`, the hash-width question, answered once per block.
+    wide_hash: bool,
+    /// W4: `block_start.saturating_sub(window).max(frame_start)` -- a
+    /// saturating sub, a max and a struct load, rebuilt on every call for a
+    /// value the caller already computes as `lowest_rep`.
+    lowest: usize,
+    /// W5: `cp || ca` -- whether ANY link-tag filter is active. Both terms are
+    /// per block, but the walk re-OR'd them on every LINK STEP.
+    tag_filter: bool,
+}
+
+type ChainFn = for<'a> fn(&ChainCtx<'a>, usize, bool, &mut (u32, u32), &mut MatchTables)
+    -> (usize, usize);
+
+#[inline(never)]
+fn chain_find_best<const MLS: usize>(
+    ctx: &ChainCtx,
+    ip: usize,
     walk_cont: bool,
     cls: &mut (u32, u32),
     tables: &mut MatchTables,
 ) -> (usize, usize) {
-    chain_find_best_inner::<MLS>(
-        src, ip, block_start, block_end, window, mls, attempts, walk_cont, cls, tables,
-    )
+    chain_find_best_inner::<MLS>(ctx, ip, walk_cont, cls, tables)
 }
 
 /// Safe `ChainFn`-shaped wrapper; handed out only behind `has_bmi2()`.
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 fn chain_find_best_bmi2_ptr<const MLS: usize>(
-    src: &[u8],
+    ctx: &ChainCtx,
     ip: usize,
-    block_start: usize,
-    block_end: usize,
-    window: usize,
-    mls: usize,
-    attempts: usize,
     walk_cont: bool,
     cls: &mut (u32, u32),
     tables: &mut MatchTables,
@@ -8950,9 +8960,7 @@ fn chain_find_best_bmi2_ptr<const MLS: usize>(
     // SAFETY: only selected under the caller's CPUID guard.
     #[allow(unsafe_code)]
     unsafe {
-        chain_find_best_bmi2::<MLS>(
-            src, ip, block_start, block_end, window, mls, attempts, walk_cont, cls, tables,
-        )
+        chain_find_best_bmi2::<MLS>(ctx, ip, walk_cont, cls, tables)
     }
 }
 
@@ -8962,38 +8970,21 @@ fn chain_find_best_bmi2_ptr<const MLS: usize>(
 #[allow(unsafe_code)]
 #[inline(never)]
 unsafe fn chain_find_best_bmi2<const MLS: usize>(
-    src: &[u8],
+    ctx: &ChainCtx,
     ip: usize,
-    block_start: usize,
-    block_end: usize,
-    window: usize,
-    mls: usize,
-    attempts: usize,
     walk_cont: bool,
     cls: &mut (u32, u32),
     tables: &mut MatchTables,
 ) -> (usize, usize) {
-    chain_find_best_inner::<MLS>(
-        src, ip, block_start, block_end, window, mls, attempts, walk_cont, cls, tables,
-    )
+    chain_find_best_inner::<MLS>(ctx, ip, walk_cont, cls, tables)
 }
 
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn chain_find_best_inner<const MLS: usize>(
-    src: &[u8],
+    ctx: &ChainCtx,
     ip: usize,
-    block_start: usize,
-    block_end: usize,
-    window: usize,
-    mls: usize,
-    // Hoisted by the caller once per block: `search_attempts` reads its arm
-    // atomic, and this function runs per position plus per look-ahead step.
-    attempts: usize,
-    // Also caller-hoisted (arm atomic + rep_yield dispatch), once per block.
     walk_cont: bool,
-    // Block-local (first-find, upgrade) accept counters past a collision --
-    // the walk gate's own dispatch signal. Plain integers, never atomics.
     cls: &mut (u32, u32),
     tables: &mut MatchTables,
 ) -> (usize, usize) {
@@ -9005,14 +8996,34 @@ fn chain_find_best_inner<const MLS: usize>(
     // with `index out of bounds: the len is 16777216 but the index is
     // 28488790`. Brick 52 fixed `find_fast` and `find_dfast` and left the
     // chain-walking finders on the raw value.
+    // W1/W2: all six of these were rebuilt on EVERY call -- see `ChainCtx`.
+    let ChainCtx {
+        src,
+        block_start,
+        block_end,
+        window,
+        mls,
+        attempts,
+        hash_log,
+        chain_mask,
+        smask,
+        cp,
+        ca,
+        wchain,
+        wide_hash,
+        lowest,
+        tag_filter,
+    } = *ctx;
+    debug_assert_eq!(tag_filter, cp || ca);
     let mls = if MLS == 0 { mls } else { MLS };
-    let hash_log = tables.hash_log;
-    let chain_mask = tables.chain.len() - 1;
-    let cp = tables.chain_pack;
-    let ca = !tables.ctags.is_empty();
-    let wchain = tables.chain_wide;
-    let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
-    let (h, gtag) = if mls >= 8 && ip + 8 <= src.len() {
+    debug_assert_eq!(hash_log, tables.hash_log);
+    debug_assert_eq!(chain_mask, tables.chain.len() - 1);
+    debug_assert_eq!(cp, tables.chain_pack);
+    debug_assert_eq!(ca, !tables.ctags.is_empty());
+    debug_assert_eq!(wchain, tables.chain_wide);
+    debug_assert_eq!(wide_hash, mls >= 8);
+    debug_assert_eq!(smask, if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 });
+    let (h, gtag) = if wide_hash && ip + 8 <= src.len() {
         (hash8(src, ip, hash_log), 0u8)
     } else if wchain {
         hash_wide_link_tag(src, ip, hash_log, smask)
@@ -9027,11 +9038,17 @@ fn chain_find_best_inner<const MLS: usize>(
     let mut probes = 0u64;
     let mut best_m = 0usize;
     let mut best_ml = 0usize;
+    // W7: the acceptance bar -- see the accept test.
+    let mut bar = mls;
     let Some(mut m) = prev else {
         return (0, 0);
     };
     let mut mtag = head_tag;
-    let lowest = block_start.saturating_sub(window).max(tables.frame_start);
+    // W4: from the context -- see `ChainCtx::lowest`.
+    debug_assert_eq!(
+        lowest,
+        block_start.saturating_sub(window).max(tables.frame_start)
+    );
     // The walk's THREE per-step validity tests fold to ONE: `m >= ip` can
     // only fire on ENTRY (afterwards m strictly decreases below ip), and the
     // window and lowest checks are both lower bounds on m, merged into a
@@ -9049,7 +9066,7 @@ fn chain_find_best_inner<const MLS: usize>(
             // equal => tags equal.
             // See the greedy walk: position 0 is sentinel-ambiguous, never
             // tag-filtered.
-            if (cp || ca) && m != 0 && mtag != gtag {
+            if tag_filter && m != 0 && mtag != gtag {
                 #[cfg(feature = "profile")]
                 if COUNT {
                     use core::sync::atomic::Ordering::Relaxed;
@@ -9087,7 +9104,15 @@ fn chain_find_best_inner<const MLS: usize>(
                     // the walk bound (m >= low >= lowest >= frame_start,
                     // m >= ip - window, m < ip); re-checking per accept was
                     // pure redundancy.
-                    if ml >= mls && ml > best_ml {
+                    //
+                    // W7: `ml >= mls && ml > best_ml` is two compares and two
+                    // branches per accepted candidate, but `best_ml` is only
+                    // ever assigned a value that already cleared `mls` -- so
+                    // it is 0 or >= mls, and the pair is one compare against
+                    // a running bar. (The same fold REGRESSED in the Bt walk,
+                    // where the extra live value spilled `best_m`; this loop
+                    // carries fewer, so it is re-measured here, not assumed.)
+                    if ml >= bar {
                         if missed_before {
                             if best_ml == 0 {
                                 cls.0 += 1;
@@ -9106,6 +9131,7 @@ fn chain_find_best_inner<const MLS: usize>(
                         }
                         best_ml = ml;
                         best_m = m;
+                        bar = ml + 1;
                         if ip + best_ml >= block_end {
                             break;
                         }
@@ -9317,11 +9343,36 @@ fn find_lazy_impl<const MLS: usize>(
         tables.walk_probe - 1
     };
     let mut wcls = (0u32, 0u32);
+    // ORDER IS LOAD-BEARING: `maybe_latch_wide_chain` can flip
+    // `tables.chain_wide` for the REST of the frame, so every value below it
+    // must be read AFTER it. Building the context any earlier captured the
+    // pre-latch key and moved output -- lazyid caught it at L9/L12.
     maybe_latch_wide_chain(tables, src, block_start, window, mls);
     let cp = tables.chain_pack;
     let ca = !tables.ctags.is_empty();
     let wchain = tables.chain_wide;
     let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
+    // W6: the same two facts the fill loop re-derived per inserted position.
+    let wide_h = mls >= 8;
+    let src_len = src.len();
+    // W1/W2: the walk's prologue, hoisted -- see `ChainCtx`.
+    let chain_ctx = ChainCtx {
+        src,
+        block_start,
+        block_end,
+        window,
+        mls,
+        attempts,
+        hash_log: tables.hash_log,
+        chain_mask: tables.chain.len() - 1,
+        smask,
+        cp,
+        ca,
+        wchain,
+        wide_hash: mls >= 8,
+        lowest: lowest_rep,
+        tag_filter: cp || ca,
+    };
     let gain_cmp = lazy_gain_enabled();
     while ip <= ilimit {
         if use_rep {
@@ -9341,7 +9392,9 @@ fn find_lazy_impl<const MLS: usize>(
         }
         searches += 1;
         let (mut best_m, mut best_ml) =
-            cfb(src, ip, block_start, block_end, window, mls, attempts, walk_cont, &mut wcls, tables);
+            cfb(&chain_ctx, ip, walk_cont, &mut wcls, tables);
+        // W3: the in-hand match's gain, carried with it.
+        let mut best_gain = if gain_cmp { lazy_gain(best_ml, ip - best_m) } else { 0 };
         let mut best_ip = ip;
         let mut look_hi = ip; // PROBE: highest position the look-ahead inserted
         if best_ml >= mls {
@@ -9351,23 +9404,25 @@ fn find_lazy_impl<const MLS: usize>(
                     break;
                 }
                 look_hi = ip2;
-                let (m, ml) = cfb(
-                    src,
-                    ip2,
-                    block_start,
-                    block_end,
-                    window,
-                    mls,
-                    attempts,
-                    walk_cont,
-                    &mut wcls,
-                    tables,
-                );
+                let (m, ml) = cfb(&chain_ctx, ip2, walk_cont, &mut wcls, tables);
+                // W3: `lazy_gain(best_ml, best_ip - best_m)` describes the
+                // match ALREADY IN HAND, so it changes only when that match
+                // does -- but it was recomputed on every look-ahead step (a
+                // multiply, a `leading_zeros` and two subs). Carried beside
+                // the best it describes, and refreshed only on improvement.
+                // W9: `cfb` returns either `(0, 0)` or a length that already
+                // cleared its own `>= mls` bar, so `ml >= mls` IS `ml != 0` --
+                // a test against zero instead of against a value that has to
+                // stay live.
+                //
+                // W8: and when the test passes, the gain it computed for THIS
+                // candidate is exactly the new best's gain. It was thrown away
+                // and rebuilt one line later (a multiply and a
+                // `leading_zeros`, on every improvement).
+                let cand_gain = if gain_cmp { lazy_gain(ml, ip2 - m) } else { 0 };
                 let take = if gain_cmp {
                     // C parity: the +4 favors the match already in hand.
-                    ml >= mls
-                        && lazy_gain(ml, ip2 - m)
-                            > lazy_gain(best_ml, best_ip - best_m) + 4
+                    ml != 0 && cand_gain > best_gain + 4
                 } else {
                     ml > best_ml
                 };
@@ -9375,10 +9430,13 @@ fn find_lazy_impl<const MLS: usize>(
                     best_ml = ml;
                     best_m = m;
                     best_ip = ip2;
+                    best_gain = cand_gain;
                 }
             }
         }
-        if best_ml >= mls {
+        // W10: same identity as W9 -- `best_ml` is 0 or already past `mls`.
+        debug_assert!(best_ml == 0 || best_ml >= mls);
+        if best_ml != 0 {
             // DEFECT B3 FIX: back-extend the match -- see `find_greedy`.
             let mut s = best_ip;
             let mut mm = best_m;
@@ -9445,7 +9503,10 @@ fn find_lazy_impl<const MLS: usize>(
                 while p < end && p <= ilimit {
                     #[cfg(feature = "profile")]
                     LF_INSERTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    let (hh, gt) = if mls >= 8 && p + 8 <= src.len() {
+                    // W6: `mls >= 8` is the same per-block question
+                    // `ChainCtx::wide_hash` answers; the fill re-asked it on
+                    // every inserted position.
+                    let (hh, gt) = if wide_h && p + 8 <= src_len {
                         (hash8(src, p, hash_log), 0u8)
                     } else if wchain {
                         hash_wide_link_tag(src, p, hash_log, smask)
