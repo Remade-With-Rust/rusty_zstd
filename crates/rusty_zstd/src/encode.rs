@@ -3067,6 +3067,29 @@ pub(crate) fn write_frame_header(
 /// table costs only the small section header, so the coded stream is then a
 /// clean measure of the MARGINAL bits per literal; a freshly emitted table adds
 /// a large fixed cost that has nothing to do with what one more literal costs.
+/// SIMD-3 arm: the AVX2+BMI2 entropy twins (`write_literals`, `write_sequences`).
+///
+/// The 17 existing twins in this crate all enable `bmi2,lzcnt` and NOT avx2, so
+/// every loop LLVM auto-vectorises inside them is emitted as 128-bit legacy SSE:
+/// 526 SSE ops in `write_sequences_bmi2`, 283 in `write_literals_bmi2`, 0 ymm in
+/// either. Unlike the block driver (SIMD-2, per BLOCK, measured 0), these bodies
+/// carry per-SEQUENCE and per-LITERAL-BYTE loops, so the count multiplies.
+/// 1 = off, 2 = on (default).
+static ENC_AVX2_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
+
+/// Bench hook: `false` routes the entropy twins back to the bmi2-only arm.
+pub fn set_enc_avx2_arm(on: bool) {
+    ENC_AVX2_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[inline(always)]
+fn enc_avx2_on() -> bool {
+    ENC_AVX2_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
+}
+
 fn write_literals(
     dst: &mut Vec<u8>,
     lits: &[u8],
@@ -3075,6 +3098,14 @@ fn write_literals(
     // The literal-section table builders (histogram, ctable, tree write,
     // normalize, ncount) all carry variable shifts; the BMI2 twin compiles
     // the whole section in its own ISA context.
+    // SIMD-3 TRIED AND REVERTED HERE. Enabling avx2 on this twin converted all
+    // 283 legacy SSE ops to VEX and produced 799 ymm -- and made Huff **+5.0%
+    // SLOWER** (14-corpus in-process ABBA x7, byte-identity asserted). The
+    // instruction count said so before the clock did: the body GREW 3,659 ->
+    // 4,404 (+745). LLVM vectorised histogram/ctable loops whose trip counts
+    // cannot amortise ymm setup and the vzeroupper on exit. Contrast
+    // `write_sequences`, whose body SHRANK 8,769 -> 8,324 and measured -1.8%.
+    // **Enable avx2 where the instruction count DROPS; revert where it GROWS.**
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     if crate::simd::has_bmi2() {
         // SAFETY: runtime CPUID guard; identical body.
@@ -3083,6 +3114,7 @@ fn write_literals(
     }
     write_literals_inner(dst, lits, entropy)
 }
+
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "bmi2,lzcnt")]
@@ -3139,12 +3171,35 @@ fn write_sequences(
     // The encode-side mirror of 621a140: the FSE flush loop and add_bits are
     // variable-shift chains; the BMI2 twin compiles the same body with
     // shrx/shlx available. Byte-identity by construction.
+    // SIMD-3: AVX2 arm first -- 526 legacy SSE ops / 0 ymm in the bmi2-only twin.
+    // The per-SEQUENCE transcode and the ll/of/ml histogram walks live in here.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if enc_avx2_on() && crate::simd::has_avx2() && crate::simd::has_bmi2() {
+        // SAFETY: runtime CPUID guard for BOTH features; identical body.
+        #[allow(unsafe_code)]
+        return unsafe { write_sequences_avx2(dst, seqs, reps, entropy, strategy, tables) };
+    }
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     if crate::simd::has_bmi2() {
         // SAFETY: guarded by runtime CPUID; the body is identical.
         #[allow(unsafe_code)]
         return unsafe { write_sequences_bmi2(dst, seqs, reps, entropy, strategy, tables) };
     }
+    write_sequences_inner(dst, seqs, reps, entropy, strategy, tables)
+}
+
+/// SIMD-3: the AVX2 + BMI2 sequence-section twin. Byte-identical by construction.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx2,bmi2,lzcnt")]
+#[allow(unsafe_code)]
+unsafe fn write_sequences_avx2(
+    dst: &mut Vec<u8>,
+    seqs: &[Seq],
+    reps: &mut [u32; 3],
+    entropy: &mut EntropyState,
+    strategy: Strategy,
+    tables: &mut MatchTables,
+) -> Result<(), Error> {
     write_sequences_inner(dst, seqs, reps, entropy, strategy, tables)
 }
 
@@ -8575,7 +8630,7 @@ fn find_greedy(
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "bmi2,lzcnt")]
+#[target_feature(enable = "avx2,bmi2,lzcnt")]
 #[allow(clippy::too_many_arguments)]
 #[allow(unsafe_code)]
 unsafe fn find_greedy_bmi2(
@@ -10717,14 +10772,17 @@ fn find_bt_lazy(
     //
     // `encode_block` already hands these back at all four of its exits, so the
     // plumbing was in place and only these finders were missing from it.
-    let mut seqs = if finder_scratch_enabled() {
+    // W6: `finder_scratch_enabled()` is an arm read, and it was read TWICE --
+    // once per buffer -- for one per-block answer.
+    let keep = finder_scratch_enabled();
+    let mut seqs = if keep {
         let mut v = std::mem::take(&mut tables.seq_scratch);
         v.clear();
         v
     } else {
         Vec::new()
     };
-    let mut lits = if finder_scratch_enabled() {
+    let mut lits = if keep {
         let mut v = std::mem::take(&mut tables.lit_scratch);
         v.clear();
         v
@@ -10737,6 +10795,29 @@ fn find_bt_lazy(
         lits.extend_from_slice(&src[block_start..block_end]);
         return (seqs, lits);
     }
+    // W8: GATE 6 for BtLazy2 -- every other finder takes its output buffers
+    // from the frame WITH A RESERVE; this one grew them by repeated `realloc`
+    // with LIVE contents, so every growth is a real memcpy.
+    let block_len = block_end - block_start;
+    if lits.capacity() < block_len + LIT_PUSH_WIDTH_MAX {
+        lits = Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX);
+    }
+    let seq_guess = (tables.last_nseq + tables.last_nseq / 4 + 64).min(block_len / mls + 16);
+    if seqs.capacity() < seq_guess {
+        seqs = Vec::with_capacity(seq_guess);
+    }
+    // W9: GATE 13 for BtLazy2. `push_lits_range` appends through a
+    // runtime-length `extend_from_slice`; `push_literals` takes the
+    // fixed-width `copy_nonoverlapping` path when the run fits and the spare
+    // capacity proves the wide store is in bounds -- which W8's reserve now
+    // guarantees. The capability has been in find_fast since brick 38 and in
+    // find_dfast since 4.46; the Bt ladder never got it. Byte-identical: only
+    // `n` bytes are ever published.
+    let lp_copy = if tables.blocks_done == 0 || tables.lit_short_share >= lit_short_min() {
+        lit_width_for(tables)
+    } else {
+        0
+    };
     // BRICK 73: repcode-1 in BtLazy2 (L13-L14) -- the last finder without it.
     // Per-call arm reads hoisted to once per block (the chain_find_best rule):
     // attempts (an arm atomic inside bt_depth_apply/search_attempts) ran per
@@ -10746,6 +10827,11 @@ fn find_bt_lazy(
     let clog = params.chain_log.min(24);
     let btf = bt_resolve::<true>(tables.hash_log, clog);
     let btf_ins = bt_resolve_ins(tables.hash_log, clog);
+    // W7: `block_start.saturating_sub(window).max(frame_start)` was built
+    // TWICE per block -- once for the tree's lower bound, once for the
+    // repcode's. One value now, and the two cannot drift apart.
+    let fstart_c = tables.frame_start;
+    let lowest_rep = block_start.saturating_sub(window).max(fstart_c);
     let bt_ctx = BtCtx {
         src,
         block_start,
@@ -10754,7 +10840,7 @@ fn find_bt_lazy(
         mls,
         attempts,
         chain_log: clog,
-        bt_lowest: block_start.saturating_sub(window).max(tables.frame_start),
+        bt_lowest: lowest_rep,
         chain_len: tables.chain.len(),
         wide_hash: mls >= 8,
     };
@@ -10764,16 +10850,13 @@ fn find_bt_lazy(
     let use_rep = rep_search_on(tables.rep_yield, params.strategy);
     let mut rep1 = reps[0] as usize;
     let mut rep_hits = 0u64;
-    // W5: hoisted for the back-extension loop -- see its use.
-    let fstart_c = tables.frame_start;
-    let lowest_rep = block_start.saturating_sub(window).max(fstart_c);
     let mut ip = block_start;
     while ip <= ilimit {
         if use_rep {
             if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end, ilimit) {
                 rep_hits += 1;
                 let mstart = ip + 1;
-                push_lits_range(&mut lits, src, anchor, mstart);
+                push_literals(&mut lits, src, anchor, mstart, lp_copy);
                 seqs.push(Seq {
                     litlen: (mstart - anchor) as u32,
                     matchlen: ml as u32,
@@ -10787,7 +10870,17 @@ fn find_bt_lazy(
         let (mut best_m, mut best_ml) = btf(&bt_ctx, ip, tables);
         let mut best_ip = ip;
         let mut look_hi = ip;
-        if best_ml >= mls {
+        // W3: `bt_find_best` returns either `(0, 0)` or a length that already
+        // cleared its own `>= mls` bar, so `best_ml >= mls` IS `best_ml != 0`
+        // -- a test against zero instead of against a value that has to stay
+        // live across the whole look-ahead.
+        debug_assert!(best_ml == 0 || best_ml >= mls);
+        if best_ml != 0 {
+            // W5: the in-hand gain is only meaningful once there IS a match to
+            // describe, and only the look-ahead reads it -- computing it per
+            // POSITION spent a multiply and a `leading_zeros` on every miss,
+            // which is most positions.
+            let mut best_gain = if gain_cmp { lazy_gain(best_ml, ip - best_m) } else { 0 };
             for d in 1..=depth {
                 let ip2 = ip + d;
                 if ip2 > ilimit {
@@ -10798,9 +10891,19 @@ fn find_bt_lazy(
                 // C's offset-priced look-ahead (`set_lazy_gain_arm`), wired
                 // here for its own board: refuted at L7-L12, untested at
                 // L13-L15 where BtLazy2's economics differ.
+                // W1: `lazy_gain(best_ml, best_ip - best_m)` describes the
+                // match ALREADY IN HAND, so it changes only when that match
+                // does -- it was rebuilt on every look-ahead step (a multiply,
+                // a `leading_zeros` and two subs).
+                //
+                // W2: and the gain this test computes for the CANDIDATE is
+                // exactly the new best's gain when the test passes; it was
+                // thrown away and recomputed.
+                //
+                // W4: `ml >= mls` is `ml != 0` -- see W3 above.
+                let cand_gain = if gain_cmp { lazy_gain(ml, ip2 - m) } else { 0 };
                 let take = if gain_cmp {
-                    ml >= mls
-                        && lazy_gain(ml, ip2 - m) > lazy_gain(best_ml, best_ip - best_m) + 4
+                    ml != 0 && cand_gain > best_gain + 4
                 } else {
                     ml > best_ml
                 };
@@ -10808,10 +10911,12 @@ fn find_bt_lazy(
                     best_ml = ml;
                     best_m = m;
                     best_ip = ip2;
+                    best_gain = cand_gain;
                 }
             }
         }
-        if best_ml >= mls {
+        // W3: same identity -- `best_ml` is 0 or already past `mls`.
+        if best_ml != 0 {
             // DEFECT B3 FIX (btlazy2): back-extend -- see `find_greedy`.
             let mut s = best_ip;
             let mut mm = best_m;
@@ -10829,7 +10934,7 @@ fn find_bt_lazy(
             }
             #[cfg(feature = "profile")]
             note_bext((bext_from - s) as u64);
-            push_lits_range(&mut lits, src, anchor, s);
+            push_literals(&mut lits, src, anchor, s, lp_copy);
             seqs.push(Seq {
                 litlen: (s - anchor) as u32,
                 matchlen: n as u32,
@@ -10853,8 +10958,12 @@ fn find_bt_lazy(
                 // is not whether to fill but how densely.
                 let stride = bt_stride;
                 // B2: the look-ahead already inserted up to `look_hi`.
+                // W10: `end` and `ilimit` are both fixed for this fill, so the
+                // two bounds it tested on EVERY inserted position fold to one
+                // stop value -- and this loop is 61.9% of all tree work here.
+                let stop = end.min(ilimit + 1);
                 let mut p = (best_ip + 1).max(look_hi + 1);
-                while p < end && p <= ilimit {
+                while p < stop {
                     btf_ins(&bt_ctx, p, tables);
                     p += stride;
                 }
