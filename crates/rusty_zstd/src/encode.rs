@@ -403,7 +403,10 @@ pub(crate) struct MatchTables {
     /// GATE 6, deeper: `find_opt`'s parse-backtrace buffer, kept for the same
     /// reason as `payload_scratch` and worth far more -- this one carried the
     /// bulk of the 340 MB L19 was pushing through `realloc` on a 2 MiB board.
-    opt_ops: Vec<(u32, u32, u32, bool)>,
+    /// W2: `(start, off, ml)`. The trailing `matched: bool` went away with
+    /// W1 -- every entry is a match now, and the flag cost 4 bytes of padding
+    /// in a 16-byte tuple that the parse writes once per sequence.
+    opt_ops: Vec<(u32, u32, u32)>,
     /// T2: `find_opt`'s DP arrays, kept on the frame.
     ///
     /// Sized `n + 1` for a block of `n`, they were built fresh EVERY block:
@@ -11179,6 +11182,10 @@ fn find_opt(
     // W5: hoisted for the back-extension loop -- see its use.
     let fstart_c = tables.frame_start;
     let lowest_rep = block_start.saturating_sub(window).max(fstart_c);
+    // W6: the DP's own `i + 8 > n` continue gives `ip + 8 <= block_end`, which
+    // is exactly the finders' `ip <= ilimit`. The bound is per BLOCK; it was
+    // rebuilt from `block_end` on every position that probed the repcode.
+    let rep_ilimit = block_end.saturating_sub(8);
     // Hoisted once per block (the chain_find_best rule): bt_find_best runs
     // per DP position here.
     let bt_attempts = bt_depth_apply(search_attempts(params), params, tables.opt_rep_rate);
@@ -11276,6 +11283,9 @@ fn find_opt(
     let fill_rep_max = opt_fill_rep_max();
     let fill_step = opt_fill_stride();
     let fill_span_max = opt_fill_max();
+    // W9: the jump-fill gate, resolved once per block for the shipped arm.
+    let fill_gate_hoisted =
+        fill_on && tables.opt_rep_meas >= 2 && tables.opt_rep_peak < fill_rep_max;
     let mlb_on = opt_mlbits_enabled();
     // W8: the DP's length loop compared `params.strategy == BtUltra2` on every
     // LENGTH STEP of every priced match -- a per-BLOCK constant read from a
@@ -11354,7 +11364,7 @@ fn find_opt(
             // The DP's own `i + 8 > n` continue above gives `ip + 8 <=
             // block_end`, which is exactly the finders' `ip <= ilimit`.
             if let Some(rml) =
-                try_rep1(src, ip, rep1, lowest_rep, block_end, block_end.saturating_sub(8))
+                try_rep1(src, ip, rep1, lowest_rep, block_end, rep_ilimit)
             {
                 o_rep_hits += 1;
                 o_rep_bytes += rml as u64;
@@ -11399,7 +11409,11 @@ fn find_opt(
         // the encoder then writes that many extra bits, so the true cost grows
         // with the offset's magnitude. A near match is genuinely cheaper.
         let off_bits = 32 - ((ip - bm) as u32 | 1).leading_zeros();
-        let seq_cost = (12u32 + off_bits).saturating_sub(extra);
+        // W7: `extra` is 0, 1 or 2 (BtUltra2 / BtUltra / else), and the left
+        // side is at least 12 -- the saturating form's cmov guards an
+        // underflow no strategy can produce, once per priced match.
+        debug_assert!(extra <= 2);
+        let seq_cost = (12u32 + off_bits) - extra;
         // GATE 19 DEFECT FIX -- the DP enumerated LENGTHS; C enumerates MATCHES.
         //
         // `np` below does not depend on `len`: this price model charges a match
@@ -11421,7 +11435,10 @@ fn find_opt(
         // already below the cap -- which is all normal content; only inputs
         // with very long matches take a different path.
         const OPT_MAX_LENGTHS: usize = 64;
-        let floor_step = (bml.saturating_sub(mls) / OPT_MAX_LENGTHS).max(1);
+        // W8: the `if bml < mls { continue }` above proves `bml >= mls`, so
+        // this saturating sub is another dead cmov, once per priced match.
+        debug_assert!(bml >= mls);
+        let floor_step = ((bml - mls) / OPT_MAX_LENGTHS).max(1);
         // price[i] and seq_cost are PER-MATCH constants: the sum was
         // reloaded and re-added on every length step.
         #[allow(unsafe_code)]
@@ -11522,7 +11539,17 @@ fn find_opt(
             } else {
                 (opt_fill_enabled(), opt_fill_rep_max())
             };
-            if g_on && tables.opt_rep_meas >= 2 && tables.opt_rep_peak < g_rep {
+            // W9: `opt_rep_meas` and `opt_rep_peak` are per-BLOCK signals, but
+            // they were read from the struct on every JUMP -- and on
+            // match-dense content the DP jumps constantly. Hoisted for the
+            // shipped (hoisted) arm; the measurement arm keeps its deliberate
+            // per-jump re-reads.
+            let gate_ok = if hoisted {
+                fill_gate_hoisted
+            } else {
+                g_on && tables.opt_rep_meas >= 2 && tables.opt_rep_peak < g_rep
+            };
+            if gate_ok {
                 let step = if hoisted { fill_step } else { opt_fill_stride() };
                 // Cap the span. text-32m and versions-16m hold 93% of ALL jumped
                 // positions (3.58M of 3.85M) and contribute -15 and +54 bytes;
@@ -11577,7 +11604,7 @@ fn find_opt(
     // it on the frame and let it converge on its own high-water mark.
     // (start, off, ml, matched): 16 bytes -- start fits u32 (positions
     // < 2^24), and the bool packs into the 4-aligned layout. Was 24.
-    let mut ops: Vec<(u32, u32, u32, bool)> = std::mem::take(&mut tables.opt_ops);
+    let mut ops: Vec<(u32, u32, u32)> = std::mem::take(&mut tables.opt_ops);
     ops.clear();
     // The reuse above leaves exactly ONE growth ladder per frame: the first
     // block still climbs from nothing to its high-water mark. It is removable,
@@ -11615,28 +11642,37 @@ fn find_opt(
     // and the frame-kept scratch converges there after the first blocks. The
     // pre-walk (an O(steps) pointer chase over `prev`) then sizes nothing:
     // it ran on EVERY block anyway. Skip it when capacity is the proof.
-    if opt_ops_exact() && ops.capacity() <= n {
+    // W5: the pre-walk is an O(steps) DEPENDENT pointer chase over `prev`,
+    // run only to size `ops`. Its old proof was `k <= n`, which a converged
+    // buffer rarely satisfied. After W1 the buffer holds MATCHES, and every
+    // match advances at least `mls` positions, so `n / mls + 1` bounds it --
+    // a proof a converged buffer meets immediately, and the chase is skipped
+    // entirely from the second block on.
+    let ops_bound = n / mls.max(1) + 1;
+    if opt_ops_exact() && ops.capacity() < ops_bound {
         let mut k = 0usize;
         let mut j = n;
         // j <= n along the whole chain (prev entries are indices the DP
         // wrote, all <= n); the checked op was a bounds branch per parse
         // step.
         while j > 0 {
-            k += 1;
             debug_assert!(j < prev.len());
             #[allow(unsafe_code)]
-            {
-                j = (*unsafe { prev.get_unchecked(j) } & !OPT_MATCH_BIT) as usize;
-            }
+            let pr = *unsafe { prev.get_unchecked(j) };
+            // W1: count only what will be PUSHED -- the matched steps.
+            k += usize::from(pr & OPT_MATCH_BIT != 0);
+            j = (pr & !OPT_MATCH_BIT) as usize;
         }
         if ops.capacity() < k {
             ops = Vec::with_capacity(k);
         }
     } else if opt_ops_blanket() && ops.capacity() < n + 1 {
+        // The blanket arm keeps its `n + 1` upper bound: it deliberately does
+        // not pre-walk, so it cannot know the match count. It is still an
+        // upper bound after W1 (matches <= steps).
         ops = Vec::with_capacity(n + 1);
     }
     let mut i = n;
-    let mut nmatched = 0usize;
     // opt_w's literal-run histogram is ALSO computed here (the pending-start
     // trick: walking backward, the run before match k is start_k minus the
     // end of the match seen NEXT in this walk), removing what was a separate
@@ -11653,18 +11689,31 @@ fn find_opt(
     while i > 0 {
         debug_assert!(i < prev.len());
         #[allow(unsafe_code)]
-        let (pr, om) = unsafe { (*prev.get_unchecked(i), *match_om.get_unchecked(i)) };
-        let (off, ml) = (om as u32, (om >> 32) as u32);
+        let pr = unsafe { *prev.get_unchecked(i) };
         let p = (pr & !OPT_MATCH_BIT) as usize;
         let m = pr & OPT_MATCH_BIT != 0;
         if m {
-            nmatched += 1;
+            // W3: `match_om` is only read on MATCHED steps. It used to be
+            // loaded -- and split into `off`/`ml` -- on every step of the
+            // walk, and after W1 the walk is ~20 literal steps per match, so
+            // that load and its two extracts were wasted 19 times out of 20.
+            #[allow(unsafe_code)]
+            let om = unsafe { *match_om.get_unchecked(i) };
+            let (off, ml) = (om as u32, (om >> 32) as u32);
             if pending_start != usize::MAX {
                 count_run(pending_start - (p + ml as usize), &mut w_short, &mut w_mid);
             }
             pending_start = p;
+            // W1: ONLY matched steps are pushed. The emit loop below reads
+            // `ops` and skips every entry whose flag is false, so a literal
+            // step contributed a 16-byte tuple that nothing ever used -- and a
+            // literal step advances ONE BYTE, so incompressible content pushed
+            // one per input byte (the 4 MiB-per-128 KiB the comment above
+            // describes). The literal runs are not lost: each match's own
+            // `start` minus the running `anchor` is exactly the run before it,
+            // which is how the emit loop already reconstructs them.
+            ops.push((p as u32, off, ml));
         }
-        ops.push((p as u32, off, ml, m));
         i = p;
     }
     if pending_start != usize::MAX {
@@ -11687,6 +11736,10 @@ fn find_opt(
     // Capacity stays EXACT (ops is built, so the counts are known).
     let mut seqs = std::mem::take(&mut tables.seq_scratch);
     seqs.clear();
+    // W4: `nmatched` was a counter incremented once per match beside the
+    // push that already records exactly those steps -- `ops.len()` IS the
+    // match count now that W1 stores nothing else.
+    let nmatched = ops.len();
     if seqs.capacity() < nmatched + 1 {
         seqs = Vec::with_capacity(nmatched + 1);
     }
@@ -11709,9 +11762,9 @@ fn find_opt(
         }
     };
     let mut anchor = 0usize;
-    for &(start, off, ml, matched) in ops.iter().rev() {
+    for &(start, off, ml) in ops.iter().rev() {
         let start = start as usize;
-        if matched {
+        {
             push_literals(
                 &mut lits,
                 src,
@@ -11719,11 +11772,21 @@ fn find_opt(
                 block_start + start,
                 opt_w,
             );
-            seqs.push(Seq {
-                litlen: (start - anchor) as u32,
-                matchlen: ml,
-                offset: off,
-            });
+            // W10: `seqs` was reserved to `nmatched + 1` immediately above and
+            // this loop pushes exactly `nmatched` times (one per `ops` entry,
+            // and after W1 every entry is a match) -- so `push`'s grow branch
+            // is provably dead, yet it re-read len and capacity per sequence.
+            debug_assert!(seqs.len() < seqs.capacity());
+            #[allow(unsafe_code)]
+            unsafe {
+                let l = seqs.len();
+                seqs.as_mut_ptr().add(l).write(Seq {
+                    litlen: (start - anchor) as u32,
+                    matchlen: ml,
+                    offset: off,
+                });
+                seqs.set_len(l + 1);
+            }
             anchor = start + ml as usize;
         }
     }
