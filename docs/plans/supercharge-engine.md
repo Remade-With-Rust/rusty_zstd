@@ -12,7 +12,9 @@ reproducible. Every proposal below is unverified until it is measured.
 
 ## 1. The gap
 
-From the L3 baseline board in `gg-Addendum.md` (`C/us c` = C's compress speed ÷
+From the L3 baseline board in the internal `gg-Addendum.md` (see
+[`README.md`](README.md); the same board is public in
+[`m7-anatomy.md`](m7-anatomy.md)) (`C/us c` = C's compress speed ÷
 ours; above 1.0 means C is faster):
 
 | | mean `C/us c` | range |

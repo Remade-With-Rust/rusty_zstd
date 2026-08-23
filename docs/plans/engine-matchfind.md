@@ -2,7 +2,8 @@
 
 **Date:** 2026-08-21 (updated post BMI2 twin campaign, `08d14e3`..`bfd0cf0`; original
 2026-08-20). Companion to [`m7-optimize-anatomy.md`](m7-optimize-anatomy.md)
-(what the campaign already did) and [`gg-matchfind.md`](gg-matchfind.md) (the gates).
+(what the campaign already did) and `gg-matchfind.md` (the gates -- an internal
+document, see the note in [`README.md`](README.md)).
 
 > **BASELINE SHIFT (2026-08-21).** Every finder in this file now runs a
 > `#[target_feature(enable = "bmi2,lzcnt")]` twin on modern hardware; the transitive

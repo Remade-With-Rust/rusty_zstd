@@ -12,9 +12,12 @@
 /bench/tmp/
 *.zst
 
-# Great Gate -- private content-adaptive-dispatch campaign (doc + gate
+# Great Gate -- private content-adaptive-dispatch campaign (docs + gate
 # calculator). Local-only, never published. Same policy as remade_ffmpeg_rs.
+# The docs/plans/gg-*.md plans were stripped from history before the repo went
+# public; keep them out.
 /_greatgate/
+/docs/plans/gg-*.md
 
 # `rustc scripts/cpuprobe.rs` drops its binary wherever it is run from.
 /cpuprobe.exe
