@@ -11,9 +11,9 @@ fn main() {
         let Ok(full) = std::fs::read(format!("corpora/data/generated/{id}"))
             .or_else(|_| std::fs::read(format!("corpora/data/silesia/{id}"))) else { continue };
         let src = &full[..full.len().min(8*1024*1024)];
-        let _ = rusty_zstd::take_cand_stats();
+        let _ = rusty_zstd::take_tag_rejects();
         let _ = rusty_zstd::compress(src, 1).unwrap();
-        let (f, t) = rusty_zstd::take_cand_stats();
+        let (f, t) = rusty_zstd::take_tag_rejects();
         tf += f; tt += t;
         let pct = if f + t > 0 { 100.0 * f as f64 / (f + t) as f64 } else { 0.0 };
         println!("{id:<14}{f:>14}{t:>14}{pct:>9.1}%   {f} loads of src[m]");

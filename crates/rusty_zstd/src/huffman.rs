@@ -23,6 +23,48 @@ pub(crate) struct HuffmanTable {
     max_bits: u8,
 }
 
+/// N13 probe: `[calls, sum of present.len(), sum of present.len()^2]`.
+/// The tree-merge loop is (n-1) iterations of an adaptive sort plus two
+/// `Vec::remove(0)` memmoves, so n^2 is the work proxy.
+#[cfg(feature = "profile")]
+pub static N13_STATS: [core::sync::atomic::AtomicU64; 3] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+/// Read and clear the N13 probe.
+#[cfg(feature = "profile")]
+pub fn take_n13_stats() -> [u64; 3] {
+    use core::sync::atomic::Ordering;
+    [
+        N13_STATS[0].swap(0, Ordering::Relaxed),
+        N13_STATS[1].swap(0, Ordering::Relaxed),
+        N13_STATS[2].swap(0, Ordering::Relaxed),
+    ]
+}
+
+/// N2 instrument: `[X2 tables BUILT, X2 tables actually USED]`.
+///
+/// N1's entire value is this ratio. `x2_from_x1_into` runs on every Huffman
+/// table build -- 2,048 x u32 (8 KiB) through a data-dependent gather -- but the
+/// result is only read when `use_x2` passes. Harvest before writing the lazy
+/// build; the same discipline the 64-byte copy tier followed, where the
+/// histogram chose the width and the mean would have chosen wrong.
+#[cfg(feature = "profile")]
+pub static X2_STATS: [core::sync::atomic::AtomicU64; 2] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+/// Read and clear the N2 instrument: `(builds, uses)`.
+#[cfg(feature = "profile")]
+pub fn take_x2_stats() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        X2_STATS[0].swap(0, Ordering::Relaxed),
+        X2_STATS[1].swap(0, Ordering::Relaxed),
+    )
+}
+
 impl HuffmanTable {
     #[inline(always)]
     pub(crate) fn decode_stream(&self, src: &[u8], dst: &mut [u8]) -> Result<(), Error> {
@@ -31,6 +73,8 @@ impl HuffmanTable {
         }
         let mut br = BitRev::new(src)?;
         if self.use_x2(dst.len(), src.len()) {
+            #[cfg(feature = "profile")]
+            X2_STATS[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             self.decode_into_x2(&mut br, dst)
         } else {
             self.decode_into_x1(&mut br, dst)
@@ -91,7 +135,12 @@ impl HuffmanTable {
         self.table_x2.len() == self.table.len() && select_x2(dst_size, src_size)
     }
 
-    #[inline(always)]
+    // `#[inline(never)]`, not `always`. `decode_4x_inner` calls this at EIGHT
+    // sites (four streams, on both the `fast_4x2` tail path and the fallback),
+    // and that function has THREE twins -- so the body existed ~24 times. It
+    // runs once per STREAM, not per symbol: the per-symbol loop is INSIDE it,
+    // so the call is amortised over the whole tail it decodes.
+    #[inline(never)]
     fn decode_into_x1(&self, br: &mut BitRev<'_>, dst: &mut [u8]) -> Result<(), Error> {
         let max = u32::from(self.max_bits);
         let dt = self.table.as_slice();
@@ -126,7 +175,12 @@ impl HuffmanTable {
     }
 
     /// C `HUF_decodeStreamX2`: one peek can emit 1 or 2 symbols.
-    #[inline(always)]
+    // `#[inline(never)]`, not `always`. `decode_4x_inner` calls this at EIGHT
+    // sites (four streams, on both the `fast_4x2` tail path and the fallback),
+    // and that function has THREE twins -- so the body existed ~24 times. It
+    // runs once per STREAM, not per symbol: the per-symbol loop is INSIDE it,
+    // so the call is amortised over the whole tail it decodes.
+    #[inline(never)]
     fn decode_into_x2(&self, br: &mut BitRev<'_>, dst: &mut [u8]) -> Result<(), Error> {
         let max = u32::from(self.max_bits);
         let dt = self.table_x2.as_slice();
@@ -210,12 +264,48 @@ impl HuffmanTable {
         // The seq-loop precedent (621a140): `avx2` does not imply BMI2, and
         // this loop is made of variable shifts. The twin compiles the SAME
         // body with shrx/shlx/bzhi available; byte-identity by construction.
+        // SIMD-4: AVX2 arm first. Chosen by a 17-twin instruction-count sweep --
+        // enabling avx2 on EVERY bmi2-only twin ADDS 38,051 instructions overall
+        // and only two shrink. This is the meaningful one: 6,436 -> 6,311
+        // (**-125**). It is also at the right frequency: `decode_4x` is the
+        // 4-stream Huffman literal decode, i.e. per LITERAL BYTE
+        // (168k-362k/MiB), not per block.
+        //
+        // The guard MUST test avx2 too -- a twin compiled with avx2 but
+        // dispatched on bmi2 alone would execute VEX on the Skylake
+        // Pentium/Celeron parts that ship BMI2 with AVX2 fused off. The
+        // bmi2-only arm below stays for exactly those.
+        #[cfg(all(target_arch = "x86_64", feature = "std"))]
+        if crate::simd::has_avx2() && crate::simd::has_bmi2() {
+            // SAFETY: runtime CPUID guard for BOTH features; identical body.
+            #[allow(unsafe_code)]
+            return unsafe { self.decode_4x_avx2(s0, s1, s2, s3, d0, d1, d2, d3) };
+        }
         #[cfg(all(target_arch = "x86_64", feature = "std"))]
         if crate::simd::has_bmi2() {
             // SAFETY: guarded by runtime CPUID; the body is identical.
             #[allow(unsafe_code)]
             return unsafe { self.decode_4x_bmi2(s0, s1, s2, s3, d0, d1, d2, d3) };
         }
+        self.decode_4x_inner(s0, s1, s2, s3, d0, d1, d2, d3)
+    }
+
+    /// SIMD-4: the AVX2 + BMI2 twin. Byte-identical by construction.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[target_feature(enable = "avx2,bmi2,lzcnt")]
+    #[allow(clippy::too_many_arguments)]
+    #[allow(unsafe_code)]
+    unsafe fn decode_4x_avx2(
+        &self,
+        s0: &[u8],
+        s1: &[u8],
+        s2: &[u8],
+        s3: &[u8],
+        d0: &mut [u8],
+        d1: &mut [u8],
+        d2: &mut [u8],
+        d3: &mut [u8],
+    ) -> Result<(), Error> {
         self.decode_4x_inner(s0, s1, s2, s3, d0, d1, d2, d3)
     }
 
@@ -259,19 +349,20 @@ impl HuffmanTable {
         if !self.use_x2(dst_size, src_size) {
             return self.decode_4x_x1(s0, s1, s2, s3, d0, d1, d2, d3);
         }
-        match self.fast_4x2(s0, s1, s2, s3, d0, d1, d2, d3)? {
-            Some(st) => {
-                let mut b0 = BitRev::from_window(s0, st.ip0, st.c0)?;
-                let mut b1 = BitRev::from_window(s1, st.ip1, st.c1)?;
-                let mut b2 = BitRev::from_window(s2, st.ip2, st.c2)?;
-                let mut b3 = BitRev::from_window(s3, st.ip3, st.c3)?;
-                self.decode_into_x2(&mut b0, &mut d0[st.op0..])?;
-                self.decode_into_x2(&mut b1, &mut d1[st.op1..])?;
-                self.decode_into_x2(&mut b2, &mut d2[st.op2..])?;
-                self.decode_into_x2(&mut b3, &mut d3[st.op3..])?;
-                return Ok(());
-            }
-            None => {}
+        // N2: the 4-stream X2 use. Instrumenting only the 1-stream site read
+        // zero and would have "confirmed" N1 for the wrong reason.
+        #[cfg(feature = "profile")]
+        X2_STATS[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if let Some(st) = self.fast_4x2(s0, s1, s2, s3, d0, d1, d2, d3)? {
+            let mut b0 = BitRev::from_window(s0, st.ip0, st.c0)?;
+            let mut b1 = BitRev::from_window(s1, st.ip1, st.c1)?;
+            let mut b2 = BitRev::from_window(s2, st.ip2, st.c2)?;
+            let mut b3 = BitRev::from_window(s3, st.ip3, st.c3)?;
+            self.decode_into_x2(&mut b0, &mut d0[st.op0..])?;
+            self.decode_into_x2(&mut b1, &mut d1[st.op1..])?;
+            self.decode_into_x2(&mut b2, &mut d2[st.op2..])?;
+            self.decode_into_x2(&mut b3, &mut d3[st.op3..])?;
+            return Ok(());
         }
         let mut b0 = BitRev::new(s0)?;
         let mut b1 = BitRev::new(s1)?;
@@ -491,41 +582,86 @@ impl HuffmanTable {
 
 /// Parse Huffman_Tree_Description at the start of `src`. Returns (table, bytes used).
 #[inline(always)]
-pub(crate) fn read_table(src: &[u8]) -> Result<(HuffmanTable, usize), Error> {
+/// W36: `recycle` is the previous block's table, donated for its buffers.
+pub(crate) fn read_table(
+    recycle: Option<HuffmanTable>,
+    src: &[u8],
+) -> Result<(HuffmanTable, usize), Error> {
     if src.is_empty() {
         return Err(Error::Corruption);
     }
     let header = src[0];
-    let (weights, used) = if header >= 128 {
+    // W38 -- the DIRECT-weights arm writes to the STACK.
+    //
+    // `nsym == header - 127` with `header <= 255`, so it never exceeds 128 --
+    // the buffer is bounded and small. The FSE arm copies its (already
+    // pre-sized, W29) output in, which trades one memcpy of <=255 bytes for one
+    // heap allocation per direct-weights table.
+    let mut wbuf = [0u8; 256];
+    let (wlen, used) = if header >= 128 {
         let nsym = header as usize - 127;
         let nbytes = nsym.div_ceil(2);
         if 1 + nbytes > src.len() {
             return Err(Error::Corruption);
         }
-        let mut w = vec![0u8; nsym];
-        for i in 0..nsym {
+        let w = &mut wbuf[..nsym];
+        for (i, slot) in w.iter_mut().enumerate() {
             // SAFETY: guarded directly above -- `nbytes == nsym.div_ceil(2)` and
             // `i < nsym` give `1 + i / 2 < 1 + nbytes <= src.len()`.
             debug_assert!(1 + i / 2 < src.len());
             #[allow(unsafe_code)]
             let b = *unsafe { src.get_unchecked(1 + i / 2) };
-            w[i] = if i % 2 == 0 { b >> 4 } else { b & 0x0F };
+            *slot = if i % 2 == 0 { b >> 4 } else { b & 0x0F };
         }
-        (w, 1 + nbytes)
+        (nsym, 1 + nbytes)
     } else {
         let csize = header as usize;
         if csize == 0 || 1 + csize > src.len() {
             return Err(Error::Corruption);
         }
-        let (w, _) = fse::decompress_weights(&src[1..1 + csize], 255)?;
-        (w, 1 + csize)
+        // W39: decode straight into the stack buffer -- no Vec, no copy.
+        let (wlen, _) = fse::decompress_weights_into(&mut wbuf, &src[1..1 + csize], 255)?;
+        (wlen, 1 + csize)
     };
-    let table = table_from_weights(&weights)?;
+    let table = table_from_weights(recycle, &mut wbuf, wlen, true)?;
     Ok((table, used))
 }
 
 #[inline(always)]
-fn table_from_weights(weights_wo_last: &[u8]) -> Result<HuffmanTable, Error> {
+/// W36: `recycle` donates the previous table's two buffers so the X1 and X2
+/// tables (up to 4 KiB and 8 KiB) are rebuilt in place instead of reallocated.
+/// W42: the weights arrive in the caller's 256-byte stack buffer with `n_wo`
+/// entries filled; the last weight is appended IN PLACE. Previously this copied
+/// the whole slice into a second 256-byte buffer just to add one byte -- a
+/// memcpy of up to 255 bytes per Huffman table build (~800 per board).
+/// `want_x2 = false` skips the X2 build entirely.
+///
+/// HUFF-1: `HuffCTable.table` is `#[allow(dead_code)]` and documented as the
+/// "Decode twin kept as the test oracle". Release encode code reads only its X1
+/// half, at build time, to derive `entry[]` and `code[]`; the X2 half is read
+/// solely by `HuffmanTable`'s DECODE methods, which the encoder never calls.
+///
+/// Measured: **665-754 X2 tables built per 88 MiB encoded, and 0 used** -- each
+/// a 2048-entry data-dependent gather, ~1.5M wasted gather operations per
+/// encode. The encoder's two call sites now pass `cfg!(test)`, so the oracle
+/// still exists in test builds (where `ct.table.decode_stream` is asserted
+/// against) and costs nothing in release.
+fn table_from_weights(
+    recycle: Option<HuffmanTable>,
+    wbuf: &mut [u8; 256],
+    n_wo: usize,
+    want_x2: bool,
+) -> Result<HuffmanTable, Error> {
+    let weights_wo_last = &wbuf[..n_wo];
+    let (rec_x1, rec_x2) = match recycle {
+        Some(h) => (h.table, h.table_x2),
+        // ALLOC-10: the encoder's call sites pass `None`; take from the pool
+        // rather than allocating two fresh table buffers per build.
+        #[cfg(all(feature = "std", feature = "alloc"))]
+        None => huff_pool::take(),
+        #[cfg(not(all(feature = "std", feature = "alloc")))]
+        None => (Vec::new(), Vec::new()),
+    };
     if weights_wo_last.is_empty() {
         return Err(Error::Corruption);
     }
@@ -561,8 +697,19 @@ fn table_from_weights(weights_wo_last: &[u8]) -> Result<HuffmanTable, Error> {
     if last_weight > MAX_BITS {
         return Err(Error::Corruption);
     }
-    let mut weights = Vec::from(weights_wo_last);
-    weights.push(last_weight);
+    // W40 -- append the last weight on the STACK, not via a heap copy.
+    //
+    // This was `Vec::from(weights_wo_last)` followed by one `push`: a heap
+    // allocation and a copy of up to 255 bytes, per Huffman table build, purely
+    // to append a single byte. It was the largest remaining allocation class in
+    // the decode census (769 of 1,660, the 200..299-byte bucket). Weights are
+    // indexed by symbol, so the count is bounded by 256.
+    if n_wo + 1 > 256 {
+        return Err(Error::Corruption);
+    }
+    // W42: append in place -- no second buffer, no copy.
+    wbuf[n_wo] = last_weight;
+    let weights = &wbuf[..n_wo + 1];
     // SAFETY: `last_weight > MAX_BITS` was rejected above; `rank` is [_; 13].
     debug_assert!((last_weight as usize) < rank.len());
     #[allow(unsafe_code)]
@@ -575,8 +722,25 @@ fn table_from_weights(weights_wo_last: &[u8]) -> Result<HuffmanTable, Error> {
 
     // C HUF_readDTableX1: fill consecutive slots by increasing weight.
     let table_size = 1usize << table_log;
-    let mut table = vec![0u16; table_size];
-    let mut symbols = vec![0u8; weights.len()];
+    // W35 -- allocate at the WIDTH `upsample_dtable` will need.
+    //
+    // The X1 table is built at `1 << table_log`, then `upsample_dtable` widens
+    // it to `1 << FAST_TABLELOG`. With W34 doing that expansion in place, an
+    // initial allocation sized for the final width makes the widening a pure
+    // `set_len` -- one allocation for the pair instead of two.
+    let mut table: Vec<u16> = rec_x1;
+    table.clear();
+    table.reserve(1usize << FAST_TABLELOG);
+    table.resize(table_size, 0);
+    // W32 -- `symbols` on the STACK. Bounded by 256: it is indexed by symbol
+    // value, and symbols are `u8`. Same bounded-buffer move as `symbol_next`
+    // and `norm` in fse.rs, which removed 4,496 allocations between them.
+    let nsym_s = weights.len();
+    if nsym_s > 256 {
+        return Err(Error::Corruption);
+    }
+    let mut symbols_buf = [0u8; 256];
+    let symbols = &mut symbols_buf[..nsym_s];
     let mut rank_start = [0usize; 13];
     let mut acc = 0usize;
     // SAFETY for the weight-indexed arrays here and below: every weight was
@@ -629,16 +793,20 @@ fn table_from_weights(weights_wo_last: &[u8]) -> Result<HuffmanTable, Error> {
             if pos + length > table.len() {
                 return Err(Error::Corruption);
             }
-            // SAFETY: `pos + length > table.len()` was rejected immediately
-            // above, and `k < length`, so `pos + k < table.len()`.
-            for k in 0..length {
-                debug_assert!(pos + k < table.len());
-                #[allow(unsafe_code)]
-                unsafe {
-                    *table.get_unchecked_mut(pos + k) =
-                        u16::from(sym) | (u16::from(nb_bits) << 8);
-                }
-            }
+            // D1 (inline-execution): this is a `memset` of a u16, and it was
+            // written as a scalar store chain. The stored value is
+            // loop-INVARIANT, but it was rebuilt inside the body from two
+            // `u16::from` conversions against a runtime `pos + length` bound
+            // that LLVM re-proved per iteration through `get_unchecked_mut` --
+            // so it emitted one store per entry. `length` is `1 << (w-1)` and
+            // reaches 1024 at table_log 11.
+            //
+            // Hoisting the entry and using `slice::fill` lowers to a vector
+            // store loop, needs no intrinsics, and REMOVES the unsafe: the
+            // range check three lines up already proved `pos + length <=
+            // table.len()`, which is exactly what the safe index wants.
+            let entry = u16::from(sym) | (u16::from(nb_bits) << 8);
+            table[pos..pos + length].fill(entry);
             pos += length;
         }
     }
@@ -648,8 +816,26 @@ fn table_from_weights(weights_wo_last: &[u8]) -> Result<HuffmanTable, Error> {
     // C HUF_readDTableX2: fill at targetLog=11 so one peek can pair more symbols
     // and the fast loop's `bits >> 53` is legal. nbits in each entry stay native;
     // encode codes (`idx >> (max-nb)`) are unchanged (see ctable_from_weights).
-    let (table, table_log) = upsample_dtable(table, table_log);
-    let table_x2 = x2_from_x1(&table, table_log);
+    // HUFF-2: the upsample exists so ONE decoder peek can pair more symbols --
+    // a decode concern. The encoder derives `code[sym] = idx >> (max - nb)`,
+    // which the source already notes is "unchanged" across the upsample, and
+    // `max_nbits` comes from the `nbits` array rather than `table.max_bits`.
+    // So skip the 2048-entry replication too when X2 is not wanted.
+    let (table, table_log) = if want_x2 {
+        upsample_dtable(table, table_log)
+    } else {
+        (table, table_log)
+    };
+    let table_x2 = if want_x2 {
+        #[cfg(feature = "profile")]
+        X2_STATS[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        x2_from_x1_into(rec_x2, &table, table_log)
+    } else {
+        // Hand the (possibly pooled) buffer straight back rather than filling it.
+        let mut v = rec_x2;
+        v.clear();
+        v
+    };
     Ok(HuffmanTable {
         table,
         table_x2,
@@ -657,27 +843,68 @@ fn table_from_weights(weights_wo_last: &[u8]) -> Result<HuffmanTable, Error> {
     })
 }
 
-#[inline(always)]
+// `#[inline(never)]`, not `always`: this builds the X1 decode table -- ONCE per Huffman table,
+// so a call is free at that frequency -- while inlining reproduced its
+// whole body at every site, and the hosts here are twinned
+// (baseline / bmi2 / avx2). Same finding as `select_seq_table`, which
+// shrank `write_sequences` from 12,413 to 2,216 instructions.
+#[inline(never)]
 fn upsample_dtable(table: Vec<u16>, table_log: u8) -> (Vec<u16>, u8) {
     if table_log >= FAST_TABLELOG {
         return (table, table_log);
     }
     let scale = FAST_TABLELOG - table_log;
     let factor = 1usize << scale;
-    let mut wide = vec![0u16; 1 << FAST_TABLELOG];
-    // SAFETY: `i < table.len() == 1 << table_log` and `scale ==
+    // W34 -- upsample IN PLACE, reusing the caller's allocation.
+    //
+    // This allocated a fresh `1 << FAST_TABLELOG` table (4 KiB at
+    // FAST_TABLELOG 11) on every Huffman table build and dropped the input --
+    // the >=4096 size class, 1,641 of the decode's remaining allocations. The
+    // expansion is order-safe backwards: source entry `i` lands in
+    // `[i << scale, (i+1) << scale)`, and since `scale >= 1` that range starts
+    // at or after `i`, so walking i DOWNWARD never overwrites a source entry
+    // that has not yet been read. `resize` keeps the allocation whenever
+    // capacity already suffices.
+    let src_len = table.len();
+    let mut wide = table;
+    // N4 (inline-execution): `resize(_, 0)` ZERO-FILLS the tail and the loop
+    // below then overwrites every one of those slots -- `base + factor` covers
+    // `[0, src_len << scale) == [0, 1 << FAST_TABLELOG)` exactly. That is up to
+    // 4 KiB of dead memset per Huffman table build, ~1,400 builds per corpus
+    // run. Grow the length without writing; the loop is the initialiser.
+    let want = 1usize << FAST_TABLELOG;
+    if wide.len() < want {
+        wide.reserve(want - wide.len());
+    }
+    // SAFETY: capacity is at least `want` after the reserve, and every slot in
+    // `[0, want)` is written by the expansion loop below before any read --
+    // source entry `i` fills `[i << scale, (i+1) << scale)` and `i` runs over
+    // all of `0..src_len` with `src_len << scale == want`. `u16` has no drop
+    // glue, so the slots being logically uninitialised here is not observable.
+    #[allow(unsafe_code)]
+    unsafe {
+        wide.set_len(want);
+    }
+    // SAFETY: `i < src_len == 1 << table_log` and `scale ==
     // FAST_TABLELOG - table_log`, so `base = i << scale < 1 << FAST_TABLELOG`;
     // `k < factor == 1 << scale` keeps `base + k` inside the same bound, and
-    // `wide` is exactly `1 << FAST_TABLELOG` long.
-    for (i, &e) in table.iter().enumerate() {
+    // `wide` is exactly `1 << FAST_TABLELOG` long after the resize.
+    // D2 (inline-execution): same shape as D1, one level up. The OUTER walk
+    // cannot vectorise -- it is a reverse walk over overlapping in-place ranges
+    // and LLVM's dependence analysis cannot prove source and destination
+    // disjoint -- but the INNER loop is a pure broadcast of one `u16` across
+    // `factor` slots, and that vectorises regardless of what the outer walk
+    // does. `fill` is the whole fix.
+    for i in (0..src_len).rev() {
+        debug_assert!(i < wide.len());
+        #[allow(unsafe_code)]
+        let e = unsafe { *wide.get_unchecked(i) };
         let base = i << scale;
-        for k in 0..factor {
-            debug_assert!(base + k < wide.len());
-            #[allow(unsafe_code)]
-            unsafe {
-                *wide.get_unchecked_mut(base + k) = e;
-            }
-        }
+        // SAFETY: `base + factor == (i + 1) << scale <= src_len << scale ==
+        // 1 << FAST_TABLELOG == wide.len()` after the resize above.
+        debug_assert!(base + factor <= wide.len());
+        #[allow(unsafe_code)]
+        unsafe { wide.get_unchecked_mut(base..base + factor) }.fill(e);
     }
     (wide, FAST_TABLELOG)
 }
@@ -786,8 +1013,23 @@ const ALGO_TIME: [(u32, u32, u32, u32); 16] = [
 
 /// C `HUF_DEltX2` composed from the X1 DTable: one peek of `table_log` bits can
 /// emit two symbols when `n1 + n2 <= table_log`. Pack: `seq16 | nbits<<16 | length<<24`.
-#[inline(always)]
-fn x2_from_x1(table: &[u16], table_log: u8) -> Vec<u32> {
+// `#[inline(never)]`, not `always`: this derives the X2 table from X1 -- ONCE per Huffman table,
+// so a call is free at that frequency -- while inlining reproduced its
+// whole body at every site, and the hosts here are twinned
+// (baseline / bmi2 / avx2). Same finding as `select_seq_table`, which
+// shrank `write_sequences` from 12,413 to 2,216 instructions.
+#[inline(never)]
+/// W36 -- build the X2 table into a RECYCLED buffer.
+///
+/// This allocated `vec![0u32; n]` per Huffman table build, n up to
+/// `1 << FAST_TABLELOG` = 8 KiB -- the >=4096 size class, 1,641 of the decode's
+/// remaining allocations. The caller holds the previous table's buffer, so pass
+/// it in: `resize` keeps the allocation once capacity suffices.
+//
+// (The `#[inline(never)]` above this doc block is the live one and is what the
+// comment above it argues for; a second `#[inline(always)]` sat here and was
+// discarded by rustc. Removed -- codegen is unchanged.)
+fn x2_from_x1_into(recycle: Vec<u32>, table: &[u16], table_log: u8) -> Vec<u32> {
     let n = table.len();
     let log = u32::from(table_log);
     let mut min_nbits = log;
@@ -798,7 +1040,9 @@ fn x2_from_x1(table: &[u16], table_log: u8) -> Vec<u32> {
         }
     }
     let mask = n.saturating_sub(1);
-    let mut out = vec![0u32; n];
+    let mut out = recycle;
+    out.clear();
+    out.resize(n, 0);
     for (val, slot) in out.iter_mut().enumerate() {
         // SAFETY: `out` is `vec![0u32; n]` with `n == table.len()`, so the
         // enumeration index is in range for `table` by construction.
@@ -823,6 +1067,101 @@ fn x2_from_x1(table: &[u16], table_log: u8) -> Vec<u32> {
         }
     }
     out
+}
+
+/// ALLOC-10: a bounded free list for the Huffman table buffers.
+///
+/// `table_from_weights` ALREADY takes a `recycle: Option<HuffmanTable>` and
+/// reuses its two buffers -- and the decoder passes one while **both encoder
+/// call sites pass `None`**. The mechanism existed and the encoder did not use
+/// it, for the fourth time in this campaign (V1, N9, ALLOC-2, this).
+///
+/// `HuffmanTable` itself cannot carry the `Drop` that would close the loop --
+/// `table_from_weights` MOVES its two fields out (`Some(h) => (h.table,
+/// h.table_x2)`), and Rust forbids moving out of a type with `Drop`. `HuffCTable`
+/// owns it and is never destructured, so the impl goes there and reaches the
+/// buffers with `mem::take`, which is a mutation rather than a move-out.
+///
+/// The buffers are `1 << FAST_TABLELOG` entries: 4 KiB of `u16` plus 8 KiB of
+/// `u32` per table. Bounded at 4 tables per thread.
+#[cfg(all(feature = "std", feature = "alloc"))]
+mod huff_pool {
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+    const CAP: usize = 4;
+    thread_local! {
+        static X1: RefCell<Vec<Vec<u16>>> = const { RefCell::new(Vec::new()) };
+        static X2: RefCell<Vec<Vec<u32>>> = const { RefCell::new(Vec::new()) };
+        static W: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    }
+    /// ALLOC-17: `HuffCTable`'s third owned buffer, `weights_wo_last`. Built by
+    /// `ctable_from_nbits` and MOVED into the table by `finish_ctable`, so it
+    /// escapes its constructor -- same shape as the two above, same cure.
+    pub(super) fn take_w() -> Vec<u8> {
+        let mut v = W
+            .try_with(|c| c.try_borrow_mut().ok().and_then(|mut p| p.pop()))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        v.clear();
+        v
+    }
+    pub(super) fn give_w(v: Vec<u8>) {
+        if v.capacity() == 0 {
+            return;
+        }
+        let _ = W.try_with(|c| {
+            if let Ok(mut p) = c.try_borrow_mut() {
+                if p.len() < CAP {
+                    p.push(v)
+                }
+            }
+        });
+    }
+    pub(super) fn take() -> (Vec<u16>, Vec<u32>) {
+        let a = X1
+            .try_with(|c| c.try_borrow_mut().ok().and_then(|mut p| p.pop()))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let b = X2
+            .try_with(|c| c.try_borrow_mut().ok().and_then(|mut p| p.pop()))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        (a, b)
+    }
+    pub(super) fn give(a: Vec<u16>, b: Vec<u32>) {
+        if a.capacity() != 0 {
+            let _ = X1.try_with(|c| {
+                if let Ok(mut p) = c.try_borrow_mut() {
+                    if p.len() < CAP {
+                        p.push(a)
+                    }
+                }
+            });
+        }
+        if b.capacity() != 0 {
+            let _ = X2.try_with(|c| {
+                if let Ok(mut p) = c.try_borrow_mut() {
+                    if p.len() < CAP {
+                        p.push(b)
+                    }
+                }
+            });
+        }
+    }
+}
+
+#[cfg(all(feature = "std", feature = "alloc"))]
+impl Drop for HuffCTable {
+    fn drop(&mut self) {
+        huff_pool::give(
+            core::mem::take(&mut self.table.table),
+            core::mem::take(&mut self.table.table_x2),
+        );
+        huff_pool::give_w(core::mem::take(&mut self.weights_wo_last));
+    }
 }
 
 /// Huffman encode table (codes + nbits) plus the DTable used as an oracle.
@@ -850,7 +1189,43 @@ pub(crate) enum HuffUpdate {
 }
 
 #[cfg(feature = "alloc")]
+/// E11 census: `(literal bytes the old O(n) `covers` walk would have read,
+/// calls)`. `profile`-gated; the shipping build carries nothing.
+#[cfg(feature = "profile")]
+pub static E11_WALKED: (core::sync::atomic::AtomicU64, core::sync::atomic::AtomicU64) = (
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+);
+
+/// Read and clear the E11 census.
+#[cfg(feature = "profile")]
+pub fn take_e11_walked() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        E11_WALKED.0.swap(0, Ordering::Relaxed),
+        E11_WALKED.1.swap(0, Ordering::Relaxed),
+    )
+}
+
 impl HuffCTable {
+    /// ALLOC-2: `encode_stream` with a recycled output buffer. Mirrors the
+    /// arm dispatch below exactly -- same arms, same order, same bytes.
+    fn encode_stream_into(&self, src: &[u8], buf: Vec<u8>) -> Result<Vec<u8>, Error> {
+        if crate::encode::huff_fast_enabled() {
+            #[cfg(all(target_arch = "x86_64", feature = "std"))]
+            if crate::simd::has_bmi2() {
+                // SAFETY: guarded by runtime CPUID; the body is identical.
+                #[allow(unsafe_code)]
+                return unsafe { self.encode_stream_unrolled_bmi2_into(src, buf) };
+            }
+            self.encode_stream_unrolled_into(src, buf)
+        } else {
+            self.encode_stream_scalar_into(src, buf)
+        }
+    }
+
+    #[allow(dead_code)] // PHASE C re-adjudication arm (`RZSTD_HUFF_FAST`); kept as the
+                        // allocating twin of the `_into` route that ships.
     fn encode_stream(&self, src: &[u8]) -> Result<Vec<u8>, Error> {
         // PHASE C re-adjudication switch. `RZSTD_HUFF_FAST=0` routes the
         // Huffman literal emit through the scalar twin, disabling bricks 16
@@ -885,8 +1260,52 @@ impl HuffCTable {
         self.encode_stream_unrolled(src)
     }
 
+    /// ALLOC-2: the BMI2 twin's recycled-buffer form. Kept a separate
+    /// `#[target_feature]` function for the same reason the twin exists at all.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[target_feature(enable = "bmi2")]
+    #[allow(unsafe_code)]
+    unsafe fn encode_stream_unrolled_bmi2_into(
+        &self,
+        src: &[u8],
+        buf: Vec<u8>,
+    ) -> Result<Vec<u8>, Error> {
+        self.encode_stream_unrolled_into(src, buf)
+    }
+
     /// True iff every byte in `src` has a code. Treeless reuse of `prev` must
     /// check this before the emit loop — missing symbols are a fallback, not a bug.
+    /// Does every symbol PRESENT in the block have a code in this table?
+    ///
+    /// E11 (inline-execution V2): this is the same predicate `covers` answers,
+    /// read off the histogram instead of the literals. `encode_literals_section`
+    /// walked the literal buffer FOUR times per block on the table-reuse path,
+    /// and this was the fourth -- an O(n) scan asking a question the `freq`
+    /// array computed twenty lines earlier already answers, in **256 iterations
+    /// instead of n**. On mozilla that is 256 loads instead of 24.4 MB.
+    ///
+    /// Byte-identical by construction: symbol `s` occurs in the block iff
+    /// `freq[s] != 0`, so the two loops quantify over exactly the same symbol
+    /// set and apply exactly the same test to each. `covers` is retained below
+    /// as the oracle and the two are gated against each other.
+    ///
+    /// Why it matters here rather than elsewhere: `Huff` reaches 86.7% of
+    /// encode at L1 on `x-ray`, and this is the stage where whole-twin AVX2
+    /// widening measured **+5.0% SLOWER**. The stage does not need wider
+    /// instructions, it needs fewer passes.
+    #[inline]
+    fn covers_freq(&self, freq: &[u32; 256]) -> bool {
+        for (s, &c) in freq.iter().enumerate() {
+            if c != 0 && self.entry[s] >> 16 == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Oracle for [`covers_freq`], and the definition of the predicate.
+    /// Test-only since E11: the shipping path answers this from the histogram.
+    #[cfg(test)]
     fn covers(&self, src: &[u8]) -> bool {
         for &b in src {
             if self.entry[b as usize] >> 16 == 0 {
@@ -902,10 +1321,20 @@ impl HuffCTable {
     /// oracle AND the `RZSTD_HUFF_FAST=0` arm used to re-adjudicate bricks
     /// 16 / 29 / 32 on the repaired instrument.
     fn encode_stream_scalar(&self, src: &[u8]) -> Result<Vec<u8>, Error> {
+        self.encode_stream_scalar_into(src, Vec::new())
+    }
+
+    /// ALLOC-2: `BitCStream::from_vec` already existed -- "Frame-scratch
+    /// constructor: reuse a caller-kept buffer so the per-block bitstream costs
+    /// no allocation after warm-up" -- and had exactly ONE caller, the sequence
+    /// bitstream. The two Huffman literal-stream sites called `with_capacity`
+    /// and allocated fresh, four times per 4-stream block. The right helper
+    /// existed and nothing here called it; the same shape as N9 and V1.
+    fn encode_stream_scalar_into(&self, src: &[u8], buf: Vec<u8>) -> Result<Vec<u8>, Error> {
         if src.is_empty() {
             return Err(Error::Corruption);
         }
-        let mut bits = crate::bit::BitCStream::with_capacity(src.len() + 8);
+        let mut bits = crate::bit::BitCStream::from_vec(buf, src.len() + 8);
         for &b in src.iter().rev() {
             let e = self.entry[b as usize];
             let nb = e >> 16;
@@ -921,10 +1350,15 @@ impl HuffCTable {
     /// `K` from `max_nbits` so `K*max + 7 leftover < 64` (16/8/6/5 analog of 4×4/8×8/16×16).
     #[inline(always)]
     fn encode_stream_unrolled(&self, src: &[u8]) -> Result<Vec<u8>, Error> {
+        self.encode_stream_unrolled_into(src, Vec::new())
+    }
+
+    /// ALLOC-2, unrolled twin. See `encode_stream_scalar_into`.
+    fn encode_stream_unrolled_into(&self, src: &[u8], buf: Vec<u8>) -> Result<Vec<u8>, Error> {
         if src.is_empty() {
             return Err(Error::Corruption);
         }
-        let mut bits = crate::bit::BitCStream::with_capacity(src.len() + 8);
+        let mut bits = crate::bit::BitCStream::from_vec(buf, src.len() + 8);
         self.encode_rev_into(&mut bits, src);
         Ok(bits.close())
     }
@@ -945,7 +1379,7 @@ impl HuffCTable {
                 _ => 8,
             }
         });
-        crate::prof::note_huff_path(9 + u8::from(self.max_nbits).min(10));
+        crate::prof::note_huff_path(9 + self.max_nbits.min(10));
         if self.use_fill() {
             self.emit_fill(bits, src);
             return;
@@ -1069,13 +1503,38 @@ impl HuffCTable {
     }
 }
 
+/// ALLOC-3: hoisted out of `huffman_nbits` so its arena can be leased -- a
+/// thread-local slot cannot name a type declared inside a function body.
 #[cfg(feature = "alloc")]
-#[inline(always)]
+struct Node {
+    count: u64,
+    left: usize,
+    right: usize,
+    sym: i16,
+}
+
+crate::scratch::scratch_slot!(SC_PRESENT: u8);
+crate::scratch::scratch_slot!(SC_NODES: Node);
+crate::scratch::scratch_slot!(SC_LEAVES: usize);
+crate::scratch::scratch_slot!(SC_INTERNAL: usize);
+
+#[cfg(feature = "alloc")]
+// `#[inline(never)]`, not `always`: this builds Huffman code lengths from a literal histogram -- ONCE per block,
+// so a call is free at that frequency -- while inlining reproduced its
+// whole body at every site, and the hosts here are twinned
+// (baseline / bmi2 / avx2). Same finding as `select_seq_table`, which
+// shrank `write_sequences` from 12,413 to 2,216 instructions.
+#[inline(never)]
 fn huffman_nbits(freq: &[u32; 256]) -> Result<[u8; 256], Error> {
-    let present: Vec<u8> = (0..256u16)
-        .filter(|&s| freq[s as usize] > 0)
-        .map(|s| s as u8)
-        .collect();
+    // ALLOC-3: all four of this function's Vecs are pure scratch -- only the
+    // `[u8; 256]` result escapes -- so they recycle per thread. It runs once per
+    // block on the Huffman table-build path.
+    let mut present = crate::scratch::lease(&SC_PRESENT);
+    present.extend(
+        (0..256u16)
+            .filter(|&s| freq[s as usize] > 0)
+            .map(|s| s as u8),
+    );
     if present.len() < 2 {
         return Err(Error::Corruption);
     }
@@ -1088,44 +1547,110 @@ fn huffman_nbits(freq: &[u32; 256]) -> Result<[u8; 256], Error> {
         return Ok(nbits);
     }
 
-    struct Node {
-        count: u64,
-        left: usize,
-        right: usize,
-        sym: i16,
+    let mut nodes = crate::scratch::lease(&SC_NODES);
+    nodes.extend(present.iter().map(|&s| Node {
+        count: u64::from(freq[s as usize]),
+        left: usize::MAX,
+        right: usize::MAX,
+        sym: i16::from(s),
+    }));
+    #[cfg(feature = "profile")]
+    {
+        // N13 probe: the loop is (n-1) iterations of [adaptive sort of `active`]
+        // + two `Vec::remove(0)` memmoves, so the work proxy is n^2.
+        let n = nodes.len() as u64;
+        N13_STATS[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        N13_STATS[1].fetch_add(n, core::sync::atomic::Ordering::Relaxed);
+        N13_STATS[2].fetch_add(n * n, core::sync::atomic::Ordering::Relaxed);
     }
-    let mut nodes: Vec<Node> = present
-        .iter()
-        .map(|&s| Node {
-            count: u64::from(freq[s as usize]),
-            left: usize::MAX,
-            right: usize::MAX,
-            sym: i16::from(s),
-        })
-        .collect();
-    let mut active: Vec<usize> = (0..nodes.len()).collect();
-    // `active` starts as `0..nodes.len()` and only ever gains `parent`, which
-    // is the index of a node pushed in the same step -- so every element is a
-    // valid arena index. That is true but spans the loop, so the checked
-    // accessors are used instead of asserting it: they cost the same compare and
-    // cannot abort. This runs once per BLOCK, not per literal.
-    while active.len() > 1 {
-        active.sort_by_key(|&i| nodes.get(i).map_or(0, |n| n.count));
-        let a = active.remove(0);
-        let b = active.remove(0);
-        let parent = nodes.len();
+    // N13 (inline-execution): the TWO-QUEUE Huffman merge.
+    //
+    // (The `active: Vec<usize>` work list the original merge sorted in place is
+    // gone with it -- one `Vec` allocation per block that nothing had read
+    // since the two-queue rewrite landed.)
+    //
+    // The original re-sorted `active` on EVERY iteration and then paid two
+    // O(len) `Vec::remove(0)` memmoves -- (n-1) iterations of O(n) work.
+    // Measured: mean alphabet 164-172 symbols, **sum(n^2) = 23.8M-29.1M element
+    // operations per 88 MiB encoded**, in a stage that is 86.7% of encode at L1
+    // on `x-ray`. The textbook fix sorts the leaves ONCE and then merges in
+    // O(n): ~29.1M -> ~1.1M.
+    //
+    // It works because BOTH queues are monotone:
+    //   * leaves, sorted ascending once;
+    //   * internal nodes in creation order -- each parent's count is the sum of
+    //     the two smallest then available, and that sequence is non-decreasing.
+    //     (If step k takes x <= y and emits s = x+y, every survivor is >= y and
+    //     s >= y, so step k+1 takes x',y' >= y and emits s' >= 2y >= s.)
+    //
+    // **The tie rule is what makes this byte-identical, and it is not
+    // arbitrary.** The old code stable-sorted the live region, so equal counts
+    // kept their pre-sort order. A leaf still live was in the array before any
+    // internal node was appended, so on a tie the LEAF came first; and among
+    // internal nodes the earlier-created one came first, because it was appended
+    // first and every later sort was stable. That is exactly "prefer the leaf on
+    // a tie, otherwise FIFO" -- `l <= x` below, not `l < x`.
+    //
+    // Gated on the byte-identity table: any tie drift changes code lengths and
+    // therefore the bitstream, and would show up immediately.
+    fn pop_min(
+        nodes: &[Node],
+        leaves: &[usize],
+        li: &mut usize,
+        internal: &[usize],
+        ii: &mut usize,
+    ) -> Option<usize> {
+        let lc = leaves.get(*li).and_then(|&i| nodes.get(i)).map(|n| n.count);
+        let ic = internal
+            .get(*ii)
+            .and_then(|&i| nodes.get(i))
+            .map(|n| n.count);
+        match (lc, ic) {
+            // `<=`: the leaf wins a tie. See the tie-rule note above.
+            (Some(l), Some(x)) if l <= x => {
+                let r = leaves[*li];
+                *li += 1;
+                Some(r)
+            }
+            (Some(_), Some(_)) | (None, Some(_)) => {
+                let r = internal[*ii];
+                *ii += 1;
+                Some(r)
+            }
+            (Some(_), None) => {
+                let r = leaves[*li];
+                *li += 1;
+                Some(r)
+            }
+            (None, None) => None,
+        }
+    }
+
+    // ONE stable sort, ascending by count, ties left in symbol order -- which is
+    // precisely the order the old first iteration produced.
+    let mut leaves = crate::scratch::lease(&SC_LEAVES);
+    leaves.extend(0..nodes.len());
+    leaves.sort_by_key(|&i| nodes.get(i).map_or(0, |n| n.count));
+    let mut internal = crate::scratch::lease(&SC_INTERNAL);
+    let (mut li, mut ii) = (0usize, 0usize);
+
+    while (leaves.len() - li) + (internal.len() - ii) > 1 {
+        let a = pop_min(&nodes, &leaves, &mut li, &internal, &mut ii).ok_or(Error::Corruption)?;
+        let b = pop_min(&nodes, &leaves, &mut li, &internal, &mut ii).ok_or(Error::Corruption)?;
         let (ca, cb) = match (nodes.get(a), nodes.get(b)) {
             (Some(x), Some(y)) => (x.count, y.count),
             _ => return Err(Error::Corruption),
         };
+        let parent = nodes.len();
         nodes.push(Node {
             count: ca + cb,
             left: a,
             right: b,
             sym: -1,
         });
-        active.push(parent);
+        internal.push(parent);
     }
+
     /// LEFT CHECKED, deliberately. This walks a node ARENA by indices stored in
     /// the nodes themselves (`left`/`right`), so its invariant lives in the tree
     /// construction above rather than in any local guard. Proving it means
@@ -1151,15 +1676,44 @@ fn huffman_nbits(freq: &[u32; 256]) -> Result<[u8; 256], Error> {
     }
     // The loop above exits only at `len <= 1`, and `present.len() > 2` got us
     // here, so exactly one root remains -- taken through `first()` regardless.
-    let root = *active.first().ok_or(Error::Corruption)?;
+    // N13: exactly one element survives, in one of the two queues.
+    let root = match (leaves.get(li), internal.get(ii)) {
+        (Some(&r), None) | (None, Some(&r)) => r,
+        _ => return Err(Error::Corruption),
+    };
     walk(&nodes, root, 0, &mut nbits);
     limit_nbits(&mut nbits, &present, MAX_BITS);
     Ok(nbits)
 }
 
+/// E12 ceiling probe: `(calls, total inner-scan element visits, adjustment steps)`.
+#[cfg(feature = "profile")]
+pub static E12_SCAN: [core::sync::atomic::AtomicU64; 3] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+/// Read and clear the E12 ceiling probe.
+#[cfg(feature = "profile")]
+pub fn take_e12_scan() -> [u64; 3] {
+    use core::sync::atomic::Ordering;
+    [
+        E12_SCAN[0].swap(0, Ordering::Relaxed),
+        E12_SCAN[1].swap(0, Ordering::Relaxed),
+        E12_SCAN[2].swap(0, Ordering::Relaxed),
+    ]
+}
+
 #[cfg(feature = "alloc")]
-#[inline(always)]
+// `#[inline(never)]`, not `always`: this clamps code lengths to the table log -- ONCE per block,
+// so a call is free at that frequency -- while inlining reproduced its
+// whole body at every site, and the hosts here are twinned
+// (baseline / bmi2 / avx2). Same finding as `select_seq_table`, which
+// shrank `write_sequences` from 12,413 to 2,216 instructions.
+#[inline(never)]
 fn limit_nbits(nbits: &mut [u8; 256], present: &[u8], max_bits: u8) {
+    #[cfg(feature = "profile")]
+    E12_SCAN[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let max = i32::from(max_bits);
     let mut kraft = 0i32;
     for &s in present {
@@ -1170,6 +1724,11 @@ fn limit_nbits(nbits: &mut [u8; 256], present: &[u8], max_bits: u8) {
     }
     let target = 1 << max;
     while kraft > target {
+        #[cfg(feature = "profile")]
+        {
+            E12_SCAN[1].fetch_add(present.len() as u64, core::sync::atomic::Ordering::Relaxed);
+            E12_SCAN[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         let mut best: Option<usize> = None;
         let mut best_nb = 0u8;
         for &s in present {
@@ -1186,6 +1745,11 @@ fn limit_nbits(nbits: &mut [u8; 256], present: &[u8], max_bits: u8) {
         nbits[s] += 1;
     }
     while kraft < target {
+        #[cfg(feature = "profile")]
+        {
+            E12_SCAN[1].fetch_add(present.len() as u64, core::sync::atomic::Ordering::Relaxed);
+            E12_SCAN[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         let mut best: Option<usize> = None;
         let mut best_nb = 0u8;
         for &s in present {
@@ -1204,7 +1768,12 @@ fn limit_nbits(nbits: &mut [u8; 256], present: &[u8], max_bits: u8) {
 }
 
 #[cfg(feature = "alloc")]
-#[inline(always)]
+// `#[inline(never)]`, not `always`: this builds the encode table from code lengths -- ONCE per block,
+// so a call is free at that frequency -- while inlining reproduced its
+// whole body at every site, and the hosts here are twinned
+// (baseline / bmi2 / avx2). Same finding as `select_seq_table`, which
+// shrank `write_sequences` from 12,413 to 2,216 instructions.
+#[inline(never)]
 fn ctable_from_nbits(nbits: &[u8; 256], freq: Option<&[u32; 256]>) -> Result<HuffCTable, Error> {
     let max_symbol = nbits
         .iter()
@@ -1217,7 +1786,15 @@ fn ctable_from_nbits(nbits: &[u8; 256], freq: Option<&[u32; 256]>) -> Result<Huf
     if max_symbol == 0 {
         return Err(Error::Corruption);
     }
-    let mut weights = vec![0u8; max_symbol];
+    // ALLOC-17: recycled via `HuffCTable`'s Drop -- see `huff_pool::take_w`.
+    // The pool is `thread_local!`, so it is `std`-only; `no_std + alloc` (a
+    // supported target -- see lib.rs) allocates fresh, as it does at every
+    // other pool site in this file.
+    #[cfg(all(feature = "std", feature = "alloc"))]
+    let mut weights = huff_pool::take_w();
+    #[cfg(not(all(feature = "std", feature = "alloc")))]
+    let mut weights = Vec::new();
+    weights.resize(max_symbol, 0u8);
     for (s, slot) in weights.iter_mut().enumerate() {
         // SAFETY: `max_symbol` is an `rposition` INDEX into a `[u8; 256]`, so it
         // is at most 255, and `s < weights.len() == max_symbol`.
@@ -1226,7 +1803,12 @@ fn ctable_from_nbits(nbits: &[u8; 256], freq: Option<&[u32; 256]>) -> Result<Huf
         let nb = *unsafe { nbits.get_unchecked(s) };
         *slot = if nb == 0 { 0 } else { huff_log + 1 - nb };
     }
-    let table = table_from_weights(&weights)?;
+    let mut wtmp = [0u8; 256];
+    if weights.len() > 255 {
+        return Err(Error::Corruption);
+    }
+    wtmp[..weights.len()].copy_from_slice(&weights);
+    let table = table_from_weights(None, &mut wtmp, weights.len(), cfg!(test))?;
     let mut out_nbits = [0u8; 256];
     let mut code = [0u16; 256];
     let max = table.max_bits;
@@ -1258,7 +1840,12 @@ fn ctable_from_nbits(nbits: &[u8; 256], freq: Option<&[u32; 256]>) -> Result<Huf
 
 #[cfg(feature = "alloc")]
 pub(crate) fn ctable_from_weights(weights: &[u8]) -> Result<HuffCTable, Error> {
-    let table = table_from_weights(weights)?;
+    let mut wtmp = [0u8; 256];
+    if weights.len() > 255 {
+        return Err(Error::Corruption);
+    }
+    wtmp[..weights.len()].copy_from_slice(weights);
+    let table = table_from_weights(None, &mut wtmp, weights.len(), cfg!(test))?;
     let mut out_nbits = [0u8; 256];
     let mut code = [0u16; 256];
     let max = table.max_bits;
@@ -1291,7 +1878,7 @@ pub(crate) fn ctable_from_weights(weights: &[u8]) -> Result<HuffCTable, Error> {
 /// Parse a Huffman_Tree_Description into an encode table.
 #[cfg(feature = "alloc")]
 pub(crate) fn read_ctable(src: &[u8]) -> Result<(HuffCTable, usize), Error> {
-    let (table, used) = read_table(src)?;
+    let (table, used) = read_table(None, src)?;
     let _ = table;
     let header = src[0];
     let weights = if header >= 128 {
@@ -1305,11 +1892,11 @@ pub(crate) fn read_ctable(src: &[u8]) -> Result<(HuffCTable, usize), Error> {
             return Err(Error::Corruption);
         }
         let mut w = vec![0u8; nsym];
-        for i in 0..nsym {
+        for (i, slot) in w.iter_mut().enumerate() {
             debug_assert!(1 + i / 2 < src.len());
             #[allow(unsafe_code)]
             let b = *unsafe { src.get_unchecked(1 + i / 2) };
-            w[i] = if i % 2 == 0 { b >> 4 } else { b & 0x0F };
+            *slot = if i % 2 == 0 { b >> 4 } else { b & 0x0F };
         }
         w
     } else {
@@ -1415,7 +2002,7 @@ mod nbits_census {
 
     pub(super) fn take() -> Vec<(u8, u8)> {
         ON.with(|c| c.set(false));
-        ROWS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+        ROWS.with(|r| core::mem::take(&mut *r.borrow_mut()))
     }
 }
 
@@ -1447,7 +2034,11 @@ fn write_tree_raw(weights: &[u8]) -> Result<Vec<u8>, Error> {
         return Err(Error::Corruption);
     }
     let nsym = weights.len();
-    let mut out = Vec::with_capacity(1 + nsym.div_ceil(2));
+    // ALLOC-15: both tree encodings are built and the LOSER is dropped inside
+    // `write_tree`; the winner dies at the end of `encode_literals_section`.
+    // Pooled, with give-backs at both death sites.
+    let mut out = crate::scratch::pool_take(&SC_TREE);
+    out.reserve(1 + nsym.div_ceil(2));
     out.push(128 + (nsym as u8 - 1));
     let mut i = 0usize;
     while i < nsym {
@@ -1463,7 +2054,12 @@ fn write_tree_raw(weights: &[u8]) -> Result<Vec<u8>, Error> {
 }
 
 #[cfg(feature = "alloc")]
-#[inline(always)]
+// `#[inline(never)]`, not `always`: this writes the weight tree -- ONCE per block,
+// so a call is free at that frequency -- while inlining reproduced its
+// whole body at every site, and the hosts here are twinned
+// (baseline / bmi2 / avx2). Same finding as `select_seq_table`, which
+// shrank `write_sequences` from 12,413 to 2,216 instructions.
+#[inline(never)]
 fn write_tree_fse(weights: &[u8]) -> Result<Vec<u8>, Error> {
     if weights.len() <= 2 {
         return Err(Error::Corruption);
@@ -1508,29 +2104,64 @@ pub(crate) fn write_tree(ct: &HuffCTable) -> Result<Vec<u8>, Error> {
     let raw = write_tree_raw(weights).ok();
     let fse = match write_tree_fse(weights) {
         Ok(fse) if fse.len() > 2 && fse[0] < 128 && fse.len() == 1 + usize::from(fse[0]) => {
-            match fse::decompress_weights(&fse[1..], 255) {
-                Ok((got, _)) if got == *weights => Some(fse),
+            // ALLOC-18: verify into a STACK buffer. `decompress_weights_into`
+            // already existed and the decoder already used it ("W39: decode
+            // straight into the stack buffer -- no Vec, no copy"); this
+            // verification called the allocating twin and threw the Vec away
+            // one line later. Fifth time in this campaign that the mechanism
+            // was already there and this caller did not use it.
+            let mut wbuf = [0u8; 256];
+            match fse::decompress_weights_into(&mut wbuf, &fse[1..], 255) {
+                Ok((wlen, _)) if wbuf[..wlen] == **weights => Some(fse),
                 _ => None,
             }
         }
         _ => None,
     };
     match (raw, fse) {
-        (Some(r), Some(f)) if f.len() < r.len() => Ok(f),
-        (Some(r), _) => Ok(r),
+        (Some(r), Some(f)) if f.len() < r.len() => {
+            crate::scratch::pool_give(&SC_TREE, r);
+            Ok(f)
+        }
+        (Some(r), Some(f)) => {
+            crate::scratch::pool_give(&SC_TREE, f);
+            Ok(r)
+        }
+        (Some(r), None) => Ok(r),
         (None, Some(f)) => Ok(f),
         _ => Err(Error::Corruption),
     }
 }
 
+/// ALLOC-15: give a tree buffer back once it has been copied into a section.
 #[cfg(feature = "alloc")]
+fn give_tree_buf(v: Vec<u8>) {
+    crate::scratch::pool_give(&SC_TREE, v);
+}
+
+#[cfg(feature = "alloc")]
+#[allow(dead_code)] // superseded by the in-place writer; kept as its reference shape.
 fn write_lit_huff_header(
     lit_type: u8,
     n_streams: u32,
     regen: u32,
     csize: u32,
 ) -> Result<Vec<u8>, Error> {
-    let mut h = Vec::new();
+    write_lit_huff_header_into(lit_type, n_streams, regen, csize, Vec::new())
+}
+
+/// ALLOC-13: the section header is 3-5 bytes and was a fresh `Vec::new()` grown
+/// by `push` -- and it is the buffer the whole section is then built on top of,
+/// so handing it the pooled buffer removes the section allocation as well.
+fn write_lit_huff_header_into(
+    lit_type: u8,
+    n_streams: u32,
+    regen: u32,
+    csize: u32,
+    outbuf: Vec<u8>,
+) -> Result<Vec<u8>, Error> {
+    let mut h = outbuf;
+    h.clear();
     if n_streams == 1 {
         if regen > 0x3FF || csize > 0x3FF {
             return Err(Error::Corruption);
@@ -1598,7 +2229,7 @@ fn body_bytes_exact(ct: &HuffCTable, seg: &[[u32; 256]], n_streams: u32) -> Opti
             // `encode_4_streams` rejects an empty piece.
             return None;
         }
-        let bytes = ((bits + 1 + 7) / 8) as usize;
+        let bytes = (bits + 1).div_ceil(8) as usize;
         if n_streams == 4 && bytes > 65535 {
             return None;
         }
@@ -1610,14 +2241,34 @@ fn body_bytes_exact(ct: &HuffCTable, seg: &[[u32; 256]], n_streams: u32) -> Opti
 /// Per-segment symbol histograms matching `encode_4_streams`' split, in ONE
 /// pass. For `n_streams == 1` this is a single whole-input histogram.
 #[cfg(feature = "alloc")]
-fn segment_histograms(lits: &[u8], n_streams: u32) -> Vec<[u32; 256]> {
+/// ALLOC-6: fill a caller-owned buffer instead of returning a fresh `Vec`.
+///
+/// The result is 1-4 x `[u32; 256]` (1-4 KiB) built once per block and dropped
+/// at the end of `encode_literals_section`, so the caller can lease it. The
+/// returning form is kept as a thin wrapper for the tests.
+#[allow(dead_code)] // superseded histogram shape; kept as the reference.
+fn segment_histograms_into(lits: &[u8], n_streams: u32, out: &mut Vec<[u32; 256]>) {
+    out.clear();
     if n_streams != 4 {
         let mut h = [0u32; 256];
         hist_count(lits, &mut h);
-        return alloc::vec![h];
+        out.push(h);
+        return;
     }
+    out.resize(4, [0u32; 256]);
+    segment_histograms_fill(lits, out);
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // reference shape for the `_into` writer; not every test uses it.
+fn segment_histograms(lits: &[u8], n_streams: u32) -> Vec<[u32; 256]> {
+    let mut v = Vec::new();
+    segment_histograms_into(lits, n_streams, &mut v);
+    v
+}
+
+fn segment_histograms_fill(lits: &[u8], segs: &mut [[u32; 256]]) {
     let chunk = lits.len().div_ceil(4);
-    let mut segs = alloc::vec![[0u32; 256]; 4];
     let mut off = 0usize;
     for (i, h) in segs.iter_mut().enumerate() {
         let end = if i == 3 {
@@ -1628,7 +2279,6 @@ fn segment_histograms(lits: &[u8], n_streams: u32) -> Vec<[u32; 256]> {
         hist_count(&lits[off..end], h);
         off = end;
     }
-    segs
 }
 
 /// C's `HIST_count_parallel` shape: a single count table serializes on the
@@ -1657,9 +2307,26 @@ fn hist_count(bytes: &[u8], h: &mut [u32; 256]) {
     }
 }
 
+crate::scratch::scratch_slot!(SC_STREAMS: Vec<u8>);
+crate::scratch::scratch_slot!(SC_SEGS: [u32; 256]);
+#[cfg(feature = "alloc")]
+crate::scratch::pool_slot!(SC_TREE: u8);
+
+#[allow(dead_code)] // superseded by the in-place writer; kept as its reference shape.
 fn encode_4_streams(ct: &HuffCTable, src: &[u8]) -> Result<Vec<u8>, Error> {
+    encode_4_streams_into(ct, src, Vec::new())
+}
+
+/// ALLOC-12: build the 4-stream section into a caller-supplied buffer.
+#[cfg(feature = "alloc")]
+fn encode_4_streams_into(ct: &HuffCTable, src: &[u8], outbuf: Vec<u8>) -> Result<Vec<u8>, Error> {
+    // ALLOC-2: six allocations per call became one. `streams` itself and the
+    // four buffers `encode_stream` returned were all dropped at the end of this
+    // function, so they recycle: the pool hands each stream its previous
+    // buffer, and the pool is handed back on every exit including the `?`s.
+    // Only `out` still allocates, and it is the value returned.
     let chunk = src.len().div_ceil(4);
-    let mut streams = Vec::with_capacity(4);
+    let mut streams = crate::scratch::lease_pool(&SC_STREAMS);
     let mut off = 0usize;
     for i in 0..4 {
         let end = if i == 3 {
@@ -1671,15 +2338,23 @@ fn encode_4_streams(ct: &HuffCTable, src: &[u8]) -> Result<Vec<u8>, Error> {
         if piece.is_empty() {
             return Err(Error::Corruption);
         }
-        let s = ct.encode_stream(piece)?;
+        // Reuse slot `i`'s buffer from the previous block if the pool kept it.
+        let reuse = streams.get_mut(i).map(core::mem::take).unwrap_or_default();
+        let s = ct.encode_stream_into(piece, reuse)?;
         if s.len() > 65535 {
             return Err(Error::Corruption);
         }
-        streams.push(s);
+        if i < streams.len() {
+            streams[i] = s;
+        } else {
+            streams.push(s);
+        }
         off = end;
     }
     let body: usize = streams.iter().map(|s| s.len()).sum();
-    let mut out = Vec::with_capacity(6 + body);
+    let mut out = outbuf;
+    out.clear();
+    out.reserve(6 + body);
     // The loop above pushes exactly four streams or returns `Err`, so a slice
     // pattern states the length structurally instead of re-proving it three
     // times. These were the last three panic sites in the file.
@@ -1689,13 +2364,14 @@ fn encode_4_streams(ct: &HuffCTable, src: &[u8]) -> Result<Vec<u8>, Error> {
     out.extend_from_slice(&(s0.len() as u16).to_le_bytes());
     out.extend_from_slice(&(s1.len() as u16).to_le_bytes());
     out.extend_from_slice(&(s2.len() as u16).to_le_bytes());
-    for s in &streams {
+    for s in streams.iter() {
         out.extend_from_slice(s);
     }
     Ok(out)
 }
 
 #[cfg(feature = "alloc")]
+#[allow(dead_code)] // superseded by the in-place writer; kept as its reference shape.
 fn pack_huff_section(
     lit_type: u8,
     n_streams: u32,
@@ -1703,8 +2379,19 @@ fn pack_huff_section(
     tree: &[u8],
     body: &[u8],
 ) -> Result<Vec<u8>, Error> {
+    pack_huff_section_into(lit_type, n_streams, regen, tree, body, Vec::new())
+}
+
+fn pack_huff_section_into(
+    lit_type: u8,
+    n_streams: u32,
+    regen: u32,
+    tree: &[u8],
+    body: &[u8],
+    outbuf: Vec<u8>,
+) -> Result<Vec<u8>, Error> {
     let csize = (tree.len() + body.len()) as u32;
-    let mut out = write_lit_huff_header(lit_type, n_streams, regen, csize)?;
+    let mut out = write_lit_huff_header_into(lit_type, n_streams, regen, csize, outbuf)?;
     out.extend_from_slice(tree);
     out.extend_from_slice(body);
     Ok(out)
@@ -1875,7 +2562,9 @@ pub(crate) fn encode_literals_section(
     // would have computed. Costs no extra work when there is no previous
     // table either -- a segment histogram is the same increments as a whole
     // one, just indexed by segment.
-    let segs = segment_histograms(lits, preferred);
+    // ALLOC-6: leased -- `segs` never escapes this function.
+    let mut segs = crate::scratch::lease(&SC_SEGS);
+    segment_histograms_into(lits, preferred, &mut segs);
     let mut freq = [0u32; 256];
     for h in segs.iter() {
         for (s, &c) in h.iter().enumerate() {
@@ -1893,7 +2582,18 @@ pub(crate) fn encode_literals_section(
     };
 
     if let Some(prev_ct) = prev {
-        if prev_ct.covers(lits) {
+        #[cfg(feature = "profile")]
+        {
+            // E11 census: `covers(lits)` walked this many literal bytes; the
+            // histogram form walks 256 regardless. A count, not a clock.
+            E11_WALKED
+                .0
+                .fetch_add(lits.len() as u64, core::sync::atomic::Ordering::Relaxed);
+            E11_WALKED
+                .1
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        if prev_ct.covers_freq(&freq) {
             // Can the previous table possibly win? The new table is Huffman-
             // OPTIMAL for these frequencies, so `body_new <= body_prev` always;
             // prev can only win by saving the tree. If it loses by more than the
@@ -1923,14 +2623,18 @@ pub(crate) fn encode_literals_section(
                     if sec.len() < best_len {
                         crate::prof::note_lit_try(2);
                         best_len = sec.len();
-                        best = Some(sec);
+                        if let Some(old) = best.replace(sec) {
+                            sec_pool_give(old);
+                        }
                         update = HuffUpdate::Unchanged;
                     }
                 } else if preferred == 4 {
                     if let Some(sec) = try_huff_section(3, 1, n, &[], prev_ct, lits) {
                         if sec.len() < best_len {
                             best_len = sec.len();
-                            best = Some(sec);
+                            if let Some(old) = best.replace(sec) {
+                                sec_pool_give(old);
+                            }
                             update = HuffUpdate::Unchanged;
                         }
                     }
@@ -1939,24 +2643,35 @@ pub(crate) fn encode_literals_section(
         }
     }
 
+    // ALLOC-15: `new_tbl`'s tree is consumed by `try_huff_section` (which copies
+    // it into the section) and then dropped -- give it back on the way out.
     if let Some((ct, tree)) = new_tbl {
         {
             crate::prof::note_lit_try(3);
             if let Some(sec) = try_huff_section(2, preferred, n, &tree, &ct, lits) {
                 if sec.len() < best_len {
                     crate::prof::note_lit_try(4);
-                    best = Some(sec);
-                    update = HuffUpdate::New(ct.clone());
+                    if let Some(old) = best.replace(sec) {
+                        sec_pool_give(old);
+                    }
+                    // ALLOC-11: MOVE, don't clone. The `else if` below is the
+                    // only other user and the two arms are exclusive, so the
+                    // borrow checker accepts the move -- the clone was copying
+                    // a 12 KiB table (4 KiB x1 + 8 KiB x2) for nothing.
+                    update = HuffUpdate::New(ct);
                 }
             } else if preferred == 4 {
                 if let Some(sec) = try_huff_section(2, 1, n, &tree, &ct, lits) {
                     if sec.len() < best_len {
-                        best = Some(sec);
+                        if let Some(old) = best.replace(sec) {
+                            sec_pool_give(old);
+                        }
                         update = HuffUpdate::New(ct);
                     }
                 }
             }
         }
+        give_tree_buf(tree);
     }
 
     // Raw only gets built if nothing beat it.
@@ -1967,6 +2682,12 @@ pub(crate) fn encode_literals_section(
             write_raw_or_rle(lits, false)
         }
     };
+    // PROMETHEUS margin tap. Measured against `best.len()`, the section ACTUALLY
+    // emitted -- NOT against `best_len`, which the new-table branch above leaves
+    // stale (it assigns `best` without lowering `best_len`, since it is the last
+    // comparison). Tapping `best_len` reported a perfect hole across four
+    // buckets, which is what a stale variable looks like, not a distribution.
+    crate::prof::note_lit_margin(raw_len, best.len());
     Ok((best, update))
 }
 
@@ -1979,13 +2700,82 @@ fn try_huff_section(
     ct: &HuffCTable,
     lits: &[u8],
 ) -> Option<Vec<u8>> {
+    // ALLOC-12: `body` never escapes -- `pack_huff_section` copies it into the
+    // section it returns -- so it comes from a pool and goes back. This runs
+    // once per literal-section CANDIDATE, and a block tries several.
+    //
+    // The `?` on a failed encode skips the give-back; that path is an error
+    // return, so the buffer is simply not recycled that time rather than lost.
+    let buf = body_pool_take();
     let body = if n_streams == 1 {
-        ct.encode_stream(lits).ok()?
+        ct.encode_stream_into(lits, buf).ok()?
     } else {
-        encode_4_streams(ct, lits).ok()?
+        encode_4_streams_into(ct, lits, buf).ok()?
     };
-    pack_huff_section(lit_type, n_streams, regen, tree, &body).ok()
+    let sec = pack_huff_section_into(lit_type, n_streams, regen, tree, &body, sec_pool_take()).ok();
+    body_pool_give(body);
+    sec
 }
+
+/// ALLOC-13: every literal-section CANDIDATE is recyclable, including the
+/// winner. The losers are dropped as `best` is replaced, and the winner is
+/// `extend_from_slice`d into `dst` by `write_literals_inner` and dropped there
+/// too -- so no section Vec ever escapes the block. A block builds several.
+#[cfg(all(feature = "std", feature = "alloc"))]
+fn sec_pool_take() -> Vec<u8> {
+    SC_SEC.with(|c| c.borrow_mut().pop()).unwrap_or_default()
+}
+#[cfg(all(feature = "std", feature = "alloc"))]
+pub(crate) fn sec_pool_give(v: Vec<u8>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    SC_SEC.with(|c| {
+        let mut p = c.borrow_mut();
+        if p.len() < 6 {
+            p.push(v);
+        }
+    });
+}
+#[cfg(all(feature = "std", feature = "alloc"))]
+thread_local! {
+    static SC_SEC: core::cell::RefCell<Vec<Vec<u8>>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(not(all(feature = "std", feature = "alloc")))]
+fn sec_pool_take() -> Vec<u8> {
+    Vec::new()
+}
+#[cfg(not(all(feature = "std", feature = "alloc")))]
+pub(crate) fn sec_pool_give(_v: Vec<u8>) {}
+
+#[cfg(all(feature = "std", feature = "alloc"))]
+fn body_pool_take() -> Vec<u8> {
+    SC_BODY.with(|c| c.borrow_mut().pop()).unwrap_or_default()
+}
+#[cfg(all(feature = "std", feature = "alloc"))]
+fn body_pool_give(v: Vec<u8>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    SC_BODY.with(|c| {
+        let mut p = c.borrow_mut();
+        if p.len() < 4 {
+            p.push(v);
+        }
+    });
+}
+#[cfg(all(feature = "std", feature = "alloc"))]
+thread_local! {
+    static SC_BODY: core::cell::RefCell<Vec<Vec<u8>>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(not(all(feature = "std", feature = "alloc")))]
+fn body_pool_take() -> Vec<u8> {
+    Vec::new()
+}
+#[cfg(not(all(feature = "std", feature = "alloc")))]
+fn body_pool_give(_v: Vec<u8>) {}
 
 #[cfg(feature = "alloc")]
 #[cfg(test)]
@@ -2023,7 +2813,7 @@ fn huff_section_roundtrips(sec: &[u8], lits: &[u8]) -> bool {
     if hdr_csize != payload.len() {
         return false;
     }
-    let Ok((table, tree)) = read_table(payload) else {
+    let Ok((table, tree)) = read_table(None, payload) else {
         return false;
     };
     if tree > payload.len() {
@@ -2138,7 +2928,8 @@ mod tests {
             assert_eq!(sec[0] & 3, 1, "n={n}: literals section type must be RLE");
             let mut r = crate::reader::Reader::new(&sec);
             let mut st = crate::compressed::BlockState::new();
-            let got = crate::compressed::decode_literals(&mut r, &mut st).expect("decode");
+            let got =
+                crate::compressed::decode_literals(Vec::new(), &mut r, &mut st).expect("decode");
             assert_eq!(got, lits, "n={n}");
         }
         let mut mixed = vec![b'q'; 64];
@@ -2243,7 +3034,7 @@ mod tests {
             _ => panic!("unexpected header"),
         };
         let payload = &sec[header_len..];
-        let (table, tree) = read_table(payload).expect("read_table");
+        let (table, tree) = read_table(None, payload).expect("read_table");
         let mut out = vec![0u8; src.len()];
         table
             .decode_stream(&payload[tree..], &mut out)
@@ -2280,6 +3071,41 @@ mod tests {
         let ct = build_ctable(src).expect("build");
         assert!(ct.covers(src));
         assert!(!ct.covers(b"aaaaabbbbbcccccZ"));
+    }
+
+    /// E11 gate: the histogram-answered predicate must agree with the O(n)
+    /// oracle on every input, including the ones that differ only in a symbol
+    /// the table lacks. A disagreement here is a bitstream change.
+    #[test]
+    fn covers_freq_matches_covers_oracle() {
+        let base = b"aaaaabbbbbccccc";
+        let ct = build_ctable(base).expect("build");
+        let mut cases: Vec<Vec<u8>> = vec![
+            base.to_vec(),
+            b"aaaaabbbbbcccccZ".to_vec(),
+            b"a".to_vec(),
+            b"Z".to_vec(),
+            Vec::new(),
+            b"abcabcabc".to_vec(),
+        ];
+        // every single-symbol block, so each of the 256 histogram bins is the
+        // deciding one exactly once
+        for b in 0..=255u8 {
+            cases.push(vec![b; 3]);
+            cases.push([base.as_slice(), &[b]].concat());
+        }
+        for c in &cases {
+            let mut freq = [0u32; 256];
+            for &b in c {
+                freq[b as usize] += 1;
+            }
+            assert_eq!(
+                ct.covers_freq(&freq),
+                ct.covers(c),
+                "covers_freq disagreed with the oracle on {:?}",
+                &c[..c.len().min(20)]
+            );
+        }
     }
 
     #[test]
@@ -2522,7 +3348,7 @@ mod tests {
         let ct = build_ctable(&src).expect("build");
         let raw = write_tree_raw(&ct.weights_wo_last).expect("raw tree");
         assert!(raw[0] >= 128, "direct 4-bit weight header");
-        let (t_raw, n_raw) = read_table(&raw).expect("read raw tree");
+        let (t_raw, n_raw) = read_table(None, &raw).expect("read raw tree");
         assert_eq!(n_raw, raw.len());
         let stream = ct.encode_stream(&src).expect("encode");
         let mut out = vec![0u8; src.len()];
@@ -2542,7 +3368,7 @@ mod tests {
             got_w.len(),
             ct.weights_wo_last.len()
         );
-        let (t_fse, n_fse) = read_table(&fse).expect("read FSE tree");
+        let (t_fse, n_fse) = read_table(None, &fse).expect("read FSE tree");
         assert_eq!(n_fse, fse.len());
         out.fill(0);
         t_fse
@@ -2551,7 +3377,7 @@ mod tests {
         assert_eq!(out, src);
 
         let chosen = write_tree(&ct).expect("write_tree");
-        read_table(&chosen).expect("chosen tree");
+        read_table(None, &chosen).expect("chosen tree");
     }
 
     #[test]

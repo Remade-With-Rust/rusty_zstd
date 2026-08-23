@@ -1,3 +1,8 @@
+// The `drop(g_*)` calls below END A PROFILER SCOPE. With `--features profile`
+// the guard is a real `Drop` that records the stage; without it the guard is a
+// ZST and the drop is a no-op -- which is the configuration clippy sees.
+#![allow(clippy::drop_non_drop)]
+
 //! Compressed block: literals, sequences, match copy.
 
 use crate::bit::BitRev;
@@ -15,6 +20,9 @@ pub static DEC_LIT32: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 pub static DEC_MATCH32: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "profile")]
 pub static DEC_LIT16: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Literal copies served by the 64-byte tier (BRICK 80's missing third rung).
+#[cfg(feature = "profile")]
+pub static DEC_LIT64: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "profile")]
 pub static DEC_MATCH16: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -23,7 +31,9 @@ pub static DEC_MATCH16: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// 3 = extend_from_within (offset >= len, runtime-length memcpy CALL),
 /// 4 = overlapping loop (offset < len).
 #[cfg(feature = "profile")]
-pub static DEC_BAND: [core::sync::atomic::AtomicU64; 6] = [
+pub static DEC_BAND: [core::sync::atomic::AtomicU64; 8] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
@@ -34,7 +44,9 @@ pub static DEC_BAND: [core::sync::atomic::AtomicU64; 6] = [
 
 /// Bytes moved by each route, so a rare-but-long band cannot hide.
 #[cfg(feature = "profile")]
-pub static DEC_BAND_B: [core::sync::atomic::AtomicU64; 6] = [
+pub static DEC_BAND_B: [core::sync::atomic::AtomicU64; 8] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
@@ -43,12 +55,52 @@ pub static DEC_BAND_B: [core::sync::atomic::AtomicU64; 6] = [
     core::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Length histogram for the UN-TIERED bands (3 = `extend_from_within`,
+/// 4 = overlapping chunked). Buckets: 0=<=16, 1=17-32, 2=33-64, 3=65-128,
+/// 4=129-256, 5=257-512, 6=513-1024, 7=>1024. Calls in the low half, BYTES in
+/// the high half -- a band's mean hides its distribution, and the tier width has
+/// to be chosen from the distribution.
 #[cfg(feature = "profile")]
-pub fn take_dec_bands() -> ([u64; 6], [u64; 6]) {
+pub static DEC_UNTIERED: [core::sync::atomic::AtomicU64; 16] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 16];
+
+#[cfg(feature = "profile")]
+pub fn take_dec_untiered() -> [u64; 16] {
     use core::sync::atomic::Ordering::Relaxed;
-    let mut a = [0u64; 6];
-    let mut b = [0u64; 6];
-    for i in 0..6 {
+    let mut a = [0u64; 16];
+    for i in 0..16 {
+        a[i] = DEC_UNTIERED[i].swap(0, Relaxed);
+    }
+    a
+}
+
+#[cfg(feature = "profile")]
+#[inline(always)]
+fn note_untiered(len: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let b = match len {
+        0..=16 => 0usize,
+        17..=32 => 1,
+        33..=64 => 2,
+        65..=128 => 3,
+        129..=256 => 4,
+        257..=512 => 5,
+        513..=1024 => 6,
+        _ => 7,
+    };
+    DEC_UNTIERED[b].fetch_add(1, Relaxed);
+    DEC_UNTIERED[8 + b].fetch_add(len as u64, Relaxed);
+}
+#[cfg(not(feature = "profile"))]
+#[inline(always)]
+fn note_untiered(_len: usize) {}
+
+#[cfg(feature = "profile")]
+pub fn take_dec_bands() -> ([u64; 8], [u64; 8]) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut a = [0u64; 8];
+    let mut b = [0u64; 8];
+    for i in 0..8 {
         a[i] = DEC_BAND[i].swap(0, Relaxed);
         b[i] = DEC_BAND_B[i].swap(0, Relaxed);
     }
@@ -78,13 +130,18 @@ pub fn take_dec_copies() -> (u64, u64, u64, u64) {
     )
 }
 
+/// Read and clear the 64-byte literal tier.
+#[cfg(feature = "profile")]
+pub fn take_dec_lit64() -> u64 {
+    DEC_LIT64.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
 
-#[cfg(feature = "alloc")]
-use alloc::vec;
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 pub(crate) struct BlockState {
+    /// W30: the literal buffer, recycled across blocks.
+    pub lit_buf: Vec<u8>,
     pub huff: Option<HuffmanTable>,
     pub ll: Option<FseTable>,
     pub of: Option<FseTable>,
@@ -95,6 +152,7 @@ pub(crate) struct BlockState {
 impl BlockState {
     pub(crate) fn new() -> Self {
         Self {
+            lit_buf: Vec::new(),
             huff: None,
             ll: None,
             of: None,
@@ -111,6 +169,7 @@ impl BlockState {
             return Self::new();
         };
         Self {
+            lit_buf: Vec::new(),
             huff: Some(e.huff_d.clone()),
             ll: Some(e.ll_d.clone()),
             of: Some(e.of_d.clone()),
@@ -120,7 +179,6 @@ impl BlockState {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_compressed_block(
     payload: &[u8],
     out: &mut Vec<u8>,
@@ -134,24 +192,69 @@ pub(crate) fn decode_compressed_block(
     // Wholesale BMI2 twin -- the decode-side analog of encode_block: the
     // block driver carried 100 variable shifts of its own (section headers,
     // direct-weights table reads) outside every finer-grained twin.
+    // SIMD-2: AVX2 arm FIRST, kept for ISA CONTINUITY across the decode path.
+    //
+    // The bmi2-only twin below is `enable = "bmi2,lzcnt"`, which does NOT imply
+    // avx2, so the literal-section work inlined into it was emitted as **57
+    // LEGACY SSE instructions** (27 `movdqa`, 9 `movaps`, 7 `movdqu`, plus a
+    // `pshufd`/`punpcklbw` group). This arm converts all 57 to VEX encoding and
+    // emits **71 ymm** ops -- deterministic, verified from the emitted asm, and
+    // byte-identical by construction (same `#[inline(always)]` body).
+    //
+    // HONEST LEDGER: on THIS box it measured +0.3% DecLits / +0.5% decode over
+    // the bmi2-only arm -- i.e. no speed win, inside noise (`simd2ab.rs`,
+    // 14-corpus in-process ABBA x9). It is kept on the DETERMINISTIC ground:
+    // the whole decode path is then uniformly VEX-encoded, with no legacy-SSE
+    // island sitting beside the AVX2 sequence twin. `BLOCK_AVX2_ARM` keeps it
+    // adjudicable on other microarchitectures without a rebuild.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if block_avx2_on() && crate::simd::has_avx2() && crate::simd::has_bmi2() {
+        // SAFETY: runtime CPUID guard; identical body.
+        #[allow(unsafe_code)]
+        return unsafe {
+            decode_compressed_block_avx2(
+                payload,
+                out,
+                window_size,
+                block_max,
+                state,
+                dict,
+                frame_start,
+                frame_skipped,
+            )
+        };
+    }
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     if crate::simd::has_bmi2() {
         // SAFETY: runtime CPUID guard; identical body.
         #[allow(unsafe_code)]
         return unsafe {
             decode_compressed_block_bmi2(
-                payload, out, window_size, block_max, state, dict, frame_start, frame_skipped,
+                payload,
+                out,
+                window_size,
+                block_max,
+                state,
+                dict,
+                frame_start,
+                frame_skipped,
             )
         };
     }
     decode_compressed_block_inner(
-        payload, out, window_size, block_max, state, dict, frame_start, frame_skipped,
+        payload,
+        out,
+        window_size,
+        block_max,
+        state,
+        dict,
+        frame_start,
+        frame_skipped,
     )
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "bmi2,lzcnt")]
-#[allow(clippy::too_many_arguments)]
 #[allow(unsafe_code)]
 unsafe fn decode_compressed_block_bmi2(
     payload: &[u8],
@@ -164,11 +267,44 @@ unsafe fn decode_compressed_block_bmi2(
     frame_skipped: usize,
 ) -> Result<(), Error> {
     decode_compressed_block_inner(
-        payload, out, window_size, block_max, state, dict, frame_start, frame_skipped,
+        payload,
+        out,
+        window_size,
+        block_max,
+        state,
+        dict,
+        frame_start,
+        frame_skipped,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// SIMD-2: the AVX2 + BMI2 block driver. Byte-identical by construction -- it
+/// calls the same `#[inline(always)]` body as the other two arms.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx2,bmi2,lzcnt")]
+#[allow(unsafe_code)]
+unsafe fn decode_compressed_block_avx2(
+    payload: &[u8],
+    out: &mut Vec<u8>,
+    window_size: u64,
+    block_max: u32,
+    state: &mut BlockState,
+    dict: &[u8],
+    frame_start: usize,
+    frame_skipped: usize,
+) -> Result<(), Error> {
+    decode_compressed_block_inner(
+        payload,
+        out,
+        window_size,
+        block_max,
+        state,
+        dict,
+        frame_start,
+        frame_skipped,
+    )
+}
+
 #[inline(always)]
 fn decode_compressed_block_inner(
     payload: &[u8],
@@ -184,7 +320,8 @@ fn decode_compressed_block_inner(
     let before = r.remaining();
     let literals = {
         let _l = crate::prof::scope(crate::prof::Stage::DecodeLiterals);
-        decode_literals(&mut r, state)?
+        let recycle = core::mem::take(&mut state.lit_buf);
+        decode_literals(recycle, &mut r, state)?
     };
     // Bit accountant, decode side. Running this over C's OWN frame gives C's
     // literals/sequences split in the same units as the encoder's counters,
@@ -193,7 +330,7 @@ fn decode_compressed_block_inner(
     crate::prof::note_emit_seq(r.remaining() as u64);
     let seq_bytes = r.take(r.remaining())?;
     let _s = crate::prof::scope(crate::prof::Stage::DecodeSeq);
-    decode_sequences(
+    let r = decode_sequences(
         seq_bytes,
         &literals,
         out,
@@ -203,12 +340,17 @@ fn decode_compressed_block_inner(
         dict,
         frame_start,
         frame_skipped,
-    )
+    );
+    // W30: hand the literal buffer back for the next block. Both borrows above
+    // have ended, so this is a move.
+    state.lit_buf = literals;
+    r
 }
 
 // The literal chain is inline(always) into the twinned block driver -- outlined, it ran baseline (transitive trap trace).
 #[inline(always)]
 pub(crate) fn decode_literals(
+    recycle: Vec<u8>,
     r: &mut Reader<'_>,
     state: &mut BlockState,
 ) -> Result<Vec<u8>, Error> {
@@ -279,17 +421,33 @@ pub(crate) fn decode_literals(
     let _ = header_rest;
 
     match lit_type {
+        // W37 -- the RAW and RLE literal arms recycle too.
+        //
+        // W30 wired the recycled buffer only into the Huffman arm; these two
+        // still did `to_vec()` / `vec![b; regen]`, a fresh allocation per block
+        // on every raw or RLE literal section. Both fully overwrite the buffer,
+        // so reusing it is free.
         0 => {
             let src = r.take(regen as usize)?;
-            Ok(src.to_vec())
+            let mut out = recycle;
+            out.clear();
+            out.extend_from_slice(src);
+            Ok(out)
         }
         1 => {
             let b = r.u8()?;
-            Ok(vec![b; regen as usize])
+            let mut out = recycle;
+            out.clear();
+            out.resize(regen as usize, b);
+            Ok(out)
         }
         2 => {
             let section = r.take(csize as usize)?;
-            let (table, tree_size) = huffman::read_table(section)?;
+            // W36: donate the previous table's X1/X2 buffers (up to 4 KiB and
+            // 8 KiB) to the new build instead of dropping them and allocating
+            // fresh. It is replaced on the next line anyway.
+            let huff_recycle = state.huff.take();
+            let (table, tree_size) = huffman::read_table(huff_recycle, section)?;
             // BRICK 63: MOVE the freshly-read table into `state`, then borrow it
             // back to decode with. It was being CLONED into `state` and the
             // original used for the decode -- a full decode-table allocation and
@@ -297,12 +455,12 @@ pub(crate) fn decode_literals(
             // mr's decode, and mr takes this arm on nearly every block.
             state.huff = Some(table);
             let table = state.huff.as_ref().ok_or(Error::Corruption)?;
-            decode_huff_streams(table, &section[tree_size..], regen, n_streams)
+            decode_huff_streams(recycle, table, &section[tree_size..], regen, n_streams)
         }
         3 => {
             let table = state.huff.as_ref().ok_or(Error::Corruption)?;
             let section = r.take(csize as usize)?;
-            decode_huff_streams(table, section, regen, n_streams)
+            decode_huff_streams(recycle, table, section, regen, n_streams)
         }
         _ => Err(Error::Corruption),
     }
@@ -310,12 +468,22 @@ pub(crate) fn decode_literals(
 
 #[inline(always)]
 fn decode_huff_streams(
+    recycle: Vec<u8>,
     table: &HuffmanTable,
     src: &[u8],
     regen: u32,
     n_streams: u32,
 ) -> Result<Vec<u8>, Error> {
-    let mut out = vec![0u8; regen as usize];
+    // W30 -- reuse the previous block's literal buffer.
+    //
+    // This was `vec![0u8; regen]`, a fresh allocation of up to 128 KiB PER
+    // BLOCK -- the >=4096 size class was the largest source of the decode's
+    // ~147 MB of allocation traffic. The buffer is fully overwritten before
+    // use, so recycling is free: `resize` keeps the allocation once capacity
+    // suffices, which it does after the first block.
+    let mut out = recycle;
+    out.clear();
+    out.resize(regen as usize, 0);
     if n_streams == 1 {
         table.decode_stream(src, &mut out)?;
         return Ok(out);
@@ -379,7 +547,49 @@ pub(crate) const ML_BITS: [u8; 53] = [
     1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
 ];
 
-#[allow(clippy::too_many_arguments)]
+/// WIN 3 -- LL/ML baseline and extra-bits packed into ONE u32 table each.
+///
+/// The sequence loop read FOUR separate arrays per sequence (`ML_BITS`,
+/// `LL_BITS`, `LL_BASE`, `ML_BASE`) = four loads. The values fit together with
+/// room to spare: baseline needs 17 bits (LL max 65,536; ML max 65,539) and the
+/// extra-bit count needs 5 (max 16), so `base | (bits << 24)` is lossless in a
+/// u32 and halves the loads to two. Same AoS-packing that collapsed the
+/// `FseEntry` field split (WIN 2).
+///
+/// Built by `const fn` from the RFC tables above, so the two forms cannot drift
+/// -- and `packed_tables_match_rfc` asserts equality element-by-element.
+const fn pack_ll() -> [u32; 36] {
+    let mut o = [0u32; 36];
+    let mut i = 0;
+    while i < 36 {
+        o[i] = LL_BASE[i] | ((LL_BITS[i] as u32) << 24);
+        i += 1;
+    }
+    o
+}
+const fn pack_ml() -> [u32; 53] {
+    let mut o = [0u32; 53];
+    let mut i = 0;
+    while i < 53 {
+        o[i] = ML_BASE[i] | ((ML_BITS[i] as u32) << 24);
+        i += 1;
+    }
+    o
+}
+pub(crate) const LL_PACK: [u32; 36] = pack_ll();
+pub(crate) const ML_PACK: [u32; 53] = pack_ml();
+
+/// Baseline half of a packed LL/ML entry.
+#[inline(always)]
+const fn pk_base(w: u32) -> u32 {
+    w & 0x00FF_FFFF
+}
+/// Extra-bits half of a packed LL/ML entry.
+#[inline(always)]
+const fn pk_bits(w: u32) -> u8 {
+    (w >> 24) as u8
+}
+
 /// BRICK 64: `SEQCHECK` is a const generic, not a runtime read.
 ///
 /// The per-sequence guard called `seqcheck_hoisted()` -- an ATOMIC load plus a
@@ -399,7 +609,6 @@ pub(crate) const ML_BITS: [u8; 53] = [
 ///
 /// `decode_sequences_inner` is `#[inline(always)]` so its body is compiled into
 /// both wrappers -- once at baseline, once with AVX2 enabled.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_sequences(
     src: &[u8],
     literals: &[u8],
@@ -417,13 +626,28 @@ pub(crate) fn decode_sequences(
         #[allow(unsafe_code)]
         return unsafe {
             decode_sequences_avx2(
-                src, literals, out, window_size, block_max, state, dict, frame_start,
+                src,
+                literals,
+                out,
+                window_size,
+                block_max,
+                state,
+                dict,
+                frame_start,
                 frame_skipped,
             )
         };
     }
     decode_sequences_inner(
-        src, literals, out, window_size, block_max, state, dict, frame_start, frame_skipped,
+        src,
+        literals,
+        out,
+        window_size,
+        block_max,
+        state,
+        dict,
+        frame_start,
+        frame_skipped,
     )
 }
 
@@ -437,7 +661,6 @@ pub(crate) fn decode_sequences(
 // is the m7 decode leader in 16/18 corpora). Runtime guard extended to
 // has_bmi2; the body is unchanged, so this is byte-identical by construction.
 #[target_feature(enable = "avx2,bmi2,lzcnt")]
-#[allow(clippy::too_many_arguments)]
 #[allow(unsafe_code)]
 unsafe fn decode_sequences_avx2(
     src: &[u8],
@@ -451,7 +674,15 @@ unsafe fn decode_sequences_avx2(
     frame_skipped: usize,
 ) -> Result<(), Error> {
     decode_sequences_inner(
-        src, literals, out, window_size, block_max, state, dict, frame_start, frame_skipped,
+        src,
+        literals,
+        out,
+        window_size,
+        block_max,
+        state,
+        dict,
+        frame_start,
+        frame_skipped,
     )
 }
 
@@ -493,7 +724,6 @@ fn seqloop_avx2_on() -> bool {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn decode_sequences_inner(
     src: &[u8],
@@ -509,10 +739,16 @@ fn decode_sequences_inner(
     if src.is_empty() {
         return Err(Error::Corruption);
     }
+    // DecSeq anatomy: four PER-BLOCK guards partition this function. Never per
+    // sequence -- see `Stage::DecSeqHeader`.
+    let g_hdr = crate::prof::scope(crate::prof::Stage::DecSeqHeader);
     let mut pos = 0usize;
     let byte0 = src[0];
     pos += 1;
     let nseq = if byte0 == 0 {
+        // Literals-only block: this is tail work, not header work.
+        drop(g_hdr);
+        let _g = crate::prof::scope(crate::prof::Stage::DecSeqTail);
         out.extend_from_slice(literals);
         return Ok(());
     } else if byte0 < 128 {
@@ -545,12 +781,14 @@ fn decode_sequences_inner(
     let of_mode = (modes >> 4) & 3;
     let ml_mode = (modes >> 2) & 3;
 
+    drop(g_hdr);
+    let g_tab = crate::prof::scope(crate::prof::Stage::DecSeqTables);
     let (ll, n) = seq_table(
         &src[pos..],
         ll_mode,
         35,
         9,
-        state.ll.as_ref(),
+        state.ll.take(),
         fse::default_ll,
     )?;
     pos += n;
@@ -559,7 +797,7 @@ fn decode_sequences_inner(
         of_mode,
         31,
         8,
-        state.of.as_ref(),
+        state.of.take(),
         fse::default_of,
     )?;
     pos += n;
@@ -568,7 +806,7 @@ fn decode_sequences_inner(
         ml_mode,
         52,
         9,
-        state.ml.as_ref(),
+        state.ml.take(),
         fse::default_ml,
     )?;
     pos += n;
@@ -578,6 +816,7 @@ fn decode_sequences_inner(
     let mut ll_s = ll.init_state(&mut br);
     let mut of_s = of.init_state(&mut br);
     let mut ml_s = ml.init_state(&mut br);
+    drop(g_tab);
 
     let mut lit_pos = 0usize;
     // Built ONCE per block; the loop then passes a single reference.
@@ -603,14 +842,44 @@ fn decode_sequences_inner(
     // A plain local gets the same per-sequence saving with no structural change.
     let litcopy_arm = litcopy_on();
     let seqcheck = seqcheck_hoisted();
-    for i in 0..nseq {
+    // W7: is this the common shape? Decided ONCE per block.
+    let nodict = dict.is_empty() && frame_start == 0 && frame_skipped == 0;
+    let win_sz = window_size;
+    let blk_max = block_max;
+    let wide_arm = matchcopy_on();
+    // WIN 1: resolve each table's (ptr, mask) ONCE per block instead of 3x per
+    // sequence. See `FseTable::view`.
+    let llv = ll.view();
+    let ofv = of.view();
+    let mlv = ml.view();
+    // Hoisted for the same reason `litcopy_arm` is: an atomic load will not
+    // leave a loop. Profile builds only.
+    #[cfg(feature = "dupladder")]
+    let dup = DUP_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "dupladder")]
+    let dup_k = DUP_K.load(core::sync::atomic::Ordering::Relaxed);
+    let g_loop = crate::prof::scope(crate::prof::Stage::DecSeqLoop);
+    // W22 -- count DOWN, so the loop test is the decrement's own flags.
+    //
+    // `for i in 0..nseq` keeps BOTH `i` and `nseq` live and costs a compare per
+    // iteration, plus a second compare for the `i + 1 != nseq` last-iteration
+    // test. A countdown collapses both: `rem` decrements to zero, the loop test
+    // reads the flags the decrement already set, and "is this the last one" is
+    // the same `rem == 0`. One fewer live value in a loop the spill map shows
+    // reloading 203 times.
+    let mut rem = nseq;
+    while rem != 0 {
+        rem -= 1;
         let _ = br.reload();
-        let ll_e = ll.entry(ll_s);
-        let of_e = of.entry(of_s);
-        let ml_e = ml.entry(ml_s);
-        let ll_code = ll_e.symbol as usize;
-        let of_code = of_e.symbol as usize;
-        let ml_code = ml_e.symbol as usize;
+        // WIN 2: one 4-byte load per table instead of three field loads.
+        let ll_w = llv.entry_u32(ll_s);
+        let of_w = ofv.entry_u32(of_s);
+        let ml_w = mlv.entry_u32(ml_s);
+        let ll_code = crate::fse::fse_symbol(ll_w) as usize;
+        // W5: `of_code` is only ever consumed as a u32 (read_bits, the shift and
+        // the range test), so widen once from u8 instead of u8 -> usize -> u32.
+        let of_code = u32::from(crate::fse::fse_symbol(of_w));
+        let ml_code = crate::fse::fse_symbol(ml_w) as usize;
         // No per-sequence range test: ALL FOUR table modes now bound their
         // symbols at build time (see `seq_table`), so `ll_code <= 35`,
         // `ml_code <= 52` and `of_code <= 31` hold by construction. This ran
@@ -619,7 +888,7 @@ fn decode_sequences_inner(
         if !seqcheck && (ll_code > 35 || ml_code > 52 || of_code > 31) {
             return Err(Error::Corruption);
         }
-        let offset_add = br.read_bits(of_code as u32);
+        let offset_add = br.read_bits(of_code);
         // T4: the same build-time bound the `debug_assert` above states, used.
         // `seq_table` bounds the symbol in ALL FOUR modes -- predefined by its
         // norm length, compressed by `read_ncount`'s `charnum > max_symbol`
@@ -630,16 +899,17 @@ fn decode_sequences_inner(
         //
         // This is per SEQUENCE, and LLVM cannot derive the bound from a value
         // that came out of an FSE table.
+        // WIN 3: two packed loads instead of four.
         #[allow(unsafe_code)]
-        let (ml_bits, ll_bits, ll_base, ml_base) = unsafe {
-            debug_assert!(ll_code < LL_BITS.len() && ml_code < ML_BITS.len());
+        let (ll_w2, ml_w2) = unsafe {
+            debug_assert!(ll_code < LL_PACK.len() && ml_code < ML_PACK.len());
             (
-                *ML_BITS.get_unchecked(ml_code),
-                *LL_BITS.get_unchecked(ll_code),
-                *LL_BASE.get_unchecked(ll_code),
-                *ML_BASE.get_unchecked(ml_code),
+                *LL_PACK.get_unchecked(ll_code),
+                *ML_PACK.get_unchecked(ml_code),
             )
         };
+        let (ml_bits, ll_bits) = (pk_bits(ml_w2), pk_bits(ll_w2));
+        let (ll_base, ml_base) = (pk_base(ll_w2), pk_base(ml_w2));
         let ml_add = br.read_bits(u32::from(ml_bits));
         let ll_add = br.read_bits(u32::from(ll_bits));
         let litlen = ll_base + ll_add;
@@ -650,18 +920,84 @@ fn decode_sequences_inner(
             (1u32 << of_code) + offset_add
         };
 
+        // ---- DecSeq loop anatomy: duplicate ONE op, then undo it ----
+        #[cfg(feature = "dupladder")]
+        {
+            use core::hint::black_box;
+            for _ in 0..dup_k {
+                match dup {
+                    1 => {
+                        black_box(llv.entry_u32(ll_s));
+                        black_box(ofv.entry_u32(of_s));
+                        black_box(mlv.entry_u32(ml_s));
+                    }
+                    2 => {
+                        let sv = br.dup_save();
+                        black_box(br.read_bits(of_code as u32));
+                        black_box(br.read_bits(u32::from(ml_bits)));
+                        black_box(br.read_bits(u32::from(ll_bits)));
+                        br.dup_restore(sv);
+                    }
+                    3 => {
+                        let sv = br.dup_save();
+                        black_box(FseTable::advance_w(ll_w, &mut br));
+                        black_box(FseTable::advance_w(ml_w, &mut br));
+                        black_box(FseTable::advance_w(of_w, &mut br));
+                        br.dup_restore(sv);
+                    }
+                    4 => {
+                        let sv = br.dup_save();
+                        black_box(br.reload());
+                        black_box(br.reload());
+                        br.dup_restore(sv);
+                    }
+                    5 => {
+                        let (lp, len) = (lit_pos, out.len());
+                        let _ = copy_literals(literals, &mut lit_pos, litlen, out, litcopy_arm);
+                        lit_pos = lp;
+                        out.truncate(len);
+                    }
+                    _ => {}
+                }
+            }
+        }
         copy_literals(literals, &mut lit_pos, litlen, out, litcopy_arm)?;
+        #[cfg(feature = "dupladder")]
+        if dup == 6 {
+            for _ in 0..dup_k {
+                let sv = state.reps;
+                let _ =
+                    core::hint::black_box(resolve_offset(offset_value, litlen, &mut state.reps));
+                state.reps = sv;
+            }
+        }
         let offset = resolve_offset(offset_value, litlen, &mut state.reps)?;
-        copy_match(out, &mctx, offset, matchlen)?;
+        #[cfg(feature = "dupladder")]
+        if dup == 7 {
+            for _ in 0..dup_k {
+                let len = out.len();
+                let _ = copy_match(out, &mctx, offset, matchlen);
+                out.truncate(len);
+            }
+        }
+        if nodict {
+            copy_match_nodict(out, offset, matchlen, win_sz, blk_max, wide_arm)?;
+        } else {
+            copy_match(out, &mctx, offset, matchlen)?;
+        }
 
-        if i + 1 != nseq {
+        if rem != 0 {
             let _ = br.reload();
-            ll_s = FseTable::advance(ll_e, &mut br);
-            ml_s = FseTable::advance(ml_e, &mut br);
-            of_s = FseTable::advance(of_e, &mut br);
+            ll_s = FseTable::advance_w(ll_w, &mut br);
+            ml_s = FseTable::advance_w(ml_w, &mut br);
+            of_s = FseTable::advance_w(of_w, &mut br);
         }
     }
-    out.extend_from_slice(&literals[lit_pos..]);
+    drop(g_loop);
+    {
+        let _g = crate::prof::scope(crate::prof::Stage::DecSeqTail);
+        out.extend_from_slice(&literals[lit_pos..]);
+    }
     state.ll = Some(ll);
     state.of = Some(of);
     state.ml = Some(ml);
@@ -704,7 +1040,7 @@ pub(crate) fn debug_seq_codes(
         ll_mode,
         35,
         9,
-        state.ll.as_ref(),
+        state.ll.clone(),
         fse::default_ll,
     )?;
     pos += n;
@@ -713,7 +1049,7 @@ pub(crate) fn debug_seq_codes(
         of_mode,
         31,
         8,
-        state.of.as_ref(),
+        state.of.clone(),
         fse::default_of,
     )?;
     pos += n;
@@ -722,7 +1058,7 @@ pub(crate) fn debug_seq_codes(
         ml_mode,
         52,
         9,
-        state.ml.as_ref(),
+        state.ml.clone(),
         fse::default_ml,
     )?;
     pos += n;
@@ -737,9 +1073,9 @@ pub(crate) fn debug_seq_codes(
         let ll_e = ll.entry(ll_s);
         let of_e = of.entry(of_s);
         let ml_e = ml.entry(ml_s);
-        let llc = ll_e.symbol as u8;
-        let ofc = of_e.symbol as u8;
-        let mlc = ml_e.symbol as u8;
+        let llc = ll_e.symbol;
+        let ofc = of_e.symbol;
+        let mlc = ml_e.symbol;
         if llc > 35 || mlc > 52 || ofc > 31 {
             return Err(Error::Corruption);
         }
@@ -765,16 +1101,53 @@ pub(crate) fn debug_seq_codes(
 }
 
 #[inline(always)]
+// W18 -- the per-block table SETUP is cold relative to the sequence loop.
+//
+// `seq_table` -> `read_ncount` -> `from_norm` are all `inline(always)`, so the
+// entire FSE table build was inlined into BOTH `decode_sequences` twins beside
+// the hot loop -- 3,385 instructions and 436 spill slots' worth. It runs three
+// times per BLOCK against a loop that runs 53,509 times per MiB. Outlining it
+// gives the loop back its register budget and stops the build being duplicated
+// into both ISA arms.
+//
+// Kept where its sibling outlinings were REVERTED: outlining anything reachable
+// PER SEQUENCE (the cold copy tiers, the dict path) measured 2.5% SLOWER even
+// though it cut more instructions. Per-block is the safe side of that line.
+//
+// FINDING (v0.1.0 release audit): the `#[inline(never)]` this comment argues
+// for was written BELOW the `#[inline(always)]` above, so rustc took the first
+// and DISCARDED it -- silently, until `unused_attributes` was promoted. W18 has
+// therefore never been in effect, and whatever the brick measured, it did not
+// measure this outlining. The dead attribute is removed rather than the live
+// one so the shipped binary is the one that was measured. Re-run the W18 A/B
+// before promoting `seq_table` to `inline(never)`.
 fn seq_table(
     src: &[u8],
     mode: u8,
     max_sym: usize,
     max_log: u8,
-    prev: Option<&FseTable>,
+    // W25 -- taken by VALUE so Repeat mode need not clone.
+    //
+    // Repeat is **48.3% of all table selections at L3** (1,399 of 2,895 over the
+    // 14-corpus board), and it used `prev.cloned()`: a heap allocation plus a
+    // memcpy of up to 512 x 4 bytes, to reproduce a table the caller already
+    // owns and writes straight back into `state`. Moving it through is free.
+    //
+    // HONEST LEDGER: this is a WORK reduction, not an instruction or speed one.
+    // Static instructions rose 42 (inlining shifted) and whole-decode time was
+    // dead neutral (2.084 -> 2.084 ms/MiB, ABBA x3) -- at ~12.5 clones per MiB
+    // the allocator traffic is too rare to move the clock. Kept because it is
+    // provably less work and byte-identical, not because it measured faster.
+    prev: Option<FseTable>,
     predefined: fn() -> Result<FseTable, Error>,
 ) -> Result<(FseTable, usize), Error> {
     match mode {
-        0 => Ok((predefined()?, 0)),
+        0 => {
+            // N21 probe: how often is an RFC-CONSTANT table rebuilt from scratch?
+            #[cfg(feature = "profile")]
+            N21_PREDEF.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Ok((predefined()?, 0))
+        }
         1 => {
             // RLE takes its symbol as a RAW STREAM BYTE. Every other mode
             // bounds the symbol by `max_sym` at build time (predefined by its
@@ -790,9 +1163,11 @@ fn seq_table(
             }
             Ok((FseTable::rle(u16::from(sym)), 1))
         }
-        2 => fse::read_ncount(src, max_sym, max_log),
+        // W26: recycle the previous table's allocation for the new build.
+        2 => fse::read_ncount_into(prev, src, max_sym, max_log),
         3 => {
-            let t = prev.cloned().ok_or(Error::Corruption)?;
+            // W25: hand the caller's own table back -- no clone.
+            let t = prev.ok_or(Error::Corruption)?;
             Ok((t, 0))
         }
         _ => Err(Error::Corruption),
@@ -817,7 +1192,7 @@ fn seqcheck_hoisted() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = std::env::var("RZSTD_SEQCHECK_HOIST")
+            let on = crate::env_knob("RZSTD_SEQCHECK_HOIST")
                 .map(|v| v != "0")
                 .unwrap_or(true);
             SEQCHECK_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
@@ -885,6 +1260,34 @@ fn copy_literals(
         *lit_pos = end;
         return Ok(());
     }
+    // EVERYTHING BELOW TIER 1 IS OUTLINED AND COLD -- the same shape the
+    // ENCODER already uses (`push_literals_tiers`), and for the reason its
+    // comment gives: "Inlining them here pushed `push_literals` past LLVM's
+    // inlining threshold and it stopped being inlined AT ALL... That is the
+    // linkage trap."
+    //
+    // `copy_literals` is fully inlined into all THREE
+    // `decode_compressed_block` twins, and tiers 2/3 plus the fallback were
+    // stamped into every copy. Measured share (`declit`, 8 corpora):
+    // tier1 99.7%, tier2 0.12%, tier3 0.09%, fallback ~0.1% -- so <0.4% of
+    // copies were paying for the other 99.6%'s code size.
+    copy_literals_cold(literals, lit_pos, end, n, out, arm, len)
+}
+
+/// Tiers 2 and 3 plus the `extend_from_slice` fallback: under 0.4% of literal
+/// copies. Outlined and cold so tier 1 keeps its inlining.
+#[allow(unsafe_code)]
+#[inline(never)]
+#[cold]
+fn copy_literals_cold(
+    literals: &[u8],
+    lit_pos: &mut usize,
+    end: usize,
+    n: usize,
+    out: &mut alloc::vec::Vec<u8>,
+    arm: bool,
+    len: usize,
+) -> Result<(), Error> {
     // BRICK 80: a 32-byte tier above the 16-byte one.
     //
     // MEASURED FIRST (19.6M literal copies across the corpus):
@@ -911,9 +1314,81 @@ fn copy_literals(
         *lit_pos = end;
         return Ok(());
     }
+    // BRICK 80's THIRD RUNG, which it never got. The encoder's `push_literals`
+    // has tiered at 16/32/**64** since GATE 13, and this file's own MATCH copy
+    // (`copy_from_decoded`) tiers at 16/32/**64** too -- the literal copy was
+    // the one path stopping at two rungs. Same sibling-path-parity shape as
+    // `find_lazy_impl` bypassing `push_literals` on the encode side.
+    //
+    // BRICK 80 measured the tail it left behind: of 19.6M literal copies,
+    // >32B was 728,346 (3.7%), every one of them an `extend_from_slice` --
+    // a `memcpy` CALL. This rung takes the 33..=64 slice of that.
+    if arm && n <= 64 && *lit_pos + 64 <= literals.len() && out.capacity() - len >= 64 {
+        // SAFETY: identical invariant to the two rungs above, at 64 bytes --
+        // 64 readable source bytes, 64 writable destination bytes inside the
+        // allocation, distinct buffers, and only `n <= 64` published.
+        unsafe {
+            #[cfg(feature = "profile")]
+            DEC_LIT64.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            core::ptr::copy_nonoverlapping(
+                literals.as_ptr().add(*lit_pos),
+                out.as_mut_ptr().add(len),
+                64,
+            );
+            out.set_len(len + n);
+        }
+        *lit_pos = end;
+        return Ok(());
+    }
     out.extend_from_slice(&literals[*lit_pos..end]);
     *lit_pos = end;
     Ok(())
+}
+
+/// DecSeq LOOP anatomy arm (profile builds only). Selects ONE per-sequence op to
+/// execute a SECOND time and then undo, so the arm's delta over baseline prices
+/// that op. Every arm stays byte-identical -- the duplicate work is reverted --
+/// so `dsloop.rs` can assert round-trip on every arm it times.
+///
+/// 0 = baseline, 1 = FseTable::entry x3, 2 = read_bits x3, 3 = advance x3,
+/// 4 = reload x2, 5 = copy_literals, 6 = resolve_offset, 7 = copy_match.
+#[cfg(feature = "dupladder")]
+pub static DUP_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// How many extra executions the selected arm performs per sequence. Cheap ops
+/// (the entropy primitives) execute in spare superscalar slots and measure ~0 at
+/// K=1; raising K lifts them above the noise floor so the per-execution cost is
+/// a division rather than a guess.
+#[cfg(feature = "dupladder")]
+pub static DUP_K: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+
+/// Select the duplication arm. `0` restores baseline.
+#[cfg(feature = "dupladder")]
+pub fn set_dup_arm(a: u8) {
+    DUP_ARM.store(a, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Set the duplication multiplier.
+#[cfg(feature = "dupladder")]
+pub fn set_dup_k(k: u8) {
+    DUP_K.store(k.max(1), core::sync::atomic::Ordering::Relaxed);
+}
+
+/// SIMD-2 arm: the AVX2 block driver. Kept so the in-process ABBA harness can
+/// re-adjudicate it on other microarchitectures. 1 = off, 2 = on (default).
+static BLOCK_AVX2_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
+
+/// Bench hook: `false` routes the block driver to the bmi2-only twin.
+pub fn set_block_avx2_arm(on: bool) {
+    BLOCK_AVX2_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[inline(always)]
+fn block_avx2_on() -> bool {
+    BLOCK_AVX2_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
 }
 
 /// Runtime arms for the pre-2026-08-15 bricks, so the in-process ABBA
@@ -1161,7 +1636,100 @@ struct MatchCtx<'a> {
 // so the wide copy is inlined inside an AVX2-compiled loop. That is a real
 // refactor, and its ceiling is bounded by how much traffic the 32-byte tier
 // actually carries -- 8.0% of calls once the tiers are ordered 16-first.
+//
+// RESOLVED (SIMD-1). `decode_sequences_avx2` is that duplicated loop, and it has
+// existed since the twin campaign -- but the copy stayed OUTLINED, so it kept
+// being generated at baseline and the twin's 26 ymm moves all belonged to
+// `copy_literals`. The missing half was `#[inline(always)]`, below.
 
+// SIMD-1: `#[inline(always)]` so the match copy is compiled INSIDE whichever
+// twin calls it. Without it LLVM left `copy_match` (141 instrs) and
+// `copy_from_decoded` (230) outlined, and a function carrying no
+// `#[target_feature]` is generated at the crate's BASELINE ISA no matter who
+// calls it -- so ~42% of the DecSeq loop ran with 0 ymm and two nested calls per
+// sequence, while `copy_literals`, which IS inlined, got 256-bit moves. A
+// baseline callee's feature set is a SUBSET of the twin's, so inlining is legal
+// and LLVM re-generates the body under `avx2,bmi2`.
+/// W7 -- the no-dictionary, frame-start-0 specialisation of `copy_match`.
+///
+/// `MatchCtx` is loop-invariant but STACK-RESIDENT: the spill map shows its
+/// fields read 36x and 21x per function with zero writes, because `copy_match`
+/// is `inline(always)` and re-reads `&mctx` every sequence. In the common shape
+/// -- no dictionary, `frame_start == 0`, `frame_skipped == 0` -- four of the
+/// seven fields are constants, and the bounds collapse from seven field reads
+/// plus three saturating ops to two compares against two scalars.
+///
+/// Byte-identical to `copy_match` under those preconditions: with `dict` empty
+/// and both frame offsets 0, `virtual_len == out.len()`, `src_pos0 >= 0 ==
+/// dict.len()` always holds, so the dict arm is unreachable and `i == src_pos0`.
+#[inline(always)]
+fn copy_match_nodict(
+    out: &mut Vec<u8>,
+    offset: u32,
+    matchlen: u32,
+    window_size: u64,
+    block_max: u32,
+    wide: bool,
+) -> Result<(), Error> {
+    let off = offset as usize;
+    if off == 0 {
+        return Err(Error::Corruption);
+    }
+    let produced = out.len();
+    if off > produced {
+        return Err(Error::Corruption);
+    }
+    if (off as u64) > window_size {
+        return Err(Error::Corruption);
+    }
+    let len = matchlen as usize;
+    if len > block_max as usize {
+        return Err(Error::Corruption);
+    }
+    copy_from_decoded(out, produced - off, len, wide)
+}
+
+/// N21 probe: rebuilds of the RFC-constant Predefined FSE decode tables.
+/// Each is a full `from_norm` -- heap alloc + serial spread + finalize -- for a
+/// value fixed by RFC 8878 and identical for the life of the process.
+#[cfg(feature = "profile")]
+pub static N21_PREDEF: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Read and clear the N21 probe.
+#[cfg(feature = "profile")]
+pub fn take_n21_predef() -> u64 {
+    N21_PREDEF.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// D3 probe: `extend_from_within` calls made by the overlapping (band 4) loop.
+/// D3 assumes "a memcpy call per period"; this counts what actually happens.
+#[cfg(feature = "profile")]
+pub static D3_ITERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Read and clear the D3 probe.
+#[cfg(feature = "profile")]
+pub fn take_d3_iters() -> u64 {
+    D3_ITERS.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// D4 coverage census: `[frame_only, dict_only, dict_CROSSING]` calls.
+/// A brick on the crossing path is unverified until index 2 is non-zero.
+#[cfg(feature = "profile")]
+pub static D4_PATHS: [core::sync::atomic::AtomicU64; 3] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+/// Read and clear the D4 coverage census.
+#[cfg(feature = "profile")]
+pub fn take_d4_paths() -> [u64; 3] {
+    use core::sync::atomic::Ordering;
+    [
+        D4_PATHS[0].swap(0, Ordering::Relaxed),
+        D4_PATHS[1].swap(0, Ordering::Relaxed),
+        D4_PATHS[2].swap(0, Ordering::Relaxed),
+    ]
+}
+
+#[inline(always)]
 #[allow(clippy::explicit_counter_loop)]
 fn copy_match(
     out: &mut Vec<u8>,
@@ -1203,28 +1771,49 @@ fn copy_match(
             return Err(Error::Corruption);
         }
         let i = frame_start + (frame_off - frame_skipped);
+        #[cfg(feature = "profile")]
+        D4_PATHS[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return copy_from_decoded(out, i, len, wide);
     }
-    let mut src_pos = src_pos0;
+    // D4 (inline-execution): SPLIT AT THE BOUNDARY, don't re-test it per byte.
+    //
+    // This was a byte-at-a-time push that re-evaluated `src_pos < dict.len()`
+    // on every iteration -- a branch whose answer changes exactly ONCE in the
+    // whole loop, plus a bounds-checked `out.get(i)` per byte. It is not a SIMD
+    // problem, it is a decomposition problem: the match is a dictionary run
+    // followed by a frame run, so compute where it crosses and do two bulk
+    // copies. Vector stores fall out for free because both halves become slice
+    // operations (`extend_from_slice` lowers to `memcpy`; `copy_from_decoded`
+    // is the existing tiered wildcopy the pure-frame path above already uses).
+    //
+    // Byte-identical by construction: `src_pos0 < dict.len()` on this path, so
+    // the first `from_dict` bytes are exactly `dict[src_pos0..]`, and `src_pos`
+    // reaches `dict.len()` precisely when the dictionary is exhausted -- making
+    // the first frame byte's `frame_off` exactly 0. The old loop's per-byte
+    // `frame_off < frame_skipped` test therefore fails on that first frame byte
+    // iff `frame_skipped > 0`, which is the hoisted check below; and for
+    // `frame_skipped == 0` the frame source starts at `frame_start`, which is
+    // what the pure-frame early return above passes too.
     out.reserve(len);
-    for _ in 0..len {
-        let b = if src_pos < dict.len() {
-            dict[src_pos]
-        } else {
-            let frame_off = src_pos - dict.len();
-            if frame_off < frame_skipped {
-                return Err(Error::Corruption);
-            }
-            let i = frame_start + (frame_off - frame_skipped);
-            *out.get(i).ok_or(Error::Corruption)?
-        };
-        out.push(b);
-        src_pos += 1;
+    let from_dict = core::cmp::min(len, dict.len() - src_pos0);
+    out.extend_from_slice(&dict[src_pos0..src_pos0 + from_dict]);
+    let rest = len - from_dict;
+    #[cfg(feature = "profile")]
+    D4_PATHS[usize::from(rest > 0) + 1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if rest > 0 {
+        if frame_skipped > 0 {
+            return Err(Error::Corruption);
+        }
+        return copy_from_decoded(out, frame_start, rest, wide);
     }
     Ok(())
 }
 
 /// Overlapping-safe copy from already-decoded `out[src..]`. C wildcopy equivalent.
+///
+/// SIMD-1: `#[inline(always)]` for the reason on `copy_match` -- this is where the
+/// 16/32/64-byte tiers live, and outlined they were emitted as SSE.
+#[inline(always)]
 #[allow(unsafe_code)]
 fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize, wide: bool) -> Result<(), Error> {
     if src >= out.len() {
@@ -1288,6 +1877,32 @@ fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize, wide: bool) -> R
         }
         return Ok(());
     }
+    // TIERS 2/3 AND THE FALLBACK ARE OUTLINED AND COLD -- the same split the
+    // ENCODER uses (`push_literals_tiers`) and that `copy_literals` just
+    // received. `copy_from_decoded` is fully inlined into all three
+    // `decode_compressed_block` twins, so every rung below the first was
+    // stamped into each copy.
+    //
+    // The census in this function already says tier 1 dominates: "a band
+    // census over 12 corpora at L3 puts **86.6% of ALL match copies** there
+    // with `len <= 16`, at a mean of 7.4 bytes." The other 13% was paying for
+    // the 87%'s code size.
+    copy_from_decoded_cold(out, src, len, wide, offset)
+}
+
+/// Match-copy tiers 2 and 3 plus the `extend_from_within` fallback: the ~13%
+/// of match copies that tier 1 declines. Outlined and cold so tier 1 keeps
+/// its inlining.
+#[allow(unsafe_code)]
+#[inline(never)]
+#[cold]
+fn copy_from_decoded_cold(
+    out: &mut Vec<u8>,
+    src: usize,
+    len: usize,
+    wide: bool,
+    offset: usize,
+) -> Result<(), Error> {
     if wide && len <= 32 && offset >= 32 && out.capacity() - out.len() >= 32 {
         let dst_at = out.len();
         // SAFETY: `offset >= 32` means `src + 32 <= out.len() == dst_at`, so
@@ -1324,8 +1939,34 @@ fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize, wide: bool) -> R
     // 16-byte regions are disjoint, capturing the `len <= 16` part of that
     // slice. Same invariant as the 32-byte tier, same shape as brick 80 on
     // literals.
+    // 64-BYTE TIER. The census that motivated it: `extend_from_within` was the
+    // only UN-TIERED band and it carried ~34% of all match bytes. Its length
+    // distribution is not diffuse -- **65.9% of its calls and 46.9% of its bytes
+    // are 33-64 bytes** (`dsuntier.rs`), i.e. exactly one 2x ymm move pair. The
+    // mean of that band is ~67 and would have chosen the wrong width; the
+    // histogram chose it.
+    //
+    // `offset >= 64` does the same double duty as the narrower tiers: it
+    // guarantees 64 readable source bytes (`src + 64 <= out.len()`) AND that the
+    // source range ends at or before the destination start, so the two 64-byte
+    // regions cannot overlap.
+    if wide && len <= 64 && offset >= 64 && out.capacity() - out.len() >= 64 {
+        let dst_at = out.len();
+        // SAFETY: `offset >= 64` means `src + 64 <= out.len() == dst_at`, so the
+        // source is fully initialised and disjoint from the destination.
+        // `capacity - len >= 64` gives 64 writable bytes inside the allocation.
+        // Only `len <= 64` bytes are published by `set_len`.
+        unsafe {
+            let p = out.as_mut_ptr();
+            note_band(6, len);
+            core::ptr::copy_nonoverlapping(p.add(src), p.add(dst_at), 64);
+            out.set_len(dst_at + len);
+        }
+        return Ok(());
+    }
     if offset >= len {
         note_band(3, len);
+        note_untiered(len);
         out.extend_from_within(src..src + len);
         return Ok(());
     }
@@ -1340,6 +1981,8 @@ fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize, wide: bool) -> R
         let take = (len - copied).min(avail);
         out.extend_from_within(src..src + take);
         copied += take;
+        #[cfg(feature = "profile")]
+        D3_ITERS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     Ok(())
 }
@@ -1347,6 +1990,19 @@ fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize, wide: bool) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WIN 3 gate: the packed tables must equal the RFC tables they replace.
+    #[test]
+    fn packed_tables_match_rfc() {
+        for i in 0..LL_BASE.len() {
+            assert_eq!(pk_base(LL_PACK[i]), LL_BASE[i], "LL_BASE[{i}]");
+            assert_eq!(pk_bits(LL_PACK[i]), LL_BITS[i], "LL_BITS[{i}]");
+        }
+        for i in 0..ML_BASE.len() {
+            assert_eq!(pk_base(ML_PACK[i]), ML_BASE[i], "ML_BASE[{i}]");
+            assert_eq!(pk_bits(ML_PACK[i]), ML_BITS[i], "ML_BITS[{i}]");
+        }
+    }
 
     #[test]
     fn repeat_offset_rfc_table18() {

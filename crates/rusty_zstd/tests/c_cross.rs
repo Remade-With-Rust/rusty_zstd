@@ -317,7 +317,22 @@ fn out_of_range_parameters_never_panic() {
     let src: Vec<u8> = (0..600_000u32)
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
         .collect();
-    let vals = [0u32, 1, 2, 3, 5, 8, 16, 24, 31, 32, 64, 1024, 65535, u32::MAX];
+    let vals = [
+        0u32,
+        1,
+        2,
+        3,
+        5,
+        8,
+        16,
+        24,
+        31,
+        32,
+        64,
+        1024,
+        65535,
+        u32::MAX,
+    ];
     type Setter = fn(&mut rusty_zstd::CompressionParameters, u32);
     let fields: &[(&str, Setter)] = &[
         ("window_log", |p, v| p.window_log = v),
@@ -330,8 +345,7 @@ fn out_of_range_parameters_never_panic() {
     for (name, set) in fields {
         for &v in &vals {
             for lvl in [1i32, 3, 7, 13, 19, 22] {
-                let Ok(mut p) = rusty_zstd::compression_params(lvl, Some(src.len() as u64))
-                else {
+                let Ok(mut p) = rusty_zstd::compression_params(lvl, Some(src.len() as u64)) else {
                     continue;
                 };
                 set(&mut p, v);

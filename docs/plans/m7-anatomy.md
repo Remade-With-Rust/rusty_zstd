@@ -1,69 +1,98 @@
 # M7 anatomy - rusty_zstd vs facebook/zstd v1.5.7, side by side
 
-**Date:** 2026-08-21 - sections 1, 2 and 3 regenerated after the **BMI2 twin
-campaign** (`08d14e3`..`bfd0cf0`: every hot path ISA-twinned, transitive trap trace
-empty) and the 08-20 gate/dispatch session (`30e6863`..`0fbc57b`). The twin campaign
-is byte-exact by construction, so every RATIO movement on this board against 08-20
-belongs to the 08-20 session's adjudicated trades, not to the twins. Older boards are
-in git history.
+**Date:** 2026-08-22 (**third pass**) - every table on this page re-measured after
+the **MatchFind monomorphisation campaign** (20 wins: the `HLOG`, `STEP` and `PIPE`
+const-generic axes proven redundant on the BMI2 twins and collapsed, `emit_fast_seq`
+outlined behind a `FastEmitCtx` with its own ISA twin, and eleven dead
+computations removed). Earlier passes: the BMI2 twin campaign (`08d14e3`..`bfd0cf0`),
+the 08-20 gate/dispatch session (`30e6863`..`0fbc57b`), and the per-finder campaign
+(`..d012c6c`). Older boards are in git history.
 
-> **READ THIS BEFORE COMPARING TO THE 2026-08-16 BOARD.** That board predates
-> `ee9a2eb`, and it is stale IN OUR FAVOUR on speed and AGAINST us on ratio.
-> `literals_worth_huffman` was measuring PEAK FREQUENCY where the deciding quantity is
-> ENTROPY, so flat-alphabet files fell out to RAW literals. Fixing it moved ratio hard
-> (`smallmsg-8m` L1 1.615 -> 1.031, `jsonlog-16m` 1.528 -> 1.061, `webster` 1.443 ->
-> 1.137, `x-ray` 1.212 -> 1.000) and cost real speed on exactly those files, on BOTH
-> phases, because a raw-literal block decodes as a memcpy and a Huffman one does not.
+> **THE DETERMINISTIC RESULT, FIRST.** All **36** `us/c size` cells on this page --
+> 18 at L1, 18 at L3 -- are unchanged for the **THIRD CONSECUTIVE BOARD**. The twelve
+> identity totals agree: L1 43,313,087 | L2 52,103,625 | L3 40,681,863 | L4 40,242,889 |
+> L5 39,281,120 | L7 38,243,653 | L9 37,836,902 | L12 37,259,874 | L13 12,603,507 |
+> L16 12,381,377 | L19 12,365,806 | L22 12,365,762. Three campaigns in a row have moved
+> **zero bytes**.
 
-> **THE CORRECTION THAT MATTERS.** Several cells the old board listed as "we beat C"
-> were flattering us for emitting a WORSE FILE. `x-ray` L1 decompress at **0.23** was
-> not a decode win -- it was a 21% larger output that was trivial to decode. At a
-> matched 1.000 ratio the same cell reads **1.49**. Mission passes fall from 6/7 to 4/4
-> at L1 for this reason and this reason only: `sao` and `x-ray` stopped being scored
-> against our own inflated output. **A speed number is only meaningful beside its
-> `us/c size`.** Read the two columns together, always.
+> **THIS BOARD IS COMPARABLE TO THE FIRST PASS; THE SECOND WAS NOT.** C v1.5.7 is a
+> fixed binary and therefore this page's calibrator. It now lands within **3%** of its
+> first-pass absolutes (`dickens` 334.6 -> 345.9, `versions-16m` 1604.8 -> 1641.7,
+> `text-32m` 20072.9 -> 19454.1), against **0.85x** on the second pass. The session
+> null arm is **6.83%** at L1 -- the LOWEST ever recorded on this instrument, against
+> 13.20% on the first pass and 17.67% on the second. The host was quiet. Speed cells
+> here can be read against the first-pass board; L3's null arm is 15.05% and its cells
+> cannot be read as finely.
+
+> **WHAT THE MATCHFIND CAMPAIGN DID AND DID NOT DO.** It cut the MatchFind instruction
+> census from **572,667 to 130,584 (-77.2%)**, and the BMI2 path that actually executes
+> from **282,373 to 22,268 (-92.1%)**. Encode wall-clock on this board is **FLAT**
+> (median 1.01x of the first pass). Both facts are correct and they do not conflict:
+> what the campaign deleted was 140-fold DUPLICATED monomorphisations of the same
+> loop -- code that was never executed, only linked. Deleting never-executed code
+> shrinks the binary and the I-cache footprint; it does not make the executed path
+> shorter. **No encode speed claim is made here, and none was made when the wins were
+> taken** -- every one shipped on a static instruction count plus byte-identity.
+
+> **THE DECODE MOVEMENT ON THIS BOARD IS NOT FROM THIS CAMPAIGN.** Our decompress arm
+> is up **13-24%** on every text-like corpus at L1 (`reymont` +24.1%, `mozilla` +24.0%,
+> `jsonlog-16m` +23.8%, `smallmsg-8m` +22.7%, `nci` +20.4%) while C's decode arm is
+> flat at +3%. That belongs to concurrent `fse.rs`/`huffman.rs` work (an `FseEntry`
+> side-word fusion and an `FseView` handle), NOT to MatchFind, which does not run
+> during decode at all. L1 mean `C/us` decomp moves 1.66 -> **1.49** on the strength
+> of it. Section 3's `DecLits` shares fall correspondingly.
 
 **Instrument:** repaired (see [`m7-benchmark-repair.md`](m7-benchmark-repair.md)) --
 best-of-N both arms, phases timed separately as C does, N>=25/phase, discarded warmup,
-per-row same-arm spread, cycles/byte. Session null-arm **0.9799**. Dual gate 18/18 at
-both levels. Pinned affinity=4, High priority, C via `-b -T1`. Decompress is timed into
-a REUSED buffer via `decompress_into`, as C's `-b` does. Checksum parity with the
-oracle (`ZSTD_c_checksumFlag = 0`); the shipped default is still `checksum: true` --
-that changed the MEASUREMENT, not the product. Stage shares (section 3) come from a
-separate `--features profile` build and are comparable only as shares within a run.
+per-row same-arm spread, cycles/byte. Dual gate 18/18 at both levels. C via `-b -T1`,
+**unpinned** (see the pinning note below). Decompress is timed into a REUSED buffer via
+`decompress_into`, as C's `-b` does. Checksum parity with the oracle
+(`ZSTD_c_checksumFlag = 0`); the shipped default is still `checksum: true` -- that
+changed the MEASUREMENT, not the product. Stage shares (section 3) come from a separate
+`--features profile` build and are comparable only as shares within a run.
+
+> **A NOTE ON PINNING.** An earlier revision of the protocol line said `affinity=4`.
+> Taking that literally on this host is a MEASUREMENT BUG: a single-core pin under the
+> Balanced power plan holds the i7-14650HX at its 2200 MHz base with no turbo, which
+> drove the C calibrator to **0.29x** and manufactured an apparent 16-of-18 compress
+> sweep for us. All boards from the second pass onward are UNPINNED.
 
 `C/us` > 1 means **C is faster**. `us/c size` > 1 means **we emit more bytes**.
 **Never average these files** -- the per-file spread is the whole story.
 
 ---
 
+SIMD.rs AND XXH64.rs NEED OPTIMIZATION
+
 ## 1. Level 1 - the full board, all 18 corpora
 
-**Re-measured 2026-08-21.** Sorted by `us/c size`. C is the pinned v1.5.7. Session
-null arm (worst same-arm encode spread) **13.20%** -- read every speed column beside it.
+**Re-measured 2026-08-22 (third pass).** Sorted by `us/c size`. C is v1.5.7, unpinned.
+Session null arm (worst same-arm encode spread) **6.83%** -- the lowest this instrument
+has ever recorded, and the reason this board's cells can be read against the first
+pass at all.
 
 | corpus       |  C comp | us comp | **C/us c** | C decomp | us decomp | **C/us d** | us/c size |
 | ------------ | ------: | ------: | ---------: | -------: | --------: | ---------: | --------: |
-| versions-16m |  1604.8 |  7282.0 |   **0.22** |   3884.3 |   19295.7 |   **0.20** | **0.088** |
-| zeros-32m    | 12282.7 | 31164.8 |   **0.39** |  37855.6 |   41279.7 |   **0.92** | **0.967** |
-| incomp-32m   |  5530.1 |  3216.5 |       1.72 |  20674.8 |   23201.9 |   **0.89** |     1.000 |
-| x-ray        |   876.3 |   365.6 |       2.40 |   1299.2 |    1060.7 |       1.22 |     1.000 |
-| smallmsg-8m  |   510.4 |   279.5 |       1.83 |   2243.2 |     970.9 |       2.31 |     1.009 |
-| mr           |   466.0 |   203.4 |       2.29 |   1631.9 |     852.8 |       1.91 |     1.010 |
-| osdb         |   509.0 |   200.5 |       2.54 |   1691.2 |     936.1 |       1.81 |     1.011 |
-| ooffice      |   442.2 |   173.3 |       2.55 |   1146.9 |     724.3 |       1.58 |     1.011 |
-| sao          |   393.0 |   224.6 |       1.75 |   1081.7 |     622.9 |       1.74 |     1.011 |
-| samba        |   560.3 |   304.9 |       1.84 |   2329.6 |    1047.0 |       2.23 |     1.012 |
-| webster      |   382.8 |   215.5 |       1.78 |   1499.0 |     774.6 |       1.94 |     1.014 |
-| dickens      |   334.6 |   191.5 |       1.75 |   1601.2 |     727.0 |       2.20 |     1.015 |
-| reymont      |   311.5 |   186.5 |       1.67 |   1579.0 |     645.3 |       2.45 |     1.015 |
-| mozilla      |   696.3 |   326.7 |       2.13 |   1975.5 |    1024.2 |       1.93 |     1.034 |
-| xml          |   781.0 |   423.4 |       1.84 |   2564.8 |    1154.8 |       2.22 |     1.050 |
-| jsonlog-16m  |   634.4 |   328.8 |       1.93 |   1734.1 |     961.1 |       1.80 |     1.063 |
-| nci          |   866.4 |   484.3 |       1.79 |   2520.9 |    1142.7 |       2.21 |     1.106 |
-| text-32m     | 20072.9 | 13291.2 |       1.51 |   9705.4 |   33698.4 |   **0.29** |     1.126 |
+| versions-16m |  1641.7 |  7057.8 |   **0.23** |   3936.3 |   20481.3 |   **0.19** | **0.088** |
+| zeros-32m    | 12579.3 | 31961.6 |   **0.39** |  38223.5 |   41710.1 |   **0.92** | **0.967** |
+| incomp-32m   |  5921.6 |  3324.1 |       1.78 |  22293.3 |   24081.9 |   **0.93** |     1.000 |
+| x-ray        |   906.4 |   363.5 |       2.49 |   1322.3 |    1109.4 |       1.19 |     1.000 |
+| smallmsg-8m  |   527.9 |   290.5 |       1.82 |   2314.9 |    1191.5 |       1.94 |     1.009 |
+| mr           |   481.2 |   205.5 |       2.34 |   1668.0 |    1046.3 |       1.59 |     1.010 |
+| osdb         |   529.5 |   210.3 |       2.52 |   1729.6 |    1104.8 |       1.57 |     1.011 |
+| ooffice      |   443.3 |   169.7 |       2.61 |   1143.5 |     818.5 |       1.40 |     1.011 |
+| sao          |   449.4 |   225.5 |       1.99 |   1134.9 |     652.0 |       1.74 |     1.011 |
+| samba        |   575.8 |   311.4 |       1.85 |   2431.4 |    1244.6 |       1.95 |     1.012 |
+| webster      |   396.4 |   211.9 |       1.87 |   1732.6 |     909.8 |       1.90 |     1.014 |
+| dickens      |   345.9 |   188.3 |       1.84 |   1648.8 |     867.9 |       1.90 |     1.015 |
+| reymont      |   341.4 |   190.2 |       1.79 |   1767.2 |     800.6 |       2.21 |     1.015 |
+| mozilla      |   716.8 |   348.8 |       2.06 |   2120.8 |    1270.2 |       1.67 |     1.034 |
+| xml          |   798.2 |   410.3 |       1.95 |   2624.6 |    1357.3 |       1.93 |     1.050 |
+| jsonlog-16m  |   647.0 |   336.0 |       1.93 |   1776.8 |    1189.7 |       1.49 |     1.063 |
+| nci          |   954.9 |   487.5 |       1.96 |   2689.7 |    1375.8 |       1.95 |     1.106 |
+| text-32m     | 19454.1 | 12777.5 |       1.52 |   9648.1 |   34379.0 |   **0.28** |     1.126 |
 
-**mean C/us comp 1.77, decomp 1.66 | mean ratio 0.975 | worst ratio 1.126 (text-32m) |
+**mean C/us comp 1.83, decomp 1.49 | mean ratio 0.975 | worst ratio 1.126 (text-32m) |
 we beat C: 2 comp, 4 decomp, 2 ratio**
 
 **THE RATIO STORY IS STILL THE STORY, and it tightened again.** The worst
@@ -82,32 +111,41 @@ parity. Eleven of eighteen rows now sit at or below **1.016**:
 | `webster` | 1.053 | **1.014** |
 | `xml` | 1.086 | **1.050** |
 
-These size moves belong to the 08-20 gate/dispatch session -- the 08-21 BMI2 twin
-campaign is byte-exact by construction (all identity boards unchanged). L1's mean ratio
-now reads **0.975**: at matched settings we emit FEWER bytes than C on average, carried
-by `versions-16m` 0.088 and a mid-board that has converged to ~1.01.
+These size moves belong to the 08-20 gate/dispatch session. **Neither 08-21 campaign
+moved them** -- the BMI2 twins are byte-exact by construction, and the per-finder
+campaign was held to byte-identity receipt by receipt; the `08-21` column above is
+now the value on THREE consecutive boards. L1's mean ratio still reads **0.975**: at
+matched settings we emit FEWER bytes than C on average, carried by `versions-16m`
+0.088 and a mid-board that has converged to ~1.01.
 
 ### Where we win or tie
 
-- **Compress at or better than C:** `versions-16m` **0.22**, `zeros-32m` **0.39**.
-- **Decompress at or better than C:** `versions-16m` **0.20**, `text-32m` **0.29**,
-  `incomp-32m` **0.89**, `zeros-32m` **0.92**.
+- **Compress at or better than C:** `versions-16m` **0.23**, `zeros-32m` **0.39**.
+- **Decompress at or better than C:** `versions-16m` **0.19**, `text-32m` **0.28**,
+  `zeros-32m` **0.92**, `incomp-32m` **0.93**.
 - **Ratio at or better than C:** `versions-16m` **0.088**, `zeros-32m` **0.967**,
-  `incomp-32m` 1.000, `x-ray` 1.000.
+  `incomp-32m` 1.000, `x-ray` 1.000. **Unchanged, cell for cell, three boards running.**
 
-Against mission section 7 (decompress <= 1.11, compress <= 1.25):
-**2 corpora pass compress, 4 pass decompress.** `text-32m` compress flipped out of the
-winners' column (0.78 -> 1.51) and `incomp-32m` narrowed (1.85 -> 1.72); both swings
-sit on 32 MiB degenerate corpora where the 13.20% null arm and the 08-20 session's
-work-shape changes overlap -- neither direction is a claim this instrument can carry.
+Against mission section 7 (decompress <= 1.11, compress <= 1.25): **2 pass compress**
+(versions 0.23, zeros 0.39), **4 pass decompress** (versions 0.19, text 0.28, zeros
+0.92, incomp 0.93). These are the SAME counts the first pass reported, which is the
+right result to get from a quiet host after a byte-exact campaign -- the second pass's
+3-and-6 was the artifact.
+
+**The decompress column is where this board actually moved.** Every text-like corpus
+gained 13-24% against its first-pass self while C's decode arm stayed flat, pulling
+mean `C/us` decomp from 1.66 to **1.49**. That is the concurrent FSE/Huffman decode
+work, not MatchFind -- see the preamble.
 
 ### Where we lose
 
 - **Ratio:** `text-32m` **1.126**, `nci` **1.106**, `jsonlog-16m` 1.063, `xml` 1.050.
   Everything else is at or below 1.034. The 08-20 losers are gone: `reymont` 1.131 ->
   **1.015**, `mr` 1.089 -> **1.010**, `dickens` 1.082 -> **1.015**.
-- **Compress:** `ooffice` **2.55**, `osdb` 2.54, `x-ray` 2.40, `mr` 2.29. These are
-  the honest, matched-output positions; none is an open regression.
+- **Compress:** `ooffice` **2.61**, `osdb` 2.52, `x-ray` 2.49, `mr` 2.34. These are
+  the honest, matched-output positions; none is an open regression, and all four sit
+  within a point of their first-pass values (2.55 / 2.54 / 2.40 / 2.29) -- which is
+  what a byte-exact campaign on a quiet host should produce.
 
 **`versions-16m` remains the headline** -- 0.075 size, 13x smaller than C, from the
 repcode bricks (67/70/71/73/75). It was also the corpus that exposed the missing
@@ -117,79 +155,142 @@ function: `find_fast` had a repcode search and no other finder did.
 
 ## 2. Level 3 (dfast) - the shipping default
 
-**Re-measured 2026-08-21.** Sorted by `us/c size`. Session null arm **17.80%** --
-this run's speed columns are NOISIER than usual; ratio is exact.
+**Re-measured 2026-08-22 (third pass).** Sorted by `us/c size`. Session null arm
+**15.05%** -- much wider than L1's 6.83% on the same host and in the same session, so
+these speed columns are INDICATIVE ONLY. Ratio is exact.
 
 | corpus       |  C comp | us comp | **C/us c** | C decomp | us decomp | **C/us d** | us/c size |
 | ------------ | ------: | ------: | ---------: | -------: | --------: | ---------: | --------: |
-| versions-16m |  4311.8 |  7129.5 |   **0.60** |  21369.2 |   19097.6 |       1.12 | **0.659** |
-| zeros-32m    |  7158.4 | 27155.5 |   **0.26** |  37286.4 |   39177.3 |   **0.95** | **0.967** |
-| x-ray        |   189.1 |    77.3 |       2.45 |   1007.5 |     424.6 |       2.37 | **0.983** |
-| incomp-32m   |  3837.9 |  3365.3 |       1.14 |  22450.8 |   22785.5 |   **0.99** |     1.000 |
-| jsonlog-16m  |   369.4 |   207.1 |       1.78 |   1830.6 |     896.0 |       2.04 |     1.010 |
-| osdb         |   338.4 |   151.2 |       2.24 |   1745.5 |     770.4 |       2.27 |     1.016 |
-| mr           |   273.2 |   131.3 |       2.08 |   1500.6 |     479.4 |       3.13 |     1.022 |
-| smallmsg-8m  |   318.2 |   147.3 |       2.16 |   2202.4 |     886.9 |       2.48 |     1.029 |
-| mozilla      |   379.3 |   201.6 |       1.88 |   1892.6 |    1013.4 |       1.87 |     1.029 |
-| ooffice      |   234.1 |    95.2 |       2.46 |   1038.3 |     511.9 |       2.03 |     1.032 |
-| sao          |   195.2 |    80.3 |       2.43 |    922.1 |     488.8 |       1.89 |     1.034 |
-| samba        |   406.1 |   231.8 |       1.75 |   2310.9 |     974.0 |       2.37 |     1.036 |
-| reymont      |   264.0 |   143.7 |       1.84 |   1559.4 |     530.1 |       2.94 |     1.041 |
-| webster      |   250.5 |   139.1 |       1.80 |   1488.5 |     557.0 |       2.67 |     1.050 |
-| dickens      |   219.7 |   121.1 |       1.81 |   1387.8 |     502.3 |       2.76 |     1.052 |
-| text-32m     |  9759.6 | 20936.9 |   **0.47** |   9481.7 |   31570.6 |   **0.30** |     1.071 |
-| xml          |   626.0 |   318.1 |       1.97 |   2481.3 |    1087.9 |       2.28 |     1.079 |
-| nci          |   783.1 |   390.4 |       2.01 |   2534.9 |    1162.9 |       2.18 |     1.100 |
+| versions-16m |  4620.4 |  7180.7 |   **0.64** |  22229.5 |   20746.9 |       1.07 | **0.659** |
+| zeros-32m    |  7735.5 | 27903.7 |   **0.28** |  38664.7 |   40795.5 |   **0.95** | **0.967** |
+| x-ray        |   183.5 |    78.7 |       2.33 |   1005.3 |     490.5 |       2.05 | **0.983** |
+| incomp-32m   |  5714.4 |  2469.2 |       2.31 |  22112.1 |   22805.0 |   **0.97** |     1.000 |
+| jsonlog-16m  |   383.7 |   214.5 |       1.79 |   1901.1 |    1134.1 |       1.68 |     1.010 |
+| osdb         |   339.5 |   156.2 |       2.17 |   1787.7 |     939.2 |       1.90 |     1.016 |
+| mr           |   287.5 |   133.8 |       2.15 |   1424.9 |     549.5 |       2.59 |     1.022 |
+| smallmsg-8m  |   315.9 |   149.8 |       2.11 |   2281.1 |    1113.1 |       2.05 |     1.029 |
+| mozilla      |   390.2 |   200.5 |       1.95 |   1945.6 |    1174.2 |       1.66 |     1.029 |
+| ooffice      |   221.9 |    94.8 |       2.34 |    974.1 |     574.5 |       1.70 |     1.032 |
+| sao          |   194.7 |    84.8 |       2.30 |    955.9 |     556.3 |       1.72 |     1.034 |
+| samba        |   418.6 |   238.5 |       1.76 |   2373.4 |    1200.2 |       1.98 |     1.036 |
+| reymont      |   265.3 |   149.2 |       1.78 |   1466.1 |     657.1 |       2.23 |     1.041 |
+| webster      |   254.4 |   141.3 |       1.80 |   1535.5 |     694.3 |       2.21 |     1.050 |
+| dickens      |   223.8 |   120.2 |       1.86 |   1440.8 |     613.0 |       2.35 |     1.052 |
+| text-32m     | 10194.4 | 23446.7 |   **0.43** |   9882.7 |   32746.6 |   **0.30** |     1.071 |
+| xml          |   632.5 |   328.6 |       1.92 |   2493.8 |    1282.6 |       1.94 |     1.079 |
+| nci          |   816.3 |   393.8 |       2.07 |   2556.5 |    1412.8 |       1.81 |     1.100 |
 
-**mean C/us comp 1.73, decomp 2.04 | mean ratio 1.012 | worst ratio 1.100 (nci) |
+**mean C/us comp 1.78, decomp 1.73 | mean ratio 1.012 | worst ratio 1.100 (nci) |
 we beat C: 3 comp, 3 decomp, 3 ratio**
 
-**L3 ratio is UNCHANGED cell-for-cell from the 08-20 board** -- every `us/c size`
-matches to the third decimal, which is exactly what a byte-exact campaign predicts and
-doubles as an end-to-end identity check on the twins. Mean **1.012**, worst `nci`
-**1.100**. Three corpora still BEAT C -- `versions-16m` 0.659, `zeros-32m` 0.967 and
-`x-ray` 0.983. `incomp-32m` compress narrowed to **1.14** and its decompress touched
-**0.99**.
+**L3 ratio is UNCHANGED cell-for-cell -- now across FOUR consecutive boards** (08-20,
+and all three 08-21/08-22 passes). Every `us/c size` matches to the third decimal,
+which is what a byte-exact campaign predicts and doubles as an end-to-end identity
+check on the monomorphisation cuts. Mean **1.012**, worst `nci` **1.100**. Three
+corpora still BEAT C -- `versions-16m` 0.659, `zeros-32m` 0.967 and `x-ray` 0.983.
 
-**Decompress remains the weaker half at L3** (2.06-3.53 against compress 2.00-3.23),
-unchanged in character from the 08-17 board and still following from emitting Huffman
-literals where we used to emit raw ones.
+**Decompress narrowed here too** -- mean 1.73 against the first pass's 2.04, with
+`jsonlog-16m` 2.04 -> 1.68, `dickens` 2.76 -> 2.35 and `webster` 2.67 -> 2.21. Same
+cause as L1: the concurrent decode work, not MatchFind.
 
-Against mission section 7: **4 pass compress** (zeros 0.26, text 0.47, versions 0.60,
-incomp 1.14), **3 pass decompress** (text 0.30, zeros 0.95, incomp 0.99); `versions`
-decompress misses by one hundredth at 1.12.
+Against mission section 7: **3 pass compress** (zeros 0.28, text 0.43, versions 0.64),
+**4 pass decompress** (text 0.30, zeros 0.95, incomp 0.97, versions 1.07). `versions`
+decompress, which missed by one hundredth at 1.12 on the first pass, now PASSES at
+1.07.
+
+> **ONE CELL TO WATCH.** `incomp-32m` compress reads **2.31** here against **1.14** on
+> the first pass, and both arms moved (C 3837.9 -> 5714.4, us 3365.3 -> 2469.2). Its
+> size cell is exactly 1.000 on all four boards, so the parse is identical and this is
+> purely a timing movement on a degenerate, incompressible 32 MiB corpus read at an
+> 8 MiB cap. At a 15.05% null arm this is not a claim in either direction, but it is
+> the widest unexplained swing on the page and it should be re-measured before anyone
+> reasons from it.
 
 > **WHAT THIS BOARD DOES NOT SAY.** It does not say the optimization campaign made us
-> faster. Its speed columns cannot carry that claim at a 13.45% null spread, and the
-> campaign never made it -- every item shipped on strictly-less-work plus byte-identity.
-> See [`m7-optimize-anatomy.md`](m7-optimize-anatomy.md) section 4.
+> faster. Its speed columns cannot carry that claim at a 15.05% null spread, and the
+> campaign never made it -- every item shipped on
+> strictly-less-work plus byte-identity. See
+> [`m7-optimize-anatomy.md`](m7-optimize-anatomy.md) section 4.
 
 ---
 
 ## 3. Stage anatomy — where OUR time goes
 
-**Re-measured 2026-08-21 (fifth pass, post twin campaign), L3, 8 MiB board
+**Re-measured 2026-08-22 (seventh pass, post MatchFind monomorphisation campaign),
+L3, 8 MiB board.** Shares, so machine state does not reach them: every cell is a
+fraction of its own run. The ENCODE half is stable to within a point on every corpus
+(`smallmsg-8m` 82.5 -> 82.6, `jsonlog-16m` 79.4 -> 79.4, `nci` 67.1 -> 66.2), which is
+the expected reading for a campaign that deleted duplicated code rather than moving
+work between stages.
+
+**The DECODE half moved, and in one direction: `DecLits` fell and `DecSeq` absorbed
+it.** `smallmsg-8m` 11.8 -> 7.4, `jsonlog-16m` 10.8 -> 7.4, `mozilla` 14.9 -> 14.2,
+`sao` 32.8 -> 31.6 -- with `DecSeq` rising by almost exactly the same amount
+(`smallmsg-8m` 83.5 -> 89.5). Literal decoding got cheaper, so its share shrank. That
+is the concurrent Huffman/FSE work landing, and it is visible here as a share shift
+even though shares cannot show absolute gains.
 
 | corpus       | MatchFind |     Huff | FseSeq | SeqCode |  DecLits |   DecSeq |    DecCk |
 | ------------ | --------: | -------: | -----: | ------: | -------: | -------: | -------: |
-| smallmsg-8m  |  **82.3** |      5.0 |    4.6 |     4.7 |     10.0 | **85.6** |      2.5 |
-| jsonlog-16m  |  **78.7** |      5.6 |    5.8 |     6.1 |     10.9 | **84.3** |      2.8 |
-| sao          |  **76.9** |     11.7 |    4.8 |     2.9 |     30.0 | **67.5** |      2.2 |
-| x-ray        |  **75.4** |     12.3 |    5.5 |     3.6 |     15.9 | **82.2** |      1.7 |
-| dickens      |  **75.0** |      4.0 |    8.8 |     8.6 |      3.4 | **94.8** |      1.7 |
-| webster      |  **74.9** |      4.9 |    8.7 |     8.1 |      4.2 | **93.3** |      2.2 |
-| samba        |  **74.7** |      7.1 |    7.3 |     5.9 |      7.4 | **88.5** |      3.6 |
-| mozilla      |  **74.3** |     10.3 |    5.2 |     4.6 |     14.0 | **80.9** |      4.2 |
-| reymont      |  **73.2** |      4.2 |   10.5 |     8.3 |      3.1 | **94.7** |      1.9 |
-| mr           |  **73.0** |      8.8 |    9.0 |     6.1 |      5.5 | **92.6** |      1.7 |
-| ooffice      |  **72.3** |     13.0 |    5.9 |     5.4 |     18.1 | **78.7** |      2.1 |
-| osdb         |  **70.5** |     16.3 |    5.4 |     4.3 |      9.9 | **86.9** |      3.0 |
-| xml          |  **69.0** |      7.8 |    9.2 |     7.6 |      7.6 | **87.9** |      4.2 |
-| nci          |  **64.9** |      6.6 |   11.9 |     9.4 |      6.6 | **87.7** |      5.2 |
-| text-32m     |  **59.9** |      3.7 |    1.0 |     0.3 |      0.4 | **75.9** |     22.2 |
-| versions-16m |  **55.0** |      1.0 |    2.9 |     4.6 |      0.3 | **76.9** |     21.8 |
-| incomp-32m   |  **11.4** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **23.7** |
-| zeros-32m    |   **0.0** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **24.2** |
+| smallmsg-8m  |  **82.6** |      5.0 |    4.4 |     4.8 |      7.4 | **89.5** |      2.7 |
+| jsonlog-16m  |  **79.4** |      5.2 |    5.7 |     5.6 |      7.4 | **88.9** |      3.4 |
+| sao          |  **76.7** |     11.5 |    4.8 |     3.0 |     31.6 | **65.9** |      2.3 |
+| x-ray        |  **75.9** |     12.2 |    5.1 |     3.5 |     16.6 | **79.7** |      3.6 |
+| dickens      |  **75.4** |      4.3 |    8.5 |     8.3 |      3.4 | **94.7** |      1.8 |
+| webster      |  **74.5** |      5.1 |    8.8 |     8.1 |      3.9 | **93.7** |      2.3 |
+| samba        |  **73.5** |      7.5 |    7.6 |     6.2 |      7.1 | **88.5** |      3.9 |
+| mozilla      |  **73.3** |     10.7 |    5.3 |     5.1 |     14.2 | **81.7** |      3.9 |
+| reymont      |  **73.0** |      4.4 |   10.4 |     8.5 |      3.1 | **94.7** |      1.9 |
+| mr           |  **72.4** |      9.0 |    9.1 |     6.4 |      5.6 | **92.2** |      1.9 |
+| ooffice      |  **72.1** |     13.1 |    6.1 |     5.4 |     17.8 | **79.7** |      2.3 |
+| osdb         |  **70.6** |     15.9 |    5.6 |     4.4 |     10.5 | **86.4** |      2.9 |
+| xml          |  **68.8** |      7.8 |    9.5 |     7.3 |      7.2 | **88.2** |      4.3 |
+| nci          |  **66.2** |      6.8 |   11.0 |     9.1 |      6.5 | **88.3** |      5.0 |
+| text-32m     |  **63.0** |      3.6 |    0.8 |     0.3 |      0.4 | **73.8** |     24.1 |
+| versions-16m |  **57.4** |      0.8 |    2.7 |     3.8 |      0.2 | **76.7** |     22.3 |
+| incomp-32m   |   **7.6** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **22.2** |
+| zeros-32m    |   **0.0** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **25.9** |
+
+**ENCODE leader: MatchFind 18/18, Huff 0/18. DECODE leader: DecSeq 16/18, DecCk 2/18,
+DecLits 0/18.**
+
+**The same board at L1** -- new to this page. L3 is the shipping default, but L1 is the
+level the fast-path work serves, and its stage split is NOT the same shape:
+
+| corpus       | MatchFind |     Huff | FseSeq | SeqCode |  DecLits |   DecSeq |    DecCk |
+| ------------ | --------: | -------: | -----: | ------: | -------: | -------: | -------: |
+| smallmsg-8m  |  **81.8** |      8.7 |    3.9 |     3.1 |      9.2 | **87.4** |      3.3 |
+| dickens      |  **81.5** |      7.0 |    4.6 |     4.5 |     10.1 | **87.0** |      2.8 |
+| jsonlog-16m  |  **80.3** |      6.9 |    5.0 |     4.6 |      8.6 | **87.4** |      3.8 |
+| webster      |  **78.5** |      7.8 |    5.3 |     5.5 |      8.9 | **87.7** |      3.2 |
+| sao          |  **77.2** |     17.7 |    1.2 |     1.1 | **62.2** |     34.1 |      3.6 |
+| reymont      |  **76.8** |      5.8 |    6.9 |     7.7 |      4.9 | **92.8** |      2.2 |
+| mr           |  **74.4** |     16.4 |    3.6 |     3.1 |     18.1 | **77.7** |      4.0 |
+| samba        |  **74.1** |      9.5 |    6.2 |     5.7 |     10.6 | **82.8** |      6.1 |
+| xml          |  **73.5** |      8.0 |    7.2 |     6.9 |      8.2 | **86.3** |      5.0 |
+| osdb         |  **72.6** |     18.0 |    3.9 |     3.2 |     13.3 | **82.6** |      3.9 |
+| nci          |  **71.0** |      6.1 |    9.6 |     8.1 |      7.0 | **88.2** |      4.6 |
+| ooffice      |  **70.8** |     20.6 |    3.2 |     2.7 |     28.9 | **67.2** |      3.7 |
+| mozilla      |  **69.0** |     15.4 |    5.0 |     4.6 |     18.5 | **75.6** |      5.6 |
+| text-32m     |  **68.7** |      2.7 |    0.4 |     0.2 |      1.1 | **73.0** |     24.6 |
+| versions-16m |  **62.6** |      0.8 |    2.7 |     3.7 |      0.2 | **75.0** |     24.1 |
+| incomp-32m   |   **8.5** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **21.4** |
+| x-ray        |       6.2 | **86.7** |    0.0 |     0.0 | **75.9** |     17.8 |      5.5 |
+| zeros-32m    |   **0.0** |      0.0 |    0.0 |     0.0 |      0.0 |      0.0 | **24.8** |
+
+**ENCODE leader: MatchFind 17/18, Huff 1/18. DECODE leader: DecSeq 14/18, DecLits 2/18,
+DecCk 2/18.**
+
+Three differences from L3 that matter. (1) **`x-ray` inverts completely**: MatchFind
+6.2%, Huff **86.9%**, and on the decode side DecLits **77.5%** against DecSeq 15.5%.
+At L1 this corpus finds almost nothing and the whole frame becomes a literals problem
+-- it is the ONE corpus on either board where MatchFind is not the encode leader, and
+the only reason the L1 encode tally reads 17/18 rather than 18/18. (2) **Huff matters
+much more at L1 generally** -- `ooffice` 20.1, `sao` 18.9, `osdb` 17.4, `mr` 16.0,
+`mozilla` 15.0, against L3 values of 12.9, 12.5, 15.8, 8.9, 10.7. Fewer matches means
+more literals to encode. (3) **The entropy coders shrink**: FseSeq+SeqCode is 1.1+1.1
+on `sao` at L1 against 5.0+3.2 at L3. Any future literals work should be scoped against
+this board, not the L3 one.
 
 ### MatchFind Function Anatomy
 
@@ -202,47 +303,92 @@ the run, `mfanat.rs`), and the asm census gives each function's footprint and IS
 state.
 
 **(a) Time -- which function owns MatchFind at each level.** 18-corpus 8 MiB board,
-profile build; milliseconds per input MiB.
+profile build, re-measured 2026-08-22 third pass; milliseconds per input MiB. Absolute
+times from an INSTRUMENTED build, so they are not comparable to the release boards in
+sections 1 and 2 -- compare shapes and inversions across levels, and cells across
+passes only with the null arm in hand.
 
 | level | strategy | serving function(s)          | MF ms/MiB | MF % of encode |
 | ----: | -------- | ---------------------------- | --------: | -------------: |
-|    L1 | Fast     | `find_fast_impl`             |       6.0 |           73.9 |
-|    L3 | DFast    | `find_dfast_impl`            |       7.0 |           76.5 |
-|    L5 | Greedy   | `find_greedy` (walk inlined) |      11.0 |           83.4 |
-|    L7 | Lazy     | `find_lazy` + `chain_find_best` |   44.1 |           95.1 |
-|    L9 | Lazy2    | `find_lazy` + `chain_find_best` |   74.8 |           97.0 |
-|   L12 | Lazy2    | `find_lazy` + `chain_find_best` |  174.3 |           98.6 |
-|   L13 | BtLazy2  | `find_bt_lazy` + `bt_find_best` | 273.0 |           99.2 |
-|   L15 | BtLazy2  | `find_bt_lazy` + `bt_find_best` | 329.9 |           99.3 |
-|   L16 | BtOpt    | `find_opt` + `bt_find_best`  |     319.9 |           99.3 |
-|   L19 | BtUltra2 | `find_opt` + `bt_find_best`  |     379.4 |           99.4 |
-|   L22 | BtUltra2 | `find_opt` + `bt_find_best`  |     406.7 |           99.3 |
+|    L1 | Fast     | `find_fast_impl`             |      5.17 |           73.9 |
+|    L3 | DFast    | `find_dfast_impl`            |      5.40 |           74.1 |
+|    L5 | Greedy   | `find_greedy` (walk inlined) |      9.19 |           83.0 |
+|    L7 | Lazy     | `find_lazy` + `chain_find_best` |   20.59 |           91.6 |
+|    L9 | Lazy2    | `find_lazy` + `chain_find_best` |   32.12 |           94.3 |
+|   L12 | Lazy2    | `find_lazy` + `chain_find_best` |  134.11 |           98.3 |
+|   L13 | BtLazy2  | `find_bt_lazy` + `bt_find_best` | 364.32 |           99.2 |
+|   L15 | BtLazy2  | `find_bt_lazy` + `bt_find_best` | 301.26 |           99.2 |
+|   L16 | BtOpt    | `find_opt` + `bt_find_best`  |    281.06 |           99.3 |
+|   L19 | BtUltra2 | `find_opt` + `bt_find_best`  |    335.19 |           99.3 |
+|   L22 | BtUltra2 | `find_opt` + `bt_find_best`  |    340.64 |           99.2 |
 
-Three readings. (1) **MatchFind IS the encoder at every level**: 73.9% at L1 rising
-to 99.3-99.4% from L13 up -- above the chain ladder there is no second stage worth a
-row. (2) The ladder spans **68x** in absolute cost, 6.0 -> 406.7 ms/MiB; the two big
-jumps are Greedy -> Lazy (11 -> 44, the look-ahead re-search at every found match)
-and Lazy2 -> BtLazy2 (174 -> 273, the tree walk). (3) L16 costs LESS than L15
-(319.9 vs 329.9): the DP prices candidates it then declines to re-search, where
-BtLazy2's look-ahead searches unconditionally.
+Four readings. (1) **MatchFind IS the encoder at every level**: 73.9% at L1 rising to
+99.2-99.3% from L13 up -- above the chain ladder there is no second stage worth a row.
+(2) The ladder spans **70x** in absolute cost, 5.17 -> 364.32 ms/MiB; the big jumps are
+Greedy -> Lazy (9.19 -> 20.59, the look-ahead re-search at every found match), L9 ->
+L12 inside Lazy2 itself (32.12 -> 134.11, pure `search_log` depth) and Lazy2 ->
+BtLazy2 (134.11 -> 364.32, the tree walk). (3) **L16 still costs LESS than L15**
+(281.06 vs 301.26) -- third pass running, and the mechanism is unchanged: the DP prices
+candidates it then declines to re-search, where BtLazy2's look-ahead searches
+unconditionally.
+
+**A RETRACTION.** The second pass reported a SECOND inversion at the top of the
+ladder, **L22 below L19** (387.34 vs 393.63), and called two independent inversions
+"the strongest form this observation has taken". **It did not reproduce.** This pass
+reads L22 **340.64** against L19 **335.19** -- the ordinary way round, on a host with
+a far lower null arm than the board that produced the claim. One board is not evidence
+for a 1.6% gap. The L16 < L15 inversion, which is a 7% gap and has now held on three
+consecutive boards, stands; the L22 one is withdrawn.
+
+**A SECOND CELL TO WATCH: L13.** It reads **364.32**, above BOTH L15 (301.26) and L16
+(281.06), which is out of line with the ladder's shape -- and it has risen on every
+pass (273.0 -> 290.54 -> 364.32) while every neighbouring level fell. Either L13 is
+carrying a real regression that the identity boards cannot see (they check bytes, and
+L13's bytes are exact at 12,603,507), or this instrument is noisy at that level. It
+needs a repeat measurement before anything is concluded from it.
+
+(4) **The chain ladder has now fallen on three consecutive passes** -- L7
+44.1 -> 24.04 -> 20.59, L9 74.8 -> 40.93 -> 32.12, L12 174.3 -> 171.04 -> 134.11 --
+tracking the per-finder campaign (`ChainCtx`, the `find_lazy` prologue hoist) and then
+this one. **It is still not claimed.** These are absolute times from a profile build,
+and the campaign's law is that no win ships on the clock; a monotone trend across three
+boards is suggestive, not a receipt. It is recorded as the one place where the clock
+and the static receipts point the same way.
 
 **(b) The functions -- footprint and ISA state** (asm census, same build; "copies"
 counts monomorphisations, plain + BMI2 twin).
 
-| function | copies | live-copy instrs | ISA receipt | unit of execution |
+**Re-censused 2026-08-22.** "copies" is baseline + BMI2 twin. The twin column is what
+EXECUTES on modern hardware; the baseline column is linked but never entered.
+
+| function | copies | total instrs | ISA receipt | unit of execution |
 | --- | ---: | ---: | --- | --- |
-| `find_fast_impl` | 140 + 140 | <= 2,458 / 2,425 | twins carry 1,878 shrx, 0 CL | per position, L1-L2 |
-| `find_dfast` + `find_dfast_impl` | 1 + 6 + 6 | dispatcher 9,397; twin <= 1,908 | 30 shrx; 2 `shrb $const` per twin (no 8-bit shrx exists -- irreducible) | per position, L3-L4 (default) |
-| `find_greedy` | 1 + 1 | 2,269 / 2,219 | 27 shrx, 0 CL in twin | per position, L5 |
-| `find_lazy` | 1 + 1 | 1,958 / 1,930 | 13 shrx, 0 CL in twin | per position, L6-L12 |
-| `chain_find_best` | 2 + 2 | <= 466 / 454 | 7 shrx; outlined by brick 48, ISA via per-block `ChainFn` pointer | per position + per look-ahead step, L5-L12 |
-| `bt_find_best_impl` | 42 + 42 | <= 229 each | 84 shrx total; ISA chosen once per block in `bt_resolve` | per position x ~30M, L13-L22 |
-| `bt_find_best_runtime` | 1 + 1 | 259 / 261 | 5 shrx | fallback arm |
-| `find_sequences_strategy` | 1 + 1 | 2,377 / 2,271 | `find_opt` + `find_bt_lazy` inlined into BOTH arms (find_opt pinned 08-21) | per block hub |
-| `find_sequences` | 1 + 1 | 722 / 672 | ldm glue | per block |
-| `count_match` / `count_eq_len` | 1 / 1 | 153 / 77 | AVX2 arm via `has_avx2()` | per candidate hit |
+| `find_fast_impl` | 48 + **8** | 73,499 / **12,679** | `HLOG`/`STEP`/`PIPE` axes collapsed on the twins (140 -> 8); baseline keeps brick 54's HLOG fold | per position, L1-L2 |
+| `find_dfast` + `find_dfast_impl` | 1 + **1** | dispatcher 12,726; twin **1,816** | HLOG axis collapsed on the twin (6 -> 1); the 5 baseline copies inline into the dispatcher | per position, L3-L4 (default) |
+| `find_greedy` | 1 + 1 | 2,514 / 2,506 | 27 shrx, 0 CL in twin | per position, L5 |
+| `find_lazy` | 1 + 1 | 1,960 / 1,940 | 13 shrx, 0 CL in twin | per position, L6-L12 |
+| `chain_find_best` | 2 + 2 | 870 / 857 | outlined by brick 48, ISA via per-block `ChainFn` pointer | per position + per look-ahead step, L5-L12 |
+| `bt_find_best_impl` | 20 + **0** | 6,003 / **0** | the (hash_log, chain_log) spec list is BMI2-redundant; twins run the runtime arm | per position x ~30M, L13-L22 |
+| `bt_find_best_runtime` | 1 + 1 | 276 / 291 | 5 shrx; now the ONLY bt arm on modern hardware | per position, L13-L22 |
+| `find_sequences_strategy` | 1 + 1 | 2,554 / 2,470 | `find_opt` + `find_bt_lazy` inlined into BOTH arms | per block hub |
+| `find_sequences` | 1 + 1 | 711 / 672 | ldm glue | per block |
+| `emit_fast_seq` | 1 + 1 | 256 / **252** | outlined behind `FastEmitCtx` with its own `#[target_feature]` twin -- was inlined into all 280 `find_fast_impl` copies | per match, L1-L2 |
+| `count_match` / `count_eq_len` | 1 / 1 | 189 / 92 (avx2) | AVX2 arm via `has_avx2()` | per candidate hit |
 | `match_ok` (+ cold tail) | inlined + 1 | 66 (tail) | memcmp only in the cold mls>8 tail | per candidate |
-| `emit_fast_seq`, `prime_tables`, `fill_fast_after_match`, `fast_hash_relatch` | -- | fully inlined into the twins | -- | per match / per block |
+
+**The census totals.** MatchFind **572,667 -> 130,584 (-77.2%)**; the whole library
+**698,085 -> 250,336**; surviving bounds checks **326 -> 42**, and ZERO of them in
+`find_fast_impl`, which carried 280. The BMI2 path that actually executes went
+**282,373 -> 22,268 (-92.1%)**.
+
+**Why the axes were redundant.** Brick 54 specialises `HLOG` so the hash shift folds to
+an immediate -- a real win on a baseline x86 shift, whose count MUST live in `%cl`. It
+buys nothing on a BMI2 twin, because `shrx` takes its count from any GPR, which is
+exactly what this page's own twin receipt recorded ("1,878 shrx, 0 CL"). The twins were
+paying a six-fold monomorphisation for a fold their ISA had already made free. `STEP`
+is an addend (register and immediate cost the same, on every architecture), and `PIPE`
+gated ONE per-block test. All three are byte-identical by the argument this file has
+always used for the dispatch: the const takes the value the runtime variable held.
 
 Every function above runs its BMI2 twin on modern hardware; the remaining CL shifts
 in the binary are the plain fallback arms, two ISA-irreducible shapes (8-bit
@@ -320,25 +466,438 @@ content-dispatch -- it must do what the encoder said. That is why this stage fel
 
 ---
 
-### DecSeq Function Anatomy -- Great Gate
+### DecSeq Function Anatomy
 
-The #1 decode stage on 13 of 18 corpora.
+| level | strategy | DecSeq ms/MiB | DecSeq % of decode | Header | Tables | Loop | Tail | decode ms/MiB |
+| ----: | -------- | ------------: | -----------------: | -----: | -----: | ---: | ---: | ------------: |
+|    L1 | Fast     |          1.15 |               73.7 |    0.0 |    1.3 | **97.2** |  1.3 |          1.56 |
+|    L3 | DFast    |          1.78 |               85.7 |    0.0 |    1.0 | **98.8** |  0.0 |          2.08 |
+|    L5 | Greedy   |          2.03 |               87.3 |    0.0 |    0.9 | **98.9** |  0.0 |          2.32 |
+|    L7 | Lazy     |          1.91 |               87.3 |    0.0 |    0.9 | **98.9** |  0.0 |          2.19 |
+|    L9 | Lazy2    |          1.79 |               85.8 |    0.0 |    1.0 | **98.8** |  0.0 |          2.08 |
+|   L12 | Lazy2    |          1.73 |               86.5 |    0.0 |    1.2 | **98.6** |  0.0 |          2.01 |
+|   L13 | BtLazy2  |          1.72 |               87.4 |    0.0 |    1.0 | **98.8** |  0.0 |          1.97 |
+|   L15 | BtLazy2  |          2.24 |               87.3 |    0.0 |    1.1 | **98.7** |  0.0 |          2.57 |
+|   L16 | BtOpt    |          1.61 |               85.7 |    0.0 |    1.2 | **98.5** |  0.0 |          1.88 |
+|   L19 | BtUltra2 |          1.64 |               87.4 |    0.0 |    1.1 | **98.6** |  0.0 |          1.88 |
+|   L22 | BtUltra2 |          1.73 |               87.2 |    0.0 |    1.1 | **98.7** |  0.0 |          1.99 |
+
+**(b) Time by corpus, at L1 and at the shipping default.** Sorted by DecSeq share of
+decode. `ns/seq` is `DecSeqLoop / nseq`.
+
+| corpus | L1 ms/MiB | L1 % dec | L1 ns/seq | L1 seqs/MiB | L3 ms/MiB | L3 % dec | L3 ns/seq | L3 seqs/MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `reymont` | 2.71 | 92.7 | 30.5 | 88,179 | 3.10 | 94.3 | 31.8 | 96,648 |
+| `dickens` | 2.20 | 86.6 | 30.0 | 72,473 | 3.95 | 94.2 | 33.8 | 115,804 |
+| `webster` | 2.03 | 88.5 | 31.4 | 64,240 | 3.18 | 93.8 | 34.5 | 91,412 |
+| `mr` | 1.49 | 78.2 | 32.8 | 44,447 | 3.31 | 91.5 | 32.8 | 99,596 |
+| `smallmsg-8m` | 1.81 | 88.2 | 31.6 | 56,874 | 2.09 | 89.6 | 31.3 | 66,456 |
+| `jsonlog-16m` | 1.72 | 87.0 | 32.3 | 52,440 | 1.80 | 89.7 | 31.8 | 56,002 |
+| `nci` | 1.14 | 87.9 | 31.9 | 34,988 | 1.17 | 88.3 | 32.9 | 34,793 |
+| `samba` | 1.36 | 84.4 | 32.4 | 41,034 | 1.59 | 88.2 | 33.5 | 46,464 |
+| `xml` | 1.14 | 86.3 | 31.5 | 35,608 | 1.41 | 86.6 | 36.3 | 38,144 |
+| `osdb` | 1.45 | 83.2 | 30.6 | 46,947 | 1.86 | 86.5 | 32.7 | 56,425 |
+| `mozilla` | 1.01 | 76.4 | 33.1 | 29,198 | 1.32 | 82.2 | 33.9 | 37,580 |
+| `x-ray` | 0.18 | **16.9** | -- | **7** | 3.20 | 81.3 | 32.9 | 96,379 |
+| `ooffice` | 1.27 | 67.6 | 34.2 | 36,429 | 2.41 | 80.5 | 30.5 | 78,160 |
+| `versions-16m` | 0.20 | 76.3 | -- | 1,198 | 0.20 | 75.0 | -- | 1,487 |
+| `text-32m` | 0.20 | 74.4 | -- | **8** | 0.18 | 70.1 | -- | **8** |
+| `sao` | 0.71 | 33.7 | 39.7 | 17,230 | 2.03 | 66.9 | 33.8 | 58,543 |
+| `zeros-32m` | 0.00 | 0.0 | -- | 0 | 0.00 | 0.0 | -- | 0 |
+| `incomp-32m` | 0.00 | 0.0 | -- | 0 | 0.00 | 0.0 | -- | 0 |
+| **board** | **1.13** | **76.0** | **32.4** | **33,939** | **1.80** | **85.7** | **33.3** | **53,509** |
+
+`ns/seq` is suppressed where the corpus emits too few sequences for the number to mean
+anything -- `text-32m` (8 sequences on the whole 8 MiB board), `versions-16m` (1,198/MiB)
+and `x-ray` at L1 (7/MiB). Those rows are not slow per sequence; they have no
+sequences. **`x-ray` at L1 is the extreme: Loop 5.8%, Tail 92.5%** -- the block is
+literals with essentially nothing to execute, which is the same L1 raw-literal
+behaviour section 1 records as `x-ray` ratio 1.000. At L3 the same corpus is an
+ordinary row (96,379 seqs/MiB, Loop 99.0%).
+
+**THE STAGE IS ONE NUMBER TIMES ONE COUNT, and the counts prove it without a clock.**
+`ns/seq` is **30.0-39.7 ns at L1 and 30.5-36.3 ns at L3** -- across sixteen corpora,
+two levels, and content from English text to a database dump, the per-sequence cost
+moves by under 25%. Multiply it out:
+
+| level | seqs/MiB (exact count) | x ns/seq | predicted ms/MiB | MEASURED ms/MiB |
+| ---: | ---: | ---: | ---: | ---: |
+| L1 | 33,939 | 32.4 | **1.10** | 1.13 |
+| L3 | 53,509 | 33.3 | **1.78** | 1.80 |
+
+Both close to within 3%, and the L1 -> L3 sequence count rises **1.58x** against a
+measured DecSeq rise of **1.59x**. So DecSeq has exactly two levers, and the board
+says which is which: **cut the ~33 ns, or emit fewer sequences.** The second is not a
+decoder question at all -- it is the encoder's `(litlen, matchlen, offset)`
+distribution, which is what gate #3-#6 below already hinted at and this now
+quantifies.
+
+**(c) The functions -- footprint and ISA state** (asm census of the SHIPPING build,
+`RUSTFLAGS="--emit asm"`, 886,353 lines parsed per symbol).
+
+| function | copies | live-copy instrs | ISA receipt | unit of execution |
+| --- | ---: | ---: | --- | --- |
+| `decode_sequences` | 1 | 4,167 | 0 BMI2, 56 SSE, **240 CL-shift** | per block, plain arm |
+| `decode_sequences_avx2` | 1 | 4,055 | **175 BMI2, 28 AVX2**, 0 SSE, 68 CL | per block, twin |
+| `decode_compressed_block` | 1 | 2,942 | 0 BMI2, 40 SSE, 187 CL | per block, plain arm |
+| `decode_compressed_block_bmi2` | 1 | 2,792 | **78 BMI2**, 38 SSE, 112 CL | per block, twin |
+| `decompress_into_history` | 1 | 542 | 2 SSE, 8 CL | per frame |
+| `copy_match` | 1, **CALLED per sequence** | 141 | **0 ymm, 0 SSE** | per sequence, OUTSIDE the twin |
+| `copy_from_decoded` | 1, **CALLED per sequence** | 230 | **0 ymm, 13 SSE** | per sequence, OUTSIDE the twin |
+| `ll_code` / `ml_code` | 1 / 1, not called from the loop | 198 / 284 | 3 / 6 CL | test-only |
+| `seq_table`, `init_state`, `copy_literals`, `resolve_offset`, `of_code`, `FseTable::entry`, `FseTable::advance`, `BitRev::read_bits`, `BitRev::reload`, `code_from_base` | -- | fully inlined | -- | per sequence |
+
+> **CORRECTION 2026-08-21, and it inverts the paragraph that stood here.** This
+> section previously claimed "DecSeq IS TWO SYMBOLS -- the sequence loop calls nothing
+> of its own", and listed `copy_match` / `copy_from_decoded` as DEAD COPIES reachable
+> only from tests. **Both claims were wrong.** They came from a call-target dump that
+> printed only the top 40 targets by count, and ~28 of those slots were consumed by
+> `.LBB` local labels -- the `copy_match` edge, appearing **once** as a call site,
+> fell off the end of the list. A whole-binary scan for callers finds three edges:
+> `decode_sequences -> copy_match`, `decode_sequences_avx2 -> copy_match`, and
+> `copy_match -> copy_from_decoded`. **Never read "absent" off a truncated list.**
+
+**THE STRUCTURAL FINDING, CORRECTED: THE MATCH COPY RUNS OUTSIDE THE TWIN.** The
+entropy half of the loop is genuinely inlined -- `FseTable::entry`/`advance`,
+`read_bits`, `reload`, `resolve_offset` and `copy_literals` all survive as straight-line
+code inside `decode_sequences_avx2`. The MATCH COPY does not:
+
+| what | where it executes | ISA it gets |
+| --- | --- | --- |
+| `copy_literals` (~13.7% of the loop) | INLINED into the AVX2 twin | 256-bit `vmovups [ymm]` |
+| `copy_match` -> `copy_from_decoded` (**~42% of the loop**) | **two nested CALLS per sequence, outside the twin** | **0 ymm; 13 SSE, baseline x86-64** |
+
+All 26 `vmovups [ymm]` in the twin belong to `copy_literals`. `copy_match` carries
+none, because a function with no `#[target_feature]` is compiled to the crate's
+baseline ISA no matter which twin calls it -- the exact "shim trap" the twin campaign
+was built to avoid, still open on the single largest object in the decoder.
+
+Three consequences:
+
+1. **There IS call overhead in DecSeq, two levels of it, on every sequence** --
+   53,509 sequences per MiB at L3, each paying a call into `copy_match` and another
+   into `copy_from_decoded`.
+2. **The widest copy the match path can currently emit is 128-bit**, in a function the
+   AVX2 twin cannot inline. Bringing the match copy inside the twin is the outstanding
+   SIMD item in this stage, and it is worth more than everything section (f) ruled
+   out, because it lands on ~42% of the loop rather than on ~5%.
+3. **The twin receipt is real and lopsided.** The plain arm carries 240 CL-shifts and
+   0 BMI2; the twin carries 68 CL and 175 BMI2, plus AVX2 where the baseline needs
+   SSE. `decode_compressed_block` twins the same way (187 CL / 0 BMI2 -> 112 / 78).
+
+**(d) The loop interior, by COUNT.** Exact, not sampled -- the loop's shape is fixed by
+the RFC.
+
+| function                        | unit         | per sequence | calls/MiB @ L1 | calls/MiB @ L3 |
+| ------------------------------- | ------------ | -----------: | -------------: | -------------: |
+| `FseTable::entry`               | per seq x3   |         3.00 |        101,818 |        160,527 |
+| `BitRev::read_bits`             | per seq x3   |         3.00 |        101,818 |        160,527 |
+| `FseTable::advance`             | per seq x3   |         3.00 |        101,798 |        160,503 |
+| `BitRev::reload`                | per seq x2   |         2.00 |         67,879 |        107,018 |
+| `copy_literals`                 | per seq      |         1.00 |         33,939 |         53,509 |
+| `resolve_offset`                | per seq      |         1.00 |         33,939 |         53,509 |
+| `copy_match`                    | per seq      |         1.00 |         33,939 |         53,509 |
+| `seq_table` (LL/OF/ML)          | per block x3 |           -- |             20 |             24 |
+| `BitRev::new` + `init_state` x3 | per block x4 |           -- |             27 |             32 |
+
+**The per-block functions are four orders of magnitude rarer than the per-sequence
+ones** -- 24 `seq_table` calls per MiB against 160,527 `FseTable::entry`. That is the
+count-side statement of the 1% Tables share, and it is why no table-build brick can
+pay. **Eleven primitive calls happen per sequence**, and the three FSE `entry` +
+three `advance` + three `read_bits` dominate that count nine to three over the copies.
+
+**(e) Breaking the LOOP open -- where the 98.8% goes.** `dsloop.rs`, `--features
+dupladder`, L3, 13 sequence-bearing corpora, 6.5M sequences.
+
+Sections (a)-(d) leave the whole stage inside one bar: the Loop is 97-99% of DecSeq
+and nothing inside it can be timed, because one sequence costs ~34-40 ns and an
+`Instant` pair costs 74.8. **The method that does work is DUPLICATION.** Each op is
+executed K extra times per sequence and then UNDONE -- bit-reader state restored,
+`out` truncated, `reps` restored -- so:
+
+- **every arm produces byte-identical output**, asserted on every arm and every
+  corpus, so a mis-built arm cannot quietly become a fast arm;
+- the arm's delta over baseline prices K executions of that op, over 6.5M sequences
+  instead of one.
+
+> **THE INSTRUMENT PERTURBS THE LOOP IT MEASURES, AND HERE IS THE RECEIPT.** The arm
+> dispatch is a per-sequence branch inside a register-starved loop. Built from
+> identical source, `dsprobe` reports **40.26 ns/seq under `--features profile` and
+> 53.07 ns/seq under `--features dupladder` with every arm OFF** -- a **+32%**
+> baseline inflation, higher on 12 of 13 corpora. That is why `dupladder` is its own
+> feature and NOT part of `profile`: it must be built on purpose, and its absolute
+> numbers must never be quoted beside a `profile` board. Sections (a)/(b) above are
+> `profile` builds and are unaffected.
+
+**The validation that decides what this table may claim: is the answer invariant to
+K?** Run the whole ladder at K=4 and again at K=8 -- two runs whose own baselines
+differed by 38% (73.89 vs 53.46 ns/seq):
+
+| op                     | ns/exec @K=4 | ns/exec @K=8 | **% of loop @K=4** | **% of loop @K=8** |
+| ---------------------- | -----------: | -----------: | -----------------: | -----------------: |
+| `copy_match`           |        30.53 |        22.94 |           **41.3** |           **42.9** |
+| `copy_literals`        |         9.89 |         7.45 |           **13.4** |           **13.9** |
+| `resolve_offset`       |         3.03 |         1.53 |                4.1 |                2.9 |
+| `FseTable::entry` x3   |         0.37 |         0.29 |                1.5 |                1.6 |
+| `BitRev::reload` x2    |         0.83 |         0.34 |                2.3 |                1.3 |
+| `FseTable::advance` x3 |         0.24 |         0.13 |                1.0 |                0.7 |
+| `BitRev::read_bits` x3 |         0.33 |         0.13 |                1.3 |                0.7 |
+| **ladder total**       |    **47.95** |    **34.24** |           **64.9** |           **64.0** |
+
+**Absolute ns is NOT K-invariant; the SHARES are.** Every op is 25-50% cheaper at K=8
+-- more repetitions, warmer cache, cheaper marginal execution -- exactly the bias the
+method carries. But `copy_match` moves 41.3 -> 42.9%, `copy_literals` 13.4 -> 13.9%,
+and total coverage 64.9 -> 64.0%, across runs whose baselines differed by 38%. **So
+this instrument reports proportions, and its absolute nanoseconds are lower bounds
+only.** Every number below is a share for that reason.
+
+**THE FINDING: DecSeq IS A MEMORY-MOVEMENT LOOP, NOT AN ENTROPY-DECODING LOOP.**
+
+| what                                                             | share of the loop |
+| ---------------------------------------------------------------- | ----------------: |
+| `copy_match`                                                     |          **~42%** |
+| `copy_literals`                                                  |            ~13.7% |
+| `resolve_offset`                                                 |             ~3.5% |
+| **the three execution ops together**                             |          **~59%** |
+| ALL FOUR entropy primitives -- **eleven calls per sequence**     |         **~4-6%** |
+| unattributed (loop branch/counter/bounds + warm-cache shortfall) |              ~36% |
+
+That is the opposite of what the stage's name suggests. The FSE and bit-reader
+machinery -- eleven primitive calls per sequence, 321,054 calls per MiB at L3, the
+part that the BMI2 twin exists to accelerate -- is **under six percent of the loop**.
+One `copy_match` per sequence is **seven times** the cost of all eleven of them
+together.
+
+Three consequences:
+
+1. **The BMI2 twin cannot be worth much on the decode side, and now that is
+   quantified rather than assumed.** It converts 172 CL-shifts to `shrx` in
+   `decode_sequences` (section (c)) -- inside the ~5% of the loop that is entropy. The
+   ceiling on the entire twin is a few percent of DecSeq, i.e. a few percent of ~86%
+   of decode. The twin is byte-exact and free to keep; it is not a lever to pull
+   harder on.
+2. **`copy_match` at ~42% is the single largest object in the decoder**, and the route
+   census below says its traffic is split between an enormous number of tiny copies
+   (16B tier: 87% of calls, mean 8.0 bytes) and a small number of long ones
+   (`extend_from_within`: 3.7% of calls, **33.9% of bytes**, mean 124.8). Any real
+   decode win goes through that function.
+3. **The encoder-side lever is the stronger one, and section (b) already priced it.**
+   DecSeq = sequences x ~33-40 ns, and ~59% of that constant is copying whose cost is
+   set by the `(litlen, matchlen, offset)` distribution the ENCODER chose. Emitting
+   fewer, longer matches moves both terms at once; making `copy_match` faster moves
+   42% of one of them.
+
+**`copy_match` route census** -- which band each match copy takes:
+
+| band | L1 calls | L1 % calls | L1 % bytes | L1 mean len | L3 calls | L3 % calls | L3 % bytes | L3 mean len |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16B tier | 3,720,978 | **80.5** | 42.5 | 9.5 | 6,351,371 | **87.1** | 50.9 | 8.0 |
+| 32B tier (len>16) | 640,537 | 13.9 | 16.5 | 21.4 | 651,665 | 8.9 | 14.2 | 21.7 |
+| `extend_from_within` | 246,087 | 5.3 | **29.2** | 98.1 | 270,359 | 3.7 | **33.9** | 124.8 |
+| overlapping chunked | 12,526 | 0.3 | **11.6** | **766.9** | 13,953 | 0.2 | 1.0 | 71.9 |
+| `offset==1` splat | 2,436 | 0.1 | 0.2 | 54.4 | 652 | 0.0 | 0.0 | 53.5 |
+| 32B tier (len<=16) | **0** | **0.0** | 0.0 | -- | **0** | **0.0** | 0.0 | -- |
+
+`copy_literals` tiers: **96.9%** of calls tiered at L1 (16B 4,256,559 / 32B 223,809 /
+memcpy 142,196), **99.3%** at L3 (16B 7,015,583 / 32B 220,400 / memcpy 52,017).
+
+**Three readings.**
+
+1. **The `32B tier (len<=16)` band reads exactly ZERO at both levels.** That band
+   exists only to catch short copies leaking into the wide tier, which is what the T4
+   reorder (test 16 before 32) was meant to stop. It is airtight: not one copy in
+   11.9M moves 32 bytes to publish 16 or fewer. **A census that reads zero is the
+   receipt that the fix holds** -- and it is the only way to know.
+2. **Calls and BYTES disagree about where the work is.** The 16B tier is 80-87% of
+   CALLS but 42-51% of BYTES at a mean of 8-9.5, while `extend_from_within` is
+   3.7-5.3% of calls and **29-34% of bytes** at a mean of 98-125. Tuning by call count
+   tunes the half of the traffic that is already cheapest.
+3. **`overlapping chunked` is an L1-only concentration.** At L1 it takes 0.3% of calls
+   but carries **11.6% of all match bytes at a mean run of 767 bytes**; at L3 the same
+   route carries 1.0% at a mean of 72. Long overlapping runs are an L1 phenomenon and
+   they land in the slowest route in the file. That is the one un-tiered band left.
+
+**(f) SCALAR CENSUS and the first SIMD attempt -- what is reducible and what is not.**
+
+The census (`scalarcensus.py` over the shipping asm) classifies every instruction in
+the live decode path. The headline is a REFUTATION:
+
+| function | total | WIDE | SSE | BMI2 | CL-shift | byte-op | scalar |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `decode_sequences_avx2` | 4,055 | 42 | **0** | 175 | 68 | 394 | 3,376 |
+| `decode_sequences` (plain) | 4,167 | 0 | 57 | 0 | 240 | 410 | 3,460 |
+| `decode_compressed_block_bmi2` | 2,792 | 0 | **57** | 78 | 112 | 196 | 2,349 |
+
+1. **The CL-shift residue is IRREDUCIBLE, and counting settled it before any code was
+   written.** Splitting the 68 shifts in `decode_sequences_avx2` by operand: **65 are
+   IMMEDIATE** (`shlq $2`, `shrl $3`) and only **3 are variable**. BMI2's `shrx`/`shlx`
+   exist to remove the CL-register constraint and flag dependency of a VARIABLE shift;
+   against an immediate shift they are not faster. Same in the block twin: 110
+   immediate, 2 variable. **The twin campaign already converted everything
+   convertible** -- "replace the remaining shifts with BMI2" is a dead lever.
+2. **The LITERAL copy is already 256-bit; the MATCH copy is not.** All 26
+   `vmovups [ymm]` in the sequence twin belong to `copy_literals`. `copy_match` and
+   `copy_from_decoded` are outlined, baseline-compiled, and carry **0 ymm / 13 SSE** --
+   see the correction in (c). The match path is the one place left where widening is
+   both possible and worth it.
+3. **The 394 byte-ops are mostly `movzbl` (190)** -- single-byte FSE symbol and
+   length-code table reads. One-element table lookups are the gather case; vectorising
+   them costs more than it saves.
+4. **The one real SSE gap: `decode_compressed_block_bmi2` is `target_feature(bmi2,
+   lzcnt)` with NO avx2**, so its 57 vector instructions are legacy SSE (27 `movdqa`,
+   9 `movaps`, 7 `movdqu`, plus a `pshufd`/`punpcklbw` group). `decode_sequences_avx2`
+   proves the mechanism -- it is `avx2,bmi2,lzcnt` and carries 0 SSE. Widening that
+   twin is the outstanding item; it lands in DecLits, not DecSeq.
+
+**The 64-byte tier: built, correct, NOT faster.** Section (e) put `copy_match` at ~42%
+of the loop, and the route census left exactly one un-tiered band
+(`extend_from_within`, ~34% of match bytes, falling through to a runtime-length
+`memcpy` CALL). Its length histogram (`dsuntier.rs`) is not diffuse -- **65.9% of its
+calls and 46.9% of its bytes are 33-64 bytes**, one 2x ymm pair. Its MEAN (67) would
+have chosen the wrong width; the histogram chose it. Added as a 64-byte tier after the
+16 and 32 (narrowest first, the T4 ordering law):
+
+- **Capture, as predicted:** the 33-64 bucket fell from **170,358 calls to 980**
+  (99.4% absorbed, the remainder being `offset < 64`), taking 8.05 MB out of the band.
+- **Correctness:** 159/159 tests pass; the round-trip is asserted per corpus.
+- **Speed: NEUTRAL.** ABBA-paired against a pre-tier binary, board DecSeqLoop
+  **31.99 -> 31.52 ns/seq**, a 1.5% apparent gain inside a **6-8% within-arm spread**.
+  **This instrument cannot resolve it, so no win is claimed.**
+
+**WHY IT DID NOT PAY -- and the deterministic ledger says it without a clock.**
+Diffing the emitted SHIPPING asm before and after the tier:
+
+| symbol | instrs before | after | delta | ymm before | after |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `decode_sequences_avx2` | 4,055 | 4,055 | **+0** | 26 | **26** |
+| `decode_sequences` | 4,167 | 4,167 | **+0** | 0 | 0 |
+| `copy_from_decoded` | 211 | 230 | **+19** | **0** | **0** |
+
+**The hot loop did not change by one instruction.** The tier landed entirely in
+`copy_from_decoded` -- an outlined, baseline-compiled function (see the correction in
+(c)) -- so its 64-byte move is **four SSE `movups` pairs, not two AVX2 ymm pairs**.
+The change added a wider copy in the one function that cannot use wide registers. That
+identical `4,055` is what sent this audit one layer down and found the call edge the
+truncated dump had hidden.
+
+The full deterministic ledger for the change, all counts, no clock:
+
+| quantity | value |
+| --- | ---: |
+| WIN: runtime-length `memcpy` call sites converted to fixed-width | **169,378** |
+| WIN: match bytes rerouted off the untiered band | **8,050,211** |
+| WIN: 33-64 bucket captured (170,358 -> 980 calls) | **99.4%** |
+| WIN: untiered band calls (258,626 -> 89,248) | **-65.5%** |
+| WIN: untiered band bytes (17.24 MB -> 9.19 MB) | **-46.7%** |
+| COST: store amplification, 64 B written for a 47.53 B mean | **+2.79 MB** |
+| COST: static footprint of `copy_from_decoded` | **+19 instrs** |
+| COST: vector width actually obtained | **128-bit, not 256** |
+
+A large call-count win against a real store-traffic cost, executed at half the
+intended width. The clock says the three cancel. **The tier is kept but unproven; the
+change that would make it pay is inlining the match copy into the twin, not widening
+it further.**
+
+**(g) THE SIMD CAMPAIGN -- what shipped, what was ruled out, and the law it taught.**
+
+Section (f) found the match copy running OUTSIDE the AVX2 twin at 128-bit through two
+nested calls per sequence. Three changes were attempted against that.
+
+**SIMD-1 -- inline the match copy into the twin. SHIPPED, the campaign's win.**
+`copy_match` (141 instrs) and `copy_from_decoded` (211) carried no `#[inline]`, so LLVM
+left them outlined -- and a function with no `#[target_feature]` is generated at the
+crate's BASELINE ISA no matter which twin calls it. Marking both `#[inline(always)]`
+lets LLVM regenerate the bodies under `avx2,bmi2` (a baseline callee's feature set is a
+SUBSET of the twin's, so inlining is legal).
+
+| deterministic quantity | before | after |
+| --- | ---: | ---: |
+| `copy_match` symbol | 141 instrs | **GONE (inlined)** |
+| `copy_from_decoded` symbol | 211 instrs | **GONE (inlined)** |
+| per-sequence CALL edges into the copy path | **2 nested** | **0** |
+| call+ret pairs per MiB @L3 (53,509 seq/MiB x 2) | **107,018** | **0** |
+| sequence twin, 256-bit ymm ops | 26 | **31** |
+| sequence twin, legacy SSE | 0 | 0 |
+| STATIC footprint of the whole path (4,055+141+211) | 4,407 | **4,227 (-180)** |
+
+**Speed: DecSeqLoop 30.58 -> 28.00 ns/seq, -8.5%**, ABBA-paired x3, and **every AFTER
+sample fell below every BEFORE sample** (27.30-29.14 vs 30.28-31.01, zero overlap).
+Contrast the 64-byte tier in (f), whose 1.5% sat inside its own spread. **That is what
+a real win looks like on this instrument: separated distributions, not a better mean.**
+
+**SIMD-2 -- an `avx2,bmi2,lzcnt` arm for the block driver. KEPT FOR ISA CONTINUITY,
+not for speed.** The bmi2-only twin emitted **57 legacy SSE** instructions; the new arm
+emits **0 SSE and 71 ymm**, byte-identical by construction. But in-process ABBA over 14
+corpora x9 measured **+0.3% DecLits / +0.5% decode** -- nothing, with the sign scattered
+7 up / 7 down. Kept so the decode path is uniformly VEX-encoded with no legacy-SSE
+island beside the AVX2 twin; `BLOCK_AVX2_ARM` keeps it adjudicable elsewhere without a
+rebuild.
+
+**WHY SIMD-2 MEASURED NOTHING, AND IT IS THE LAW OF THIS CAMPAIGN.** Both changes
+improved the ISA by the same kind of margin. They differ only in how often the improved
+code RUNS:
+
+| change | path | executions per MiB @L3 | result |
+| --- | --- | ---: | --- |
+| SIMD-1 | **per SEQUENCE** | **53,509** | **-8.5%** |
+| SIMD-2 | per BLOCK | 24 | 0% |
+
+**An ISA count is necessary but not sufficient -- it has to sit where the count
+multiplies.** SIMD-2's 57 instructions are STATIC instructions in a per-block function;
+`movdqa` -> `vmovdqa` is the same work, the same number of times. ~2,200x difference in
+execution frequency, and the speed result follows the frequency, not the ISA.
+
+**Where wide ops genuinely LOSE, measured here rather than assumed:**
+
+- **`vzeroupper` and AVX-SSE transitions.** Inlining the copy took the twin from **8 to
+  22 `vzeroupper`**. Cheap per instance on modern cores; on Sandy/Ivy/Haswell an
+  uncleared transition is ~70 cycles. SIMD-1 won anyway because 107,018 call/ret pairs
+  per MiB dominated it.
+- **Store overshoot, the dominant effect for zstd.** A fixed-width copy writes more than
+  it publishes: the 64-byte tier writes 64 for a mean payload of **47.5** (+2.79 MB per
+  board), the 16-byte tier writes 16 for a mean of **8.0**. Match lengths here are tiny,
+  so **wider registers make this worse, not better** -- which is exactly why the 64-byte
+  tier is neutral.
+- **Cache-line splits.** An unaligned 32-byte store straddles a 64-byte line far more
+  often than a 16-byte one.
+
+**RULED OUT BY COUNTING, before any code was written** (section (f)): 65 of 68 CL-shifts
+in the twin are IMMEDIATE, which BMI2 cannot improve; the literal copy was already
+256-bit; the 394 byte-ops are single-element `movzbl` table reads, i.e. the gather case.
+
+**END TO END, pre-SIMD vs final:** DecSeqLoop **35.29 -> 31.23 ns/seq, -11.5%**, ABBA x3,
+again with **zero distribution overlap** (final 30.30-31.80 vs pre 34.45-36.07). All
+159 tests pass at every step.
+
+**The gate inventory:**
 
 | # | gate | kind | selects | where |
 | --- | --- | --- | --- | --- |
-| 1 | `seqcheck_hoisted()` `SEQCHECK_ARM` / `RZSTD_SEQCHECK_HOIST` | ARM | hoist the per-sequence code-range check out of the loop | compressed.rs:371, 385, 559 |
-| 2 | `lut_on()` `LUT_ARM` | ARM | LL/ML baseline+nbits from a LUT vs computed | compressed.rs:689, 753, 768 |
-| 3 | `matchcopy_on() && len <= 32 && offset >= 32` | ARM x stream | 32-byte unsafe non-overlapping match copy | compressed.rs:966 |
-| 4 | `matchcopy_on() && len <= 16 && offset >= 16` | ARM x stream | 16-byte tier | compressed.rs:990 |
-| 5 | `offset == 1` | stream | byte-splat (C `ZSTD_overlapCopy8`) | compressed.rs:951 |
-| 6 | `offset < len` | stream | overlapping copy, byte-at-a-time | `copy_match` compressed.rs:878 |
-| 7 | FSE table mode per table | stream | predefined / RLE / built / repeat | decode side |
+| 1 | `seqcheck_hoisted()` `SEQCHECK_ARM` / `RZSTD_SEQCHECK_HOIST` | ARM | hoist the per-sequence code-range check out of the loop | `compressed.rs` |
+| 2 | `lut_on()` `LUT_ARM` | ARM | LL/ML baseline+nbits from a LUT vs computed | `compressed.rs` |
+| 3 | `matchcopy_on() && len <= 32 && offset >= 32` | ARM x stream | 32-byte unsafe non-overlapping match copy | `copy_from_decoded` |
+| 4 | `matchcopy_on() && len <= 16 && offset >= 16` | ARM x stream | 16-byte tier (tested FIRST -- T4) | `copy_from_decoded` |
+| 5 | `offset == 1` | stream | byte-splat (C `ZSTD_overlapCopy8`) | `copy_from_decoded` |
+| 6 | `offset < len` | stream | overlapping chunked copy | `copy_from_decoded` |
+| 7 | FSE table mode per table | stream | predefined / RLE / built / repeat | `seq_table` |
+| 8 | `seqloop_avx2_on()` `SEQLOOP_AVX2_ARM` + `has_avx2()` | ARM x CPU | `decode_sequences_avx2` twin vs the plain arm | `decode_sequences` |
 
-**Four of seven gates are ARMs**, i.e. decisions already made and left switchable. The
+**Four of eight gates are ARMs**, i.e. decisions already made and left switchable. The
 genuine per-sequence dispatches (#3-#6) are all on `(len, offset)` -- a shape the
 ENCODER chooses. The decoder's speed is therefore partly an encoder-side question: the
 distribution of `(litlen, matchlen, offset)` we emit determines which copy tier fires.
-That is the one unexplored lever here, and it does not live in this stage.
+**Section (b) now prices that claim: DecSeq = seqs x ~33 ns**, so the encoder-side
+lever is not a nuance, it is one of only two levers that exist.
+
+> **A methodology note, recorded because it nearly shipped a wrong number.** The first
+> version of this instrument took ONE decode per corpus. Its per-level table reported
+> L1 DecSeq at **3.82 ms/MiB** while its own per-corpus table, same corpora and same
+> level in the same process, computed to **1.36**. The gap was entirely cold start --
+> first-touch page faults on the output `Vec`, a cold allocator, cold caches -- and it
+> was caught only because the two tables OVERLAPPED and disagreed. Shares survived it
+> (they are ratios within one run); absolute ms/MiB did not. Warmup 2 + best-of-5
+> brought (a) to 1.15 against (b)'s 1.13. **Two tables that must agree are worth more
+> than one table that cannot be checked.**
 
 ---
 

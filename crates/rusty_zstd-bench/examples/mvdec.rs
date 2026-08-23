@@ -6,7 +6,7 @@ fn load(id:&str)->Option<Vec<u8>>{
         .or_else(|_|std::fs::read(format!("corpora/data/silesia/{id}"))).ok()
 }
 fn ms(z:&[u8],on:bool,r:usize)->f64{
-    rusty_zstd::set_seqmv_arm(on);
+    rusty_zstd::set_seqloop_avx2_arm(on);
     let mut b=f64::MAX;
     for _ in 0..r { let t=std::time::Instant::now(); let _=rusty_zstd::decompress(z).unwrap();
         let e=t.elapsed().as_secs_f64()*1000.0; if e<b{b=e;} }
@@ -35,5 +35,5 @@ fn main(){
         tn+=n.abs(); ta+=a; k+=1.0;
     }
     println!("\nmean |null| {:.2}%   mean avx2 multiversion {:+.2}%", tn/k, ta/k);
-    rusty_zstd::set_seqmv_arm(true);
+    rusty_zstd::set_seqloop_avx2_arm(true);
 }

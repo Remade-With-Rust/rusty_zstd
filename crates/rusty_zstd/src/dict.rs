@@ -92,7 +92,7 @@ fn parse_trained(src: &[u8]) -> Result<Dictionary, Error> {
     }
     let id = u32::from_le_bytes([src[4], src[5], src[6], src[7]]);
     let mut pos = 8usize;
-    let (huff_d, hn) = huffman::read_table(&src[pos..])?;
+    let (huff_d, hn) = huffman::read_table(None, &src[pos..])?;
     let (huff_c, _) = huffman::read_ctable(&src[pos..])?;
     pos += hn;
     let (of_d, of_c, n) = fse::read_ncount_ctable(&src[pos..], 31, 8)?;

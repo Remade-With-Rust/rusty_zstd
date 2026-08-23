@@ -9,6 +9,17 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# WHAT IS GATED, AND WHY IT IS SCOPED THAT WAY
+#
+# The shipping artifacts are `rusty_zstd` (published), `rusty_zstd-cli` and the
+# `rzstd-alloc` seam. Those are held to `-D warnings` and tested on three OSes.
+#
+# `rusty_zstd-bench` is the campaign harness: 455 one-off measurement
+# instruments that need a pinned C `zstd` binary and multi-gigabyte corpora this
+# runner does not have. It is checked for compilation in the configuration it is
+# actually built in (`--features profile`), which is the useful signal; holding
+# its historical instruments to `-D warnings` would gate nothing a consumer sees.
+
 jobs:
   test:
     name: test (${{ matrix.os }})
@@ -20,10 +31,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Test
-        run: cargo test --workspace
-      - name: CLI version
-        run: cargo run -p rusty_zstd-cli -- --version
+        run: cargo test -p rusty_zstd -p rusty_zstd-cli -p rzstd-alloc
+      - name: Doc tests (the README's examples)
+        run: cargo test -p rusty_zstd --doc
+      - name: CLI version + aliases
+        run: |
+          cargo run -p rusty_zstd-cli --bin rzstd -- --version
+          cargo run -p rusty_zstd-cli --bin unzstd -- --version
+          cargo run -p rusty_zstd-cli --bin zstdcat -- --version
+          cargo run -p rusty_zstd-cli --bin zstdmt -- --version
+
+  # The portable configurations the README advertises, so they cannot rot.
+  portable:
+    name: no_std + wasm32
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: no_std + alloc
+        run: cargo check -p rusty_zstd --no-default-features --features alloc
+      - name: wasm32 (std)
+        run: cargo check -p rusty_zstd --target wasm32-unknown-unknown --no-default-features --features std
+      - name: wasm32 (alloc)
+        run: cargo check -p rusty_zstd --target wasm32-unknown-unknown --no-default-features --features alloc
+      - name: profile feature builds
+        run: cargo check -p rusty_zstd --features profile
 
   lint:
     runs-on: ubuntu-latest
@@ -32,19 +69,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt -p rusty_zstd -p rusty_zstd-cli -p rzstd-alloc -- --check
+      - run: cargo clippy -p rusty_zstd -p rusty_zstd-cli -p rzstd-alloc --all-targets -- -D warnings
       - name: ASCII sources
         run: bash scripts/check-ascii-rs.sh crates
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
 
-  wasm:
+  # The campaign harness, in the configuration it is actually built in.
+  harness:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - run: cargo check -p rusty_zstd --target wasm32-unknown-unknown --no-default-features --features std
-      - run: cargo check -p rusty_zstd --target wasm32-unknown-unknown --no-default-features --features alloc
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p rusty_zstd-bench --all-targets --features profile
+
+  # Catches a broken manifest, a missing README, or a file the package would
+  # ship without -- before `cargo publish` does, not after.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo package -p rusty_zstd --allow-dirty

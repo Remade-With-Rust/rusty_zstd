@@ -2,7 +2,10 @@ fn main() {
     #[cfg(feature = "profile")]
     {
         rusty_zstd::set_walk_rep_max_arm(f32::MAX);
-        rusty_zstd::set_walk_offrep_max_arm(f32::MAX);
+        // `set_walk_offrep_max_arm` was called here but has never existed in the
+        // crate -- so this instrument has never compiled under `--features
+        // profile`, the only configuration it runs in. Dropped, not stubbed:
+        // there is no off-rep ceiling arm to pin.
         rusty_zstd::set_walk_cont_arm(true);
         for id in ["jsonlog-16m","smallmsg-8m","dickens","reymont","mr"] {
             let f = std::fs::read(format!("corpora/data/generated/{id}"))

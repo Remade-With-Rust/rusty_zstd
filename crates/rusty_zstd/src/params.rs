@@ -382,9 +382,16 @@ pub fn compression_params(
     Ok(p)
 }
 
-/// Gate 1 arm. 0 = no override; else `strategy as u8 + 1`.
-#[cfg(feature = "std")]
 /// Arm for the `ZSTD_adjustCParams` table clamp. Default ON.
+///
+/// NOT `#[cfg(feature = "std")]`, and it must not become so again: both of its
+/// users -- `set_cparam_clamp_arm` and `cparam_clamp_enabled` -- are ungated,
+/// so gating the static broke `no_std + alloc`, which mission 3.6 names as the
+/// supported floor. The tell was the doc line that used to sit above the
+/// attribute: it reads "Gate 1 arm ... strategy as u8 + 1", which describes
+/// `STRATEGY_ARM` further down, not this clamp. An attribute drifted up through
+/// an edit and took a comment with it. This is a plain atomic and needs
+/// nothing from `std`.
 static CPARAM_CLAMP_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Bench hook: `false` restores unclamped table logs (the old behaviour).
@@ -400,6 +407,8 @@ fn cparam_clamp_enabled() -> bool {
     )
 }
 
+/// Gate 1 arm. 0 = no override; else `strategy as u8 + 1`. (This is the doc
+/// line that had drifted up onto `CPARAM_CLAMP_ARM`.)
 static STRATEGY_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Bench hook for the Gate 1 truth table. `None` restores the level's strategy.

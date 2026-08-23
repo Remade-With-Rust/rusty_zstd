@@ -10,21 +10,13 @@ rust-version.workspace = true
 description = "zstd-compatible CLI for rusty_zstd (M6: MT, list, bench, aliases)"
 publish = false
 
-[[bin]]
-name = "rzstd"
-path = "src/main.rs"
+[lib]
+name = "rusty_zstd_cli"
+path = "src/lib.rs"
 
-[[bin]]
-name = "unzstd"
-path = "src/main.rs"
-
-[[bin]]
-name = "zstdcat"
-path = "src/main.rs"
-
-[[bin]]
-name = "zstdmt"
-path = "src/main.rs"
+# The four installed names are four shims in src/bin/ over one `entry()`; the
+# mode each implies is read off argv[0]. Four `[[bin]]` targets sharing a single
+# `path` is what Cargo warns about, and it is deprecated.
 
 [dependencies]
 rzstd-alloc = { path = "../rzstd-alloc" }

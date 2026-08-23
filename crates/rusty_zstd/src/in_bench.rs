@@ -239,7 +239,6 @@ where
     let opts = CompressOptions {
         level,
         checksum: false,
-        ..Default::default()
     };
     let zst = compress_with(src, opts)?;
     let raw = decompress(&zst)?;

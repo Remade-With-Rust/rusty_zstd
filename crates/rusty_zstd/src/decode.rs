@@ -94,7 +94,11 @@ pub fn set_ck_fuse_arm(v: usize) {
 #[inline]
 fn ck_fuse_min() -> usize {
     let v = CK_FUSE_ARM.load(core::sync::atomic::Ordering::Relaxed);
-    if v == 0 { CK_FUSE_MIN } else { v }
+    if v == 0 {
+        CK_FUSE_MIN
+    } else {
+        v
+    }
 }
 
 static CK_STREAM_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
@@ -106,10 +110,7 @@ pub fn set_ck_stream_arm(on: bool) {
 
 #[inline]
 fn ck_stream_enabled() -> bool {
-    matches!(
-        CK_STREAM_ARM.load(core::sync::atomic::Ordering::Relaxed),
-        2
-    )
+    matches!(CK_STREAM_ARM.load(core::sync::atomic::Ordering::Relaxed), 2)
 }
 
 /// One-shot decompress of one or more concatenated frames (skippable frames ignored).
@@ -547,7 +548,6 @@ fn skip_blocks(r: &mut Reader<'_>, header: FrameHeader) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     /// `decompress_into` must equal `decompress`, byte for byte, on content
     /// that exercises RLE blocks, literals and matches alike.
@@ -585,6 +585,62 @@ mod tests {
         assert_eq!(&buf[6..], &src[..]);
     }
 
+    /// SIBLING-PATH PARITY for `decompress_into`.
+    ///
+    /// `compressed.rs` decides `nodict = dict.is_empty() && frame_start == 0
+    /// && frame_skipped == 0` once per block and runs a different sequence
+    /// path on each side of it. Every other test here decodes into an EMPTY
+    /// buffer, so they all take the `frame_start == 0` arm; the arm that the
+    /// append contract actually selects was covered by exactly one case (a
+    /// 6-byte prefix, one level, one content).
+    ///
+    /// This drives the other arm across word, block and window boundaries and
+    /// compares byte-for-byte against the one-shot oracle. The failure this
+    /// API's shape invites is a back-reference reaching past `frame_start`
+    /// into the caller's own bytes, which changes the appended region -- so
+    /// the oracle comparison catches it. The prefix is filled with a pattern
+    /// the CONTENT also contains, so a leaked match cannot coincidentally
+    /// land on the right bytes and hide.
+    #[test]
+    fn into_appends_correctly_at_every_prefix_length() {
+        let contents: [Vec<u8>; 3] = [
+            (0..90_000u32).map(|i| (i % 97) as u8).collect(),
+            alloc::vec![0u8; 200_000],
+            b"hello hello hello world world world".to_vec(),
+        ];
+        // Straddle the u64 word, the 64 KiB and 128 KiB block sizes, and the
+        // window sizes small levels pick.
+        const PREFILLS: &[usize] = &[
+            0, 1, 7, 8, 9, 63, 64, 65, 4095, 4096, 65_535, 65_536, 131_072, 131_073,
+        ];
+        // A DETERMINISTIC RECEIPT that the body ran. A test that silently
+        // stops entering its own loop still reports `ok`, and this one runs
+        // fast enough (the fixtures are highly compressible) to look skipped.
+        let mut cases = 0usize;
+        let mut appended = 0usize;
+        for (ci, src) in contents.iter().enumerate() {
+            for lvl in [1, 5, 19] {
+                let f = crate::compress(src, lvl).unwrap();
+                let want = decompress(&f).unwrap();
+                assert_eq!(&want, src, "oracle c{ci} L{lvl}");
+                for &p in PREFILLS {
+                    let prefix: Vec<u8> = (0..p).map(|i| (i % 97) as u8).collect();
+                    let mut buf = prefix.clone();
+                    let n = decompress_into(&mut buf, &f).unwrap();
+                    assert_eq!(n, want.len(), "count c{ci} L{lvl} prefill {p}");
+                    assert_eq!(buf.len(), p + want.len(), "len c{ci} L{lvl} prefill {p}");
+                    assert_eq!(&buf[..p], &prefix[..], "prefix c{ci} L{lvl} prefill {p}");
+                    assert_eq!(&buf[p..], &want[..], "appended c{ci} L{lvl} prefill {p}");
+                    cases += 1;
+                    appended += n;
+                }
+            }
+        }
+        assert_eq!(cases, 3 * 3 * PREFILLS.len(), "cases actually exercised");
+        // 3 levels x 14 prefills x (90_000 + 200_000 + 35) bytes.
+        assert_eq!(appended, 3 * PREFILLS.len() * (90_000 + 200_000 + 35));
+    }
+
     /// Reusing one allocation across many frames -- the whole point of the API.
     #[test]
     fn into_reuse_across_frames_is_stable() {
@@ -614,7 +670,10 @@ mod tests {
 
         // Good frame decodes identically with and without verification.
         assert_eq!(decompress_with(&f, skip).unwrap(), src);
-        assert_eq!(decompress_with(&f, DecompressOptions::default()).unwrap(), src);
+        assert_eq!(
+            decompress_with(&f, DecompressOptions::default()).unwrap(),
+            src
+        );
 
         // Corrupt the stored checksum ONLY (last 4 bytes of the frame).
         let mut bad = f.clone();

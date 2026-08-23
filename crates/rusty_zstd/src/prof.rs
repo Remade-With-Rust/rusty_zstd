@@ -26,9 +26,22 @@ pub enum Stage {
     DecodeChecksum = 13,
     /// seqs -> CodedSeq transcode + the ll/of/ml histogram walk.
     EncodeSeqCode = 14,
+    /// DecSeq anatomy. These four partition `DecodeSeq` and are scoped ONCE PER
+    /// BLOCK, never per sequence -- an `Instant` pair costs more than the
+    /// per-sequence body it would measure, so the loop's interior is resolved
+    /// by counts and ablation, not by a clock. See `dsanat.rs`.
+    /// nseq + mode-byte parse.
+    DecSeqHeader = 15,
+    /// The three `seq_table` FSE builds + `BitRev::new` + three `init_state`.
+    DecSeqTables = 16,
+    /// The per-sequence loop: entry, read_bits, copy_literals, resolve_offset,
+    /// copy_match, advance.
+    DecSeqLoop = 17,
+    /// The trailing literal run after the last sequence.
+    DecSeqTail = 18,
 }
 
-pub const N_STAGES: usize = 15;
+pub const N_STAGES: usize = 19;
 
 const NAMES: [&str; N_STAGES] = [
     "EncodeTotal",
@@ -46,6 +59,10 @@ const NAMES: [&str; N_STAGES] = [
     "DecodeSeq",
     "DecodeChecksum",
     "EncodeSeqCode",
+    "DecSeqHeader",
+    "DecSeqTables",
+    "DecSeqLoop",
+    "DecSeqTail",
 ];
 
 /// Per-block Z1 harvest row (profile builds only).
@@ -235,6 +252,13 @@ mod on {
         NS[stage as usize].load(Ordering::Relaxed)
     }
 
+    /// How many times one stage's scope was entered. For the DecSeq sub-phases
+    /// this is the BLOCK count, which is what turns a stage total into a
+    /// per-block cost.
+    pub fn stage_calls(stage: Stage) -> u64 {
+        CALLS[stage as usize].load(Ordering::Relaxed)
+    }
+
     /// Candidate examinations only, for finders whose probe loop lives in a
     /// shared helper (`chain_find_best`, `bt_find_best`). Those helpers report
     /// their own work; their callers then pass `probes = 0` to `note_search`
@@ -280,6 +304,50 @@ mod on {
         if let Some(c) = HUFF_PATH.get(kind as usize) {
             c.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// PROMETHEUS: the literals gate's MARGIN distribution.
+    ///
+    /// The harvest showed the gate never false-accepts (raw won 0/794), so there
+    /// is no wasted encode work to reclaim. The open question is the other side:
+    /// HOW MUCH size does an accepted block actually win? A block whose Huffman
+    /// section is 1% smaller than raw bought 1% of bytes with a full Huffman
+    /// DECODE instead of a memcpy -- the decode-cost term m7-anatomy S4.4 says
+    /// the gate is missing. Buckets on `(raw - best) * 1000 / raw`:
+    /// 0=<=0.5%, 1=0.5-1%, 2=1-2%, 3=2-5%, 4=5-10%, 5=10-20%, 6=20-40%, 7=>40%.
+    /// Low half = block counts, high half = RAW BYTES in that bucket (so a rare
+    /// but huge block cannot hide).
+    static LIT_MARGIN: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+
+    /// One accepted literal section: how much smaller than raw did it come out?
+    pub fn note_lit_margin(raw_len: usize, best_len: usize) {
+        let saved = raw_len.saturating_sub(best_len);
+        let permille = if raw_len == 0 {
+            0
+        } else {
+            (saved as u64).saturating_mul(1000) / raw_len as u64
+        };
+        let b = match permille {
+            0..=5 => 0usize,
+            6..=10 => 1,
+            11..=20 => 2,
+            21..=50 => 3,
+            51..=100 => 4,
+            101..=200 => 5,
+            201..=400 => 6,
+            _ => 7,
+        };
+        LIT_MARGIN[b].fetch_add(1, Ordering::Relaxed);
+        LIT_MARGIN[8 + b].fetch_add(raw_len as u64, Ordering::Relaxed);
+    }
+
+    /// Read and clear the margin histogram.
+    pub fn take_lit_margin() -> [u64; 16] {
+        let mut a = [0u64; 16];
+        for i in 0..16 {
+            a[i] = LIT_MARGIN[i].swap(0, Ordering::Relaxed);
+        }
+        a
     }
 
     pub fn note_lit_try(kind: u8) {
@@ -412,8 +480,11 @@ mod on {
             .filter(|(_, c)| c.load(Ordering::Relaxed) > 0)
             .map(|(i, c)| alloc::format!("{}:{}", i, c.load(Ordering::Relaxed)))
             .collect();
-        s.push_str(&alloc::format!("huff_path {}
-", hp.join(" ")));
+        s.push_str(&alloc::format!(
+            "huff_path {}
+",
+            hp.join(" ")
+        ));
         s.push_str(&format!("early_raw={}\n", c.early_raw_blocks));
         s
     }
@@ -441,6 +512,11 @@ mod off {
     }
 
     #[inline(always)]
+    pub fn stage_calls(_s: super::Stage) -> u64 {
+        0
+    }
+
+    #[inline(always)]
     pub fn note_probes(_n: u64) {}
 
     #[inline(always)]
@@ -460,6 +536,13 @@ mod off {
 
     #[inline(always)]
     pub fn note_lit_try(_k: u8) {}
+
+    #[inline(always)]
+    pub fn note_lit_margin(_r: usize, _b: usize) {}
+
+    pub fn take_lit_margin() -> [u64; 16] {
+        [0u64; 16]
+    }
 
     #[inline(always)]
     pub fn note_seq_mode(_m: u8) {}
@@ -504,19 +587,19 @@ mod off {
 #[cfg(feature = "profile")]
 pub use on::{
     dump, encode_counts, note_back_ext, note_block_tap, note_checksum_bytes, note_comp_block,
-    note_early_raw, note_emit_lit, note_emit_seq, note_hash_fill, note_huff_path, note_lit_try, note_raw_block,
-    note_probes, note_rle_block, stage_ns, note_scratch, note_search, note_seq_mode, note_tables, reset,
-    scope,
-    take_block_taps,
+    note_early_raw, note_emit_lit, note_emit_seq, note_hash_fill, note_huff_path, note_lit_margin,
+    note_lit_try, note_probes, note_raw_block, note_rle_block, note_scratch, note_search,
+    note_seq_mode, note_tables, reset, scope, stage_calls, stage_ns, take_block_taps,
+    take_lit_margin,
 };
 
 #[cfg(not(feature = "profile"))]
 pub use off::{
     dump, encode_counts, note_back_ext, note_block_tap, note_checksum_bytes, note_comp_block,
-    note_early_raw, note_emit_lit, note_emit_seq, note_hash_fill, note_huff_path, note_lit_try, note_raw_block,
-    note_probes, note_rle_block, stage_ns, note_scratch, note_search, note_seq_mode, note_tables, reset,
-    scope,
-    take_block_taps,
+    note_early_raw, note_emit_lit, note_emit_seq, note_hash_fill, note_huff_path, note_lit_margin,
+    note_lit_try, note_probes, note_raw_block, note_rle_block, note_scratch, note_search,
+    note_seq_mode, note_tables, reset, scope, stage_calls, stage_ns, take_block_taps,
+    take_lit_margin,
 };
 
 impl fmt::Display for Stage {

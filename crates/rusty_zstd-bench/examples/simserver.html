@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rusty_zstd live transfer rates</title>
+<style>
+:root{
+  --bg:#f7f7f8; --panel:#fff; --ink:#14161a; --dim:#5d6470; --line:#e2e5ea;
+  --us:#2f6fed; --c:#8a8f98; --good:#128a5b; --bad:#c0392b; --warn:#b26a00;
+  --bar:#e8edf7; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0f1115; --panel:#171a20; --ink:#e8eaee; --dim:#9aa1ad; --line:#262b34;
+  --us:#5b8dff; --c:#767c86; --good:#3fbf8a; --bad:#ef6a5a; --warn:#e0973a;
+  --bar:#1d232e;
+}}
+:root[data-theme="dark"]{
+  --bg:#0f1115; --panel:#171a20; --ink:#e8eaee; --dim:#9aa1ad; --line:#262b34;
+  --us:#5b8dff; --c:#767c86; --good:#3fbf8a; --bad:#ef6a5a; --warn:#e0973a;
+  --bar:#1d232e;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;}
+header{padding:18px 20px 12px;border-bottom:1px solid var(--line);background:var(--panel)}
+h1{margin:0 0 4px;font-size:17px;letter-spacing:-.01em}
+.sub{color:var(--dim);font-size:12.5px;max-width:80ch}
+.wrap{padding:16px 20px 60px}
+.controls{display:flex;flex-wrap:wrap;gap:14px;align-items:end;
+  background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:14px}
+label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim);margin-bottom:4px}
+select,input[type=number]{background:var(--bg);color:var(--ink);border:1px solid var(--line);
+  border-radius:6px;padding:5px 8px;font:inherit;font-size:13px}
+button{background:var(--us);color:#fff;border:0;border-radius:6px;padding:7px 16px;
+  font:inherit;font-weight:600;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+button.ghost{background:transparent;color:var(--ink);border:1px solid var(--line);font-weight:500}
+.chk{display:flex;align-items:center;gap:6px;font-size:13px;padding-bottom:6px}
+.status{font-size:12.5px;color:var(--dim);margin:10px 0;font-family:var(--mono);min-height:18px}
+.bar-outer{height:4px;background:var(--bar);border-radius:2px;overflow:hidden;margin-top:3px}
+.bar-inner{height:100%;background:var(--us)}
+.bar-inner.c{background:var(--c)}
+table{width:100%;border-collapse:collapse;font-size:13px;background:var(--panel);
+  border:1px solid var(--line);border-radius:10px;overflow:hidden}
+th,td{padding:7px 9px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+th{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim);
+  font-weight:600;cursor:pointer;user-select:none;background:var(--panel);position:sticky;top:0}
+th:first-child,td:first-child{text-align:left}
+th.grp{text-align:center;border-left:1px solid var(--line);color:var(--ink)}
+td.grp{border-left:1px solid var(--line)}
+tbody tr:hover{background:var(--bar)}
+.name{font-family:var(--mono);font-size:12.5px}
+.cat{display:inline-block;font-size:10px;padding:1px 6px;border-radius:99px;
+  background:var(--bar);color:var(--dim);margin-left:6px;vertical-align:1px}
+.prov{display:inline-block;font-size:9.5px;padding:1px 5px;border-radius:99px;
+  margin-left:5px;vertical-align:1px;font-weight:700;letter-spacing:.03em}
+.prov.real{background:rgba(18,138,91,.14);color:var(--good)}
+.prov.synthetic{background:rgba(178,106,0,.16);color:var(--warn)}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.spread{color:var(--dim);font-size:11px}
+.win{color:var(--good);font-weight:600}
+.lose{color:var(--bad)}
+.pending{color:var(--dim);opacity:.55}
+.scroll{overflow-x:auto;border-radius:10px}
+.note{margin-top:14px;padding:11px 13px;border-left:3px solid var(--warn);
+  background:var(--panel);border-radius:0 8px 8px 0;font-size:12.5px;color:var(--dim);max-width:95ch}
+.note b{color:var(--ink)}
+tfoot td{font-weight:600;border-top:2px solid var(--line);border-bottom:0}
+</style>
+</head>
+<body>
+<header>
+  <h1>rusty_zstd — live transfer rates</h1>
+  <div class="sub">Real corpora, measured in-process at this moment. Encode and decode are
+  timed separately, best-of-N with a discarded warmup; decode runs into a reused buffer.
+  Checksum is off on both arms so the C comparison is like-for-like.</div>
+</header>
+
+<div class="wrap">
+  <div class="controls">
+    <div><label>Cap per file</label>
+      <select id="cap">
+        <option value="1048576">1 MiB</option>
+        <option value="4194304">4 MiB</option>
+        <option value="8388608" selected>8 MiB</option>
+        <option value="16777216">16 MiB</option>
+        <option value="33554432">32 MiB (full)</option>
+      </select></div>
+    <div><label>Iterations</label>
+      <input id="n" type="number" value="10" min="3" max="60" style="width:74px"></div>
+    <div><label>Levels</label>
+      <select id="levels">
+        <option value="1,3" selected>L1 + L3</option>
+        <option value="1">L1 only</option>
+        <option value="3">L3 only</option>
+        <option value="1,3,9,19">L1, L3, L9, L19</option>
+      </select></div>
+    <div class="chk"><input type="checkbox" id="carm" checked><label for="carm"
+      style="margin:0;text-transform:none;letter-spacing:0;font-size:13px">compare vs C v1.5.7</label></div>
+    <div style="padding-bottom:2px"><button id="run">Run</button></div>
+    <div style="padding-bottom:2px"><button id="stop" class="ghost" disabled>Stop</button></div>
+    <div style="padding-bottom:2px"><button id="copy" class="ghost">Copy TSV</button></div>
+  </div>
+
+  <div class="controls">
+    <div style="flex:1;min-width:280px"><label>Scan a folder of your own real files</label>
+      <input id="dir" type="text" placeholder="C:\path\to\a\folder  —  recursive, skips .git/target/node_modules"
+        style="width:100%;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:5px 8px;font:inherit;font-size:13px"></div>
+    <div><label>Min file size</label>
+      <select id="min">
+        <option value="16384">16 KiB</option>
+        <option value="65536" selected>64 KiB</option>
+        <option value="1048576">1 MiB</option>
+      </select></div>
+    <div style="padding-bottom:2px"><button id="scan" class="ghost">Scan folder</button></div>
+    <div style="padding-bottom:2px"><button id="reset" class="ghost">Built-in corpora</button></div>
+    <div class="chk"><input type="checkbox" id="realonly"><label for="realonly"
+      style="margin:0;text-transform:none;letter-spacing:0;font-size:13px">real files only</label></div>
+  </div>
+
+  <div class="status" id="status">Idle. Press Run.</div>
+
+  <div class="scroll"><table id="tbl">
+    <thead id="thead"></thead>
+    <tbody id="tbody"></tbody>
+    <tfoot id="tfoot"></tfoot>
+  </table></div>
+
+  <div class="note" id="note">
+    <b>R is us, C is zstd v1.5.7.</b> Each phase shows both arms and the ratio between
+    them: <b>R/C enc</b> and <b>R/C dec</b> are <i>our MB/s ÷ C's MB/s</i>, so
+    <b>above 1.00× we are faster</b> (green) and below it we are slower (red).
+    <i>Careful when cross-checking against</i> <code>m7-anatomy.md</code> — that page
+    prints the <i>inverse</i>, <code>C/us</code>, where above 1.00 means C is faster.
+    <br><br>
+    <b>R/C size</b> is <i>our output bytes ÷ C's output bytes</i> — who emits the
+    smaller file. Below 1.000 we win. It is the only column here that is fully
+    deterministic: it carries no spread and does not move between runs at any cap.
+    Hover it for the underlying byte counts and for how much the file actually shrank
+    (1.00× or “grew” means the data was incompressible — every codec adds a small
+    header to data it cannot compress, so random input always ends up slightly larger
+    than it started, for us and for C alike).
+    <br><br>
+    <b>Read the ± beside every rate.</b> It is a same-arm spread from two independent
+    best-of-N arms on identical input; amber above 10%, red above 25%. When it is large
+    the rate cannot separate small differences — a 1 MiB cap is usually the cause, so
+    raise the cap or the iteration count. Compressed <b>sizes</b> are deterministic and
+    carry no such caveat at any cap.
+  </div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+let CORPORA=[], ROWS={}, LEVELS=[1,3], stop=false, sortKey='name', sortDir=1;
+
+const fmt=(v,d=1)=>v==null?'—':v.toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});
+const bytes=b=>b>=1048576?(b/1048576).toFixed(1)+' MiB':(b/1024).toFixed(0)+' KiB';
+
+async function loadCorpora(q=''){
+  const r=await fetch('/api/corpora'+q); const j=await r.json();
+  if(j.error){ $('status').textContent='✗ '+j.error; return; }
+  CORPORA=j; ROWS={};
+  CORPORA.forEach(c=>ROWS[c.name]={c,lv:{}});
+  header(); render();
+  const nr=CORPORA.filter(c=>c.provenance==='real').length;
+  const ns=CORPORA.length-nr;
+  $('status').textContent=`${CORPORA.length} files — ${nr} real`+
+    (ns?`, ${ns} synthetic (generated by recipe)`:'')+`. Press Run.`;
+}
+
+function header(){
+  const c=$('carm').checked;
+  let h1='<tr><th rowspan="2" onclick="sortBy(\'name\')">File</th>'+
+         '<th rowspan="2" onclick="sortBy(\'bytes\')">Size</th>';
+  let h2='<tr>';
+  for(const L of LEVELS){
+    h1+=`<th class="grp" colspan="${c?7:2}">L${L}</th>`;
+    h2+=`<th class="grp" onclick="sortBy('e:${L}')" title="rusty_zstd encode throughput, MB/s">R enc</th>`;
+    if(c){
+      h2+=`<th onclick="sortBy('ce:${L}')" title="C v1.5.7 encode throughput, MB/s">C enc</th>`+
+          `<th onclick="sortBy('re:${L}')" title="R enc divided by C enc. Above 1.00 WE ARE FASTER. (Note: m7-anatomy.md prints the inverse, C/us, where above 1.00 means C is faster.)">R/C enc</th>`;
+    }
+    h2+=`<th class="${c?'grp':''}" onclick="sortBy('d:${L}')" title="rusty_zstd decode throughput, MB/s">R dec</th>`;
+    if(c){
+      h2+=`<th onclick="sortBy('cd:${L}')" title="C v1.5.7 decode throughput, MB/s">C dec</th>`+
+          `<th onclick="sortBy('rd:${L}')" title="R dec divided by C dec. Above 1.00 WE ARE FASTER.">R/C dec</th>`+
+          `<th class="grp" onclick="sortBy('s:${L}')" title="our output bytes divided by C's output bytes. BELOW 1.000 we emit the smaller file. Deterministic - carries no spread at any cap.">R/C size</th>`;
+    }
+  }
+  $('thead').innerHTML=h1+'</tr>'+h2+'</tr>';
+}
+
+/// Bytes actually fed to the codec, from whichever level has reported. Null
+/// until a measurement lands (the cap is not known client-side before that).
+function measuredBytes(R){
+  for(const L of LEVELS){ const d=R.lv[L]; if(d) return d.bytes; }
+  return null;
+}
+
+function maxOf(key){
+  let m=0; for(const k in ROWS){const v=val(ROWS[k],key); if(v>m)m=v;} return m||1;
+}
+/// Keys are "field:level". The separator matters: levels reach two digits
+/// (L12, L19, L22) and the old single-char slice read "e19" as field "e1".
+function val(row,key){
+  const i=key.lastIndexOf(':');
+  const k=key.slice(0,i), L=+key.slice(i+1);
+  const d=row.lv[L]; if(!d) return null;
+  switch(k){
+    case 'e':  return d.enc_mbps;
+    case 'd':  return d.dec_mbps;
+    case 'ce': return d.c_enc_mbps||null;
+    case 'cd': return d.c_dec_mbps||null;
+    case 're': return d.c_enc_mbps? d.enc_mbps/d.c_enc_mbps : null;
+    case 'rd': return d.c_dec_mbps? d.dec_mbps/d.c_dec_mbps : null;
+    case 's':  return d.c_csize?   d.csize/d.c_csize       : null;
+  }
+  return null;
+}
+function sortBy(k){ sortDir = sortKey===k? -sortDir : -1; sortKey=k; render(); }
+
+const bar=(v,m,cls='')=>`<div class="bar-outer"><div class="bar-inner ${cls}" style="width:${Math.max(2,100*v/m)}%"></div></div>`;
+
+function render(){
+  const c=$('carm').checked;
+  let keys=Object.keys(ROWS);
+  if($('realonly').checked) keys=keys.filter(k=>ROWS[k].c.provenance==='real');
+  keys.sort((a,a2)=>{
+    if(sortKey==='name')  return sortDir*a.localeCompare(a2);
+    if(sortKey==='bytes') return sortDir*(ROWS[a].c.bytes-ROWS[a2].c.bytes);
+    const x=val(ROWS[a],sortKey), y=val(ROWS[a2],sortKey);
+    if(x==null&&y==null)return 0; if(x==null)return 1; if(y==null)return -1;
+    return sortDir*(x-y);
+  });
+  const mx={};
+  for(const L of LEVELS) ['e','d','ce','cd'].forEach(k=>mx[k+':'+L]=maxOf(k+':'+L));
+
+  let html='';
+  for(const name of keys){
+    const R=ROWS[name];
+    // The SIZE SHOWN IS THE SIZE MEASURED, not the file's size on disk.
+    const meas=measuredBytes(R);
+    const trunc=meas!=null && meas<R.c.bytes;
+    html+=`<tr><td class="name" title="${R.c.path||''}">${name}`+
+          `<span class="prov ${R.c.provenance}">${R.c.provenance==='real'?'REAL':'SYNTH'}</span>`+
+          `<span class="cat">${R.c.category}</span></td>`+
+          `<td class="num">${bytes(meas??R.c.bytes)}`+
+          (trunc?`<div class="spread" title="capped from ${bytes(R.c.bytes)}">of ${bytes(R.c.bytes)}</div>`:'')+
+          `</td>`;
+    for(const L of LEVELS){
+      const d=R.lv[L];
+      if(!d){ html+=`<td class="grp pending num" colspan="${c?7:2}">…</td>`; continue; }
+      const sc=d.spread_pct>25?'style="color:var(--bad);font-weight:700"'
+              :d.spread_pct>10?'style="color:var(--warn)"':'';
+      const noisy=d.spread_pct>10
+        ?'NOISY - this rate cannot support a fine comparison. Raise the cap or the iteration count.'
+        :'quiet';
+      // --- encode triple ---
+      html+=`<td class="grp num">${fmt(d.enc_mbps)}`+
+            `<div class="spread" ${sc} title="${noisy}">±${fmt(d.spread_pct)}%</div>`+
+            `${bar(d.enc_mbps,mx['e:'+L])}</td>`;
+      if(c){
+        html+=`<td class="num" style="color:var(--c)">${fmt(d.c_enc_mbps)}`+
+              `${d.c_enc_mbps?bar(d.c_enc_mbps,mx['ce:'+L],'c'):''}</td>`;
+        const re=d.c_enc_mbps? d.enc_mbps/d.c_enc_mbps : null;
+        html+=`<td class="num ${re==null?'':(re>=1?'win':'lose')}" `+
+              `title="${fmt(d.enc_mbps)} / ${fmt(d.c_enc_mbps)} MB/s">`+
+              `${re==null?'—':re.toFixed(2)+'×'}</td>`;
+      }
+      // --- decode triple ---
+      html+=`<td class="${c?'grp ':''}num">${fmt(d.dec_mbps)}${bar(d.dec_mbps,mx['d:'+L])}</td>`;
+      if(c){
+        html+=`<td class="num" style="color:var(--c)">${fmt(d.c_dec_mbps)}`+
+              `${d.c_dec_mbps?bar(d.c_dec_mbps,mx['cd:'+L],'c'):''}</td>`;
+        const rd=d.c_dec_mbps? d.dec_mbps/d.c_dec_mbps : null;
+        html+=`<td class="num ${rd==null?'':(rd>=1?'win':'lose')}" `+
+              `title="${fmt(d.dec_mbps)} / ${fmt(d.c_dec_mbps)} MB/s">`+
+              `${rd==null?'—':rd.toFixed(2)+'×'}</td>`;
+        // --- size ratio: deterministic, no spread. Compression ratio lives in
+        // the tooltip so the column set stays the requested seven.
+        const us=d.c_csize? d.csize/d.c_csize : null;
+        const grew=d.csize>=d.bytes;
+        html+=`<td class="grp num ${us==null?'':(us<1?'win':(us>1.05?'lose':''))}" `+
+              `title="in ${d.bytes.toLocaleString()} B → ours ${d.csize.toLocaleString()} B, C ${(d.c_csize||0).toLocaleString()} B`+
+              `  |  shrank by ${grew?'nothing (grew '+(d.csize-d.bytes)+' B)':d.ratio.toFixed(2)+'×'}">`+
+              `${us==null?'—':us.toFixed(3)}</td>`;
+      }
+    }
+    html+='</tr>';
+  }
+  $('tbody').innerHTML=html;
+  footer(keys);
+}
+
+function footer(keys){
+  const c=$('carm').checked;
+  let f='<tr><td>aggregate (throughput-weighted)</td><td></td>';
+  for(const L of LEVELS){
+    let tb=0,te=0,td=0,cb=0,ce=0,cd=0,n=0,zs=0,czs=0;
+    for(const k of keys){
+      const d=ROWS[k].lv[L]; if(!d)continue;
+      const mb=d.bytes/1048576;               // bytes ACTUALLY compressed
+      tb+=mb; te+=mb/d.enc_mbps; td+=mb/d.dec_mbps; n++;
+      if(d.c_enc_mbps){cb+=mb; ce+=mb/d.c_enc_mbps; cd+=mb/d.c_dec_mbps;}
+      if(d.c_csize){zs+=d.csize; czs+=d.c_csize;}
+    }
+    if(!n){ f+=`<td class="grp" colspan="${c?7:2}"></td>`; continue; }
+    const Re=tb/te, Rd=tb/td, Ce=cb?cb/ce:null, Cd=cb?cb/cd:null;
+    f+=`<td class="grp num">${fmt(Re)}</td>`;
+    if(c){
+      f+=`<td class="num" style="color:var(--c)">${Ce==null?'—':fmt(Ce)}</td>`;
+      const r=Ce?Re/Ce:null;
+      f+=`<td class="num ${r==null?'':(r>=1?'win':'lose')}">${r==null?'—':r.toFixed(2)+'×'}</td>`;
+    }
+    f+=`<td class="${c?'grp ':''}num">${fmt(Rd)}</td>`;
+    if(c){
+      f+=`<td class="num" style="color:var(--c)">${Cd==null?'—':fmt(Cd)}</td>`;
+      const r=Cd?Rd/Cd:null;
+      f+=`<td class="num ${r==null?'':(r>=1?'win':'lose')}">${r==null?'—':r.toFixed(2)+'×'}</td>`;
+      // aggregate size ratio is SUM(ours)/SUM(C), never a mean of ratios
+      f+=`<td class="grp num ${czs&&zs/czs<1?'win':''}">${czs?(zs/czs).toFixed(3):'—'}</td>`;
+    }
+  }
+  $('tfoot').innerHTML=f+'</tr>';
+}
+
+async function run(){
+  if(!CORPORA.length){ $('status').textContent='No files loaded — scan a folder or press “Built-in corpora”.'; return; }
+  stop=false; $('run').disabled=true; $('stop').disabled=false;
+  LEVELS=$('levels').value.split(',').map(Number);
+  const cap=$('cap').value, iters=$('n').value, carm=$('carm').checked?1:0;
+  for(const k in ROWS) ROWS[k].lv={};
+  header(); render();
+  const list=$('realonly').checked?CORPORA.filter(x=>x.provenance==='real'):CORPORA;
+  const total=list.length*LEVELS.length;
+  let done=0, failed=0, lastErr='';
+  for(const L of LEVELS){
+    for(const cp of list){
+      if(stop) break;
+      $('status').textContent=`[${done+1}/${total}] L${L} ${cp.name} …`;
+      try{
+        const r=await fetch(`/api/run?file=${encodeURIComponent(cp.name)}&level=${L}`+
+                            `&cap=${cap}&n=${iters}&c=${carm}`);
+        const j=await r.json();
+        if(j.ok) ROWS[cp.name].lv[L]=j;
+        else { failed++; lastErr=`${cp.name} L${L}: ${j.error}`; console.warn(lastErr); }
+      }catch(e){ failed++; lastErr=`${cp.name} L${L}: ${e}`; console.warn(lastErr); }
+      done++; render();
+    }
+    if(stop) break;
+  }
+  // Failures used to vanish into the console. Say so on the page.
+  const tail = failed? `  —  ${failed} FAILED (last: ${lastErr})` : '';
+  $('status').textContent = (stop? `Stopped after ${done}/${total}.`
+                                 : `Done — ${done} measurements.`) + tail;
+  $('run').disabled=false; $('stop').disabled=true;
+}
+
+function tsv(){
+  let out=['file\tprovenance\tcategory\tfile_bytes\tmeasured_bytes'];
+  for(const L of LEVELS) out[0]+=`\tL${L}_enc_MBps\tL${L}_dec_MBps\tL${L}_ratio\tL${L}_spread_pct\tL${L}_csize\tL${L}_c_csize\tL${L}_us_c_size`;
+  for(const k in ROWS){const R=ROWS[k];
+    let line=`${k}\t${R.c.provenance}\t${R.c.category}\t${R.c.bytes}\t${measuredBytes(R)??''}`;
+    for(const L of LEVELS){const d=R.lv[L];
+      line+=d?`\t${d.enc_mbps.toFixed(2)}\t${d.dec_mbps.toFixed(2)}\t${d.ratio.toFixed(4)}\t${d.spread_pct.toFixed(2)}\t${d.csize}\t${d.c_csize||''}\t${d.c_csize?(d.csize/d.c_csize).toFixed(4):''}`:'\t\t\t\t\t\t\t';}
+    out.push(line);}
+  return out.join('\n');
+}
+
+$('run').onclick=run;
+$('stop').onclick=()=>{stop=true};
+$('carm').onchange=()=>{header();render()};
+$('realonly').onchange=render;
+$('copy').onclick=async()=>{await navigator.clipboard.writeText(tsv());
+  $('status').textContent='TSV copied to clipboard.'};
+$('scan').onclick=()=>{
+  const d=$('dir').value.trim();
+  if(!d){$('status').textContent='Enter a folder path first.';return}
+  $('status').textContent='Scanning '+d+' …';
+  loadCorpora(`?dir=${encodeURIComponent(d)}&min=${$('min').value}`);
+};
+$('dir').addEventListener('keydown',e=>{if(e.key==='Enter')$('scan').click()});
+$('reset').onclick=()=>{$('dir').value='';loadCorpora('?reset=1')};
+loadCorpora();
+</script>
+</body>
+</html>

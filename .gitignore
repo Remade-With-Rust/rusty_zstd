@@ -15,3 +15,7 @@
 # Great Gate -- private content-adaptive-dispatch campaign (doc + gate
 # calculator). Local-only, never published. Same policy as remade_ffmpeg_rs.
 /_greatgate/
+
+# `rustc scripts/cpuprobe.rs` drops its binary wherever it is run from.
+/cpuprobe.exe
+/cpuprobe.pdb

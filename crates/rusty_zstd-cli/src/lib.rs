@@ -2,9 +2,10 @@
 //!
 //! Installed name is `rzstd` so it does not collide with the C oracle on PATH.
 //! Aliases: `unzstd` (`-d`), `zstdcat` (`-dcf`), `zstdmt` (`-T0`).
-
-#[global_allocator]
-static ALLOC: rzstd_alloc::Alloc = rzstd_alloc::Alloc;
+//!
+//! The four installed names are four `src/bin/*.rs` shims over this one
+//! `entry()`; the mode each implies is read back off `argv[0]`. They cannot be
+//! four `[[bin]]` targets sharing one `path`, which is what Cargo warns about.
 
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
@@ -61,7 +62,8 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
-fn main() -> ExitCode {
+/// The whole CLI. Each installed name is a shim that calls this.
+pub fn entry() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

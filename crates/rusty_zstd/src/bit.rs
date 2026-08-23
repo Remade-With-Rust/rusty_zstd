@@ -15,6 +15,24 @@ pub(crate) struct BitRev<'a> {
 }
 
 impl<'a> BitRev<'a> {
+    /// DecSeq loop anatomy (profile only): snapshot/restore the reader so an op
+    /// can be executed a SECOND time and undone, leaving output byte-identical.
+    /// See `dsloop.rs` -- duplication is how a ~33 ns loop body is attributed
+    /// without a clock that costs 74.8 ns.
+    #[cfg(feature = "dupladder")]
+    #[inline(always)]
+    pub(crate) fn dup_save(&self) -> (usize, u64, u32) {
+        (self.ptr, self.bit_container, self.bits_consumed)
+    }
+
+    #[cfg(feature = "dupladder")]
+    #[inline(always)]
+    pub(crate) fn dup_restore(&mut self, s: (usize, u64, u32)) {
+        self.ptr = s.0;
+        self.bit_container = s.1;
+        self.bits_consumed = s.2;
+    }
+
     // The bit-engine helpers are inline(always): outlined, they compile as
     // baseline code even when called from a BMI2 twin (the shim-trap rule),
     // and the twin call-graph trace caught exactly that.
@@ -31,7 +49,9 @@ impl<'a> BitRev<'a> {
         let skip_in_last = 8 - highbit;
         if src.len() >= 8 {
             let ptr = src.len() - 8;
-            let raw = read_u64_le(&src[ptr..ptr + 8]);
+            // `ptr + 8 == src.len()` by construction, so the checked range and
+            // its landing pad were re-proving the line above.
+            let raw = crate::simd::load_u64_le(src, ptr);
             Ok(Self {
                 src,
                 ptr,
@@ -39,6 +59,14 @@ impl<'a> BitRev<'a> {
                 bits_consumed: skip_in_last,
             })
         } else {
+            // REFUTED, recorded: outlining this as `#[cold] fn new_short`
+            // measured WORSE (+660 instructions), even though it is the exact
+            // shape that won -3,854 in `reload`. The difference is DUPLICATION,
+            // not rarity: `reload` is called four times per unrolled group
+            // INSIDE the decode loop, so its cold tail existed in many inline
+            // copies; `new` runs once per stream, so outlining only adds a
+            // call. Outlining pays in proportion to how often the HOST is
+            // duplicated.
             let mut buf = [0u8; 8];
             buf[..src.len()].copy_from_slice(src);
             let consumed = skip_in_last + (8 - src.len() as u32) * 8;
@@ -65,7 +93,7 @@ impl<'a> BitRev<'a> {
     /// so this is one shift instead of `(container << consumed) >> (64-n)` every peek.
     #[inline(always)]
     pub(crate) fn look_bits_fast(&self, n: u32) -> u32 {
-        debug_assert!(n >= 1 && n <= 56);
+        debug_assert!((1..=56).contains(&n));
         (self.bit_container >> (64 - n)) as u32
     }
 
@@ -81,6 +109,14 @@ impl<'a> BitRev<'a> {
             return 0;
         }
         let v = self.look_bits_fast(n);
+        // REFUTED, recorded: `shl64`'s `n >= 64` guard IS dead here
+        // (`look_bits_fast` above only defines `1 <= n <= 63`), but replacing
+        // `skip_bits` with a direct shift measured WORSE -- +228 instructions
+        // crate-wide. `read_bits` is inlined widely and LLVM's range analysis
+        // already folds the guard per site; hand-removing it just stops the
+        // shared `skip_bits` body from being reused. Third branch-removal in
+        // this file to measure worse -- bit.rs's branchy helpers are already
+        // optimal in context.
         self.skip_bits(n);
         v
     }
@@ -103,7 +139,8 @@ impl<'a> BitRev<'a> {
         Ok(Self {
             src,
             ptr,
-            bit_container: shl64(read_u64_le(&src[ptr..ptr + 8]), bits_consumed),
+            // The guard above already rejected `ptr + 8 > src.len()`.
+            bit_container: shl64(crate::simd::load_u64_le(src, ptr), bits_consumed),
             bits_consumed,
         })
     }
@@ -132,25 +169,58 @@ impl<'a> BitRev<'a> {
             self.ptr -= bytes;
             self.bits_consumed &= 7;
             if self.ptr + 8 <= self.src.len() {
-                self.bit_container = read_u64_le(&self.src[self.ptr..self.ptr + 8]);
+                // The `if` above IS the bound, so the slice form re-derived it:
+                // `&self.src[ptr..ptr + 8]` is a checked range with its own
+                // `slice_index_fail` pad, feeding a `read_u64_le` that then
+                // indexes eight times. `simd::load_u64_le` is a safe function
+                // whose `unsafe` is contained, and it takes the offset directly.
+                self.bit_container = crate::simd::load_u64_le(self.src, self.ptr);
             } else {
-                let mut buf = [0u8; 8];
-                let n = self.src.len() - self.ptr;
-                buf[..n].copy_from_slice(&self.src[self.ptr..]);
-                self.bit_container = u64::from_le_bytes(buf);
+                self.bit_container = self.tail_word();
             }
-            self.bit_container = shl64(self.bit_container, self.bits_consumed);
+            // `bits_consumed &= 7` two lines up, so it is 0..=7 here and
+            // `shl64`'s `n >= 64` guard is DEAD -- a compare and a select per
+            // refill, and `reload` runs four times per unrolled group in the
+            // 4-stream Huffman loop. The guard stays on every OTHER `shl64`
+            // caller, where the count genuinely can reach 64.
+            debug_assert!(self.bits_consumed < 8);
+            self.bit_container <<= self.bits_consumed;
             Ok(())
         } else {
-            let nb = self.ptr;
-            self.ptr = 0;
-            self.bits_consumed -= (nb as u32) * 8;
-            let mut buf = [0u8; 8];
-            let n = self.src.len().min(8);
-            buf[..n].copy_from_slice(&self.src[..n]);
-            self.bit_container = shl64(u64::from_le_bytes(buf), self.bits_consumed);
+            self.rewind_to_start();
             Ok(())
         }
+    }
+
+    /// Fewer than 8 bytes left ahead of `ptr`: assemble the last word by hand.
+    ///
+    /// `#[cold]` + `#[inline(never)]`. `reload` is `#[inline(always)]` and is
+    /// reproduced at every call site in the 4-stream Huffman loop and the
+    /// sequence loop, so this end-of-stream fallback was being stamped out
+    /// with it -- an 8-byte zeroed buffer, a `copy_from_slice` and a
+    /// `from_le_bytes`, in every copy, for a case that happens once per
+    /// STREAM.
+    #[cold]
+    #[inline(never)]
+    fn tail_word(&self) -> u64 {
+        let mut buf = [0u8; 8];
+        let n = self.src.len() - self.ptr;
+        buf[..n].copy_from_slice(&self.src[self.ptr..]);
+        u64::from_le_bytes(buf)
+    }
+
+    /// The reader has consumed past the start of `src`: clamp to 0 and refill.
+    /// Also once per stream, also stamped into every inline copy of `reload`.
+    #[cold]
+    #[inline(never)]
+    fn rewind_to_start(&mut self) {
+        let nb = self.ptr;
+        self.ptr = 0;
+        self.bits_consumed -= (nb as u32) * 8;
+        let mut buf = [0u8; 8];
+        let n = self.src.len().min(8);
+        buf[..n].copy_from_slice(&self.src[..n]);
+        self.bit_container = shl64(u64::from_le_bytes(buf), self.bits_consumed);
     }
 }
 
@@ -170,9 +240,11 @@ fn ones(n: u32) -> u32 {
     }
 }
 
-fn read_u64_le(s: &[u8]) -> u64 {
-    u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
-}
+// `read_u64_le` DELETED: it assembled a u64 from EIGHT separately-indexed byte
+// loads, and all three callers had already proven `ptr + 8 <= len` on the line
+// above. They now use `simd::load_u64_le`, which is the same primitive the
+// encoder and the match finders have used for bricks -- one unaligned load,
+// with its `unsafe` contained in the simd island.
 
 /// Forward bit writer matching libzstd `BIT_CStream_t` (little-endian container).
 #[cfg(feature = "alloc")]
@@ -192,14 +264,6 @@ impl BitCStream {
         }
     }
 
-    pub(crate) fn with_capacity(n: usize) -> Self {
-        Self {
-            buf: alloc::vec::Vec::with_capacity(n),
-            container: 0,
-            bit_pos: 0,
-        }
-    }
-
     /// Frame-scratch constructor: reuse a caller-kept buffer (cleared here)
     /// so the per-block bitstream costs no allocation after warm-up.
     pub(crate) fn from_vec(mut buf: alloc::vec::Vec<u8>, want: usize) -> Self {
@@ -207,7 +271,11 @@ impl BitCStream {
         if buf.capacity() < want {
             buf = alloc::vec::Vec::with_capacity(want);
         }
-        Self { buf, container: 0, bit_pos: 0 }
+        Self {
+            buf,
+            container: 0,
+            bit_pos: 0,
+        }
     }
 
     pub(crate) fn add_bits(&mut self, value: u64, nb_bits: u32) {
@@ -217,6 +285,12 @@ impl BitCStream {
         if self.bit_pos + nb_bits >= 64 {
             self.flush();
         }
+        // REFUTED, recorded: replacing this with a branchless
+        // `(1u64 << nb_bits) - 1` under a `debug_assert!(nb_bits < 64)`
+        // measured WORSE -- +36 instructions crate-wide. `add_bits` is
+        // inlined, and at the call sites where `nb_bits` is a compile-time
+        // constant the BRANCHY form folds the whole select away; the
+        // "branchless" one does not fold as well.
         let mask = if nb_bits >= 64 {
             u64::MAX
         } else {
@@ -305,6 +379,31 @@ impl<'a> BitFwd<'a> {
     }
 
     fn refill(&mut self) {
+        // FIXED-WIDTH REFILL. The loop below adds ONE bounds-checked byte per
+        // iteration, up to eight per `peek`, and `peek` runs once per symbol of
+        // every FSE ncount header. When eight bytes are readable, the same
+        // bytes can be taken in one unaligned load.
+        //
+        // Byte-identical by algebra: the loop ORs `src[pos+i] << (nbits + 8i)`
+        // for `i in 0..k`, and that IS the k-byte little-endian word shifted
+        // left by `nbits`. `k` is exactly the number of iterations the loop
+        // would run -- `nbits` climbs by 8 while it is `<= 56`.
+        if self.nbits <= 56 && self.pos + 8 <= self.src.len() {
+            let k = (56 - self.nbits) / 8 + 1;
+            let word = crate::simd::load_u64_le(self.src, self.pos);
+            // `k == 8` only when `nbits == 0`, and `1u64 << 64` would overflow.
+            let masked = if k >= 8 {
+                word
+            } else {
+                word & ((1u64 << (k * 8)) - 1)
+            };
+            self.buf |= masked << self.nbits;
+            self.nbits += k * 8;
+            self.pos += k as usize;
+            debug_assert!(self.nbits <= 64);
+            return;
+        }
+        // Tail: fewer than eight bytes left. One byte at a time, as before.
         while self.nbits <= 56 && self.pos < self.src.len() {
             self.buf |= u64::from(self.src[self.pos]) << self.nbits;
             self.nbits += 8;

@@ -25,6 +25,24 @@ engine-function inventory for it.
 > deterministic work counters (`probes/B`, `hit%`, `take_tag_rejects`), byte-identity
 > boards. Every "candidate lever" below names its deciding instrument.
 
+## Priority order
+
+| #   | item| ladder| confidence| deciding instrument|
+ALMOST DONE | ~~1~~ | **1a** long-table tag — **DONE 2026-08-21**: the long tag IS the short tag (zero new arithmetic), packed under the same < 16 MiB proof. `ltag` census: **10,955,562 avoided of 15,175,449 long probes (72.2%)**, 36/36 byte-identical, FALSE asserted 0 per cell. x-ray 99.6%, sao 91.8%, ooffice 91.2%, mozilla 85.4%; controls (zeros/incomp/versions) ~0 probes. | L3/L4 default | shipped | `ltag` |
+DONE | 2   | **4** first-word early-exit      | all, worst L16–L22 | high — histogram  | `EQ_LEN_HIST` |
+| 3   | **3a** chain prefetch (address known ahead)   | L5–L12 | medium-high | 80-cell board + parity |
+| 4   | **2b** hoist Bt loop invariants  | L13–L22            | high, small | asm loop-body count |
+| 5   | **2a** Bt child prefetch (dependent chase)  | L13–L22 | medium — | rdtsc micro-harness |
+ALMOST DONE | 6   | **6** `find_sequences_strategy` chain alloc + 17 sites | all| high, | `g6alloc` |
+| 7   | **1b** telemetry register pressure  | L3/L4| blocked on gate campaign| stack movs in hot region|
+| 8   | **2c/5a** dead-copy censuses| L1, L13+| census first| per-copy call counters|
+
+**The standing pattern check applies here first:** items 1a and 3b are both "the
+capability exists in one path and not its neighbour" (tag: short table but not long;
+Fast but not Lazy). That shape is 6-for-6 this campaign — prefetch built with zero
+callers being the sixth. Check the neighbour before inventing anything new.
+
+
 ## 0. Current asm footprint (2026-08-21, release, per symbol family)
 
 Post twin campaign: "copies" counts plain + BMI2-twin monomorphisations. Full table
@@ -396,21 +414,3 @@ long array) now runs at or near the 8-bit collision floor at every frame
 size.
 
 ---
-
-## Priority order
-
-| #   | item                                                   | ladder             | confidence                    | deciding instrument                  |
-| --- | ------------------------------------------------------ | ------------------ | ----------------------------- | ------------------------------------ |
-| ~~1~~ | **1a** long-table tag — **DONE 2026-08-21**: the long tag IS the short tag (zero new arithmetic), packed under the same < 16 MiB proof. `ltag` census: **10,955,562 avoided of 15,175,449 long probes (72.2%)**, 36/36 byte-identical, FALSE asserted 0 per cell. x-ray 99.6%, sao 91.8%, ooffice 91.2%, mozilla 85.4%; controls (zeros/incomp/versions) ~0 probes. | L3/L4 default | shipped | `ltag` |
-| 2   | **4** first-word early-exit in `count_eq_len`          | all, worst L16–L22 | high — histogram exists       | `EQ_LEN_HIST` + asm head count       |
-| 3   | **3a** chain prefetch (address known ahead)            | L5–L12             | medium-high                   | 80-cell board + parity               |
-| 4   | **2b** hoist Bt loop invariants                        | L13–L22            | high, small                   | asm loop-body count                  |
-| 5   | **2a** Bt child prefetch (dependent chase)             | L13–L22            | medium — needs cycle evidence | rdtsc micro-harness                  |
-| 6   | **6** `find_sequences_strategy` chain alloc + 17 sites | all                | high, small                   | `g6alloc` + census                   |
-| 7   | **1b** telemetry register pressure                     | L3/L4              | blocked on gate campaign      | stack movs in hot region             |
-| 8   | **2c/5a** dead-copy censuses                           | L1, L13+           | census first                  | per-copy call counters               |
-
-**The standing pattern check applies here first:** items 1a and 3b are both "the
-capability exists in one path and not its neighbour" (tag: short table but not long;
-Fast but not Lazy). That shape is 6-for-6 this campaign — prefetch built with zero
-callers being the sixth. Check the neighbour before inventing anything new.

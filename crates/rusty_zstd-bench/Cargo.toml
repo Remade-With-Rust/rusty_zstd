@@ -8,6 +8,11 @@ authors.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
 description = "Harness: shells out to pinned C zstd; never links libzstd"
+readme = "README.md"
+# Build the examples with `--features profile`: over half of the 455 instruments
+# read counters that only exist behind it. `profile` is deliberately NOT a default
+# feature -- the profiler has a real timing tax, and a speed board taken with it
+# compiled in is not admissible. See README.md.
 publish = false
 
 [[bin]]
@@ -29,8 +34,17 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_WindowsProgramming",
 ] }
 
+# `dsloop` drives the DecSeq loop-anatomy ladder, which only exists behind
+# `dupladder` -- it adds a per-sequence arm dispatch to the very loop it
+# measures, so it is opt-in rather than part of `profile`.
+[[example]]
+name = "dsloop"
+path = "examples/dsloop.rs"
+required-features = ["dupladder"]
+
 [features]
 profile = ["rusty_zstd/profile"]
+dupladder = ["profile", "rusty_zstd/dupladder"]
 
 [lints]
 workspace = true

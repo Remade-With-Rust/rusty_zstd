@@ -20,22 +20,43 @@ fn main() {
     for lvl in [1, 3] {
         let on = rusty_zstd::compress_with(
             &src,
-            rusty_zstd::CompressOptions { level: lvl, checksum: true, ..Default::default() },
+            rusty_zstd::CompressOptions {
+                level: lvl,
+                checksum: true,
+            },
         )
         .expect("compress ck-on");
         let off = rusty_zstd::compress_with(
             &src,
-            rusty_zstd::CompressOptions { level: lvl, checksum: false, ..Default::default() },
+            rusty_zstd::CompressOptions {
+                level: lvl,
+                checksum: false,
+            },
         )
         .expect("compress ck-off");
 
         let mut d = Vec::with_capacity(n_bytes);
         rusty_zstd::decompress_into(&mut d, &on).unwrap();
-        let a = best(n, || { d.clear(); rusty_zstd::decompress_into(&mut d, &on).unwrap(); });
-        let b = best(n, || { d.clear(); rusty_zstd::decompress_into(&mut d, &off).unwrap(); });
+        let a = best(n, || {
+            d.clear();
+            rusty_zstd::decompress_into(&mut d, &on).unwrap();
+        });
+        let b = best(n, || {
+            d.clear();
+            rusty_zstd::decompress_into(&mut d, &off).unwrap();
+        });
 
-        println!("L{lvl}  checksum ON {:8.1} MB/s ({:.4} s) | OFF {:8.1} MB/s ({:.4} s)",
-                 mbps(a), a, mbps(b), b);
-        println!("      checksum costs {:.4} s = {:.0}% of the ON time", a - b, (a - b) / a * 100.0);
+        println!(
+            "L{lvl}  checksum ON {:8.1} MB/s ({:.4} s) | OFF {:8.1} MB/s ({:.4} s)",
+            mbps(a),
+            a,
+            mbps(b),
+            b
+        );
+        println!(
+            "      checksum costs {:.4} s = {:.0}% of the ON time",
+            a - b,
+            (a - b) / a * 100.0
+        );
     }
 }

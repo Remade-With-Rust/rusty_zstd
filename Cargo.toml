@@ -19,3 +19,12 @@ rust-version = "1.85"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "allow"
+
+# Clippy is denied wholesale in CI, so the exceptions are declared here rather
+# than sprinkled through the source. Both are shape, not smell: an entropy or
+# match-find kernel takes the state it needs by argument precisely so it does
+# NOT reach through a struct in the hot loop, and the tuple returns are the
+# census shapes the bench harness reads.
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"

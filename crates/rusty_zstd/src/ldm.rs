@@ -195,13 +195,31 @@ fn ldm_hash(src: &[u8], ip: usize, hash_log: u32) -> usize {
     (v.wrapping_mul(0xCF1B_BCDC_B7A5_6463) >> shift) as usize
 }
 
+/// Common prefix length of `src[m..]` and `src[ip..]`, bounded by `limit`.
+///
+/// E2 (inline-execution): this was a byte-at-a-time, bounds-checked compare
+/// loop -- in a codec that ships a tiered word/AVX2/NEON common-prefix kernel
+/// with a tested scalar oracle, three modules away. `encode::count_match` has
+/// the identical signature and the identical contract; LDM simply never called
+/// it.
+///
+/// **Byte-identical by construction, in every case.** `count_match` requires
+/// `limit <= src.len()` and `m <= ip`, and then its `max` IS `limit - ip`. The
+/// clamp below establishes the first (and is a no-op whenever `block_end` is a
+/// real position in `src`, which the block driver guarantees); the caller's
+/// `m < ip` guard establishes the second. The two defensive `min`s that used to
+/// be here computed the same bound: with `m <= ip`,
+/// `src.len() - m >= src.len() - ip`, so the min collapses to `limit - ip` when
+/// `limit <= src.len()` and to `src.len() - ip` otherwise -- which is exactly
+/// what the clamp produces.
+///
+/// LDM is `enable_ldm: false` by default, so this is off the shipping path. It
+/// is here because it is free, and because the oversight CLASS -- a hand-rolled
+/// loop beside a better kernel nobody wired in -- is the same one that left the
+/// xxh64 vector kernel unreachable (V1/D8a).
+#[inline]
 fn count_eq(src: &[u8], m: usize, ip: usize, limit: usize) -> usize {
-    let max = (limit - ip).min(src.len() - m).min(src.len() - ip);
-    let mut n = 0usize;
-    while n < max && src[m + n] == src[ip + n] {
-        n += 1;
-    }
-    n
+    crate::encode::count_match(src, m, ip, limit.min(src.len()))
 }
 
 #[cfg(test)]

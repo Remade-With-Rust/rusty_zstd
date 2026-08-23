@@ -8,13 +8,95 @@ use alloc::vec;
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
+/// W4: `align(4)` so the whole entry is one naturally-aligned u32. Without it
+/// the struct is align-2 and `entry_u32` must use `read_unaligned`, which LLVM
+/// will not always fold into an addressing mode.
 #[derive(Clone, Copy, Debug)]
-#[repr(C)]
+#[repr(C, align(4))]
 pub(crate) struct FseEntry {
     /// C `FSE_decode_t.newState`.
     pub baseline: u16,
     pub symbol: u8,
     pub num_bits: u8,
+}
+
+/// A borrowed, loop-invariant handle on a built FSE decode table: the base
+/// pointer and the index mask, both already resolved. Copy, so it lives in
+/// registers across the sequence loop.
+#[derive(Clone, Copy)]
+pub(crate) struct FseView<'a> {
+    ptr: *const FseEntry,
+    mask: usize,
+    _m: core::marker::PhantomData<&'a [FseEntry]>,
+}
+
+/// D6 probe: `[dtable builds, builds with NO low-probability symbols]`.
+/// D6's zstd-parity fast path (write 8 symbols at a time as a broadcast u64)
+/// applies only when `high_threshold == table_size - 1`. This counts how often
+/// that is true, before anything is built.
+#[cfg(feature = "profile")]
+pub static D6_SPREAD: [core::sync::atomic::AtomicU64; 3] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+/// Read and clear the D6 probe.
+#[cfg(feature = "profile")]
+pub fn take_d6_spread() -> [u64; 3] {
+    use core::sync::atomic::Ordering;
+    [
+        D6_SPREAD[0].swap(0, Ordering::Relaxed),
+        D6_SPREAD[1].swap(0, Ordering::Relaxed),
+        D6_SPREAD[2].swap(0, Ordering::Relaxed),
+    ]
+}
+
+impl FseView<'_> {
+    /// Same invariant as `FseTable::entry`: the table is a non-empty power of
+    /// two (both constructors guarantee it), and `mask == len - 1`, so the
+    /// masked index is always in range.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    #[allow(dead_code)] // the `FseView` twin of `FseTable::entry`; kept as its oracle.
+    pub(crate) fn entry(self, state: u16) -> FseEntry {
+        // SAFETY: `mask == len - 1` for a non-empty power-of-two table, so
+        // `state & mask < len`; `ptr` borrows that same live allocation.
+        unsafe { *self.ptr.add((state as usize) & self.mask) }
+    }
+
+    /// WIN 2 -- one 4-byte load instead of three field loads.
+    ///
+    /// `FseEntry` is `#[repr(C)]` {baseline: u16, symbol: u8, num_bits: u8} = 4
+    /// bytes, and the emitted asm reads it as THREE loads (movzwl +0, movzbl +2,
+    /// movzbl +3) -- 3 per table, 9 per sequence. Reading the whole entry as one
+    /// `u32` and extracting in registers makes it one load.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    pub(crate) fn entry_u32(self, state: u16) -> u32 {
+        // SAFETY: same invariant as `entry`; `FseEntry` is repr(C), 4 bytes,
+        // align 2, and a u32 read of 4 initialised bytes is a valid bit-cast.
+        unsafe {
+            let p = self.ptr.add((state as usize) & self.mask);
+            // SAFETY: `FseEntry` is repr(C, align(4)) and 4 bytes, so `p` is a
+            // validly-aligned u32 address holding 4 initialised bytes.
+            *p.cast::<u32>()
+        }
+    }
+}
+
+/// Field extraction for the packed form (`FseView::entry_u32`). Layout is
+/// `repr(C)` little-endian: baseline in bits 0..16, symbol 16..24, nb 24..32.
+#[inline(always)]
+pub(crate) const fn fse_baseline(w: u32) -> u16 {
+    w as u16
+}
+#[inline(always)]
+pub(crate) const fn fse_symbol(w: u32) -> u8 {
+    (w >> 16) as u8
+}
+#[inline(always)]
+pub(crate) const fn fse_nbits(w: u32) -> u8 {
+    (w >> 24) as u8
 }
 
 #[derive(Clone, Debug)]
@@ -35,21 +117,82 @@ impl FseTable {
         }
     }
 
+    /// W26 -- build into a RECYCLED buffer.
+    ///
+    /// W25 removed the Repeat-mode clone; Compressed mode -- **51.3% of table
+    /// selections at L3** -- still allocated a fresh `Vec<FseEntry>` per table
+    /// per block. Since `seq_table` now takes the previous table BY VALUE, its
+    /// allocation is right there: `resize` reuses the buffer whenever it is
+    /// already large enough, which it is for every block after the first at a
+    /// given accuracy log.
+    // REFUTED, recorded: `#[inline(never)]` here measured NEUTRAL (+5
+    // instructions). Unlike `select_seq_table`, this has few inline sites, so
+    // there was no duplication to remove -- LLVM had already made the call.
+    #[inline(always)]
+    pub(crate) fn from_norm_into(
+        recycle: Option<Self>,
+        norm: &[i16],
+        accuracy_log: u8,
+    ) -> Result<Self, Error> {
+        match recycle {
+            Some(mut t) => {
+                Self::from_norm_buf(&mut t.decode, norm, accuracy_log)?;
+                t.accuracy_log = accuracy_log;
+                Ok(t)
+            }
+            None => Self::from_norm(norm, accuracy_log),
+        }
+    }
+
     #[inline(always)]
     pub(crate) fn from_norm(norm: &[i16], accuracy_log: u8) -> Result<Self, Error> {
+        let mut decode = Vec::new();
+        Self::from_norm_buf(&mut decode, norm, accuracy_log)?;
+        Ok(Self {
+            decode,
+            accuracy_log,
+        })
+    }
+
+    /// W26: the table build, writing into a caller-owned buffer. `resize` keeps
+    /// the existing allocation whenever it is already large enough -- which it
+    /// is for every block after the first at a given accuracy log.
+    fn from_norm_buf(
+        decode: &mut Vec<FseEntry>,
+        norm: &[i16],
+        accuracy_log: u8,
+    ) -> Result<(), Error> {
         if !(5..=9).contains(&accuracy_log) {
             return Err(Error::Corruption);
         }
         let table_size = 1usize << accuracy_log;
-        let mut decode = vec![
+        decode.clear();
+        decode.resize(
+            table_size,
             FseEntry {
                 baseline: 0,
                 symbol: 0,
                 num_bits: 0,
-            };
-            table_size
-        ];
-        let mut symbol_next = vec![0u16; norm.len().max(1)];
+            },
+        );
+        // W27 -- `symbol_next` on the STACK, not the heap.
+        //
+        // It was `vec![0u16; norm.len().max(1)]` -- a heap allocation per table
+        // build, and the 64..127-byte size class was the single largest bucket
+        // in the decode allocation census (3,530 of 14,871). `norm.len()` is
+        // bounded: the spread loop below rejects `s > 255`, so 256 entries
+        // always suffice and the buffer fits comfortably in a frame.
+        //
+        // `n_sym` preserves the EFFECTIVE length exactly, so the
+        // `s >= symbol_next.len()` reject in the final pass keeps rejecting the
+        // same symbols it did before -- a fixed 256-long array would silently
+        // accept symbols outside the norm table.
+        let n_sym = norm.len().max(1);
+        if n_sym > 256 {
+            return Err(Error::Corruption);
+        }
+        let mut symbol_next_buf = [0u16; 256];
+        let symbol_next = &mut symbol_next_buf[..n_sym];
         let mut high_threshold = table_size - 1;
 
         for (s, &p) in norm.iter().enumerate() {
@@ -93,6 +236,16 @@ impl FseTable {
 
         let mask = table_size - 1;
         let step = (table_size >> 1) + (table_size >> 3) + 3;
+        // D6 probe: does zstd's spread fast path condition ever hold here?
+        #[cfg(feature = "profile")]
+        {
+            D6_SPREAD[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if high_threshold == table_size - 1 {
+                D6_SPREAD[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                // entries the fast path would actually cover
+                D6_SPREAD[2].fetch_add(table_size as u64, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let mut position = 0usize;
         for (s, &p) in norm.iter().enumerate() {
             let sym = s as u8;
@@ -112,7 +265,7 @@ impl FseTable {
             }
         }
 
-        for item in &mut decode {
+        for item in decode.iter_mut() {
             let s = item.symbol as usize;
             if s >= symbol_next.len() {
                 return Err(Error::Corruption);
@@ -131,10 +284,7 @@ impl FseTable {
             item.baseline = ((u32::from(next_state) << nb) - table_size as u32) as u16;
         }
 
-        Ok(Self {
-            decode,
-            accuracy_log,
-        })
+        Ok(())
     }
 
     pub(crate) fn init_state(&self, br: &mut BitRev<'_>) -> u16 {
@@ -157,6 +307,29 @@ impl FseTable {
     /// This runs THREE TIMES PER SEQUENCE on the decode path (LL, ML and OF
     /// tables), and LLVM cannot see the mask invariant because the length is a
     /// runtime value -- so it emitted a compare and a branch on every one.
+    /// WIN 1 -- the loop-invariant half of `entry`, hoisted.
+    ///
+    /// `entry` re-derives BOTH halves of the fat pointer on every call: a load
+    /// of `decode.ptr`, a load of `decode.len`, and a `dec` to make the mask.
+    /// That is 3x per sequence, 160,527 sequences/MiB at L3 -- and because the
+    /// sequence loop also holds `out: &mut Vec<u8>`, LLVM cannot always prove
+    /// the table buffer is not aliased by it, so the reload is not hoistable
+    /// by the optimiser either. Taking the view ONCE per block turns the
+    /// per-call work into a register-held pointer plus an `and`.
+    ///
+    /// Same shape as the `litcopy_arm` / `seqcheck` hoists already in the
+    /// sequence loop, for the same reason.
+    #[inline(always)]
+    pub(crate) fn view(&self) -> FseView<'_> {
+        let dt = self.decode.as_slice();
+        debug_assert!(!dt.is_empty() && dt.len().is_power_of_two());
+        FseView {
+            ptr: dt.as_ptr(),
+            mask: dt.len().wrapping_sub(1),
+            _m: core::marker::PhantomData,
+        }
+    }
+
     #[inline(always)]
     #[allow(unsafe_code)]
     pub(crate) fn entry(&self, state: u16) -> FseEntry {
@@ -165,6 +338,14 @@ impl FseTable {
         let i = (state as usize) & dt.len().wrapping_sub(1);
         debug_assert!(i < dt.len());
         *unsafe { dt.get_unchecked(i) }
+    }
+
+    /// WIN 2: `advance` over the packed word, so the caller never materialises
+    /// an `FseEntry` and both fields come from a register it already holds.
+    #[inline(always)]
+    pub(crate) fn advance_w(w: u32, br: &mut BitRev<'_>) -> u16 {
+        let add = br.read_bits(u32::from(fse_nbits(w)));
+        fse_baseline(w).wrapping_add(add as u16)
     }
 
     #[inline(always)]
@@ -180,14 +361,35 @@ impl FseTable {
 }
 
 /// Read an FSE NCount header. Returns (table, bytes_consumed).
+///
+/// Superseded on every shipping path by the recycled-table W31 route; kept as
+/// the allocating reference shape that route is gated against.
 #[inline(always)]
+#[allow(dead_code)]
 pub(crate) fn read_ncount(
     src: &[u8],
     max_symbol: usize,
     max_log: u8,
 ) -> Result<(FseTable, usize), Error> {
-    let (norm, accuracy, consumed) = parse_ncount(src, max_symbol, max_log)?;
-    let table = FseTable::from_norm(&norm, accuracy)?;
+    let mut nbuf = [0i16; 256];
+    let (nlen, accuracy, consumed) = parse_ncount_into(&mut nbuf, src, max_symbol, max_log)?;
+    let norm = &nbuf[..nlen];
+    let table = FseTable::from_norm(norm, accuracy)?;
+    Ok((table, consumed))
+}
+
+/// W26: `read_ncount` that rebuilds into a recycled table allocation.
+#[inline(never)]
+pub(crate) fn read_ncount_into(
+    recycle: Option<FseTable>,
+    src: &[u8],
+    max_symbol: usize,
+    max_log: u8,
+) -> Result<(FseTable, usize), Error> {
+    let mut nbuf = [0i16; 256];
+    let (nlen, accuracy, consumed) = parse_ncount_into(&mut nbuf, src, max_symbol, max_log)?;
+    let norm = &nbuf[..nlen];
+    let table = FseTable::from_norm_into(recycle, norm, accuracy)?;
     Ok((table, consumed))
 }
 
@@ -198,20 +400,29 @@ pub(crate) fn read_ncount_ctable(
     max_symbol: usize,
     max_log: u8,
 ) -> Result<(FseTable, FseCTable, usize), Error> {
-    let (norm, accuracy, consumed) = parse_ncount(src, max_symbol, max_log)?;
-    let dt = FseTable::from_norm(&norm, accuracy)?;
-    let ct = FseCTable::from_norm(&norm, accuracy)?;
+    let mut nbuf = [0i16; 256];
+    let (nlen, accuracy, consumed) = parse_ncount_into(&mut nbuf, src, max_symbol, max_log)?;
+    let norm = &nbuf[..nlen];
+    let dt = FseTable::from_norm(norm, accuracy)?;
+    let ct = FseCTable::from_norm(norm, accuracy)?;
     Ok((dt, ct, consumed))
 }
 
 // inline(always) so callers compiled with BMI2 (the decode twin) get this
 // bit-reading loop in their own ISA context -- the shim-trap rule.
 #[inline(always)]
-fn parse_ncount(
+/// W28 -- `norm` filled into a caller-owned STACK buffer.
+///
+/// `parse_ncount` allocated `vec![0i16; max_symbol + 1]` per table build and
+/// returned it by value. `max_symbol` is at most 52 (ML) on the sequence path
+/// and 255 for Huffman weights, so a 256-entry array covers every case and the
+/// heap allocation disappears. Returns the filled LENGTH; the caller slices.
+fn parse_ncount_into(
+    norm: &mut [i16; 256],
     src: &[u8],
     max_symbol: usize,
     max_log: u8,
-) -> Result<(Vec<i16>, u8, usize), Error> {
+) -> Result<(usize, u8, usize), Error> {
     if src.is_empty() {
         return Err(Error::Corruption);
     }
@@ -228,7 +439,11 @@ fn parse_ncount(
     let mut remaining = (1i32 << accuracy) + 1;
     let mut threshold = 1i32 << accuracy;
     let mut nb_bits = accuracy as u32 + 1;
-    let mut norm = vec![0i16; max_symbol + 1];
+    if max_symbol + 1 > 256 {
+        return Err(Error::Corruption);
+    }
+    let norm = &mut norm[..max_symbol + 1];
+    norm.fill(0);
     let mut charnum = 0usize;
     let mut previous0 = false;
 
@@ -294,10 +509,11 @@ fn parse_ncount(
     if remaining != 1 {
         return Err(Error::Corruption);
     }
+    // W28: return the USED length; the caller slices the stack buffer, which is
+    // exactly what `norm.truncate(used)` did to the heap Vec.
     let used = charnum.max(1);
-    norm.truncate(used);
     let consumed = bits.bytes_consumed().min(src.len());
-    Ok((norm, accuracy, consumed))
+    Ok((used, accuracy, consumed))
 }
 
 pub(crate) const DEFAULT_LL_NORM: [i16; 36] = [
@@ -335,6 +551,15 @@ struct FseCDelta {
     find: i32,
 }
 
+#[cfg(feature = "alloc")]
+crate::scratch::scratch_slot!(SC_TABLE_SYMBOL: u16);
+#[cfg(feature = "alloc")]
+crate::scratch::scratch_slot!(SC_CUMUL: u16);
+#[cfg(feature = "alloc")]
+crate::scratch::pool_slot!(SC_NORM: i16);
+#[cfg(feature = "alloc")]
+crate::scratch::pool_slot!(SC_NCOUNT: u8);
+
 /// FSE encode table (`FSE_buildCTable_wksp`).
 #[cfg(feature = "alloc")]
 #[derive(Clone, Debug)]
@@ -342,6 +567,85 @@ pub(crate) struct FseCTable {
     table_log: u8,
     state_table: Vec<u16>,
     delta: Vec<FseCDelta>,
+}
+
+/// ALLOC-9: a bounded free list for `FseCTable`'s two owned buffers.
+///
+/// `state_table` and `delta` are owned BY the table, so they cannot be leased
+/// like pure scratch -- they outlive `from_norm`. But their lifetime is still
+/// short and bursty: `select_seq_table` builds a candidate table per seq table
+/// per block and DROPS it whenever it loses, and even a winner is replaced next
+/// block. Closing the loop at `Drop` recycles the buffers without changing a
+/// single signature.
+///
+/// Bounded at 8 entries each, so a thread retains at most ~24 KiB rather than an
+/// unbounded pool.
+///
+/// Equivalence: take + `clear` + `resize(n, default)` produces exactly what
+/// `vec![default; n]` produced, and both buffers are fully overwritten by the
+/// build that follows. `bytegate` is the gate.
+#[cfg(all(feature = "std", feature = "alloc"))]
+mod ct_pool {
+    use super::FseCDelta;
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+    const CAP: usize = 8;
+    thread_local! {
+        static STATE: RefCell<Vec<Vec<u16>>> = const { RefCell::new(Vec::new()) };
+        static DELTA: RefCell<Vec<Vec<FseCDelta>>> = const { RefCell::new(Vec::new()) };
+    }
+    pub(super) fn take_state(n: usize) -> Vec<u16> {
+        let mut v = STATE
+            .try_with(|c| c.try_borrow_mut().ok().and_then(|mut p| p.pop()))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        v.clear();
+        v.resize(n, 0u16);
+        v
+    }
+    pub(super) fn take_delta(n: usize) -> Vec<FseCDelta> {
+        let mut v = DELTA
+            .try_with(|c| c.try_borrow_mut().ok().and_then(|mut p| p.pop()))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        v.clear();
+        v.resize(n, FseCDelta { nb: 0, find: 0 });
+        v
+    }
+    pub(super) fn give_state(v: Vec<u16>) {
+        if v.capacity() == 0 {
+            return;
+        }
+        let _ = STATE.try_with(|c| {
+            if let Ok(mut p) = c.try_borrow_mut() {
+                if p.len() < CAP {
+                    p.push(v)
+                }
+            }
+        });
+    }
+    pub(super) fn give_delta(v: Vec<FseCDelta>) {
+        if v.capacity() == 0 {
+            return;
+        }
+        let _ = DELTA.try_with(|c| {
+            if let Ok(mut p) = c.try_borrow_mut() {
+                if p.len() < CAP {
+                    p.push(v)
+                }
+            }
+        });
+    }
+}
+
+#[cfg(all(feature = "std", feature = "alloc"))]
+impl Drop for FseCTable {
+    fn drop(&mut self) {
+        ct_pool::give_state(core::mem::take(&mut self.state_table));
+        ct_pool::give_delta(core::mem::take(&mut self.delta));
+    }
 }
 
 #[cfg(feature = "alloc")]
@@ -359,8 +663,15 @@ impl FseCTable {
         }
         let table_size = 1usize << table_log;
         let max_sv = norm.len().saturating_sub(1);
-        let mut table_symbol = vec![0u16; table_size];
-        let mut cumul = vec![0u16; max_sv + 2];
+        // ALLOC-1: both are pure scratch -- dropped when this function
+        // returns -- so they recycle per thread. Two allocations per candidate
+        // table build, x3 seq tables, per block. See `scratch.rs` for why a
+        // lease rather than a hand-written take/restore: the `?` exits below
+        // would leak the buffer.
+        let mut table_symbol = crate::scratch::lease(&SC_TABLE_SYMBOL);
+        table_symbol.resize(table_size, 0u16);
+        let mut cumul = crate::scratch::lease(&SC_CUMUL);
+        cumul.resize(max_sv + 2, 0u16);
         let mut high_threshold = table_size - 1;
 
         cumul[0] = 0;
@@ -370,7 +681,9 @@ impl FseCTable {
             // both `u` and `u - 1` are in range; and `high_threshold` starts at
             // `table_size - 1` and only saturating-decreases, so it indexes
             // `table_symbol` (len `table_size`) in range.
-            debug_assert!(u - 1 < norm.len() && u < cumul.len() && high_threshold < table_symbol.len());
+            debug_assert!(
+                u - 1 < norm.len() && u < cumul.len() && high_threshold < table_symbol.len()
+            );
             #[allow(unsafe_code)]
             let nv = *unsafe { norm.get_unchecked(u - 1) };
             #[allow(unsafe_code)]
@@ -416,6 +729,9 @@ impl FseCTable {
             }
         }
 
+        #[cfg(all(feature = "std", feature = "alloc"))]
+        let mut state_table = ct_pool::take_state(table_size);
+        #[cfg(not(all(feature = "std", feature = "alloc")))]
         let mut state_table = vec![0u16; table_size];
         for (u, &s) in table_symbol.iter().enumerate() {
             // SAFETY: every value in `table_symbol` is <= max_sv -- they are
@@ -434,6 +750,9 @@ impl FseCTable {
             *cs = cs.wrapping_add(1);
         }
 
+        #[cfg(all(feature = "std", feature = "alloc"))]
+        let mut delta = ct_pool::take_delta(max_sv + 1);
+        #[cfg(not(all(feature = "std", feature = "alloc")))]
         let mut delta = vec![FseCDelta { nb: 0, find: 0 }; max_sv + 1];
         let mut total: u32 = 0;
         for s in 0..=max_sv {
@@ -552,6 +871,59 @@ pub(crate) fn default_of_ctable() -> Result<FseCTable, Error> {
     FseCTable::from_norm(&DEFAULT_OF_NORM, 5)
 }
 
+/// The three RFC-constant default ctables, built ONCE per process.
+///
+/// N9 (inline-execution): `select_seq_table` rebuilt one of these on EVERY call
+/// -- three heap allocations, a cumul pass, the serial spread loop, a scatter
+/// into `state_table` and the delta build -- for a value fixed by RFC 8878 and
+/// byte-identical for the life of the process. Measured before the fix:
+/// **22-30 rebuilds per MiB encoded**, ~7,500 heap allocations per 88 MiB.
+///
+/// This is V1's defect class exactly, and the three helpers directly above are
+/// the evidence: `default_ll_ctable()` and its siblings already existed here,
+/// correct and tested -- marked `#[allow(dead_code)]` and called only from
+/// tests, while the shipping path rebuilt the same tables by hand.
+///
+/// Returns `None` for any norm that is not one of the three, so the caller
+/// keeps its existing build path and this can never change a result.
+///
+/// Dispatch is by SHAPE, then VERIFIED BY CONTENT.
+///
+/// The obvious implementation -- pointer identity against the three constants --
+/// is a silent no-op here, and the N9 counter caught it: `DEFAULT_*_NORM` are
+/// `const`, not `static`, so each use site gets its own inlined copy at its own
+/// address and `ptr::eq` never matches. The rebuild count did not move.
+///
+/// So match on `(len, log)`, which is unique across the three today, and then
+/// confirm the CONTENT before handing back a cached table. The compare is 58-106
+/// bytes against three heap allocations plus a spread, a scatter and a delta
+/// build -- and it is what makes a future fourth table with the same shape
+/// impossible to bind to the wrong slot. A wrong ctable is a wrong bitstream,
+/// not a crash, so this is checked at runtime and not merely asserted.
+#[cfg(all(feature = "std", feature = "alloc"))]
+pub(crate) fn default_ctable_cached(norm: &[i16], log: u8) -> Option<&'static FseCTable> {
+    use std::sync::OnceLock;
+    static LL: OnceLock<FseCTable> = OnceLock::new();
+    static ML: OnceLock<FseCTable> = OnceLock::new();
+    static OF: OnceLock<FseCTable> = OnceLock::new();
+    let (slot, expect): (&'static OnceLock<FseCTable>, &[i16]) = match (norm.len(), log) {
+        (36, 6) => (&LL, &DEFAULT_LL_NORM),
+        (53, 6) => (&ML, &DEFAULT_ML_NORM),
+        (29, 5) => (&OF, &DEFAULT_OF_NORM),
+        _ => return None,
+    };
+    if norm != expect {
+        return None;
+    }
+    if let Some(t) = slot.get() {
+        return Some(t);
+    }
+    // Build outside the lock. A race just builds twice and discards one, which
+    // is harmless: the result is a pure function of two constants.
+    let built = FseCTable::from_norm(norm, log).ok()?;
+    Some(slot.get_or_init(|| built))
+}
+
 /// FSE_optimalTableLog (minus=2).
 #[cfg(feature = "alloc")]
 pub(crate) fn optimal_table_log(max_log: u8, src_size: usize, max_symbol: usize) -> u8 {
@@ -594,7 +966,11 @@ pub(crate) fn normalize_count(
     let step = (1u64 << 62) / u64::from(total.max(1));
     let v_step = 1u64 << (scale.saturating_sub(20));
     let rtb: [u64; 8] = [0, 473195, 504333, 520860, 550000, 700000, 750000, 830000];
-    let mut norm = vec![0i16; max_sv + 1];
+    // ALLOC-14: `norm` escapes to `ncount_and_ctable`, which drops it after
+    // building the header and the ctable -- so it comes from a bounded pool and
+    // is given back at that death site, not here.
+    let mut norm = crate::scratch::pool_take(&SC_NORM);
+    norm.resize(max_sv + 1, 0i16);
     let mut still = 1i32 << table_log;
     let low_threshold = total >> table_log;
     let mut largest = 0usize;
@@ -640,7 +1016,8 @@ pub(crate) fn normalize_count(
     debug_assert!(largest < norm.len());
     if still.abs() >= i32::from(norm_largest().unsigned_abs()) / 2 && still < 0 {
         // fallback: scale by table size
-        let mut n2 = vec![0i16; max_sv + 1];
+        let mut n2 = crate::scratch::pool_take(&SC_NORM);
+        n2.resize(max_sv + 1, 0i16);
         let mut dist = 0i32;
         for s in 0..=max_sv {
             if count[s] == 0 {
@@ -674,8 +1051,22 @@ pub(crate) fn normalize_count(
 /// FSE_writeNCount.
 #[cfg(feature = "alloc")]
 #[inline(always)]
+/// ALLOC-14: give an ncount header buffer back after it has been copied out.
+#[cfg(feature = "alloc")]
+pub(crate) fn give_ncount_buf(v: alloc::vec::Vec<u8>) {
+    crate::scratch::pool_give(&SC_NCOUNT, v);
+}
+
 pub(crate) fn write_ncount(norm: &[i16], table_log: u8) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::new();
+    // ALLOC-4: `Vec::new()` grown by `push` reallocated on every doubling --
+    // 1, 2, 4, 8 ... which is why the attribution sampler kept landing in
+    // `flush`, the only function that pushes. The stream is at most two bytes
+    // per symbol plus a short header, so one sized allocation replaces
+    // log2(n) of them. Capacity cannot affect content: byte-identical.
+    // ALLOC-14: the ncount header is copied into `dst` by the sequence-section
+    // writer and dropped there; pooled, with the give-back at that copy.
+    let mut out = crate::scratch::pool_take(&SC_NCOUNT);
+    out.reserve(2 * norm.len() + 8);
     let mut bit_stream: u32 = 0;
     let mut bit_count: i32 = 0;
     bit_stream |= u32::from(table_log.saturating_sub(5)) << bit_count;
@@ -856,6 +1247,7 @@ pub(crate) fn ncount_and_ctable(
     let norm = normalize_count(&count[..=max_sv], table_log, total, use_low_prob)?;
     let header = write_ncount(&norm, table_log)?;
     let ct = FseCTable::from_norm(&norm, table_log)?;
+    crate::scratch::pool_give(&SC_NORM, norm);
     Ok((header, ct))
 }
 
@@ -925,9 +1317,42 @@ unsafe fn decompress_weights_bmi2(src: &[u8], max_out: usize) -> Result<(Vec<u8>
     decompress_weights_inner(src, max_out)
 }
 
-#[inline(always)]
-fn decompress_weights_inner(src: &[u8], max_out: usize) -> Result<(Vec<u8>, usize), Error> {
-    let (table, n) = read_ncount(src, 255, 6)?;
+// W31 -- a recycled FSE table for the Huffman WEIGHT decoder.
+//
+// `read_ncount(src, 255, 6)` built a fresh table per weight decode; the
+// allocation census attributed ~1,150 allocations to it. This path has no
+// `BlockState` to hang a buffer on, so it uses a thread-local scratch -- the
+// same pattern `huffman.rs` already uses. Handed back only on success; an
+// error fails the frame anyway.
+#[cfg(feature = "std")]
+std::thread_local! {
+    static WEIGHT_TBL: core::cell::RefCell<Option<FseTable>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// W39 -- fill a caller-owned buffer instead of returning a `Vec`.
+///
+/// The only decode caller (`huffman::read_table`) copies the result into its
+/// own stack buffer and drops the Vec, so the allocation is pure overhead --
+/// ~800 per board, one per FSE-coded weight table. Writing straight into the
+/// caller's buffer removes both the allocation and the copy.
+pub(crate) fn decompress_weights_into(
+    dst: &mut [u8],
+    src: &[u8],
+    max_out: usize,
+) -> Result<(usize, usize), Error> {
+    let cap = max_out.min(dst.len());
+    weights_into_inner(dst, src, cap)
+}
+
+/// The weight decode, writing symbols straight into `dst`. Mirrors
+/// `decompress_weights_inner` exactly; `n_out` replaces `out.len()`.
+fn weights_into_inner(dst: &mut [u8], src: &[u8], max_out: usize) -> Result<(usize, usize), Error> {
+    #[cfg(feature = "std")]
+    let recycled = WEIGHT_TBL.with(|c| c.borrow_mut().take());
+    #[cfg(not(feature = "std"))]
+    let recycled: Option<FseTable> = None;
+    let (table, n) = read_ncount_into(recycled, src, 255, 6)?;
     if n >= src.len() {
         return Err(Error::Corruption);
     }
@@ -935,7 +1360,68 @@ fn decompress_weights_inner(src: &[u8], max_out: usize) -> Result<(Vec<u8>, usiz
     let mut br = BitRev::new(rest)?;
     let mut s1 = table.init_state(&mut br);
     let mut s2 = table.init_state(&mut br);
-    let mut out = Vec::new();
+    let mut n_out = 0usize;
+    loop {
+        if n_out >= max_out {
+            return Err(Error::Corruption);
+        }
+        dst[n_out] = table.entry(s1).symbol;
+        n_out += 1;
+        s1 = table.update(s1, &mut br)?;
+        let _ = br.reload();
+        if br.overflowed() {
+            if n_out < max_out {
+                dst[n_out] = table.entry(s2).symbol;
+                n_out += 1;
+            }
+            break;
+        }
+        if n_out >= max_out {
+            return Err(Error::Corruption);
+        }
+        dst[n_out] = table.entry(s2).symbol;
+        n_out += 1;
+        s2 = table.update(s2, &mut br)?;
+        let _ = br.reload();
+        if br.overflowed() {
+            if n_out < max_out {
+                dst[n_out] = table.entry(s1).symbol;
+                n_out += 1;
+            }
+            break;
+        }
+    }
+    #[cfg(feature = "std")]
+    WEIGHT_TBL.with(|c| *c.borrow_mut() = Some(table));
+    Ok((n_out, n + rest.len()))
+}
+
+// `#[inline(never)]`, not `always`: this decodes the Huffman weight header -- ONCE per block,
+// so a call is free at that frequency -- while inlining reproduced its
+// whole body at every site, and the hosts here are twinned
+// (baseline / bmi2 / avx2). Same finding as `select_seq_table`, which
+// shrank `write_sequences` from 12,413 to 2,216 instructions.
+#[inline(never)]
+fn decompress_weights_inner(src: &[u8], max_out: usize) -> Result<(Vec<u8>, usize), Error> {
+    #[cfg(feature = "std")]
+    let recycled = WEIGHT_TBL.with(|c| c.borrow_mut().take());
+    #[cfg(not(feature = "std"))]
+    let recycled: Option<FseTable> = None;
+    let (table, n) = read_ncount_into(recycled, src, 255, 6)?;
+    if n >= src.len() {
+        return Err(Error::Corruption);
+    }
+    let rest = &src[n..];
+    let mut br = BitRev::new(rest)?;
+    let mut s1 = table.init_state(&mut br);
+    let mut s2 = table.init_state(&mut br);
+    // W29 -- pre-size the weight output.
+    //
+    // This was `Vec::new()` grown by `push`, so a weight table of N symbols paid
+    // ~log2(N) reallocations plus their copies. The loop's own guard proves the
+    // bound: it errors the moment `out.len() >= max_out`, so `max_out` is an
+    // exact ceiling and one allocation replaces the whole growth chain.
+    let mut out = Vec::with_capacity(max_out);
     loop {
         if out.len() >= max_out {
             return Err(Error::Corruption);
@@ -962,6 +1448,9 @@ fn decompress_weights_inner(src: &[u8], max_out: usize) -> Result<(Vec<u8>, usiz
             break;
         }
     }
+    // W31: hand the table back for the next weight decode.
+    #[cfg(feature = "std")]
+    WEIGHT_TBL.with(|c| *c.borrow_mut() = Some(table));
     Ok((out, n + rest.len()))
 }
 

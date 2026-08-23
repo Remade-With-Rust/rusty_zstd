@@ -110,7 +110,11 @@ pub fn compress_with(src: &[u8], opts: CompressOptions) -> Result<Vec<u8>, Error
 /// The cost is real and is recorded: the advertised `windowLog` rises 20 -> 23,
 /// so a decoder must allocate 8 MiB for that frame instead of 1 MiB. C makes the
 /// same trade.
-fn params_with_history(level: i32, src_len: usize, hist_len: usize) -> Result<CompressionParameters, Error> {
+fn params_with_history(
+    level: i32,
+    src_len: usize,
+    hist_len: usize,
+) -> Result<CompressionParameters, Error> {
     let hint = if prefix_window_enabled() {
         (src_len as u64).saturating_add(hist_len as u64)
     } else {
@@ -681,7 +685,11 @@ impl MatchTables {
             pair_gain: 1.0,
             pair_probe: 0,
             pair_route: 2,
-            tags: if use_tags { alloc::vec![0u8; hsz] } else { alloc::vec::Vec::new() },
+            tags: if use_tags {
+                alloc::vec![0u8; hsz]
+            } else {
+                alloc::vec::Vec::new()
+            },
             pack_tags: false,
             fast_hash_legacy: false,
             tag_yield: 1.0,
@@ -756,12 +764,15 @@ impl MatchTables {
         };
     }
 
-
     /// Raw slot, bypassing the tag filter -- diagnostic only.
     #[inline(always)]
     fn raw_fast(&self, h: usize) -> u32 {
         let e = self.hash[h];
-        if self.pack_tags { e & 0x00FF_FFFF } else { e }
+        if self.pack_tags {
+            e & 0x00FF_FFFF
+        } else {
+            e
+        }
     }
 
     /// HAZARD (recorded 2026-08-18, not yet fixed): this writes `hash[h]` and
@@ -954,7 +965,11 @@ impl MatchTables {
     #[inline(always)]
     fn lz_head_pos(raw: u32, cp: bool) -> Option<usize> {
         let p = if cp { raw & 0x00FF_FFFF } else { raw };
-        if p == 0 { None } else { Some((p as usize) - 1) }
+        if p == 0 {
+            None
+        } else {
+            Some((p as usize) - 1)
+        }
     }
 
     #[inline(always)]
@@ -968,7 +983,11 @@ impl MatchTables {
     fn lz_link_from_head(raw: u32, cp: bool) -> u32 {
         if cp {
             let p = raw & 0x00FF_FFFF;
-            if p == 0 { 0 } else { (p - 1) | (raw & 0xFF00_0000) }
+            if p == 0 {
+                0
+            } else {
+                (p - 1) | (raw & 0xFF00_0000)
+            }
         } else if raw == 0 {
             0
         } else {
@@ -1045,7 +1064,15 @@ impl MatchTables {
     /// `Option<usize>` nobody reads.
     #[inline(always)]
     #[allow(unsafe_code)]
-    fn lz_insert_only(&mut self, h: usize, ip: usize, gtag: u8, cp: bool, ca: bool, chain_mask: usize) {
+    fn lz_insert_only(
+        &mut self,
+        h: usize,
+        ip: usize,
+        gtag: u8,
+        cp: bool,
+        ca: bool,
+        chain_mask: usize,
+    ) {
         let raw = self.lz_head_raw(h);
         let old_tag = if cp {
             Self::lz_head_tag(raw)
@@ -1096,7 +1123,6 @@ impl MatchTables {
         debug_assert!(pos < u32::MAX as usize);
         *unsafe { self.hash_long.get_unchecked_mut(h) } = (pos as u32) + 1;
     }
-
 
     /// 1a: long-table stores carry the SHORT tag (`hash4_tag`'s byte) in the
     /// high 8 bits on packed frames -- the same representation and < 16 MiB
@@ -1191,25 +1217,67 @@ impl MatchTables {
     #[inline(always)]
     fn raw_hl(&self, h: usize) -> u32 {
         let e = self.hash_long[h];
-        if self.pack_tags { e & 0x00FF_FFFF } else { e }
+        if self.pack_tags {
+            e & 0x00FF_FFFF
+        } else {
+            e
+        }
+    }
+}
+
+/// ALLOC-7: a retained seq table that may be the process-constant Predefined
+/// one, held BY REFERENCE.
+///
+/// `EntropyState` stored `Option<FseCTable>`, so selecting Predefined mode
+/// cloned the cached RFC-constant table (two or three heap allocations) purely
+/// to store a copy of something already `&'static`. After ALLOC-5 removed the
+/// Repeat-path clone this was the single largest remaining allocation site in
+/// the encoder.
+#[derive(Clone)]
+pub(crate) enum RetainedTable {
+    Static(&'static FseCTable),
+    Own(FseCTable),
+}
+
+impl core::ops::Deref for RetainedTable {
+    type Target = FseCTable;
+    #[inline(always)]
+    fn deref(&self) -> &FseCTable {
+        match self {
+            RetainedTable::Static(t) => t,
+            RetainedTable::Own(t) => t,
+        }
     }
 }
 
 /// Huffman / FSE tables carried across compressed blocks (Repeat / Treeless).
+///
+/// ALLOC-8: the tables are behind `Arc` so that CLONING this state is four
+/// refcount bumps rather than eight-to-twelve heap allocations.
+///
+/// `encode_block` takes a speculative snapshot of this state before trying the
+/// compressed encoding, so it can roll back if Raw or RLE wins. Measured: the
+/// rollback fires **0 times out of 707-876 saves, at every level from L1 to
+/// L19** -- every snapshot was a full deep copy of three FSE tables and a
+/// Huffman table, and every one was discarded.
+///
+/// `Arc` is sound here because nothing mutates a table in place: every use is a
+/// read (`as_deref`) or a whole-value assignment, so there is never a writer to
+/// share with. `Arc` rather than `Rc` keeps `Compressor` `Send`.
 #[derive(Clone, Default)]
 pub(crate) struct EntropyState {
-    huff: Option<HuffCTable>,
-    ll: Option<FseCTable>,
-    of: Option<FseCTable>,
-    ml: Option<FseCTable>,
+    huff: Option<alloc::sync::Arc<HuffCTable>>,
+    ll: Option<alloc::sync::Arc<RetainedTable>>,
+    of: Option<alloc::sync::Arc<RetainedTable>>,
+    ml: Option<alloc::sync::Arc<RetainedTable>>,
 }
 
 impl EntropyState {
     pub(crate) fn seed_from_dict(&mut self, e: &crate::dict::DictEntropy) {
-        self.huff = Some(e.huff_c.clone());
-        self.ll = Some(e.ll_c.clone());
-        self.of = Some(e.of_c.clone());
-        self.ml = Some(e.ml_c.clone());
+        self.huff = Some(alloc::sync::Arc::new(e.huff_c.clone()));
+        self.ll = Some(alloc::sync::Arc::new(RetainedTable::Own(e.ll_c.clone())));
+        self.of = Some(alloc::sync::Arc::new(RetainedTable::Own(e.of_c.clone())));
+        self.ml = Some(alloc::sync::Arc::new(RetainedTable::Own(e.ml_c.clone())));
     }
 }
 
@@ -1240,9 +1308,7 @@ pub(crate) fn encode_oneshot(
     // proven per frame rather than assumed.
     tables.enable_packed_tags(
         (params.strategy == Strategy::DFast && dfast_tag_enabled())
-            || (params.strategy == Strategy::Fast
-                && tag_alloc_enabled()
-                && fast_pack_enabled()),
+            || (params.strategy == Strategy::Fast && tag_alloc_enabled() && fast_pack_enabled()),
         hist_prefix.len() + src.len(),
     );
     if !tables.pack_tags
@@ -1338,7 +1404,7 @@ pub(crate) fn encode_oneshot(
     // where we emit 128 KiB, so it re-adapts its entropy tables ~1.56x more
     // often. This knob tests whether that explains our literals gap. Ratio is
     // deterministic, so the answer needs no quiet box.
-    if let Ok(v) = std::env::var("RZSTD_BLOCK_KB") {
+    if let Ok(v) = crate::env_knob("RZSTD_BLOCK_KB") {
         if let Ok(kb) = v.trim().parse::<usize>() {
             if kb > 0 {
                 block_max = block_max.min(kb * 1024);
@@ -1543,6 +1609,31 @@ pub fn set_prime_stride_arm(n: usize) {
 /// is the bricks 49/64/77 defect this campaign keeps finding.
 pub static PRIME_ITERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// E4 ceiling probe: `[calls, positions hashed]` in the post-match fill helpers.
+/// E4 proposes batching these into a vector tile; a tile needs positions.
+/// N9 probe: rebuilds of the RFC-constant default FSE ctable in `select_seq_table`.
+pub static N9_BASIC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ALLOC-8 probe: `[speculative EntropyState saves, saves actually ROLLED BACK]`.
+/// The save clones 3 FSE tables + a Huffman table per block; if the rollback
+/// almost never fires, the clone is almost pure waste.
+pub static ENT_SAVE: [core::sync::atomic::AtomicU64; 2] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+/// Read and clear the ALLOC-8 probe.
+pub fn take_ent_save() -> [u64; 2] {
+    use core::sync::atomic::Ordering;
+    [
+        ENT_SAVE[0].swap(0, Ordering::Relaxed),
+        ENT_SAVE[1].swap(0, Ordering::Relaxed),
+    ]
+}
+/// Read and clear the N9 probe.
+pub fn take_n9_basic() -> u64 {
+    N9_BASIC.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Read and clear the priming work counter.
 pub fn take_prime_iters() -> u64 {
     PRIME_ITERS.swap(0, core::sync::atomic::Ordering::Relaxed)
@@ -1586,10 +1677,7 @@ pub fn set_prefix_bound_arm(bound: bool) {
 
 #[inline]
 fn prefix_bound_enabled() -> bool {
-    match PREFIX_BOUND_ARM.load(core::sync::atomic::Ordering::Relaxed) {
-        1 => false,
-        _ => true,
-    }
+    PREFIX_BOUND_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
 }
 
 /// FINDING 2 (Gate 2 @ L19): build the BINARY TREE over the prefix.
@@ -1657,7 +1745,9 @@ pub fn set_prime_bt_extent_arm(n: u32) {
 
 #[inline]
 fn prime_bt_extent() -> usize {
-    PRIME_BT_EXTENT_ARM.load(core::sync::atomic::Ordering::Relaxed).max(1) as usize
+    PRIME_BT_EXTENT_ARM
+        .load(core::sync::atomic::Ordering::Relaxed)
+        .max(1) as usize
 }
 
 /// 0 = unresolved, 1 = heads only (shipped), 2 = build the tree.
@@ -1704,7 +1794,8 @@ fn prime_bt_tree_enabled() -> bool {
 /// Striding the insert was tried FIRST and refused: it moves along the same
 /// line instead of off it (stride 4 keeps 0.045% of the 1.78%, stride 8 is
 /// WORSE than not building the tree at all).
-static PRIME_BT_DEPTH_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static PRIME_BT_DEPTH_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// See the table above. `set_prime_bt_depth_arm(0)` restores full depth.
 const PRIME_BT_DEPTH_DEFAULT: u32 = 5;
@@ -1886,8 +1977,10 @@ pub fn take_g5_inputs() -> (f64, f64) {
     let a = G5_RPREV_N.swap(0, Relaxed).max(1) as f64;
     let b = G5_DRIFT_N.swap(0, Relaxed).max(1) as f64;
     (
-        G5_RPREV.swap(0, Relaxed) as f64 / 10000.0 / a,
-        G5_DRIFTSUM.swap(0, Relaxed) as f64 / 10000.0 / b,
+        // `/ 10000.0 / a` is two divisions; fold the constant into the
+        // denominator for one.
+        G5_RPREV.swap(0, Relaxed) as f64 / (10000.0 * a),
+        G5_DRIFTSUM.swap(0, Relaxed) as f64 / (10000.0 * b),
     )
 }
 
@@ -1898,7 +1991,11 @@ pub static G5_HIT_DRIFT: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 /// GATE 5 coverage: `(calls, raw-escape fires, drift fires)`.
 pub fn take_g5() -> (u64, u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
-    (G5_CALLS.swap(0, Relaxed), G5_HIT_RATIO.swap(0, Relaxed), G5_HIT_DRIFT.swap(0, Relaxed))
+    (
+        G5_CALLS.swap(0, Relaxed),
+        G5_HIT_RATIO.swap(0, Relaxed),
+        G5_HIT_DRIFT.swap(0, Relaxed),
+    )
 }
 
 /// 4.77: the Fast ladder is OFF above this input length. Crossover measured
@@ -1911,7 +2008,11 @@ static G5_FAST_LEN_A: core::sync::atomic::AtomicUsize = core::sync::atomic::Atom
 #[inline(always)]
 fn g5_fast_max_len() -> usize {
     let v = G5_FAST_LEN_A.load(core::sync::atomic::Ordering::Relaxed);
-    if v == 0 { G5_FAST_MAX_LEN } else { v }
+    if v == 0 {
+        G5_FAST_MAX_LEN
+    } else {
+        v
+    }
 }
 
 /// Bench arm. `usize::MAX` restores the pre-4.77 behaviour (ladder always on).
@@ -1961,20 +2062,30 @@ static G5_BAND_A: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 #[inline(always)]
 fn g5_tiny_max() -> f32 {
     let v = G5_TINY_A.load(core::sync::atomic::Ordering::Relaxed);
-    if v == u32::MAX { G5_TINY_MAX } else { f32::from_bits(v) }
+    if v == u32::MAX {
+        G5_TINY_MAX
+    } else {
+        f32::from_bits(v)
+    }
 }
 
 #[inline(always)]
 fn g5_band() -> usize {
     let v = G5_BAND_A.load(core::sync::atomic::Ordering::Relaxed);
-    if v == 0 { G5_BAND } else { v }
+    if v == 0 {
+        G5_BAND
+    } else {
+        v
+    }
 }
 
 /// Bench arms for the 4.76 band. `set_g5_band_arm(usize::MAX)` disables the band
 /// (it can then never bind), restoring the pre-4.76 behaviour exactly.
 pub fn set_g5_tiny_arm(v: f32) {
-    G5_TINY_A.store(if v.is_nan() { u32::MAX } else { v.to_bits() },
-        core::sync::atomic::Ordering::Relaxed);
+    G5_TINY_A.store(
+        if v.is_nan() { u32::MAX } else { v.to_bits() },
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 pub fn set_g5_band_arm(v: usize) {
     G5_BAND_A.store(v, core::sync::atomic::Ordering::Relaxed);
@@ -2048,17 +2159,29 @@ pub fn set_g5_opt_arms(rep: f32, ratio: f32, drift: f32) {
 #[inline]
 fn g5_rep_min_opt() -> f32 {
     let b = G5_REP_O.load(core::sync::atomic::Ordering::Relaxed);
-    if b == u32::MAX { G5_REP_MIN_OPT } else { f32::from_bits(b) }
+    if b == u32::MAX {
+        G5_REP_MIN_OPT
+    } else {
+        f32::from_bits(b)
+    }
 }
 #[inline]
 fn g5_ratio_min_opt() -> f32 {
     let b = G5_RATIO_O.load(core::sync::atomic::Ordering::Relaxed);
-    if b == u32::MAX { G5_RATIO_MIN_OPT } else { f32::from_bits(b) }
+    if b == u32::MAX {
+        G5_RATIO_MIN_OPT
+    } else {
+        f32::from_bits(b)
+    }
 }
 #[inline]
 fn g5_drift_min_opt() -> f32 {
     let b = G5_DRIFT_O.load(core::sync::atomic::Ordering::Relaxed);
-    if b == u32::MAX { G5_DRIFT_MIN_OPT } else { f32::from_bits(b) }
+    if b == u32::MAX {
+        G5_DRIFT_MIN_OPT
+    } else {
+        f32::from_bits(b)
+    }
 }
 
 static G5_REP_F: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
@@ -2075,17 +2198,29 @@ pub fn set_g5_fast_arms(rep: f32, ratio: f32, drift: f32) {
 #[inline]
 fn g5_rep_min_fast() -> f32 {
     let b = G5_REP_F.load(core::sync::atomic::Ordering::Relaxed);
-    if b == u32::MAX { G5_REP_MIN_FAST } else { f32::from_bits(b) }
+    if b == u32::MAX {
+        G5_REP_MIN_FAST
+    } else {
+        f32::from_bits(b)
+    }
 }
 #[inline]
 fn g5_ratio_min_fast() -> f32 {
     let b = G5_RATIO_F.load(core::sync::atomic::Ordering::Relaxed);
-    if b == u32::MAX { G5_RATIO_MIN_FAST } else { f32::from_bits(b) }
+    if b == u32::MAX {
+        G5_RATIO_MIN_FAST
+    } else {
+        f32::from_bits(b)
+    }
 }
 #[inline]
 fn g5_drift_min_fast() -> f32 {
     let b = G5_DRIFT_F.load(core::sync::atomic::Ordering::Relaxed);
-    if b == u32::MAX { G5_DRIFT_MIN_FAST } else { f32::from_bits(b) }
+    if b == u32::MAX {
+        G5_DRIFT_MIN_FAST
+    } else {
+        f32::from_bits(b)
+    }
 }
 
 static G5_REP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
@@ -2102,17 +2237,29 @@ pub fn set_g5_arms(rep: f32, ratio: f32, drift: f32) {
 #[inline]
 fn g5_rep_min() -> f32 {
     let b = G5_REP.load(core::sync::atomic::Ordering::Relaxed);
-    if b == u32::MAX { G5_REP_MIN } else { f32::from_bits(b) }
+    if b == u32::MAX {
+        G5_REP_MIN
+    } else {
+        f32::from_bits(b)
+    }
 }
 #[inline]
 fn g5_ratio_min() -> f32 {
     let b = G5_RATIO.load(core::sync::atomic::Ordering::Relaxed);
-    if b == u32::MAX { G5_RATIO_MIN } else { f32::from_bits(b) }
+    if b == u32::MAX {
+        G5_RATIO_MIN
+    } else {
+        f32::from_bits(b)
+    }
 }
 #[inline]
 fn g5_drift_min() -> f32 {
     let b = G5_DRIFT.load(core::sync::atomic::Ordering::Relaxed);
-    if b == u32::MAX { G5_DRIFT_MIN } else { f32::from_bits(b) }
+    if b == u32::MAX {
+        G5_DRIFT_MIN
+    } else {
+        f32::from_bits(b)
+    }
 }
 
 #[inline(always)]
@@ -2203,10 +2350,12 @@ pub(crate) fn prime_tables(
         let pparams = if d == 0 {
             params
         } else {
-            CompressionParameters { search_log: d, ..params }
+            CompressionParameters {
+                search_log: d,
+                ..params
+            }
         };
-        let prime_attempts =
-            bt_depth_apply(search_attempts(pparams), pparams, tables.opt_rep_rate);
+        let prime_attempts = bt_depth_apply(search_attempts(pparams), pparams, tables.opt_rep_rate);
         let btf = bt_resolve_ins(tables.hash_log, pparams.chain_log.min(24));
         let prime_ctx = BtCtx {
             src,
@@ -2257,8 +2406,7 @@ pub(crate) fn prime_tables(
             // primed slot mismatches the finder's keys -- the -59.3% priming
             // poison this function has already been bitten by once.
             let fhp = fast_hash_spec(mls, hash_log);
-            let (h, tag) =
-                fast_hash_tag::<true>(src, p, fhp.wide, fhp.mask, fhp.shift);
+            let (h, tag) = fast_hash_tag::<true>(src, p, fhp.wide, fhp.mask, fhp.shift);
             tables.store_fast(h, p, tag, packed);
         } else {
             // Chain-tag frames prime in the finder's own format (packed or
@@ -2266,7 +2414,11 @@ pub(crate) fn prime_tables(
             if tables.chain_pack || !tables.ctags.is_empty() {
                 let cp = tables.chain_pack;
                 let ca = !tables.ctags.is_empty();
-                let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
+                let smask = if mls >= 8 {
+                    u64::MAX
+                } else {
+                    (1u64 << (8 * mls)) - 1
+                };
                 let (hh, gt) = if tables.chain_wide {
                     hash_wide_link_tag(src, p, hash_log, smask)
                 } else {
@@ -2310,7 +2462,11 @@ pub(crate) fn prime_tables(
                 // MUST mirror `hash4_tag_mls` exactly -- the -59.3% priming
                 // poison. `p + 8 <= len` is this loop's own guard.
                 let sk = 8.min(mls);
-                let smask = if sk == 8 { u64::MAX } else { (1u64 << (8 * sk)) - 1 };
+                let smask = if sk == 8 {
+                    u64::MAX
+                } else {
+                    (1u64 << (8 * sk)) - 1
+                };
                 let tv = (load_u64le(src, p) & smask).wrapping_mul(FAST_HASH_PRIME64);
                 let g = (tv ^ (tv >> 29)) as u8;
                 tables.put_h_tag(h, p, g, packed, stag_live);
@@ -2355,13 +2511,34 @@ pub(crate) fn encode_block(
         #[allow(unsafe_code)]
         return unsafe {
             encode_block_bmi2(
-                out, src, block_start, block_end, window, params, tables, reps, entropy, last,
-                ldm, ldm_p,
+                out,
+                src,
+                block_start,
+                block_end,
+                window,
+                params,
+                tables,
+                reps,
+                entropy,
+                last,
+                ldm,
+                ldm_p,
             )
         };
     }
     encode_block_inner(
-        out, src, block_start, block_end, window, params, tables, reps, entropy, last, ldm, ldm_p,
+        out,
+        src,
+        block_start,
+        block_end,
+        window,
+        params,
+        tables,
+        reps,
+        entropy,
+        last,
+        ldm,
+        ldm_p,
     )
 }
 
@@ -2384,7 +2561,18 @@ unsafe fn encode_block_bmi2(
     ldm_p: crate::ldm::LdmParams,
 ) -> Result<(), Error> {
     encode_block_inner(
-        out, src, block_start, block_end, window, params, tables, reps, entropy, last, ldm, ldm_p,
+        out,
+        src,
+        block_start,
+        block_end,
+        window,
+        params,
+        tables,
+        reps,
+        entropy,
+        last,
+        ldm,
+        ldm_p,
     )
 }
 
@@ -2449,8 +2637,7 @@ fn encode_block_inner(
     // a schedule so content that starts compressing is picked up: without that
     // the gate would suppress its own evidence, the defect this campaign has now
     // hit in Gates 6, 2 and 10.
-    let skip_search =
-        raw_skip_on() && tables.raw_run >= raw_run_min() && tables.raw_probe != 0;
+    let skip_search = raw_skip_on() && tables.raw_run >= raw_run_min() && tables.raw_probe != 0;
     // LDM is excluded: the probe would have to clone and then discard the LDM
     // state too, and a second pollution problem is not worth solving for a
     // feature that is off by default on this path.
@@ -2476,11 +2663,27 @@ fn encode_block_inner(
         let mut probe = tables.clone();
         probe.route_force = 2;
         let (s2, l2) = find_sequences(
-            src, block_start, block_end, window, params, &mut probe, None, ldm_p, *reps,
+            src,
+            block_start,
+            block_end,
+            window,
+            params,
+            &mut probe,
+            None,
+            ldm_p,
+            *reps,
         );
         let _m = crate::prof::scope(crate::prof::Stage::EncodeMatchFind);
         let r = find_sequences(
-            src, block_start, block_end, window, params, tables, ldm, ldm_p, *reps,
+            src,
+            block_start,
+            block_end,
+            window,
+            params,
+            tables,
+            ldm,
+            ldm_p,
+            *reps,
         );
         note_step_probe(tables, &r.0, r.1.len(), &s2, l2.len());
         r
@@ -2564,6 +2767,8 @@ fn encode_block_inner(
         return Ok(());
     }
     let saved_reps = *reps;
+    #[cfg(feature = "profile")]
+    ENT_SAVE[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let saved_ent = entropy.clone();
     crate::prof::note_scratch(1);
     // GATE 6 @ L3 -- reuse the payload buffer across blocks.
@@ -2576,7 +2781,7 @@ fn encode_block_inner(
     // `payload_scratch`). `block.len()` is still a hard upper bound -- a payload
     // that reaches it is rejected for Raw by `raw_limit` below -- so the first
     // block sizes the buffer correctly and no later block has to grow it.
-    let mut payload = std::mem::take(&mut tables.payload_scratch);
+    let mut payload = core::mem::take(&mut tables.payload_scratch);
     payload.clear();
     if payload_reserve_enabled() && payload.capacity() < block.len() {
         // REPLACE, do not grow. `payload` was just cleared, so `realloc` would
@@ -2641,6 +2846,8 @@ fn encode_block_inner(
         #[cfg(feature = "profile")]
         RAW_EXIT[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         *reps = saved_reps;
+        #[cfg(feature = "profile")]
+        ENT_SAVE[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         *entropy = saved_ent;
         note_raw_outcome(tables, true);
         crate::prof::note_raw_block();
@@ -2760,10 +2967,6 @@ thread_local! {
         const { core::cell::Cell::new(None) };
 }
 
-
-
-
-
 /// Gate 16 arm: the incompressible early-raw skip. Also RETIRES the uncached
 /// `std::env::var` read that `incomp_skip_on` performed on EVERY BLOCK -- the
 /// last uncached env read on a hot path (m7-anatomy section 3 addendum).
@@ -2808,10 +3011,8 @@ fn raw_skip_on() -> bool {
 /// starts compressing is picked up. Both were chosen when 4.30 shipped and
 /// neither has been moved since -- the same shape as the search-strength shift
 /// of 4.43, which sat unexamined and turned out to be the biggest L1 lever.
-static RAW_RUN_MIN_ARM: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-static RAW_PROBE_ARM: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+static RAW_RUN_MIN_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static RAW_PROBE_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Bench hook: consecutive raw blocks before the search is skipped. 0 = shipped 2.
 pub fn set_raw_run_min_arm(v: u32) {
@@ -2867,11 +3068,9 @@ pub fn take_raw_exits() -> [u64; 3] {
 
 /// GATE 16 study: how far past `raw_limit` did blocks that went RAW land?
 #[cfg(feature = "profile")]
-pub static RAW_MARGIN_SUM: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static RAW_MARGIN_SUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static RAW_MARGIN_N: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static RAW_MARGIN_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "profile")]
 pub static RAW_MARGIN_HIST: [core::sync::atomic::AtomicU64; 4] = [
     core::sync::atomic::AtomicU64::new(0),
@@ -3141,7 +3340,6 @@ fn write_literals(
     write_literals_inner(dst, lits, entropy)
 }
 
-
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "bmi2,lzcnt")]
 #[allow(unsafe_code)]
@@ -3160,13 +3358,18 @@ fn write_literals_inner(
     entropy: &mut EntropyState,
 ) -> Result<bool, Error> {
     let _h = crate::prof::scope(crate::prof::Stage::EncodeHuff);
-    let (sec, upd) = huffman::encode_literals_section(lits, entropy.huff.as_ref())?;
+    let (sec, upd) = huffman::encode_literals_section(lits, entropy.huff.as_deref())?;
     let reused = matches!(upd, HuffUpdate::Unchanged);
     match upd {
-        HuffUpdate::New(ct) => entropy.huff = Some(ct),
+        HuffUpdate::New(ct) => entropy.huff = Some(alloc::sync::Arc::new(ct)),
         HuffUpdate::Unchanged => {}
     }
     dst.extend_from_slice(&sec);
+    // ALLOC-13: close the loop. The winning section is COPIED into `dst` and
+    // then dropped, so it goes back to the candidate pool -- without this the
+    // pool starves, every candidate takes from an empty pool, and the pooling
+    // measures nothing (it did: 24.0/block unchanged until this line existed).
+    huffman::sec_pool_give(sec);
     Ok(reused)
 }
 
@@ -3265,7 +3468,7 @@ fn write_sequences_inner(
         // sequence, while the two copy arms beside it are both resolved once
         // per block.
         let lut_arm = crate::compressed::lut_on();
-        let mut coded: Vec<CodedSeq> = std::mem::take(&mut tables.coded_scratch);
+        let mut coded: Vec<CodedSeq> = core::mem::take(&mut tables.coded_scratch);
         coded.clear();
         if coded.capacity() < seqs.len() {
             coded = Vec::with_capacity(seqs.len());
@@ -3337,7 +3540,7 @@ fn write_sequences_inner(
             9,
             &fse::DEFAULT_LL_NORM,
             6,
-            entropy.ll.as_ref(),
+            entropy.ll.as_deref().map(|r| &**r),
             use_low,
             false,
             coded[last_i].llc as usize,
@@ -3349,7 +3552,7 @@ fn write_sequences_inner(
             8,
             &fse::DEFAULT_OF_NORM,
             5,
-            entropy.of.as_ref(),
+            entropy.of.as_deref().map(|r| &**r),
             use_low,
             of_needs_comp,
             coded[last_i].ofc as usize,
@@ -3360,7 +3563,7 @@ fn write_sequences_inner(
             9,
             &fse::DEFAULT_ML_NORM,
             6,
-            entropy.ml.as_ref(),
+            entropy.ml.as_deref().map(|r| &**r),
             use_low,
             false,
             coded[last_i].mlc as usize,
@@ -3377,6 +3580,11 @@ fn write_sequences_inner(
     dst.extend_from_slice(&ll_hdr);
     dst.extend_from_slice(&of_hdr);
     dst.extend_from_slice(&ml_hdr);
+    // ALLOC-14: the three ncount headers die here -- copied into `dst` and
+    // dropped. Close the loop, or the pool starves exactly as ALLOC-13's did.
+    fse::give_ncount_buf(ll_hdr);
+    fse::give_ncount_buf(of_hdr);
+    fse::give_ncount_buf(ml_hdr);
 
     let last = last_i;
     let _fs = crate::prof::scope(crate::prof::Stage::EncodeFseSeq);
@@ -3385,7 +3593,7 @@ fn write_sequences_inner(
     let mut ll_s = ll_t.init_state2(coded[last].llc as usize);
 
     let mut bits = BitCStream::from_vec(
-        std::mem::take(&mut tables.bits_scratch),
+        core::mem::take(&mut tables.bits_scratch),
         coded.len() * 4 + 16,
     );
     bits.add_bits(u64::from(coded[last].llx), u32::from(coded[last].llb));
@@ -3412,9 +3620,38 @@ fn write_sequences_inner(
     dst.extend_from_slice(&out);
     tables.bits_scratch = out;
     tables.coded_scratch = coded;
-    entropy.ll = Some(ll_t);
-    entropy.of = Some(of_t);
-    entropy.ml = Some(ml_t);
+    // ALLOC-5 (N11): write back ONLY a table that is actually new.
+    //
+    // `prev` for each of the three is `entropy.<x>.as_ref()`, so on Repeat mode
+    // the old code cloned `entropy.ll` and then assigned the clone straight back
+    // onto `entropy.ll` -- two or three heap allocations to replace a table with
+    // a copy of itself. Borrowing (`SeqTable::Ref`) makes that visible, and the
+    // match consumes the carrier so the borrow of `entropy` ends before the
+    // write. Byte-identical: the retained table is the same table either way.
+    let ll_new = match ll_t {
+        SeqTable::Own(t) => Some(RetainedTable::Own(t)),
+        SeqTable::Static(t) => Some(RetainedTable::Static(t)),
+        SeqTable::Ref(_) => None,
+    };
+    let of_new = match of_t {
+        SeqTable::Own(t) => Some(RetainedTable::Own(t)),
+        SeqTable::Static(t) => Some(RetainedTable::Static(t)),
+        SeqTable::Ref(_) => None,
+    };
+    let ml_new = match ml_t {
+        SeqTable::Own(t) => Some(RetainedTable::Own(t)),
+        SeqTable::Static(t) => Some(RetainedTable::Static(t)),
+        SeqTable::Ref(_) => None,
+    };
+    if let Some(t) = ll_new {
+        entropy.ll = Some(alloc::sync::Arc::new(t));
+    }
+    if let Some(t) = of_new {
+        entropy.of = Some(alloc::sync::Arc::new(t));
+    }
+    if let Some(t) = ml_new {
+        entropy.ml = Some(alloc::sync::Arc::new(t));
+    }
     Ok(())
 }
 
@@ -3435,31 +3672,87 @@ fn ncount_seq_table(
     fse::ncount_and_ctable(&buf, max_log, use_low_prob)
 }
 
+/// ALLOC-5 (N11): a seq table that may be BORROWED.
+///
+/// `select_seq_table` returned an owned `FseCTable`, so the two winning modes
+/// that already have one -- Repeat (the caller's `prev`) and Predefined (the
+/// process-constant cached table from N9) -- each paid a full clone: two or
+/// three heap allocations for a table the caller could simply borrow. Only the
+/// Compressed mode genuinely builds a new one.
+///
+/// Derefs to `FseCTable`, so every consumer reads unchanged.
+#[cfg(feature = "alloc")]
+enum SeqTable<'a> {
+    /// Already the table `entropy` holds -- nothing to write back.
+    Ref(&'a FseCTable),
+    /// The process-constant Predefined table -- retain by reference.
+    Static(&'static FseCTable),
+    Own(FseCTable),
+}
+
+#[cfg(feature = "alloc")]
+impl core::ops::Deref for SeqTable<'_> {
+    type Target = FseCTable;
+    #[inline(always)]
+    fn deref(&self) -> &FseCTable {
+        match self {
+            SeqTable::Ref(t) => t,
+            SeqTable::Static(t) => t,
+            SeqTable::Own(t) => t,
+        }
+    }
+}
+
 /// Select Predefined / RLE / FSE-compressed / Repeat. Returns (mode, table, header bytes).
+///
+/// `#[inline(never)]`, NOT `always`. This runs THREE TIMES PER BLOCK -- once
+/// each for litlen, offset and matchlen -- so a call is free at that
+/// frequency. Inlined it was reproduced 3x in `write_sequences_inner`, and
+/// that function has THREE twins (baseline / bmi2 / avx2), so the selector's
+/// whole body existed NINE times. `write_sequences` was the largest lump left
+/// in the crate at 12,413 x 3 = 36K instructions.
 #[allow(clippy::too_many_arguments)]
-#[inline(always)]
-fn select_seq_table(
+#[inline(never)]
+fn select_seq_table<'a>(
     counts: &[u32],
     _alphabet: usize,
     max_log: u8,
     default_norm: &[i16],
     default_log: u8,
-    prev: Option<&FseCTable>,
+    prev: Option<&'a FseCTable>,
     use_low_prob: bool,
     force_compressed: bool,
     last_sym: usize,
-) -> Result<(u8, FseCTable, Vec<u8>), Error> {
+) -> Result<(u8, SeqTable<'a>, Vec<u8>), Error> {
     let total: u32 = counts.iter().sum();
     let most = counts.iter().copied().max().unwrap_or(0);
     // libzstd ZSTD_selectEncodingType: a single symbol is always RLE.
     if total > 0 && most == total {
         let sym = counts.iter().position(|&c| c == total).unwrap_or(0) as u8;
-        return Ok((1, FseCTable::rle(u16::from(sym)), vec![sym]));
+        return Ok((1, SeqTable::Own(FseCTable::rle(u16::from(sym))), vec![sym]));
     }
 
-    let basic = fse::FseCTable::from_norm(default_norm, default_log)?;
+    // N9 probe: this rebuilds an RFC-CONSTANT ctable -- three heap allocations,
+    // a cumul pass, the serial spread, a scatter into state_table and the delta
+    // build -- for a value fixed for the life of the process.
+    // N9: hand out the process-constant table by reference. Only the losing
+    // path below needs to own it, and Predefined winning is the minority case.
+    let basic_owned;
+    #[cfg(all(feature = "std", feature = "alloc"))]
+    let cached = fse::default_ctable_cached(default_norm, default_log);
+    #[cfg(not(all(feature = "std", feature = "alloc")))]
+    let cached: Option<&fse::FseCTable> = None;
+    let basic: &fse::FseCTable = match cached {
+        Some(t) => t,
+        None => {
+            #[cfg(feature = "profile")]
+            N9_BASIC.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            basic_owned = fse::FseCTable::from_norm(default_norm, default_log)?;
+            &basic_owned
+        }
+    };
     let mut best_mode = 0u8;
-    let mut best_table: Option<FseCTable> = None;
+    let mut best_table: Option<SeqTable<'a>> = None;
     let mut best_hdr = Vec::new();
     let mut best_cost = basic.bit_cost(counts);
 
@@ -3467,7 +3760,8 @@ fn select_seq_table(
         let c = p.bit_cost(counts);
         if c <= best_cost {
             best_mode = 3;
-            best_table = Some(p.clone());
+            // ALLOC-5: borrow the caller's table instead of cloning it.
+            best_table = Some(SeqTable::Ref(p));
             best_hdr = Vec::new();
             best_cost = c;
         }
@@ -3478,21 +3772,50 @@ fn select_seq_table(
             let c = ct.bit_cost(counts) + (hdr.len() as u64) * 8;
             if c < best_cost || force_compressed {
                 best_mode = 2;
-                best_table = Some(ct);
+                best_table = Some(SeqTable::Own(ct));
                 best_hdr = hdr;
                 best_cost = c;
+            } else {
+                // ALLOC-16: the LOSING candidate's ncount header dies right
+                // here. Without this it never reached the pool and
+                // `write_ncount` stayed the top site after ALLOC-14.
+                fse::give_ncount_buf(hdr);
             }
         }
     }
 
     if force_compressed && best_mode == 0 {
         if let Ok((hdr, ct)) = ncount_seq_table(counts, last_sym, max_log, use_low_prob) {
-            return Ok((2, ct, hdr));
+            return Ok((2, SeqTable::Own(ct), hdr));
         }
         return Err(Error::Corruption);
     }
     let _ = best_cost;
-    Ok((best_mode, best_table.unwrap_or(basic), best_hdr))
+    // ALLOC-5, CORRECTED: the Predefined fallback must stay OWNED.
+    //
+    // Returning `Ref(cached)` here looked free and changed the bitstream --
+    // `bytegate` caught it on mozilla. The caller writes the returned table into
+    // `entropy.<x>`, which becomes the NEXT block's `prev`; on Predefined mode
+    // the old code therefore replaced the retained table with the predefined
+    // one. Skipping that write-back left the previous (compressed) table in
+    // place, the next block's Repeat test saw a different `prev`, and the
+    // decisions diverged.
+    //
+    // So `SeqTable::Ref` now means exactly one thing: "this IS the table
+    // `entropy` already holds, so there is nothing to write back." It is
+    // produced only on the Repeat path, from `prev`. Every other mode owns.
+    // ALLOC-7: Predefined retains the cached `&'static` table by reference.
+    // ALLOC-5's correction still holds -- this MUST still be written back, and
+    // `SeqTable::Static` carries that instruction; what it no longer does is
+    // clone a process constant to do it.
+    Ok((
+        best_mode,
+        best_table.unwrap_or_else(|| match cached {
+            Some(t) => SeqTable::Static(t),
+            None => SeqTable::Own(basic.clone()),
+        }),
+        best_hdr,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -3524,10 +3847,30 @@ fn find_sequences(
         // SAFETY: runtime CPUID guard; identical body.
         #[allow(unsafe_code)]
         return unsafe {
-            find_sequences_bmi2(src, block_start, block_end, window, params, tables, ldm, ldm_p, reps)
+            find_sequences_bmi2(
+                src,
+                block_start,
+                block_end,
+                window,
+                params,
+                tables,
+                ldm,
+                ldm_p,
+                reps,
+            )
         };
     }
-    find_sequences_inner(src, block_start, block_end, window, params, tables, ldm, ldm_p, reps)
+    find_sequences_inner(
+        src,
+        block_start,
+        block_end,
+        window,
+        params,
+        tables,
+        ldm,
+        ldm_p,
+        reps,
+    )
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
@@ -3545,7 +3888,17 @@ unsafe fn find_sequences_bmi2(
     ldm_p: crate::ldm::LdmParams,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    find_sequences_inner(src, block_start, block_end, window, params, tables, ldm, ldm_p, reps)
+    find_sequences_inner(
+        src,
+        block_start,
+        block_end,
+        window,
+        params,
+        tables,
+        ldm,
+        ldm_p,
+        reps,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3663,7 +4016,9 @@ fn find_sequences_strategy_sel(
         Strategy::Greedy => find_greedy(src, block_start, block_end, window, params, tables, reps),
         Strategy::Lazy => find_lazy(src, block_start, block_end, window, params, tables, 1, reps),
         Strategy::Lazy2 => find_lazy(src, block_start, block_end, window, params, tables, 2, reps),
-        Strategy::BtLazy2 => find_bt_lazy(src, block_start, block_end, window, params, tables, 2, reps),
+        Strategy::BtLazy2 => {
+            find_bt_lazy(src, block_start, block_end, window, params, tables, 2, reps)
+        }
         Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
             find_opt(src, block_start, block_end, window, params, tables, reps)
         }
@@ -3882,8 +4237,7 @@ fn rep_len_min() -> f32 {
     1.0
 }
 
-static REPLEN_CACHE: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
+static REPLEN_CACHE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Decay floor on `rep_yield` for DFast. 0.0 = shut on the first dry block.
 ///
@@ -3920,8 +4274,7 @@ static REP_DECAY_CACHE: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
 
 #[cfg(feature = "std")]
-static REPMIN_OVR: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
+static REPMIN_OVR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
 fn rep_yield_min_for(strategy: Strategy) -> f32 {
     #[cfg(feature = "profile")]
@@ -4040,13 +4393,17 @@ fn find_fast(
     // positions live, and the probe decides per content whether that costs
     // bytes -- no static signal separates the free content from the costly
     // (4.70: four content signals and three probe designs failed first).
-    tables.pair_route = if tables.route_force != 0 {
+    #[allow(clippy::if_same_then_else)]
+    let route = if tables.route_force != 0 {
         tables.route_force
     } else if tables.step_pick == 2 && tables.step_reprobe > 0 && step_probe_on() {
         2
     } else if !pair_enabled() {
         0
     } else if params.target_length != 0 {
+        // Two rungs, one verdict, kept apart on purpose: `--fast` and an
+        // unprobed block reach route 2 for different reasons, and the ladder is
+        // the record of which reason fired. Collapsing them erases that.
         2
     } else if tables.pair_probe == 0 {
         2
@@ -4073,6 +4430,7 @@ fn find_fast(
     } else {
         1
     };
+    tables.pair_route = route;
     #[cfg(feature = "profile")]
     {
         use core::sync::atomic::Ordering;
@@ -4126,11 +4484,71 @@ fn find_fast(
         && (5..=8).contains(&(params.min_match.max(3) as usize))
         && !tables.fast_hash_legacy
         && tables.pack_tags;
+    // W5: THE HLOG AXIS IS BMI2-REDUNDANT, and it was the single most
+    // expensive thing in the library.
+    //
+    // BRICK 54 specialises `HLOG` so the hash shift folds to an immediate --
+    // `shrl $n` instead of `mov %cl` + `shrl %cl`. That is a real win on a
+    // baseline x86-64 shift, whose count MUST live in `%cl`. It buys exactly
+    // NOTHING on the BMI2 twins: `shrx` takes its count from any GPR, with no
+    // flag dependency and no fixed register -- which is precisely what the twin
+    // campaign's own asm receipt records ("1,878 shrx, 0 CL" on the fast
+    // twins). So the twins were paying a SIX-FOLD monomorphisation for a fold
+    // their ISA had already made free.
+    //
+    // Six `hash_log` values x 2 WIDE x ~10 arms = 140 copies of a ~1,450
+    // instruction function, TWICE (plain + twin). Routing the twins to the
+    // generic-HLOG copy takes their tree from 140 to 40 and leaves brick 54
+    // intact on the baseline path that still needs it.
+    //
+    // BYTE-IDENTICAL, and for the reason this file already gives for the
+    // dispatch arms: the const takes the value the runtime variable already
+    // held. `HLOG` chooses how the shift is ENCODED, never what it computes.
+    //
+    // The ISA choice also moves HERE, out of the 140 `find_fast_impl` bodies
+    // that each re-asked `has_bmi2()` per block.
     macro_rules! go {
-        ($p:expr, $r:expr, $h:expr, $s:expr, $pi:expr) => {
-            if wide_block {
-                find_fast_impl::<$p, $r, $h, $s, $pi, true>(
+        ($p:expr, $r:expr, $h:expr, $s:expr, $pi:expr) => {{
+            // NOTE: this must stay an EXPRESSION. An earlier revision used
+            // `return` here and skipped the `pair_probe` countdown below the
+            // match, which froze GATE 6's re-probe and moved L1/L2 bytes.
+            #[cfg(all(target_arch = "x86_64", feature = "std"))]
+            #[allow(unsafe_code)]
+            let out = if crate::simd::has_bmi2() {
+                // SAFETY: runtime CPUID guard, identical body.
+                if wide_block {
+                    unsafe {
+                        find_fast_impl_bmi2::<$p, $r, 0, 0, true>(
+                            s0,
+                            pipe_on,
+                            src,
+                            block_start,
+                            block_end,
+                            window,
+                            params,
+                            tables,
+                            reps,
+                        )
+                    }
+                } else {
+                    unsafe {
+                        find_fast_impl_bmi2::<$p, $r, 0, 0, false>(
+                            s0,
+                            pipe_on,
+                            src,
+                            block_start,
+                            block_end,
+                            window,
+                            params,
+                            tables,
+                            reps,
+                        )
+                    }
+                }
+            } else if wide_block {
+                find_fast_impl::<$p, $r, $h, 0, true>(
                     s0,
+                    pipe_on,
                     src,
                     block_start,
                     block_end,
@@ -4140,8 +4558,9 @@ fn find_fast(
                     reps,
                 )
             } else {
-                find_fast_impl::<$p, $r, $h, $s, $pi, false>(
+                find_fast_impl::<$p, $r, $h, 0, false>(
                     s0,
+                    pipe_on,
                     src,
                     block_start,
                     block_end,
@@ -4150,8 +4569,35 @@ fn find_fast(
                     tables,
                     reps,
                 )
-            }
-        };
+            };
+            #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
+            let out = if wide_block {
+                find_fast_impl::<$p, $r, $h, 0, true>(
+                    s0,
+                    pipe_on,
+                    src,
+                    block_start,
+                    block_end,
+                    window,
+                    params,
+                    tables,
+                    reps,
+                )
+            } else {
+                find_fast_impl::<$p, $r, $h, 0, false>(
+                    s0,
+                    pipe_on,
+                    src,
+                    block_start,
+                    block_end,
+                    window,
+                    params,
+                    tables,
+                    reps,
+                )
+            };
+            out
+        }};
     }
     // BRICK 67: repcode-1 is DISPATCHED on its own yield, not globally on/off.
     //
@@ -4333,8 +4779,11 @@ fn find_fast(
     };
     // AFTER the call: `find_fast_impl` reads `pair_probe == 0` to force a probe,
     // so ticking beforehand would consume the very first one.
-    tables.pair_probe =
-        if tables.pair_probe == 0 { PAIR_PROBE_PERIOD } else { tables.pair_probe - 1 };
+    tables.pair_probe = if tables.pair_probe == 0 {
+        PAIR_PROBE_PERIOD
+    } else {
+        tables.pair_probe - 1
+    };
     r
 }
 
@@ -4355,10 +4804,10 @@ fn find_fast_impl<
     const REP: bool,
     const HLOG: u32,
     const STEP: usize,
-    const PIPE: bool,
     const WIDE: bool,
 >(
     step_rt: usize,
+    pipe_rt: bool,
     src: &[u8],
     block_start: usize,
     block_end: usize,
@@ -4367,22 +4816,19 @@ fn find_fast_impl<
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    // BMI2 twin per monomorphisation: the probe loop's runtime shifts (wide
-    // hash, tag mask, tail loads) become flag-free shrx/shlx. One branch per
-    // BLOCK; both wrappers stay separate frames, preserving brick 48's
-    // register isolation.
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if crate::simd::has_bmi2() {
-        // SAFETY: runtime CPUID guard; identical body.
-        #[allow(unsafe_code)]
-        return unsafe {
-            find_fast_impl_bmi2::<PACKED, REP, HLOG, STEP, PIPE, WIDE>(
-                step_rt, src, block_start, block_end, window, params, tables, reps,
-            )
-        };
-    }
-    find_fast_impl_inner::<PACKED, REP, HLOG, STEP, PIPE, WIDE>(
-        step_rt, src, block_start, block_end, window, params, tables, reps,
+    // W5: the BMI2 branch used to live here, once per monomorphisation. It is
+    // now made ONCE at the dispatch (see the `go!` macro), which is what lets
+    // the twin tree drop the HLOG axis. This wrapper is the baseline arm only.
+    find_fast_impl_inner::<PACKED, REP, HLOG, STEP, WIDE, false>(
+        step_rt,
+        pipe_rt,
+        src,
+        block_start,
+        block_end,
+        window,
+        params,
+        tables,
+        reps,
     )
 }
 
@@ -4396,10 +4842,10 @@ unsafe fn find_fast_impl_bmi2<
     const REP: bool,
     const HLOG: u32,
     const STEP: usize,
-    const PIPE: bool,
     const WIDE: bool,
 >(
     step_rt: usize,
+    pipe_rt: bool,
     src: &[u8],
     block_start: usize,
     block_end: usize,
@@ -4408,8 +4854,16 @@ unsafe fn find_fast_impl_bmi2<
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    find_fast_impl_inner::<PACKED, REP, HLOG, STEP, PIPE, WIDE>(
-        step_rt, src, block_start, block_end, window, params, tables, reps,
+    find_fast_impl_inner::<PACKED, REP, HLOG, STEP, WIDE, true>(
+        step_rt,
+        pipe_rt,
+        src,
+        block_start,
+        block_end,
+        window,
+        params,
+        tables,
+        reps,
     )
 }
 
@@ -4420,10 +4874,17 @@ fn find_fast_impl_inner<
     const REP: bool,
     const HLOG: u32,
     const STEP: usize,
-    const PIPE: bool,
     const WIDE: bool,
+    // W1: which ISA twin is running, so the outlined emitter can be selected
+    // at compile time instead of re-deciding per match.
+    const BMI2: bool,
 >(
     step_rt: usize,
+    // W16: `PIPE` was a const-generic axis used by EXACTLY ONE per-BLOCK test
+    // (`if PIPE && !pair`) -- and it doubled the whole monomorphisation tree to
+    // do it. A per-block bool costs one branch per 128 KiB; the axis cost half
+    // the copies of the largest function in the library.
+    pipe_rt: bool,
     src: &[u8],
     block_start: usize,
     block_end: usize,
@@ -4433,6 +4894,17 @@ fn find_fast_impl_inner<
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
     let mls = params.min_match.max(3) as usize;
+    // W12: state the block invariant ONCE, per block, so the body does not
+    // pay for re-proving it per copy.
+    //
+    // `block_start <= block_end <= src.len()` holds for every caller, but
+    // nothing in the signature says so, so LLVM re-derived it nowhere and kept
+    // a bounds test AND a panic landing pad on the early-return slice below --
+    // one per monomorphisation, in the function with the most of them. The two
+    // clamps are no-ops on every real call and cost two cmovs per BLOCK; they
+    // buy the range facts for the whole body.
+    debug_assert!(block_start <= block_end && block_end <= src.len());
+    let block_end = block_end.max(block_start).min(src.len());
     crate::prof::note_scratch(2);
     // Reserve both scratch buffers up front. They were `Vec::new()` and grew by
     // doubling from zero every block: nci runs ~4k sequences per 128 KiB block,
@@ -4460,13 +4932,12 @@ fn find_fast_impl_inner<
     // takes the fast path and the gate cannot suppress its own evidence.
     // GATE 13: resolve BOTH decisions once per block -- whether the guard is
     // worth evaluating at all, and how wide the copy should be. 0 = slow path.
-    let lp_copy = if reserve
-        && (tables.blocks_done == 0 || tables.lit_short_share >= lit_short_min())
-    {
-        lit_width_for(tables)
-    } else {
-        0
-    };
+    let lp_copy =
+        if reserve && (tables.blocks_done == 0 || tables.lit_short_share >= lit_short_min()) {
+            lit_width_for(tables)
+        } else {
+            0
+        };
     let seq_guess = (tables.last_nseq + tables.last_nseq / 4 + 64).min(block_len / mls + 16);
     // GATE 6 @ L1. These were built FRESH every block, and `lits` asks for
     // `block_len + LIT_PUSH_WIDTH_MAX` = 131,136 B -- above the 128 KiB
@@ -4478,12 +4949,20 @@ fn find_fast_impl_inner<
     // rather than grow when they are too small: they are cleared here, so a
     // `realloc` would memcpy an allocation that holds nothing live.
     let keep = finder_scratch_enabled();
-    let mut seqs = if keep { std::mem::take(&mut tables.seq_scratch) } else { Vec::new() };
+    let mut seqs = if keep {
+        core::mem::take(&mut tables.seq_scratch)
+    } else {
+        Vec::new()
+    };
     seqs.clear();
     if reserve && seqs.capacity() < seq_guess {
         seqs = Vec::with_capacity(seq_guess);
     }
-    let mut lits = if keep { std::mem::take(&mut tables.lit_scratch) } else { Vec::new() };
+    let mut lits = if keep {
+        core::mem::take(&mut tables.lit_scratch)
+    } else {
+        Vec::new()
+    };
     lits.clear();
     if reserve && lits.capacity() < block_len + LIT_PUSH_WIDTH_MAX {
         lits = Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX);
@@ -4492,7 +4971,12 @@ fn find_fast_impl_inner<
     let ilimit = block_end.saturating_sub(8);
     if block_start >= ilimit {
         crate::prof::note_huff_path(10);
-        lits.extend_from_slice(&src[block_start..block_end]);
+        // W20: the SAME range copy the three other exits make, but this one
+        // went through a CHECKED slice -- so every monomorphisation carried a
+        // bounds test and a panic landing pad for it. `push_lits_range` is the
+        // de-checked helper the other three already use, and W12's clamp above
+        // is exactly its `from <= to && to <= src.len()` precondition.
+        push_lits_range(&mut lits, src, block_start, block_end);
         crate::prof::note_search(0, 0, 0, 0, lits.len() as u64);
         tables.last_nseq = 0;
         return (seqs, lits);
@@ -4605,7 +5089,9 @@ fn find_fast_impl_inner<
     //   pair_gain >= T     -- the pair search is actually EARNING its probes
     // The first alone shipped a +28.9% mean time cost for -5.85% size, with
     // x-ray paying 19.8% for 0.02%. The second is what prices the trade.
-    let probe = tables.pair_probe == 0;
+    // W17: `let probe = tables.pair_probe == 0;` was computed here and
+    // discarded below (`let _ = probe;`). The route decision moved to
+    // `find_fast` and this read never followed it.
     let route = tables.pair_route;
     // Frame-constant, so it is decided ONCE here rather than tested per match.
     let maintain_rep1 = pipe_rep1_enabled() && tables.rep_yield <= fast_lazy_threshold();
@@ -4613,7 +5099,6 @@ fn find_fast_impl_inner<
     // be known before the specialised body is chosen). `rep_yield` still vetoes:
     // on rep-dominated content the pair search re-finds what the repcode path
     // already has and emits a worse parse.
-    let _ = probe;
     let pair = step0 > 2 || (route == 2 && tables.rep_yield <= pair_rep_max());
     let mut pair_bytes = 0u64;
     let mut pair_probes = 0u64;
@@ -4628,12 +5113,9 @@ fn find_fast_impl_inner<
     // time immediate, so the variable shift `shrl %cl, %edx` becomes `shrl $n`
     // -- no register held for the shift amount, no `mov` into `%cl`, and one
     // fewer value competing for the 16 GPRs.
-    let hash_shift = if HLOG != 0 {
-        32u32.saturating_sub(HLOG)
-    } else {
-        32u32.saturating_sub(tables.hash_log)
-    };
-    let _ = hash_shift;
+    // W13: `hash_shift` was computed here and immediately discarded
+    // (`let _ = hash_shift;`) -- every consumer takes `f_shift` below. It read
+    // `tables.hash_log` through the `&mut` to do it.
     // ffanat hash-width: one spec, hoisted per block, consumed by EVERY hash
     // site in this function and by the end-fill it calls -- the writers move
     // together or priming poisons (190ad8b).
@@ -4647,15 +5129,15 @@ fn find_fast_impl_inner<
     // sees only ~2K candidates on 8 MiB -- the loss is DISPATCH COUPLING
     // (different early matches shift rep_yield/rep_run and break the repcode
     // chain), not the key itself, which is why key-side protection fails.
-    let fh = if tables.fast_hash_legacy {
-        FastHash {
-            wide: false,
-            mask: 0,
-            shift: 32u32.saturating_sub(if HLOG != 0 { HLOG } else { tables.hash_log }),
-        }
-    } else {
-        fast_hash_spec(mls, if HLOG != 0 { HLOG } else { tables.hash_log })
-    };
+    // W14: of the three `FastHash` fields this built, release code consumed
+    // exactly ONE -- `mask`, and only in WIDE copies. `shift` was dead (see
+    // `f_shift`) and `wide` fed a `debug_assert!` alone.
+    //
+    // The legacy arm is dead in WIDE copies too: `wide_block` requires
+    // `!fast_hash_legacy`, so a WIDE copy can never be on the legacy key. That
+    // makes the whole conditional collapse to the spec call in the only copies
+    // that read it.
+    debug_assert!(!WIDE || !tables.fast_hash_legacy);
     // Scalarized AND const-moded: WIDE is a monomorphisation axis, so the
     // per-position mode branch is gone and specialised copies emit the shift
     // as an immediate. Only the mask (a function of runtime `mls`) stays in a
@@ -4680,9 +5162,12 @@ fn find_fast_impl_inner<
     //
     // Taking the shift from `WIDE`, like its two siblings, is byte-identical
     // on x86 by that same identity -- and defined everywhere.
-    debug_assert!(fh.wide == WIDE || !tables.pack_tags);
     let f_wide = WIDE;
-    let f_mask = if WIDE { fh.mask } else { 0 };
+    let f_mask = if WIDE {
+        fast_hash_spec(mls, if HLOG != 0 { HLOG } else { tables.hash_log }).mask
+    } else {
+        0
+    };
     let hlog_eff = if HLOG != 0 { HLOG } else { tables.hash_log };
     let f_shift = if WIDE {
         64u32.saturating_sub(hlog_eff)
@@ -4741,7 +5226,9 @@ fn find_fast_impl_inner<
     // EXPERIMENT KNOB (profile builds only): bar every block, to test whether
     // the pre-rep prefix loss is "marginal matches beating cheaper literals".
     #[cfg(feature = "profile")]
-    let bar_all = std::env::var("RZSTD_FFBAR_ALL").map(|v| v == "1").unwrap_or(false);
+    let bar_all = std::env::var("RZSTD_FFBAR_ALL")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     #[cfg(not(feature = "profile"))]
     let bar_all = false;
     // The bar also covers POST-LATCH fast blocks (refutation #5: the re-seed
@@ -4757,7 +5244,11 @@ fn find_fast_impl_inner<
     // PER-BLOCK constants. They are both lower bounds on the same value, so
     // they compose into one bar tested once. `ff_anchor_ml()` is the constant
     // 16 in release, so this is byte-identical by construction.
-    let accept_ml = if veto_block { mls.max(ff_anchor_ml()) } else { mls };
+    let accept_ml = if veto_block {
+        mls.max(ff_anchor_ml())
+    } else {
+        mls
+    };
     // 2-WAY SOFTWARE PIPELINE (brick 39, `RZSTD_MF_PIPE=0` disables).
     //
     // Measured: 26 cycles per probe on webster, while we probe 0.259/byte
@@ -4796,7 +5287,21 @@ fn find_fast_impl_inner<
     };
     // W1: hoisted for `fill_fast_after_match` -- see its `ends` parameter.
     let f_ends = dfast_fill_ends();
-    if PIPE && !pair && ip <= ilimit {
+    // W1: every per-block invariant the emitter needs, gathered once. `pack_eff`
+    // (not `pack`) so WIDE copies keep the const-true fold -- see W4.
+    let ectx = FastEmitCtx {
+        src,
+        pack: pack_eff,
+        f_wide,
+        f_mask,
+        f_shift,
+        ilimit,
+        frame_start,
+        w: lp_copy,
+        tags_live,
+        ends: f_ends,
+    };
+    if pipe_rt && !pair && ip <= ilimit {
         if COUNT {
             FF_PIPE_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
@@ -4813,14 +5318,14 @@ fn find_fast_impl_inner<
                 pipe_pos += 1;
             }
             if COUNT {
-                if COUNT {
-                    probes += 1;
-                }
+                probes += 1;
             }
             if COUNT && PACKED {
                 let raw = fast_slot_raw(&hash_v, pack_eff, h0);
                 if m0 == 0 && raw != 0 {
-                    if fast_probe(&mut (0, 0), src, raw, ip, window, lowest, mls, mls, block_end).is_some() {
+                    if fast_probe(&mut (0, 0), src, raw, ip, window, lowest, mls, block_end)
+                        .is_some()
+                    {
                         TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     }
                     TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -4839,9 +5344,7 @@ fn find_fast_impl_inner<
                     rep_hits += 1;
                     rep_bytes += ml as u64;
                     if COUNT {
-                        if COUNT {
-                            hits += 1;
-                        }
+                        hits += 1;
                     }
                     let mstart = ip + 1;
                     crate::prof::note_huff_path(11);
@@ -4914,38 +5417,26 @@ fn find_fast_impl_inner<
             } else {
                 (0usize, 0u8, 0u32)
             };
-            if let Some((m, ml)) = (if WIDE {
-                fast_probe_wide::<true>(&mut cand, src, m0, ip, window, lowest, mls, accept_ml, f_mask, block_end)
+            if let Some((m, ml)) = if WIDE {
+                fast_probe_wide::<true>(
+                    &mut cand, src, m0, ip, window, lowest, accept_ml, f_mask, block_end,
+                )
             } else {
-                fast_probe(&mut cand, src, m0, ip, window, lowest, mls, accept_ml, block_end)
-            })
-            {
+                fast_probe(&mut cand, src, m0, ip, window, lowest, accept_ml, block_end)
+            } {
                 if COUNT {
-                    if COUNT {
-                        hits += 1;
-                    }
+                    hits += 1;
                 }
-                ip = emit_fast_seq::<PACKED>(
-                    src,
+                ip = emit_fast_seq::<PACKED, BMI2>(
+                    &ectx,
                     &mut hash_v,
                     &mut tags_v,
-                    pack_eff,
-                    f_wide,
-                    f_mask,
-                    f_shift,
                     &mut seqs,
                     &mut lits,
                     anchor,
                     ip,
                     m,
                     ml,
-                    mls,
-                    ilimit,
-                    frame_start,
-                    lp_copy,
-                
-                    tags_live,
-                    f_ends,
                 );
                 anchor = ip;
                 // The non-pipelined loop does this after EVERY emitted match;
@@ -5034,10 +5525,15 @@ fn find_fast_impl_inner<
         // See `replen_pipe_fixed`.
         if REP && replen_pipe_fixed() && rep_hits > 0 && !seqs.is_empty() {
             let all_bytes: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
-            let rl = rep_bytes as f32 / rep_hits as f32;
-            let al = all_bytes as f32 / seqs.len() as f32;
-            if al > 0.0 {
-                tables.rep_len_ratio = 0.75 * tables.rep_len_ratio + 0.25 * (rl / al);
+            // THREE divisions collapsed to ONE. `rl / al` expands to
+            // `(rep_bytes/rep_hits) / (all_bytes/seqs.len())`, which is
+            // `(rep_bytes * seqs.len()) / (rep_hits * all_bytes)` -- two
+            // multiplies and one `divss` instead of three. The guard moves
+            // from `al > 0.0` to the denominator it actually protects.
+            let num = rep_bytes as f32 * seqs.len() as f32;
+            let den = rep_hits as f32 * all_bytes as f32;
+            if den > 0.0 {
+                tables.rep_len_ratio = 0.75 * tables.rep_len_ratio + 0.25 * (num / den);
             }
         }
         if COUNT {
@@ -5067,22 +5563,21 @@ fn find_fast_impl_inner<
             mm_total += 1;
         }
         if COUNT {
-            if COUNT {
-                probes += 1;
-            }
+            probes += 1;
         }
         let (h0, g0) = fast_hash_tag::<true>(src, ip, WIDE, f_mask, f_shift);
         // W7: one slot touch instead of a load and a store that each branch
         // on `pack`. The store's value and position are unchanged, and it
         // still precedes the pair probe -- only the two `pack` tests merge.
-        let m0 = fast_slot_swap::<PACKED>(&mut hash_v, &mut tags_v, pack_eff, tags_live, h0, ip, g0);
+        let m0 =
+            fast_slot_swap::<PACKED>(&mut hash_v, &mut tags_v, pack_eff, tags_live, h0, ip, g0);
         if COUNT && PACKED {
             // Gate 7 is recorded byte-identical: a tag mismatch should imply the
             // 4 bytes differ, so `fast_probe` would have rejected the candidate
             // anyway. Count the cases where it would NOT have.
             let raw = fast_slot_raw(&hash_v, pack_eff, h0);
             if m0 == 0 && raw != 0 {
-                if fast_probe(&mut (0, 0), src, raw, ip, window, lowest, mls, mls, block_end).is_some() {
+                if fast_probe(&mut (0, 0), src, raw, ip, window, lowest, mls, block_end).is_some() {
                     TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -5102,9 +5597,13 @@ fn find_fast_impl_inner<
         // aliasing `h1 == h0` observes the same value it did before), and
         // nothing between here and the pair branch writes the table -- the rep
         // and match paths both `continue`. Only the issue order moves.
-        let pair_pre = if pair && ip + 1 <= ilimit {
+        let pair_pre = if pair && ip < ilimit {
             let (h1, g1) = fast_hash_tag::<false>(src, ip + 1, WIDE, f_mask, f_shift);
-            Some((h1, g1, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, tags_live, h1, g1)))
+            Some((
+                h1,
+                g1,
+                fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, tags_live, h1, g1),
+            ))
         } else {
             None
         };
@@ -5116,9 +5615,7 @@ fn find_fast_impl_inner<
                 rep_hits += 1;
                 rep_bytes += ml as u64;
                 if COUNT {
-                    if COUNT {
-                        hits += 1;
-                    }
+                    hits += 1;
                 }
                 let mstart = ip + 1;
                 crate::prof::note_huff_path(11);
@@ -5134,37 +5631,27 @@ fn find_fast_impl_inner<
                 continue;
             }
         }
-        if let Some((m, ml)) = (if WIDE {
-                fast_probe_wide::<true>(&mut cand, src, m0, ip, window, lowest, mls, accept_ml, f_mask, block_end)
-            } else {
-                fast_probe(&mut cand, src, m0, ip, window, lowest, mls, accept_ml, block_end)
-            })
-            {
+        if let Some((m, ml)) = if WIDE {
+            fast_probe_wide::<true>(
+                &mut cand, src, m0, ip, window, lowest, accept_ml, f_mask, block_end,
+            )
+        } else {
+            fast_probe(&mut cand, src, m0, ip, window, lowest, accept_ml, block_end)
+        } {
             if COUNT {
                 hits += 1;
             }
-            ip = emit_fast_seq::<PACKED>(
-                src,
+            ip = emit_fast_seq::<PACKED, BMI2>(
+                &ectx,
                 &mut hash_v,
                 &mut tags_v,
-                pack,
-                f_wide,
-                f_mask,
-                f_shift,
                 &mut seqs,
                 &mut lits,
                 anchor,
                 ip,
                 m,
                 ml,
-                mls,
-                ilimit,
-                frame_start,
-                lp_copy,
-            
-                    tags_live,
-                    f_ends,
-                );
+            );
             anchor = ip;
             // Same decision as the pipelined loop -- see GATE 8 above. Guarding
             // only ONE loop would make the heuristic a property of which loop
@@ -5180,15 +5667,16 @@ fn find_fast_impl_inner<
             let ip1 = ip + 1;
             if ip1 <= ilimit {
                 if COUNT {
-                    if COUNT {
-                        probes += 1;
-                    }
+                    probes += 1;
                 }
                 pair_probes += 1;
                 if COUNT {
                     use core::sync::atomic::Ordering::Relaxed;
-                    if m0 == 0 { PAIR_M0_EMPTY.fetch_add(1, Relaxed); }
-                    else { PAIR_M0_LIVE.fetch_add(1, Relaxed); }
+                    if m0 == 0 {
+                        PAIR_M0_EMPTY.fetch_add(1, Relaxed);
+                    } else {
+                        PAIR_M0_LIVE.fetch_add(1, Relaxed);
+                    }
                 }
                 if COUNT {
                     PAIR_PROBES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -5198,13 +5686,19 @@ fn find_fast_impl_inner<
                     Some(v) => v,
                     None => {
                         let (h, g) = fast_hash_tag::<false>(src, ip1, WIDE, f_mask, f_shift);
-                        (h, g, fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, tags_live, h, g))
+                        (
+                            h,
+                            g,
+                            fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, tags_live, h, g),
+                        )
                     }
                 };
                 if COUNT && PACKED {
                     let raw = fast_slot_raw(&hash_v, pack_eff, h1);
                     if m1 == 0 && raw != 0 {
-                        if fast_probe(&mut (0, 0), src, raw, ip1, window, lowest, mls, mls, block_end).is_some() {
+                        if fast_probe(&mut (0, 0), src, raw, ip1, window, lowest, mls, block_end)
+                            .is_some()
+                        {
                             TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         }
                         TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -5222,49 +5716,43 @@ fn find_fast_impl_inner<
                 // (repcode already covers that span) and not of the candidate.
                 // That is why `rep_yield` is the right and sufficient variable.
                 if let Some((m, ml)) = (if WIDE {
-                    fast_probe_wide::<false>(&mut cand, src, m1, ip1, window, lowest, mls, accept_ml, f_mask, block_end)
+                    fast_probe_wide::<false>(
+                        &mut cand, src, m1, ip1, window, lowest, accept_ml, f_mask, block_end,
+                    )
                 } else {
-                    fast_probe(&mut cand, src, m1, ip1, window, lowest, mls, accept_ml, block_end)
+                    fast_probe(
+                        &mut cand, src, m1, ip1, window, lowest, accept_ml, block_end,
+                    )
                 })
-                    .filter(|&(_, ml)| !veto_block || ml >= ff_anchor_ml())
+                .filter(|&(_, ml)| !veto_block || ml >= ff_anchor_ml())
                 {
                     if COUNT {
                         use core::sync::atomic::Ordering::Relaxed;
-                        if m0 == 0 { PAIR_HIT_EMPTY.fetch_add(1, Relaxed);
-                                     PAIR_BYTES_EMPTY.fetch_add(ml as u64, Relaxed); }
-                        else { PAIR_HIT_LIVE.fetch_add(1, Relaxed);
-                               PAIR_BYTES_LIVE.fetch_add(ml as u64, Relaxed); }
+                        if m0 == 0 {
+                            PAIR_HIT_EMPTY.fetch_add(1, Relaxed);
+                            PAIR_BYTES_EMPTY.fetch_add(ml as u64, Relaxed);
+                        } else {
+                            PAIR_HIT_LIVE.fetch_add(1, Relaxed);
+                            PAIR_BYTES_LIVE.fetch_add(ml as u64, Relaxed);
+                        }
                         PAIR_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         PAIR_BYTES.fetch_add(ml as u64, core::sync::atomic::Ordering::Relaxed);
                     }
                     if COUNT {
-                        if COUNT {
-                            hits += 1;
-                        }
+                        hits += 1;
                     }
                     pair_bytes += ml as u64;
-                    ip = emit_fast_seq::<PACKED>(
-                        src,
+                    ip = emit_fast_seq::<PACKED, BMI2>(
+                        &ectx,
                         &mut hash_v,
                         &mut tags_v,
-                        pack_eff,
-                        f_wide,
-                        f_mask,
-                        f_shift,
                         &mut seqs,
                         &mut lits,
                         anchor,
                         ip1,
                         m,
                         ml,
-                        mls,
-                        ilimit,
-                        frame_start,
-                        lp_copy,
-                    
-                    tags_live,
-                    f_ends,
-                );
+                    );
                     anchor = ip;
                     continue;
                 }
@@ -5298,10 +5786,11 @@ fn find_fast_impl_inner<
     }
     if REP && rep_hits > 0 && !seqs.is_empty() {
         let all_bytes: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
-        let rl = rep_bytes as f32 / rep_hits as f32;
-        let al = all_bytes as f32 / seqs.len() as f32;
-        if al > 0.0 {
-            tables.rep_len_ratio = 0.75 * tables.rep_len_ratio + 0.25 * (rl / al);
+        // Same three-into-one as the pipelined arm above.
+        let num = rep_bytes as f32 * seqs.len() as f32;
+        let den = rep_hits as f32 * all_bytes as f32;
+        if den > 0.0 {
+            tables.rep_len_ratio = 0.75 * tables.rep_len_ratio + 0.25 * (num / den);
         }
     }
     // GATE 7: feed this block's measured reject share to the next block's gate.
@@ -5386,7 +5875,7 @@ fn fast_probe_wide<const SAFE: bool>(
     ip: usize,
     window: usize,
     lowest: usize,
-    mls: usize,
+    // W15: dead parameter -- see `fast_probe`.
     accept_ml: usize,
     mask: u64,
     block_end: usize,
@@ -5461,9 +5950,9 @@ fn fast_probe(
     ip: usize,
     window: usize,
     lowest: usize,
-    mls: usize,
-    // W6: the composed acceptance bar -- `mls`, raised to the veto anchor on
-    // blocks that carry it. See its definition in `find_fast_impl`.
+    // W15: `mls` was a dead parameter here -- the bar is `accept_ml`, which
+    // already IS `mls` raised to the veto anchor on blocks that carry it. It
+    // was set up at every per-POSITION call site.
     accept_ml: usize,
     block_end: usize,
 ) -> Option<(usize, usize)> {
@@ -5546,7 +6035,7 @@ fn lazy_fill_enabled() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = std::env::var("RZSTD_LAZY_FILL")
+            let on = crate::env_knob("RZSTD_LAZY_FILL")
                 .map(|v| v != "0")
                 .unwrap_or(true);
             LAZY_FILL_ENABLED_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
@@ -5569,7 +6058,7 @@ fn lazy_fill_threshold() -> f32 {
     if v != u32::MAX {
         return f32::from_bits(v);
     }
-    let t: f32 = std::env::var("RZSTD_LAZY_FILL_T")
+    let t: f32 = crate::env_knob("RZSTD_LAZY_FILL_T")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.0);
@@ -5642,7 +6131,7 @@ fn lazy_fill_stride() -> usize {
     if v != 0 {
         return v;
     }
-    let s: usize = std::env::var("RZSTD_LAZY_FILL_S")
+    let s: usize = crate::env_knob("RZSTD_LAZY_FILL_S")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&v: &usize| v >= 1)
@@ -5651,8 +6140,7 @@ fn lazy_fill_stride() -> usize {
     s
 }
 
-static LAZY_FILL_S_ARM: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static LAZY_FILL_S_ARM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Set the lazy back-fill stride in-process.
 /// GATE 6 next-long probe outcomes, for GATE 14's dispatch study.
@@ -5835,15 +6323,13 @@ pub fn take_opt_signals() -> (f32, f32, f32) {
 /// Both were hardcoded and never gated, the same shape as the search-strength
 /// shift of 4.43 (four sites, never gated, the biggest L1 speed lever found).
 /// Lower = accept a shorter match and stop early; higher = keep looking.
-static DFAST_GOOD_ML_ARM: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static DFAST_GOOD_ML_ARM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Bench hook: the "good enough, stop searching" match length for DFast.
 /// 0 restores the shipped 8.
 pub fn set_dfast_good_ml_arm(v: usize) {
     DFAST_GOOD_ML_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
 }
-
 
 /// The same cut, for the SECOND-CANDIDATE site only. The constant governed two
 /// mechanisms with different characters -- the next-long probe COMMITS at
@@ -5914,7 +6400,7 @@ fn dfast_fill_stride() -> usize {
     if v != usize::MAX {
         return v;
     }
-    let s: usize = std::env::var("RZSTD_DFAST_FILL_S")
+    let s: usize = crate::env_knob("RZSTD_DFAST_FILL_S")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
@@ -6075,7 +6561,7 @@ fn accel_shift_base() -> u32 {
     if v != u32::MAX {
         return v;
     }
-    let n: u32 = std::env::var("RZSTD_ACCEL")
+    let n: u32 = crate::env_knob("RZSTD_ACCEL")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .filter(|&n| (1..=24).contains(&n))
@@ -6237,14 +6723,11 @@ fn step_probe_on() -> bool {
 
 /// GATE 18 study: the measured step-2 forfeit, per mille x10.
 #[cfg(feature = "profile")]
-pub static STEP_FORFEIT_SUM: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_FORFEIT_SUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static STEP_FORFEIT_N: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_FORFEIT_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static STEP_SEQ_SUM: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_SEQ_SUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Read and clear `(sum_x10000, n)`.
 #[cfg(feature = "profile")]
@@ -6314,7 +6797,11 @@ fn note_step_probe(
         // and costs the most), which is why four content signals and two earlier
         // probe designs failed here.
         let _ = mean_seq;
-        tables.step_pick = if mean_forfeit < step_forfeit_max() { 2 } else { 1 };
+        tables.step_pick = if mean_forfeit < step_forfeit_max() {
+            2
+        } else {
+            1
+        };
         tables.step_reprobe = STEP_REPROBE_PERIOD;
         tables.step_probed = 0;
         tables.step_sum1 = 0.0;
@@ -6366,7 +6853,7 @@ fn step0_default() -> usize {
     if v != 0 {
         return v - 1;
     }
-    let on = std::env::var("RZSTD_STEP0")
+    let on = crate::env_knob("RZSTD_STEP0")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&v: &usize| v >= 1)
@@ -6374,8 +6861,6 @@ fn step0_default() -> usize {
     STEP0_ARM.store(on + 1, Ordering::Relaxed);
     on
 }
-
-
 
 /// ffanat hash-width: the per-block spec for the Fast ladder's table hash.
 /// Legacy = 4 bytes at every `min_match` (this codebase's historical choice);
@@ -6399,11 +6884,19 @@ fn fast_hash_spec(mls: usize, hash_log: u32) -> FastHash {
     if fast_hash_wide_enabled() && (5..=8).contains(&mls) {
         FastHash {
             wide: true,
-            mask: if mls == 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 },
+            mask: if mls == 8 {
+                u64::MAX
+            } else {
+                (1u64 << (8 * mls)) - 1
+            },
             shift: 64u32.saturating_sub(hash_log),
         }
     } else {
-        FastHash { wide: false, mask: 0, shift: 32u32.saturating_sub(hash_log) }
+        FastHash {
+            wide: false,
+            mask: 0,
+            shift: 32u32.saturating_sub(hash_log),
+        }
     }
 }
 
@@ -6468,7 +6961,6 @@ fn fast_hash_tag<const SAFE: bool>(
     }
 }
 
-
 /// hash4 index AND its 8-bit tag, from one multiply.
 ///
 /// The tag is a pure function of the 4 bytes at `pos`, and `fast_probe`
@@ -6494,7 +6986,6 @@ fn hash4_tag_mls(src: &[u8], pos: usize, hash_shift: u32, smask: u64) -> (usize,
     ((hv >> hash_shift) as usize, (tv ^ (tv >> 29)) as u8)
 }
 
-
 /// Brick 39 arm state: 2-way pipelined probe. Runtime-settable so the
 /// in-process ABBA harness can flip it between adjacent measurements.
 /// GATE 8 @ L1 reachability + speculation ledger for `find_fast`'s pipelined
@@ -6503,15 +6994,16 @@ fn hash4_tag_mls(src: &[u8], pos: usize, hash_shift: u32, smask: u64) -> (usize,
 /// speculation serve? `MM_MISS / MM_TOTAL` is the share of positions that reach
 /// the miss-advance, i.e. where a speculated next-position load is CONSUMED.
 /// Gate 7 audit: tag rejections that `fast_probe` would have ACCEPTED.
-pub static TAG_FALSE_REJECT: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-pub static TAG_REJECT_TOTAL: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static TAG_FALSE_REJECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static TAG_REJECT_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Read and clear `(false_rejects, total_rejects)`.
 pub fn take_tag_rejects() -> (u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
-    (TAG_FALSE_REJECT.swap(0, Relaxed), TAG_REJECT_TOTAL.swap(0, Relaxed))
+    (
+        TAG_FALSE_REJECT.swap(0, Relaxed),
+        TAG_REJECT_TOTAL.swap(0, Relaxed),
+    )
 }
 
 /// GATE 2 candidate signal: rep match BYTES per rep PROBE.
@@ -6557,16 +7049,15 @@ pub static FF_ARM: [core::sync::atomic::AtomicU64; 4] = [
 #[cfg(feature = "profile")]
 pub fn take_ff_arms() -> [u64; 4] {
     let mut o = [0u64; 4];
-    for i in 0..4 { o[i] = FF_ARM[i].swap(0, core::sync::atomic::Ordering::Relaxed); }
+    for i in 0..4 {
+        o[i] = FF_ARM[i].swap(0, core::sync::atomic::Ordering::Relaxed);
+    }
     o
 }
 
-pub static FF_PIPE_BLOCKS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-pub static FF_SPEC_MADE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-pub static FF_SPEC_USED: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static FF_PIPE_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static FF_SPEC_MADE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static FF_SPEC_USED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Read and clear `(pipelined_blocks, speculations_made, speculations_used)`.
 pub fn take_ff_pipe() -> (u64, u64, u64) {
@@ -6588,10 +7079,7 @@ pub fn set_pipe_rep1_arm(on: bool) {
 
 #[inline]
 fn pipe_rep1_enabled() -> bool {
-    match PIPE_REP1_ARM.load(core::sync::atomic::Ordering::Relaxed) {
-        1 => false,
-        _ => true,
-    }
+    PIPE_REP1_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
 }
 
 static PIPE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
@@ -6610,7 +7098,7 @@ fn pipe_enabled() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = std::env::var("RZSTD_MF_PIPE")
+            let on = crate::env_knob("RZSTD_MF_PIPE")
                 .map(|v| v != "0")
                 .unwrap_or(true);
             PIPE_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
@@ -6637,7 +7125,7 @@ pub(crate) fn huff_fast_enabled() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = std::env::var("RZSTD_HUFF_FAST")
+            let on = crate::env_knob("RZSTD_HUFF_FAST")
                 .map(|v| v != "0")
                 .unwrap_or(true);
             HUFF_FAST_ENABLED_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
@@ -6663,7 +7151,7 @@ fn payload_reserve_enabled() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = std::env::var("RZSTD_PAYLOAD_RES")
+            let on = crate::env_knob("RZSTD_PAYLOAD_RES")
                 .map(|v| v != "0")
                 .unwrap_or(true);
             PAYLOAD_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
@@ -6698,10 +7186,7 @@ pub fn set_litpush_hoist_arm(on: bool) {
 }
 
 fn litpush_hoist_enabled() -> bool {
-    match LITPUSH_HOIST_ARM.load(core::sync::atomic::Ordering::Relaxed) {
-        1 => false,
-        _ => true,
-    }
+    LITPUSH_HOIST_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
 }
 
 pub fn set_litpush_arm(on: bool) {
@@ -6722,7 +7207,7 @@ fn lit_push_enabled() -> bool {
             // nci +2.0%, ooffice +1.8%, mr +0.7%), decompress correctly null.
             // Its original +5%/z=1.0 was taken cross-process and could not be
             // resolved; the effect was real all along.
-            let on = std::env::var("RZSTD_LIT_PUSH")
+            let on = crate::env_knob("RZSTD_LIT_PUSH")
                 .map(|v| v != "0")
                 .unwrap_or(true);
             LITPUSH_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
@@ -6768,8 +7253,7 @@ pub(crate) const LIT_PUSH_TIER3: usize = 64;
 
 /// Bench arm for the tiers. 0 = all tiers (shipped), 1 = tier 1 only (the
 /// pre-tier behaviour), 2 = tiers 1 and 2.
-static LIT_PUSH_TIERS_ARM: core::sync::atomic::AtomicU8 =
-    core::sync::atomic::AtomicU8::new(0);
+static LIT_PUSH_TIERS_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Bench hook: 0 all tiers, 1 tier-1 only, 2 tiers 1+2.
 pub fn set_lit_push_tiers_arm(t: u8) {
@@ -6836,7 +7320,9 @@ fn lit_shares(seqs: &[Seq]) -> (f32, f32) {
         }
     }
     let n = seqs.len() as f32;
-    (short as f32 / n, mid as f32 / n)
+    // ONE division, not two: both shares divide by the same `n`.
+    let inv = 1.0 / n;
+    (short as f32 * inv, mid as f32 * inv)
 }
 
 /// GATE 13 WIDTH DISPATCH, derived from the emitted asm rather than fitted.
@@ -6885,8 +7371,7 @@ const LIT_SHORT_MIN: f32 = 0.25;
 
 /// Bench hook for the Gate 13 dispatch. Negative disables the gate (constant ON,
 /// the pre-dispatch behaviour and the byte-identical fallback).
-static LIT_SHORT_ARM: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
+static LIT_SHORT_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Set the Gate 13 share threshold. Negative = gate off (always take the guard).
 pub fn set_lit_short_arm(v: f32) {
@@ -6896,15 +7381,17 @@ pub fn set_lit_short_arm(v: f32) {
 #[inline]
 fn lit_short_min() -> f32 {
     let b = LIT_SHORT_ARM.load(core::sync::atomic::Ordering::Relaxed);
-    if b == u32::MAX { LIT_SHORT_MIN } else { f32::from_bits(b) }
+    if b == u32::MAX {
+        LIT_SHORT_MIN
+    } else {
+        f32::from_bits(b)
+    }
 }
 
 /// Deterministic instrument: guard evaluations that FAILED, i.e. wasted work.
-pub static LP_GUARD_FAIL: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static LP_GUARD_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Guard evaluations SKIPPED by the Gate 13 dispatch.
-pub static LP_GUARD_SKIP: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static LP_GUARD_SKIP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Read and clear the Gate 13 guard instruments.
 pub fn take_lp_guard() -> (u64, u64) {
@@ -6914,7 +7401,6 @@ pub fn take_lp_guard() -> (u64, u64) {
         LP_GUARD_SKIP.swap(0, Ordering::Relaxed),
     )
 }
-
 
 /// Append `src[from..to]` to the literal buffer.
 ///
@@ -6959,11 +7445,7 @@ fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize, w: usiz
         };
         LP_HIST[b].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
-    if n <= w
-        && from + w <= src.len()
-        && lits.capacity() - lits.len() >= w
-        && arm
-    {
+    if n <= w && from + w <= src.len() && lits.capacity() - lits.len() >= w && arm {
         #[cfg(feature = "profile")]
         LP_FAST.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let len = lits.len();
@@ -6973,11 +7455,7 @@ fn push_literals(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize, w: usiz
         // are distinct buffers, so the regions cannot overlap. Exactly
         // `n <= 16` bytes are published by `set_len`.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                src.as_ptr().add(from),
-                lits.as_mut_ptr().add(len),
-                w,
-            );
+            core::ptr::copy_nonoverlapping(src.as_ptr().add(from), lits.as_mut_ptr().add(len), w);
             lits.set_len(len + n);
         }
         return;
@@ -7104,7 +7582,11 @@ pub fn take_lp_stats() -> ([u64; 6], u64, u64) {
     for (i, c) in LP_HIST.iter().enumerate() {
         h[i] = c.swap(0, Ordering::Relaxed);
     }
-    (h, LP_FAST.swap(0, Ordering::Relaxed), LP_SLOW.swap(0, Ordering::Relaxed))
+    (
+        h,
+        LP_FAST.swap(0, Ordering::Relaxed),
+        LP_SLOW.swap(0, Ordering::Relaxed),
+    )
 }
 
 pub static LP_FAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -7207,7 +7689,11 @@ fn fast_slot_swap<const PACKED: bool>(
         }
         return e;
     }
-    if e == 0 { 0 } else { e }
+    if e == 0 {
+        0
+    } else {
+        e
+    }
 }
 
 #[inline(always)]
@@ -7264,6 +7750,7 @@ fn fast_slot_load<const PACKED: bool>(
 /// matches (stride-family offsets) feeding the reps the right flavor, by
 /// accident. This makes the accident policy: on rep-dominated blocks, consume
 /// a hash match only when it is near enough to keep the rep state coherent.
+#[allow(dead_code)] // the recorded bar for a refuted arm; kept as the record.
 const FF_NEAR_MAX: usize = 1 << 16;
 
 /// Length bar (the surviving design): profile builds may override via
@@ -7286,12 +7773,7 @@ fn ff_anchor_ml() -> usize {
 /// inherited heads), then stay legacy for the frame. Called from both triggers:
 /// the rep_yield signal and the fast_lazy switch.
 #[inline(always)]
-fn fast_hash_relatch(
-    tables: &mut MatchTables,
-    src: &[u8],
-    block_start: usize,
-    window: usize,
-) {
+fn fast_hash_relatch(tables: &mut MatchTables, src: &[u8], block_start: usize, window: usize) {
     let shift = 32u32.saturating_sub(tables.hash_log);
     let from = block_start.saturating_sub(window).max(tables.frame_start);
     let to = block_start.saturating_sub(8);
@@ -7307,7 +7789,6 @@ fn fast_hash_relatch(
     FF_LATCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
-
 /// Diagnostic twin of `raw_fast` for the local-table loop (COUNT paths only).
 #[inline(always)]
 fn fast_slot_raw(hash: &[u32], pack: bool, h: usize) -> u32 {
@@ -7319,10 +7800,35 @@ fn fast_slot_raw(hash: &[u32], pack: bool, h: usize) -> u32 {
     }
 }
 
+/// W1: the Fast ladder's match emitter carried NINETEEN arguments, eleven of
+/// them fixed for the whole block, and it was `#[inline(always)]` -- so the
+/// whole emit path was stamped into all 140 `find_fast_impl` monomorphisations
+/// AND their 140 BMI2 twins. 280 copies of one per-MATCH routine, in the
+/// function that is already 73% of the library.
+///
+/// Same shape `BtCtx` and `ChainCtx` use: the per-block constants ride in a
+/// context built once, and the emitter outlines to FOUR copies (plain/bmi2 x
+/// PACKED) instead of 280. The ISA twin is mandatory, not optional -- an
+/// outlined callee of a `#[target_feature]` twin compiles BASELINE (the
+/// shim-trap rule), so outlining without a twin would silently downgrade the
+/// end-fill's hashes from `shrx` back to `shr %cl`.
+pub(crate) struct FastEmitCtx<'a> {
+    src: &'a [u8],
+    pack: bool,
+    f_wide: bool,
+    f_mask: u64,
+    f_shift: u32,
+    ilimit: usize,
+    frame_start: usize,
+    w: usize,
+    tags_live: bool,
+    ends: (bool, bool),
+}
+
 /// The Fast ladder's after-match end-fill on the LOCAL table -- same semantics
 /// and same instruments as `fill_hash_after_match`, writing through the shared
 /// `fast_slot_store` rule.
-#[inline]
+// W2: this carried BOTH `#[inline]` and `#[inline(always)]`.
 #[inline(always)]
 fn fill_fast_after_match<const PACKED: bool>(
     hash: &mut [u32],
@@ -7370,30 +7876,95 @@ fn fill_fast_after_match<const PACKED: bool>(
     crate::prof::note_hash_fill(n);
 }
 
-
-#[inline(always)]
-fn emit_fast_seq<const PACKED: bool>(
-    src: &[u8],
+/// W3: `mls` was a DEAD parameter -- the body's first statement was
+/// `let _ = mls;`. It was set up at every one of the three call sites, on
+/// every match, in all 280 copies.
+#[inline(never)]
+fn emit_fast_seq_plain<const PACKED: bool>(
+    ctx: &FastEmitCtx,
     hash: &mut [u32],
     tags: &mut [u8],
-    pack: bool,
-    f_wide: bool,
-    f_mask: u64,
-    f_shift: u32,
     seqs: &mut Vec<Seq>,
     lits: &mut Vec<u8>,
     anchor: usize,
     found_ip: usize,
     m: usize,
     ml: usize,
-    mls: usize,
-    ilimit: usize,
-    frame_start: usize,
-    w: usize,
-    tags_live: bool,
-    ends: (bool, bool),
 ) -> usize {
-    let _ = mls;
+    emit_fast_seq_body::<PACKED>(ctx, hash, tags, seqs, lits, anchor, found_ip, m, ml)
+}
+
+/// The ISA twin. See `FastEmitCtx` -- without this the BMI2 `find_fast_impl`
+/// twins would call a baseline emitter.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(unsafe_code)]
+#[inline(never)]
+unsafe fn emit_fast_seq_bmi2<const PACKED: bool>(
+    ctx: &FastEmitCtx,
+    hash: &mut [u32],
+    tags: &mut [u8],
+    seqs: &mut Vec<Seq>,
+    lits: &mut Vec<u8>,
+    anchor: usize,
+    found_ip: usize,
+    m: usize,
+    ml: usize,
+) -> usize {
+    emit_fast_seq_body::<PACKED>(ctx, hash, tags, seqs, lits, anchor, found_ip, m, ml)
+}
+
+/// `BMI2` is threaded from the wrapper that already made the CPUID decision
+/// for the whole block, so this selection is a compile-time fold, not a
+/// per-match branch.
+#[inline(always)]
+fn emit_fast_seq<const PACKED: bool, const BMI2: bool>(
+    ctx: &FastEmitCtx,
+    hash: &mut [u32],
+    tags: &mut [u8],
+    seqs: &mut Vec<Seq>,
+    lits: &mut Vec<u8>,
+    anchor: usize,
+    found_ip: usize,
+    m: usize,
+    ml: usize,
+) -> usize {
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if BMI2 {
+        // SAFETY: `BMI2` is only ever `true` inside `find_fast_impl_bmi2`,
+        // which the plain wrapper reached under a `has_bmi2()` CPUID guard.
+        #[allow(unsafe_code)]
+        return unsafe {
+            emit_fast_seq_bmi2::<PACKED>(ctx, hash, tags, seqs, lits, anchor, found_ip, m, ml)
+        };
+    }
+    emit_fast_seq_plain::<PACKED>(ctx, hash, tags, seqs, lits, anchor, found_ip, m, ml)
+}
+
+#[inline(always)]
+fn emit_fast_seq_body<const PACKED: bool>(
+    ctx: &FastEmitCtx,
+    hash: &mut [u32],
+    tags: &mut [u8],
+    seqs: &mut Vec<Seq>,
+    lits: &mut Vec<u8>,
+    anchor: usize,
+    found_ip: usize,
+    m: usize,
+    ml: usize,
+) -> usize {
+    let &FastEmitCtx {
+        src,
+        pack,
+        f_wide,
+        f_mask,
+        f_shift,
+        ilimit,
+        frame_start,
+        w,
+        tags_live,
+        ends,
+    } = ctx;
     let mut ip = found_ip;
     let mut mm = m;
     let mut n = ml;
@@ -7452,7 +8023,8 @@ fn fill_hash_after_match(
     // Hoisted per call: see the tag accessors' `packed` doc.
     let packed = tables.pack_tags;
     let stag_live = !tables.tags.is_empty();
-    let ltag_live = !tables.ltags.is_empty();
+    // W18: `ltag_live` was computed here and never read -- an `is_empty()`
+    // read through the `&mut MatchTables`, per MATCH, on the DFast ladder.
     let (do_a, do_b) = ends;
     let mut n = 0u64;
     // W4/W5: `match_end` is `match_ip + n` with `n >= mls >= 4`, so the
@@ -7510,8 +8082,9 @@ fn fill_hash_long_after_match(
     ilimit: usize,
 ) {
     // Hoisted per call: see the tag accessors' `packed` doc.
+    // W18: `stag_live` was computed here and never read -- an `is_empty()`
+    // read through the `&mut MatchTables`, per MATCH, on the DFast ladder.
     let packed = tables.pack_tags;
-    let stag_live = !tables.tags.is_empty();
     let ltag_live = !tables.ltags.is_empty();
     let (do_a, do_b) = ends;
     let mut n = 0u64;
@@ -7531,7 +8104,11 @@ fn fill_hash_long_after_match(
     // before touching the array) but wrong, and the assert said so.
     let ltag_wanted = packed || ltag_live;
     if do_a && a <= ilimit {
-        let g = if ltag_wanted { hash4_tag_mls(src, a, hash_shift, smask).1 } else { 0 };
+        let g = if ltag_wanted {
+            hash4_tag_mls(src, a, hash_shift, smask).1
+        } else {
+            0
+        };
         tables.put_hl_tag(hash8(src, a, hash_log), a, g, packed, ltag_live);
         n += 1;
     }
@@ -7539,7 +8116,11 @@ fn fill_hash_long_after_match(
     if do_b {
         let b = match_end - 2;
         if b <= ilimit && b != a {
-            let g = if ltag_wanted { hash4_tag_mls(src, b, hash_shift, smask).1 } else { 0 };
+            let g = if ltag_wanted {
+                hash4_tag_mls(src, b, hash_shift, smask).1
+            } else {
+                0
+            };
             tables.put_hl_tag(hash8(src, b, hash_log), b, g, packed, ltag_live);
             n += 1;
         }
@@ -7567,10 +8148,38 @@ fn find_dfast(
     // a hot path. `tables.hash_log` is the AUTHORITATIVE clamped value (brick
     // 52) -- `find_dfast` had been reading `params.hash_log` instead, which is
     // the same today only because `compression_params` clamps to the same range.
+    // W8: the same BMI2 redundancy `find_fast` carried (see W5). `shrx` takes
+    // its shift count from any GPR, so on the twins the HLOG immediate buys
+    // nothing -- and DFast pays it TWICE per position (4-byte + 8-byte hash)
+    // across five specialised copies. Route the twins to the generic copy and
+    // keep brick 54's fold on the baseline arm that still needs it.
+    //
+    // The ISA choice moves here too, out of the five `find_dfast_impl` bodies.
     macro_rules! go {
-        ($h:expr) => {
-            find_dfast_impl::<$h>(src, block_start, block_end, window, params, tables, reps)
-        };
+        ($h:expr) => {{
+            #[cfg(all(target_arch = "x86_64", feature = "std"))]
+            #[allow(unsafe_code)]
+            // SAFETY: runtime CPUID guard, identical body.
+            let out = if crate::simd::has_bmi2() {
+                unsafe {
+                    find_dfast_impl_bmi2::<0>(
+                        src,
+                        block_start,
+                        block_end,
+                        window,
+                        params,
+                        tables,
+                        reps,
+                    )
+                }
+            } else {
+                find_dfast_impl::<$h>(src, block_start, block_end, window, params, tables, reps)
+            };
+            #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
+            let out =
+                find_dfast_impl::<$h>(src, block_start, block_end, window, params, tables, reps);
+            out
+        }};
     }
     if !dfast_spec_enabled() {
         return go!(0);
@@ -7613,16 +8222,8 @@ fn find_dfast_impl<const HLOG: u32>(
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    // BMI2 twin per monomorphisation -- the DEFAULT level's finder. One
-    // branch per block.
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if crate::simd::has_bmi2() {
-        // SAFETY: runtime CPUID guard; identical body.
-        #[allow(unsafe_code)]
-        return unsafe {
-            find_dfast_impl_bmi2::<HLOG>(src, block_start, block_end, window, params, tables, reps)
-        };
-    }
+    // W8: the ISA branch now lives once in `find_dfast`'s dispatch, which is
+    // what lets the twin tree drop the HLOG axis. Baseline arm only.
     find_dfast_impl_inner::<HLOG>(src, block_start, block_end, window, params, tables, reps)
 }
 
@@ -7705,7 +8306,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     // hand-back in `encode_block`.
     let keep = finder_scratch_enabled();
     let mut seqs = if keep {
-        let mut v = std::mem::take(&mut tables.seq_scratch);
+        let mut v = core::mem::take(&mut tables.seq_scratch);
         v.clear();
         v
     } else {
@@ -7715,7 +8316,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
         seqs = Vec::with_capacity(seq_guess);
     }
     let mut lits = if keep {
-        let mut v = std::mem::take(&mut tables.lit_scratch);
+        let mut v = core::mem::take(&mut tables.lit_scratch);
         v.clear();
         v
     } else {
@@ -7765,7 +8366,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     // `lowest_rep`'s expression, recomputed at two more.
     let frame_start_c = tables.frame_start;
     let mlx_c = 8.min(mls).max(4);
-    let lowest_c = lowest_rep;
+    // W19: `lowest_c` was an unread alias of `lowest_rep`.
     // W4: the literal-copy width, re-selected from a per-block flag on every
     // emitted match.
     let lp_w = if lp { LIT_PUSH_WIDTH } else { 0 };
@@ -7775,7 +8376,11 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     // pin is set; the pin stays available under `profile` (same treatment as
     // `find_fast_impl`'s loop, and `find_dfast` is dispatched for
     // Strategy::DFast only).
-    let accel = if cfg!(feature = "profile") { accel_shift_for(params.strategy) } else { 8 };
+    let accel = if cfg!(feature = "profile") {
+        accel_shift_for(params.strategy)
+    } else {
+        8
+    };
     #[cfg(feature = "profile")]
     let mut mm_total = 0u64;
     let mut nl_probes = 0u64;
@@ -7861,12 +8466,23 @@ fn find_dfast_impl_inner<const HLOG: u32>(
         g4: u8,
         live: bool,
     }
-    let mut carried = Carried { h4: 0, h8: 0, v4: 0, v8: 0, g4: 0, live: false };
+    let mut carried = Carried {
+        h4: 0,
+        h8: 0,
+        v4: 0,
+        v8: 0,
+        g4: 0,
+        live: false,
+    };
     // Decode a carried slot value back to the `Option<usize>` the match logic
     // expects: identical to `get_h_tag`/`get_hl_tag`'s own tail.
     #[inline(always)]
     fn dec(v: u32) -> Option<usize> {
-        if v == 0 { None } else { Some((v as usize) - 1) }
+        if v == 0 {
+            None
+        } else {
+            Some((v as usize) - 1)
+        }
     }
     #[inline(always)]
     fn enc(m: Option<usize>) -> u32 {
@@ -7916,7 +8532,11 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     let ltag_live = !tables.ltags.is_empty();
     // The mls-width short tag's byte mask (min(mls, 8) bytes).
     let sk = 8.min(mls);
-    let smask = if sk == 8 { u64::MAX } else { (1u64 << (8 * sk)) - 1 };
+    let smask = if sk == 8 {
+        u64::MAX
+    } else {
+        (1u64 << (8 * sk)) - 1
+    };
     // Loop-invariant arm reads, hoisted from the MATCH path to once per block.
     let fill_anchor_c = dfast_fill_anchor_c();
     let fill_stride = dfast_fill_stride();
@@ -7994,12 +8614,10 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                 let m = tables.get_h_tag(a, ga, dtag_on, packed);
                 // T1 ledger: a rejection is a candidate load AVOIDED. Counted
                 // only under `profile`, so the shipping loop is untouched.
-                if COUNT && dtag_on {
-                    if tables.raw_fast(a) != 0 {
-                        TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                        if m.is_none() {
-                            TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                        }
+                if COUNT && dtag_on && tables.raw_fast(a) != 0 {
+                    TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if m.is_none() {
+                        TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 let ml8 = tables.get_hl_tag(b, ga, lt_on, packed);
@@ -8015,15 +8633,8 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                         if ml8.is_none() {
                             LTAG_REJECT.fetch_add(1, Relaxed);
                             let mr = (raw as usize) - 1;
-                            if match_ok(
-                                src,
-                                mr,
-                                ip,
-                                window,
-                                block_start,
-                                mlx_c,
-                                frame_start_c,
-                            ) && count_match(src, mr, ip, block_end) >= mls
+                            if match_ok(src, mr, ip, window, block_start, mlx_c, frame_start_c)
+                                && count_match(src, mr, ip, block_end) >= mls
                             {
                                 LTAG_FALSE.fetch_add(1, Relaxed);
                             }
@@ -8113,7 +8724,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                 use core::sync::atomic::Ordering::Relaxed;
                 if best_ml == 0 {
                     let mlx = mlx_c;
-                    let lowest = lowest_c;
+                    let lowest = lowest_rep;
                     let cheap = m8 >= ip
                         || ip - m8 > window
                         || m8 < lowest
@@ -8142,13 +8753,17 @@ fn find_dfast_impl_inner<const HLOG: u32>(
         // byte later -- the same "capability present in one finder, absent in
         // its neighbour" shape as the repcode and back-extension defects.
         let mut best_ip = ip;
-        if best_ml < good_ml && nl_on && ip + 1 <= ilimit {
+        if best_ml < good_ml && nl_on && ip < ilimit {
             nl_probes += 1;
             let h8b = hash8(src, ip + 1, hlog);
             // The only long consumer without a free tag: `ip + 1` never
             // computed a short hash. One mul+xor on a path already gated by
             // `best_ml < good_ml && nl_on`.
-            let g8b = if lt_on { hash4_tag_mls(src, ip + 1, dtag_shift, smask).1 } else { 0 };
+            let g8b = if lt_on {
+                hash4_tag_mls(src, ip + 1, dtag_shift, smask).1
+            } else {
+                0
+            };
             if let Some(m8b) = tables.get_hl_tag(h8b, g8b, lt_on, packed) {
                 if COUNT {
                     probes += 1;
@@ -8232,8 +8847,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                     if _acc {
                         STAG_SURV_ACC.fetch_add(1, Relaxed);
                     } else {
-                        let lowest =
-                            lowest_c;
+                        let lowest = lowest_rep;
                         let cheap = m4 >= ip
                             || ip - m4 > window
                             || m4 < lowest
@@ -8262,12 +8876,24 @@ fn find_dfast_impl_inner<const HLOG: u32>(
             }
             let end = best_ip + best_ml;
             // DFast never sets `packed` (it is gated on Strategy::Fast).
-            fill_hash_after_match(tables, src, best_ip, end, fill_ends, smask, dtag_shift, ilimit);
+            fill_hash_after_match(
+                tables, src, best_ip, end, fill_ends, smask, dtag_shift, ilimit,
+            );
             // GATE 12 @ L3: `ip` here is the PRE-probe position; when the
             // next-long probe won, `best_ip == ip + 1` and the two tables index
             // different positions for one match. See `dfast_fill_anchor_c`.
             let long_anchor = if fill_anchor_c { best_ip } else { ip };
-            fill_hash_long_after_match(tables, src, long_anchor, end, hlog, fill_ends, smask, dtag_shift, ilimit);
+            fill_hash_long_after_match(
+                tables,
+                src,
+                long_anchor,
+                end,
+                hlog,
+                fill_ends,
+                smask,
+                dtag_shift,
+                ilimit,
+            );
             // GATE 12 @ L3: the density knob DFast never had. Off by default.
             let dfs = fill_stride;
             if dfs != 0 {
@@ -8509,18 +9135,14 @@ fn dfast_step_forced() -> usize {
     1
 }
 
-pub static DFAST_MATCH_BYTES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_MATCH_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static DFAST_SEQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static DFAST_BLOCK_BYTES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_BLOCK_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub static DFAST_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static DFAST_REP_BLOCKS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_REP_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Positions over which `try_rep1` is live -- the work a rep dispatch removes.
-pub static DFAST_REP_POS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_REP_POS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// `(blocks, rep_blocks, rep_positions)`
 pub fn take_dfast_rep_blocks() -> (u64, u64, u64) {
@@ -8532,10 +9154,8 @@ pub fn take_dfast_rep_blocks() -> (u64, u64, u64) {
     )
 }
 
-pub static DFAST_REP_BYTES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-pub static DFAST_REP_HITS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_REP_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_REP_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// `(match_bytes, seqs, block_bytes, rep_bytes, rep_hits)` for DFast.
 pub fn take_dfast_match_stats() -> (u64, u64, u64, u64, u64) {
@@ -8549,8 +9169,7 @@ pub fn take_dfast_match_stats() -> (u64, u64, u64, u64, u64) {
     )
 }
 
-static DFAST_STEP_ARM: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+static DFAST_STEP_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Set the DFast probe density in-process.
 pub fn set_dfast_step_arm(v: usize) {
@@ -8593,15 +9212,16 @@ static DFAST_PIPE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::Atomic
 
 /// A/B the DFast 2-way software pipeline in-process -- both shapes, one binary,
 /// so the comparison is immune to cross-binary drift.
-pub static DFAST_SPEC_MADE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-pub static DFAST_SPEC_USED: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_SPEC_MADE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_SPEC_USED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Read and clear `(speculations_made, speculations_consumed)`.
 pub fn take_dfast_spec() -> (u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
-    (DFAST_SPEC_MADE.swap(0, Relaxed), DFAST_SPEC_USED.swap(0, Relaxed))
+    (
+        DFAST_SPEC_MADE.swap(0, Relaxed),
+        DFAST_SPEC_USED.swap(0, Relaxed),
+    )
 }
 
 pub fn set_dfast_pipe_arm(on: bool) {
@@ -8610,10 +9230,7 @@ pub fn set_dfast_pipe_arm(on: bool) {
 
 #[inline]
 fn dfast_pipe_enabled() -> bool {
-    match DFAST_PIPE_ARM.load(core::sync::atomic::Ordering::Relaxed) {
-        1 => false,
-        _ => true,
-    }
+    DFAST_PIPE_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
 }
 
 fn note_finder_work(count: bool, probes: u64, hits: u64, seqs: &[Seq], lits: &[u8]) {
@@ -8703,7 +9320,11 @@ fn find_greedy_impl<const MLS: usize>(
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    let mls = if MLS == 0 { params.min_match.max(3) as usize } else { MLS };
+    let mls = if MLS == 0 {
+        params.min_match.max(3) as usize
+    } else {
+        MLS
+    };
     // BRICK 52, COMPLETED: the AUTHORITATIVE clamped value, never `params`.
     // `params.hash_log` is USER-SETTABLE with no upper bound (`hlog` in the
     // advanced-parameter setter does only `value.max(6)`), while the table is
@@ -8734,14 +9355,14 @@ fn find_greedy_impl<const MLS: usize>(
     // -- once per output buffer -- for one per-block answer.
     let keep = finder_scratch_enabled();
     let mut seqs = if keep {
-        let mut v = std::mem::take(&mut tables.seq_scratch);
+        let mut v = core::mem::take(&mut tables.seq_scratch);
         v.clear();
         v
     } else {
         Vec::new()
     };
     let mut lits = if keep {
-        let mut v = std::mem::take(&mut tables.lit_scratch);
+        let mut v = core::mem::take(&mut tables.lit_scratch);
         v.clear();
         v
     } else {
@@ -8774,9 +9395,9 @@ fn find_greedy_impl<const MLS: usize>(
         lit_width_for(tables)
     } else {
         0
-    };    // BRICK 71: repcode-1 search in find_greedy -- L5-L6 had none
-    // C checks `offset_1` at every position in `_greedy`/`_lazy` exactly as in
-    // `_fast`/`_doubleFast`. Same dispatch on measured yield as bricks 67/70.
+    }; // BRICK 71: repcode-1 search in find_greedy -- L5-L6 had none
+       // C checks `offset_1` at every position in `_greedy`/`_lazy` exactly as in
+       // `_fast`/`_doubleFast`. Same dispatch on measured yield as bricks 67/70.
     let use_rep = rep_search_on(tables.rep_yield, params.strategy)
         || (rep_reprobe_enabled() && tables.rep_probe == 0);
     if rep_reprobe_enabled() {
@@ -8805,7 +9426,11 @@ fn find_greedy_impl<const MLS: usize>(
     let cp = tables.chain_pack;
     let ca = !tables.ctags.is_empty();
     let wchain = tables.chain_wide;
-    let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
+    let smask = if mls >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (8 * mls)) - 1
+    };
     // W1: `cp || ca` -- whether ANY link-tag filter is active -- was re-OR'd on
     // every step of the chain chase.
     let tag_filter = cp || ca;
@@ -8887,11 +9512,19 @@ fn find_greedy_impl<const MLS: usize>(
                         // link, on the path the tag filter exists to make cheap.
                         let slot = m & chain_mask;
                         let link = tables.chain_masked(slot);
-                        let next = if cp { (link & 0x00FF_FFFF) as usize } else { link as usize };
+                        let next = if cp {
+                            (link & 0x00FF_FFFF) as usize
+                        } else {
+                            link as usize
+                        };
                         if next >= m {
                             break;
                         }
-                        mtag = if cp { (link >> 24) as u8 } else { tables.ctags_masked(slot) };
+                        mtag = if cp {
+                            (link >> 24) as u8
+                        } else {
+                            tables.ctags_masked(slot)
+                        };
                         m = next;
                         continue;
                     }
@@ -8938,11 +9571,21 @@ fn find_greedy_impl<const MLS: usize>(
                         }
                     }
                     let link = tables.chain_masked(m & chain_mask);
-                    let next = if cp { (link & 0x00FF_FFFF) as usize } else { link as usize };
+                    let next = if cp {
+                        (link & 0x00FF_FFFF) as usize
+                    } else {
+                        link as usize
+                    };
                     if next >= m {
                         break;
                     }
-                    mtag = if cp { (link >> 24) as u8 } else if ca { tables.ctags_masked(m & chain_mask) } else { 0 };
+                    mtag = if cp {
+                        (link >> 24) as u8
+                    } else if ca {
+                        tables.ctags_masked(m & chain_mask)
+                    } else {
+                        0
+                    };
                     m = next;
                 }
             }
@@ -9062,8 +9705,8 @@ pub(crate) struct ChainCtx<'a> {
     tag_filter: bool,
 }
 
-type ChainFn = for<'a> fn(&ChainCtx<'a>, usize, bool, &mut (u32, u32), &mut MatchTables)
-    -> (usize, usize);
+type ChainFn =
+    for<'a> fn(&ChainCtx<'a>, usize, bool, &mut (u32, u32), &mut MatchTables) -> (usize, usize);
 
 #[inline(never)]
 fn chain_find_best<const MLS: usize>(
@@ -9150,7 +9793,14 @@ fn chain_find_best_inner<const MLS: usize>(
     debug_assert_eq!(ca, !tables.ctags.is_empty());
     debug_assert_eq!(wchain, tables.chain_wide);
     debug_assert_eq!(wide_hash, mls >= 8);
-    debug_assert_eq!(smask, if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 });
+    debug_assert_eq!(
+        smask,
+        if mls >= 8 {
+            u64::MAX
+        } else {
+            (1u64 << (8 * mls)) - 1
+        }
+    );
     let (h, gtag) = if wide_hash && ip + 8 <= src.len() {
         (hash8(src, ip, hash_log), 0u8)
     } else if wchain {
@@ -9208,11 +9858,19 @@ fn chain_find_best_inner<const MLS: usize>(
                     break;
                 }
                 let link = tables.chain_masked(m & chain_mask);
-                let next = if cp { (link & 0x00FF_FFFF) as usize } else { link as usize };
+                let next = if cp {
+                    (link & 0x00FF_FFFF) as usize
+                } else {
+                    link as usize
+                };
                 if next >= m {
                     break;
                 }
-                mtag = if cp { (link >> 24) as u8 } else { tables.ctags_masked(m & chain_mask) };
+                mtag = if cp {
+                    (link >> 24) as u8
+                } else {
+                    tables.ctags_masked(m & chain_mask)
+                };
                 m = next;
                 continue;
             }
@@ -9278,11 +9936,21 @@ fn chain_find_best_inner<const MLS: usize>(
                 }
             }
             let link = tables.chain_masked(m & chain_mask);
-            let next = if cp { (link & 0x00FF_FFFF) as usize } else { link as usize };
+            let next = if cp {
+                (link & 0x00FF_FFFF) as usize
+            } else {
+                link as usize
+            };
             if next >= m {
                 break;
             }
-            mtag = if cp { (link >> 24) as u8 } else if ca { tables.ctags_masked(m & chain_mask) } else { 0 };
+            mtag = if cp {
+                (link >> 24) as u8
+            } else if ca {
+                tables.ctags_masked(m & chain_mask)
+            } else {
+                0
+            };
             m = next;
         }
     }
@@ -9310,10 +9978,28 @@ fn find_lazy(
         // SAFETY: runtime CPUID guard; identical body.
         #[allow(unsafe_code)]
         return unsafe {
-            find_lazy_bmi2(src, block_start, block_end, window, params, tables, depth, reps)
+            find_lazy_bmi2(
+                src,
+                block_start,
+                block_end,
+                window,
+                params,
+                tables,
+                depth,
+                reps,
+            )
         };
     }
-    find_lazy_sel(src, block_start, block_end, window, params, tables, depth, reps)
+    find_lazy_sel(
+        src,
+        block_start,
+        block_end,
+        window,
+        params,
+        tables,
+        depth,
+        reps,
+    )
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
@@ -9330,7 +10016,16 @@ unsafe fn find_lazy_bmi2(
     depth: usize,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    find_lazy_sel(src, block_start, block_end, window, params, tables, depth, reps)
+    find_lazy_sel(
+        src,
+        block_start,
+        block_end,
+        window,
+        params,
+        tables,
+        depth,
+        reps,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9347,9 +10042,27 @@ fn find_lazy_sel(
 ) -> (Vec<Seq>, Vec<u8>) {
     // See `find_greedy`: narrow MLS spec, runtime arm from the same body.
     if params.min_match.max(3) == 5 {
-        find_lazy_impl::<5>(src, block_start, block_end, window, params, tables, depth, reps)
+        find_lazy_impl::<5>(
+            src,
+            block_start,
+            block_end,
+            window,
+            params,
+            tables,
+            depth,
+            reps,
+        )
     } else {
-        find_lazy_impl::<0>(src, block_start, block_end, window, params, tables, depth, reps)
+        find_lazy_impl::<0>(
+            src,
+            block_start,
+            block_end,
+            window,
+            params,
+            tables,
+            depth,
+            reps,
+        )
     }
 }
 
@@ -9365,7 +10078,11 @@ fn find_lazy_impl<const MLS: usize>(
     depth: usize,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    let mls = if MLS == 0 { params.min_match.max(3) as usize } else { MLS };
+    let mls = if MLS == 0 {
+        params.min_match.max(3) as usize
+    } else {
+        MLS
+    };
     // BRICK 52, COMPLETED: the AUTHORITATIVE clamped value, never `params`.
     // `params.hash_log` is USER-SETTABLE with no upper bound (`hlog` in the
     // advanced-parameter setter does only `value.max(6)`), while the table is
@@ -9399,14 +10116,14 @@ fn find_lazy_impl<const MLS: usize>(
     // plumbing was in place and only these finders were missing from it.
     let scratch = finder_scratch_enabled();
     let mut seqs = if scratch {
-        let mut v = std::mem::take(&mut tables.seq_scratch);
+        let mut v = core::mem::take(&mut tables.seq_scratch);
         v.clear();
         v
     } else {
         Vec::new()
     };
     let mut lits = if scratch {
-        let mut v = std::mem::take(&mut tables.lit_scratch);
+        let mut v = core::mem::take(&mut tables.lit_scratch);
         v.clear();
         v
     } else {
@@ -9479,7 +10196,11 @@ fn find_lazy_impl<const MLS: usize>(
     let cp = tables.chain_pack;
     let ca = !tables.ctags.is_empty();
     let wchain = tables.chain_wide;
-    let smask = if mls >= 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
+    let smask = if mls >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (8 * mls)) - 1
+    };
     // W6: the same two facts the fill loop re-derived per inserted position.
     let wide_h = mls >= 8;
     let src_len = src.len();
@@ -9501,13 +10222,24 @@ fn find_lazy_impl<const MLS: usize>(
         lowest: lowest_rep,
         tag_filter: cp || ca,
     };
+    // GATE 13, which this finder never received. Every other finder resolves
+    // the literal-copy width once per block and emits through `push_literals`;
+    // `find_lazy_impl` alone still called `push_lits_range`, so its
+    // per-sequence literal appends went out through `extend_from_slice` -- a
+    // `memcpy` CALL, measured at 1,632,910 of them at L9 for a mean run of
+    // 3.51 bytes. Same expression as `find_greedy_impl` and `find_bt_lazy`.
+    let lp_copy = if tables.blocks_done == 0 || tables.lit_short_share >= lit_short_min() {
+        lit_width_for(tables)
+    } else {
+        0
+    };
     let gain_cmp = lazy_gain_enabled();
     while ip <= ilimit {
         if use_rep {
             if let Some(ml) = try_rep1(src, ip, rep1, lowest_rep, block_end, ilimit) {
                 rep_hits += 1;
                 let mstart = ip + 1;
-                push_lits_range(&mut lits, src, anchor, mstart);
+                push_literals(&mut lits, src, anchor, mstart, lp_copy);
                 seqs.push(Seq {
                     litlen: (mstart - anchor) as u32,
                     matchlen: ml as u32,
@@ -9519,10 +10251,13 @@ fn find_lazy_impl<const MLS: usize>(
             }
         }
         searches += 1;
-        let (mut best_m, mut best_ml) =
-            cfb(&chain_ctx, ip, walk_cont, &mut wcls, tables);
+        let (mut best_m, mut best_ml) = cfb(&chain_ctx, ip, walk_cont, &mut wcls, tables);
         // W3: the in-hand match's gain, carried with it.
-        let mut best_gain = if gain_cmp { lazy_gain(best_ml, ip - best_m) } else { 0 };
+        let mut best_gain = if gain_cmp {
+            lazy_gain(best_ml, ip - best_m)
+        } else {
+            0
+        };
         let mut best_ip = ip;
         let mut look_hi = ip; // PROBE: highest position the look-ahead inserted
         if best_ml >= mls {
@@ -9582,7 +10317,7 @@ fn find_lazy_impl<const MLS: usize>(
             }
             #[cfg(feature = "profile")]
             note_bext((bext_from - s) as u64);
-            push_lits_range(&mut lits, src, anchor, s);
+            push_literals(&mut lits, src, anchor, s, lp_copy);
             seqs.push(Seq {
                 litlen: (s - anchor) as u32,
                 matchlen: n as u32,
@@ -9670,7 +10405,10 @@ fn find_lazy_impl<const MLS: usize>(
         WALK_SIG_REP.store(tables.rep_yield.to_bits(), Relaxed);
         WALK_SIG_SPB.store(tables.last_search_per_byte.to_bits(), Relaxed);
         let mb: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
-        let ob: u64 = seqs.iter().map(|q| 64 - u64::from(q.offset.max(1)).leading_zeros() as u64).sum();
+        let ob: u64 = seqs
+            .iter()
+            .map(|q| 64 - u64::from(q.offset.max(1)).leading_zeros() as u64)
+            .sum();
         WALK_SIG_MB.store(mb, Relaxed);
         WALK_SIG_NS.store(seqs.len() as u64, Relaxed);
         WALK_SIG_OB.store(ob, Relaxed);
@@ -9678,7 +10416,13 @@ fn find_lazy_impl<const MLS: usize>(
     // `searches` is SEARCH POSITIONS, not candidate examinations -- reporting it
     // as `probes` was a work-count parity break against `find_fast`. The real
     // probe count comes from `chain_find_best` via `note_probes`, so pass 0.
-    note_finder_work(cfg!(feature = "profile"), 0, seqs.len() as u64, &seqs, &lits);
+    note_finder_work(
+        cfg!(feature = "profile"),
+        0,
+        seqs.len() as u64,
+        &seqs,
+        &lits,
+    );
     (seqs, lits)
 }
 
@@ -9760,8 +10504,7 @@ fn bt_depth_target_for(opt_rep_rate: f32) -> usize {
 
 static BT_DEEP_MIN_ARM: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
-static BT_DEEP_ARM: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static BT_DEEP_ARM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Bench hook: the `opt_rep_rate` above which the deeper cut applies.
 pub fn set_bt_deep_min_arm(v: f32) {
@@ -9809,8 +10552,7 @@ static BT_DEPTH_T_C: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(usize::MAX);
 static BT_DEPTH_SLOG_C: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
-static BT_DEPTH_REP_C: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
+static BT_DEPTH_REP_C: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 static BT_DEPTH_STEPS_C: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
 
@@ -9997,7 +10739,6 @@ macro_rules! bt_spec_pairs_const {
 }
 bt_spec_list!(bt_spec_pairs_const);
 
-
 /// The dispatch, RESOLVED ONCE PER BLOCK: `(hash_log, chain_log)` is
 /// loop-invariant in every caller, yet `bt_find_best` re-ran a jump-table
 /// dispatch (plus re-reading both fields) on every call -- per position,
@@ -10077,23 +10818,31 @@ fn bt_resolve_ins(hash_log: u32, chain_log: u32) -> BtInsFn {
     #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
     let bmi2 = false;
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    let rt: BtInsFn = if bmi2 { bt_rt_ins_bmi2 } else { bt_rt_ins_plain };
+    let rt: BtInsFn = if bmi2 {
+        bt_rt_ins_bmi2
+    } else {
+        bt_rt_ins_plain
+    };
     #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
     let rt: BtInsFn = bt_rt_ins_plain;
     if !bt_spec_enabled() {
         return rt;
     }
+    // W9: the (hash_log, chain_log) SPEC LIST IS BMI2-REDUNDANT.
+    //
+    // The spec copies exist to fold the hash shift and the chain mask to
+    // immediates. On the twins both are already free: `shrx` takes its count
+    // from any GPR, and the mask is one `and` whose operand costs the same in a
+    // register as in an immediate. `BtCtx` (brick 48's successor) already
+    // holds both in registers for the whole walk, so the runtime arm's operands
+    // are register-resident before the walk starts.
+    //
+    // The list was buying nothing on the twins and costing 40 monomorphisations
+    // of the search body plus 20 of the insert body. Byte-identical: the consts
+    // took the values the ctx fields already held.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     if bmi2 {
-        macro_rules! ins_resolve_bmi2 {
-            ($( ($h:literal, $c:literal) )*) => {
-                match (hash_log, chain_log) {
-                    $( ($h, $c) => bt_ins_spec_bmi2::<$h, $c>, )*
-                    _ => rt,
-                }
-            };
-        }
-        return bt_spec_list!(ins_resolve_bmi2);
+        return rt;
     }
     macro_rules! ins_resolve {
         ($( ($h:literal, $c:literal) )*) => {
@@ -10125,17 +10874,21 @@ fn bt_resolve<const SEARCH: bool>(hash_log: u32, chain_log: u32) -> BtFn {
     if !bt_spec_enabled() {
         return rt;
     }
+    // W9: the (hash_log, chain_log) SPEC LIST IS BMI2-REDUNDANT.
+    //
+    // The spec copies exist to fold the hash shift and the chain mask to
+    // immediates. On the twins both are already free: `shrx` takes its count
+    // from any GPR, and the mask is one `and` whose operand costs the same in a
+    // register as in an immediate. `BtCtx` (brick 48's successor) already
+    // holds both in registers for the whole walk, so the runtime arm's operands
+    // are register-resident before the walk starts.
+    //
+    // The list was buying nothing on the twins and costing 40 monomorphisations
+    // of the search body plus 20 of the insert body. Byte-identical: the consts
+    // took the values the ctx fields already held.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     if bmi2 {
-        macro_rules! bt_spec_resolve_bmi2 {
-            ($( ($h:literal, $c:literal) )*) => {
-                match (hash_log, chain_log) {
-                    $( ($h, $c) => bt_find_best_spec_bmi2::<$h, $c, SEARCH>, )*
-                    _ => rt,
-                }
-            };
-        }
-        return bt_spec_list!(bt_spec_resolve_bmi2);
+        return rt;
     }
     macro_rules! bt_spec_resolve {
         ($( ($h:literal, $c:literal) )*) => {
@@ -10177,6 +10930,7 @@ fn bt_find_best_impl<const HLOG: u32, const CLOG: u32, const SEARCH: bool>(
 /// Insert-only twin of `bt_find_best_spec_bmi2`, returning `()` -- see
 /// `BtInsFn`.
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[allow(dead_code)]
 fn bt_ins_spec_bmi2<const HLOG: u32, const CLOG: u32>(
     ctx: &BtCtx,
     ip: usize,
@@ -10190,11 +10944,7 @@ fn bt_ins_spec_bmi2<const HLOG: u32, const CLOG: u32>(
 }
 
 /// Insert-only, plain-ISA.
-fn bt_ins_spec<const HLOG: u32, const CLOG: u32>(
-    ctx: &BtCtx,
-    ip: usize,
-    tables: &mut MatchTables,
-) {
+fn bt_ins_spec<const HLOG: u32, const CLOG: u32>(ctx: &BtCtx, ip: usize, tables: &mut MatchTables) {
     bt_find_best_impl_inner::<HLOG, CLOG, false>(ctx, ip, tables);
 }
 
@@ -10212,6 +10962,7 @@ fn bt_rt_ins_bmi2(ctx: &BtCtx, ip: usize, t: &mut MatchTables) {
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[allow(dead_code)]
 fn bt_find_best_spec_bmi2<const HLOG: u32, const CLOG: u32, const SEARCH: bool>(
     ctx: &BtCtx,
     ip: usize,
@@ -10268,7 +11019,15 @@ fn bt_find_best_impl_inner<const HLOG: u32, const CLOG: u32, const SEARCH: bool>
     if cfg!(feature = "profile") {
         BT_SPEC_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
-    const fn btlog(c: u32) -> u32 { let c = if c > 24 { 24 } else { c }; let c = c.saturating_sub(1); if c < 1 { 1 } else { c } }
+    const fn btlog(c: u32) -> u32 {
+        let c = if c > 24 { 24 } else { c };
+        let c = c.saturating_sub(1);
+        if c < 1 {
+            1
+        } else {
+            c
+        }
+    }
     let _ = chain_log;
     let bt_log = btlog(CLOG);
     let bt_mask = (1usize << bt_log) - 1;
@@ -10314,7 +11073,11 @@ fn bt_find_best_impl_inner<const HLOG: u32, const CLOG: u32, const SEARCH: bool>
     // of sub+cmp per node.
     let win_low = ip.saturating_sub(window);
     // W4: the single hot-path lower bound (see the walk's break).
-    let low = if win_low > bt_lowest { win_low } else { bt_lowest };
+    let low = if win_low > bt_lowest {
+        win_low
+    } else {
+        bt_lowest
+    };
     // W1: the count head's only non-`m` precondition, hoisted out of the walk.
     // See the head itself for why the other two tests are implied.
     debug_assert!(block_end <= src.len());
@@ -10488,7 +11251,11 @@ fn bt_find_best_impl_inner<const HLOG: u32, const CLOG: u32, const SEARCH: bool>
             // BYTE-IDENTICAL: if the store above targeted the slot we
             // pre-loaded, forward the stored value by hand -- the original read
             // happened AFTER the write and would have observed it.
-            let v = if smaller == bt_idx + 1 { m as u32 } else { c_hi };
+            let v = if smaller == bt_idx + 1 {
+                m as u32
+            } else {
+                c_hi
+            };
             smaller = bt_idx + 1;
             match_idx = if v == 0 { None } else { Some(v as usize) };
         } else {
@@ -10621,7 +11388,11 @@ fn bt_find_best_runtime_inner(
     // of sub+cmp per node.
     let win_low = ip.saturating_sub(window);
     // W4: the single hot-path lower bound (see the walk's break).
-    let low = if win_low > bt_lowest { win_low } else { bt_lowest };
+    let low = if win_low > bt_lowest {
+        win_low
+    } else {
+        bt_lowest
+    };
     // W1: the count head's only non-`m` precondition, hoisted out of the walk.
     // See the head itself for why the other two tests are implied.
     debug_assert!(block_end <= src.len());
@@ -10789,7 +11560,11 @@ fn bt_find_best_runtime_inner(
             // BYTE-IDENTICAL: if the store above targeted the slot we
             // pre-loaded, forward the stored value by hand -- the original read
             // happened AFTER the write and would have observed it.
-            let v = if smaller == bt_idx + 1 { m as u32 } else { c_hi };
+            let v = if smaller == bt_idx + 1 {
+                m as u32
+            } else {
+                c_hi
+            };
             smaller = bt_idx + 1;
             match_idx = if v == 0 { None } else { Some(v as usize) };
         } else {
@@ -10849,14 +11624,14 @@ fn find_bt_lazy(
     // once per buffer -- for one per-block answer.
     let keep = finder_scratch_enabled();
     let mut seqs = if keep {
-        let mut v = std::mem::take(&mut tables.seq_scratch);
+        let mut v = core::mem::take(&mut tables.seq_scratch);
         v.clear();
         v
     } else {
         Vec::new()
     };
     let mut lits = if keep {
-        let mut v = std::mem::take(&mut tables.lit_scratch);
+        let mut v = core::mem::take(&mut tables.lit_scratch);
         v.clear();
         v
     } else {
@@ -10953,7 +11728,11 @@ fn find_bt_lazy(
             // describe, and only the look-ahead reads it -- computing it per
             // POSITION spent a multiply and a `leading_zeros` on every miss,
             // which is most positions.
-            let mut best_gain = if gain_cmp { lazy_gain(best_ml, ip - best_m) } else { 0 };
+            let mut best_gain = if gain_cmp {
+                lazy_gain(best_ml, ip - best_m)
+            } else {
+                0
+            };
             for d in 1..=depth {
                 let ip2 = ip + d;
                 if ip2 > ilimit {
@@ -11054,7 +11833,13 @@ fn find_bt_lazy(
     };
     push_lits_range(&mut lits, src, anchor, block_end);
     // Probes reported by `bt_find_best`.
-    note_finder_work(cfg!(feature = "profile"), 0, seqs.len() as u64, &seqs, &lits);
+    note_finder_work(
+        cfg!(feature = "profile"),
+        0,
+        seqs.len() as u64,
+        &seqs,
+        &lits,
+    );
     (seqs, lits)
 }
 
@@ -11107,21 +11892,26 @@ fn opt_lit_cost(tables: &MatchTables) -> u32 {
     6
 }
 
-static OPT_LIT_ARM: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
+static OPT_LIT_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// The DP's match-length extra-bits pricing (Gate 19's other half).
 static OPT_MLBITS_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Bench hook for ML-bits pricing.
 pub fn set_opt_mlbits_arm(on: bool) {
-    OPT_MLBITS_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+    OPT_MLBITS_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 fn opt_mlbits_enabled() -> bool {
     // DEFAULT ON -- adjudicated: L16 -0.007% / L19 -0.014% / L22 -0.014%
     // totals, best nci -0.302%, worst jsonlog +0.097%. Small and real.
-    !matches!(OPT_MLBITS_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
+    !matches!(
+        OPT_MLBITS_ARM.load(core::sync::atomic::Ordering::Relaxed),
+        1
+    )
 }
 
 /// Set the DP literal price in-process.
@@ -11163,8 +11953,7 @@ fn opt_rep_min() -> f32 {
     50.0
 }
 #[cfg(feature = "std")]
-static OPT_REP_MIN_C: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
+static OPT_REP_MIN_C: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Measurement arm for the opt DP's repcode candidate.
 static OPT_REP_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
@@ -11176,26 +11965,19 @@ pub fn set_opt_rep_arm(on: bool) {
 
 #[inline]
 fn opt_rep_enabled() -> bool {
-    !matches!(
-        OPT_REP_ARM.load(core::sync::atomic::Ordering::Relaxed),
-        1
-    )
+    !matches!(OPT_REP_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
 }
 
 /// GATE 10 @ L19: what the DP's repcode candidate earns. `try_rep1` runs at
 /// every position of every opt block, unconditionally.
-pub static OPT_REP_PROBES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-pub static OPT_REP_HITS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-pub static OPT_REP_BYTES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static OPT_REP_PROBES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static OPT_REP_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static OPT_REP_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub static OPT_POS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static OPT_SKIP_INF: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static OPT_SKIP_JUMP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static OPT_SKIP_JUMPS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static OPT_SKIP_JUMPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// `(positions, skipped_price_inf, bytes_jumped, jumps)`
 pub fn take_opt_skips() -> (u64, u64, u64, u64) {
@@ -11250,7 +12032,9 @@ fn opt_fill_enabled() -> bool {
         if c != 0 {
             return c == 2;
         }
-        let v = std::env::var("RZSTD_OPT_FILL").map(|v| v.trim() != "0").unwrap_or(true);
+        let v = std::env::var("RZSTD_OPT_FILL")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true);
         OPT_FILL_C.store(if v { 2 } else { 1 }, Ordering::Relaxed);
         v
     }
@@ -11283,8 +12067,7 @@ fn opt_fill_rep_max() -> f32 {
     50.0
 }
 #[cfg(feature = "std")]
-static OPT_FILL_REP_C: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
+static OPT_FILL_REP_C: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Longest span the back-fill will walk. Beyond this the jump is a single huge
 /// repeat and its interior is not worth inserting.
@@ -11309,10 +12092,8 @@ fn opt_fill_max() -> usize {
 /// Stride for that back-fill; 1 inserts every skipped position.
 /// GATE 12 @ L19 arms: the opt back-fill's stride and span cap, as atomics so
 /// they can be swept in one process. 0 = unset (use the env/default path).
-static OPT_FILL_S_ARM: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-static OPT_FILL_MAX_ARM: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static OPT_FILL_S_ARM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static OPT_FILL_MAX_ARM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Bench hook: opt back-fill stride (0 restores the default of 1).
 pub fn set_opt_fill_stride_arm(v: usize) {
@@ -11325,8 +12106,7 @@ pub fn set_opt_fill_max_arm(v: usize) {
 }
 
 /// Positions inserted by the opt back-fill -- the work GATE 12 controls at L19.
-pub static OPT_FILL_INS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static OPT_FILL_INS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Read and clear the opt back-fill insert count.
 pub fn take_opt_fill_ins() -> u64 {
@@ -11388,12 +12168,12 @@ fn find_opt(
     let inf = u32::MAX / 4;
     // T2: take the DP arrays from the frame instead of building 2.63 MiB of
     // them per block. See `MatchTables::opt_price`.
-    let mut price = std::mem::take(&mut tables.opt_price);
-    let mut prev = std::mem::take(&mut tables.opt_prev);
+    let mut price = core::mem::take(&mut tables.opt_price);
+    let mut prev = core::mem::take(&mut tables.opt_prev);
     // off and ml live in ONE u64 (off | ml << 32): one store per edge
     // improvement and one load per parse step instead of two of each, and
     // one scratch array fewer.
-    let mut match_om = std::mem::take(&mut tables.opt_om);
+    let mut match_om = core::mem::take(&mut tables.opt_om);
     reset_to(&mut price, n + 1, inf);
     // The other four arrays are NEVER read before written: every position j
     // in 1..=n is reachable through the literal chain (price[0] = 0 and the
@@ -11494,6 +12274,9 @@ fn find_opt(
     let (mut o_bt_calls, mut o_bt_dry, mut o_bt_len) = (0u64, 0u64, 0u64);
     // GATE 11 @ L19: are there positions the DP never inserts? Two paths skip
     // without calling bt_find_best.
+    // Read only by the `profile` census at the end of this function; without
+    // that feature the three adds below are not compiled at all.
+    #[cfg(feature = "profile")]
     let (mut o_skip_inf, mut o_skip_jump, mut o_skip_jumps) = (0u64, 0u64, 0u64);
     #[cfg(feature = "profile")]
     let o_positions = n as u64;
@@ -11557,7 +12340,10 @@ fn find_opt(
         #[allow(unsafe_code)]
         let pi = *unsafe { price.get_unchecked(i) };
         if pi >= inf {
-            o_skip_inf += 1;
+            #[cfg(feature = "profile")]
+            {
+                o_skip_inf += 1;
+            }
             i += 1;
             continue;
         }
@@ -11606,9 +12392,7 @@ fn find_opt(
             o_rep_probes += 1;
             // The DP's own `i + 8 > n` continue above gives `ip + 8 <=
             // block_end`, which is exactly the finders' `ip <= ilimit`.
-            if let Some(rml) =
-                try_rep1(src, ip, rep1, lowest_rep, block_end, rep_ilimit)
-            {
+            if let Some(rml) = try_rep1(src, ip, rep1, lowest_rep, block_end, rep_ilimit) {
                 o_rep_hits += 1;
                 o_rep_bytes += rml as u64;
                 let j = i + 1 + rml;
@@ -11625,8 +12409,7 @@ fn find_opt(
                         if np < *price.get_unchecked(j) {
                             *price.get_unchecked_mut(j) = np;
                             *prev.get_unchecked_mut(j) = (i + 1) as u32 | OPT_MATCH_BIT;
-                            *match_om.get_unchecked_mut(j) =
-                                rep1 as u64 | ((rml as u64) << 32);
+                            *match_om.get_unchecked_mut(j) = rep1 as u64 | ((rml as u64) << 32);
                         }
                     }
                 }
@@ -11742,8 +12525,11 @@ fn find_opt(
         // every interior position. Positions inside keep `price == inf`, so no
         // path can route through them -- exactly the greedy commitment C makes.
         if bml >= sufficient_len && i + bml <= n {
-            o_skip_jump += bml as u64;
-            o_skip_jumps += 1;
+            #[cfg(feature = "profile")]
+            {
+                o_skip_jump += bml as u64;
+                o_skip_jumps += 1;
+            }
             // GATE 11 BROUGHT TO LIFE AT L19. The DP inserts a position by
             // searching it, so the `sufficient_len` jump leaves the whole span
             // OUT of the tree -- measured, 3,853,451 positions (11.4%) over 675
@@ -11793,14 +12579,22 @@ fn find_opt(
                 g_on && tables.opt_rep_meas >= 2 && tables.opt_rep_peak < g_rep
             };
             if gate_ok {
-                let step = if hoisted { fill_step } else { opt_fill_stride() };
+                let step = if hoisted {
+                    fill_step
+                } else {
+                    opt_fill_stride()
+                };
                 // Cap the span. text-32m and versions-16m hold 93% of ALL jumped
                 // positions (3.58M of 3.85M) and contribute -15 and +54 bytes;
                 // dickens, samba, nci, ooffice and xml hold 6% and contribute
                 // -381. An enormous jump means one huge repeat, and filling its
                 // interior buys nothing -- those positions are reachable through
                 // the repeat itself.
-                let span = bml.min(if hoisted { fill_span_max } else { opt_fill_max() });
+                let span = bml.min(if hoisted {
+                    fill_span_max
+                } else {
+                    opt_fill_max()
+                });
                 // W14: the fill walked POSITIONS but addressed BYTES, so each
                 // inserted position paid `block_start + q` and `qp + 8 >
                 // block_end` -- two adds and a compare for a walk whose stride
@@ -11847,7 +12641,7 @@ fn find_opt(
     // it on the frame and let it converge on its own high-water mark.
     // (start, off, ml, matched): 16 bytes -- start fits u32 (positions
     // < 2^24), and the bool packs into the 4-aligned layout. Was 24.
-    let mut ops: Vec<(u32, u32, u32)> = std::mem::take(&mut tables.opt_ops);
+    let mut ops: Vec<(u32, u32, u32)> = core::mem::take(&mut tables.opt_ops);
     ops.clear();
     // The reuse above leaves exactly ONE growth ladder per frame: the first
     // block still climbs from nothing to its high-water mark. It is removable,
@@ -11977,7 +12771,7 @@ fn find_opt(
     // GATE 6/13 for find_opt, at last: every other finder takes its output
     // buffers from the frame; this one allocated BOTH fresh per block.
     // Capacity stays EXACT (ops is built, so the counts are known).
-    let mut seqs = std::mem::take(&mut tables.seq_scratch);
+    let mut seqs = core::mem::take(&mut tables.seq_scratch);
     seqs.clear();
     // W4: `nmatched` was a counter incremented once per match beside the
     // push that already records exactly those steps -- `ops.len()` IS the
@@ -11986,7 +12780,7 @@ fn find_opt(
     if seqs.capacity() < nmatched + 1 {
         seqs = Vec::with_capacity(nmatched + 1);
     }
-    let mut lits = std::mem::take(&mut tables.lit_scratch);
+    let mut lits = core::mem::take(&mut tables.lit_scratch);
     lits.clear();
     if lits.capacity() < block_len + LIT_PUSH_WIDTH_MAX {
         lits = Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX);
@@ -11995,7 +12789,9 @@ fn find_opt(
     // widen when mid_share > short_share * (fast32 - fast16) / (slow - fast32).
     let opt_w = {
         let n = nmatched.max(1) as f32;
-        let (sh, md) = (w_short as f32 / n, w_mid as f32 / n);
+        // ONE division, not two -- same denominator.
+        let inv = 1.0 / n;
+        let (sh, md) = (w_short as f32 * inv, w_mid as f32 * inv);
         if sh < lit_short_min() {
             0
         } else if md > sh * WIDEN_RATIO {
@@ -12053,7 +12849,14 @@ fn find_opt(
         OPT_SKIP_JUMPS.fetch_add(o_skip_jumps, Relaxed);
     }
     #[cfg(not(feature = "profile"))]
-    let _ = (o_rep_probes, o_rep_hits, o_rep_bytes, o_bt_calls, o_bt_dry, o_bt_len);
+    let _ = (
+        o_rep_probes,
+        o_rep_hits,
+        o_rep_bytes,
+        o_bt_calls,
+        o_bt_dry,
+        o_bt_len,
+    );
     if opt_rep_on && o_rep_probes > 0 {
         let now = o_rep_bytes as f32 / o_rep_probes as f32;
         tables.opt_rep_peak = tables.opt_rep_peak.max(now);
@@ -12083,7 +12886,13 @@ fn find_opt(
         tables.opt_rep_probe - 1
     };
     // Probes reported by `bt_find_best`, which the DP calls per position.
-    note_finder_work(cfg!(feature = "profile"), 0, seqs.len() as u64, &seqs, &lits);
+    note_finder_work(
+        cfg!(feature = "profile"),
+        0,
+        seqs.len() as u64,
+        &seqs,
+        &lits,
+    );
     tables.opt_ops = ops;
     tables.opt_price = price;
     tables.opt_prev = prev;
@@ -12108,7 +12917,14 @@ fn mls_eq(src: &[u8], m: usize, ip: usize, mls: usize, smask: u64) -> bool {
     // CANDIDATE).
     if mls <= 8 {
         debug_assert!(m < ip && ip + 8 <= src.len());
-        debug_assert!(smask == if mls == 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 });
+        debug_assert!(
+            smask
+                == if mls == 8 {
+                    u64::MAX
+                } else {
+                    (1u64 << (8 * mls)) - 1
+                }
+        );
         return (load_u64le(src, m) ^ load_u64le(src, ip)) & smask == 0;
     }
     if load_u32le(src, m) != load_u32le(src, ip) {
@@ -12124,7 +12940,10 @@ static WALK_CONT_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU
 
 /// Bench hook for the walk-continue arm.
 pub fn set_walk_cont_arm(on: bool) {
-    WALK_CONT_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+    WALK_CONT_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 fn walk_cont_enabled() -> bool {
@@ -12168,7 +12987,10 @@ static LAZY_GAIN_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU
 
 /// Bench hook for the offset-priced look-ahead.
 pub fn set_lazy_gain_arm(on: bool) {
-    LAZY_GAIN_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+    LAZY_GAIN_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 fn lazy_gain_enabled() -> bool {
@@ -12196,8 +13018,7 @@ fn lazy_gain(ml: usize, off: usize) -> i64 {
 /// fired on it at any threshold (its seq stream interleaves offsets). The
 /// signal that separates losers from winners is the walk's own accept mix --
 /// see `walk_first_share` on `MatchTables`.
-static WALK_FIRST_ARM: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
+static WALK_FIRST_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Bench hook: the first-find share above which the C-parity walk latches off.
 pub fn set_walk_first_max_arm(v: f32) {
@@ -12236,7 +13057,10 @@ static REP_REPROBE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::Atomi
 
 /// Bench hook for the greedy/lazy rep re-probe.
 pub fn set_rep_reprobe_arm(on: bool) {
-    REP_REPROBE_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+    REP_REPROBE_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 fn rep_reprobe_enabled() -> bool {
@@ -12246,7 +13070,10 @@ fn rep_reprobe_enabled() -> bool {
     // same matches the reopened rep search would, and reopening on
     // rep-hostile blocks trades offset economy for nothing. Arm kept for
     // study.
-    matches!(REP_REPROBE_ARM.load(core::sync::atomic::Ordering::Relaxed), 2)
+    matches!(
+        REP_REPROBE_ARM.load(core::sync::atomic::Ordering::Relaxed),
+        2
+    )
 }
 
 /// CHAIN-LINK TAG (win 5 of the chain-walk arc): pack the hash4 rejection
@@ -12265,7 +13092,10 @@ static CHAIN_TAG_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU
 
 /// Bench hook for the chain-link tag.
 pub fn set_chain_tag_arm(on: bool) {
-    CHAIN_TAG_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+    CHAIN_TAG_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 fn chain_tag_enabled() -> bool {
@@ -12277,11 +13107,18 @@ fn chain_tag_enabled() -> bool {
 /// from the same 8 bytes -- `hash4_tag_mls` and `hash8` each loaded them
 /// separately, an optimizer-mood CSE (the 4a30eb4 rule: own the fold).
 #[inline(always)]
-fn dfast_hash_pair(src: &[u8], pos: usize, dtag_shift: u32, smask: u64, hlog: u32) -> (usize, u8, usize) {
+fn dfast_hash_pair(
+    src: &[u8],
+    pos: usize,
+    dtag_shift: u32,
+    smask: u64,
+    hlog: u32,
+) -> (usize, u8, usize) {
     let v = load_u64le(src, pos);
     let hv4 = (v as u32).wrapping_mul(HASH4_PRIME);
     let tv = (v & smask).wrapping_mul(FAST_HASH_PRIME64);
-    let h8 = (v.wrapping_mul(0xCF1B_BCDC_B7A5_6463) >> (64u32.saturating_sub(hlog.min(32)))) as usize;
+    let h8 =
+        (v.wrapping_mul(0xCF1B_BCDC_B7A5_6463) >> (64u32.saturating_sub(hlog.min(32)))) as usize;
     ((hv4 >> dtag_shift) as usize, (tv ^ (tv >> 29)) as u8, h8)
 }
 
@@ -12307,7 +13144,10 @@ static WCHAIN_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::
 
 /// Bench hook for the wide chain key.
 pub fn set_wide_chain_arm(on: bool) {
-    WCHAIN_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+    WCHAIN_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 fn wide_chain_enabled() -> bool {
@@ -12317,16 +13157,14 @@ fn wide_chain_enabled() -> bool {
     !matches!(WCHAIN_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
 }
 
-static WIDE_FIRST_ARM: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
+static WIDE_FIRST_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Bench hook: the first-find-share bar for the wide-chain latch.
 pub fn set_wide_first_max_arm(v: f32) {
     WIDE_FIRST_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
 }
 
-static WIDE_SPB_ARM: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
+static WIDE_SPB_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Bench hook: the searches-per-byte floor for the latch's second route.
 pub fn set_wide_spb_min_arm(v: f32) {
@@ -12348,16 +13186,20 @@ fn wide_first_max(attempts: usize) -> f32 {
     }
     // Level-scaled like walk_first_max: jsonlog's sustained share at deep
     // attempts sits in (0.60, 0.65) and must stay excluded.
-    if attempts <= 16 { 0.65 } else { 0.60 }
+    if attempts <= 16 {
+        0.65
+    } else {
+        0.60
+    }
 }
 
 /// The sao class is CAPTURED by the latch's second route (searches/byte
 /// >= 0.50: sao 0.66 against every first-heavy loser <= 0.36 -- content
-/// where nearly every position searches has almost no literal+rep economy
-/// for the wide key to disturb). Still unlatched, deliberately: ooffice
-/// (-0.43), osdb (-0.77), mr (-0.69) -- first-heavy winners whose spb sits
-/// AMONG the losers'; no maintained signal separates them, recorded as the
-/// residual.
+/// > where nearly every position searches has almost no literal+rep economy
+/// > for the wide key to disturb). Still unlatched, deliberately: ooffice
+/// > (-0.43), osdb (-0.77), mr (-0.69) -- first-heavy winners whose spb sits
+/// > AMONG the losers'; no maintained signal separates them, recorded as the
+/// > residual.
 ///
 /// The wide-chain LATCH: at a block boundary, once walk_first_share has
 /// been measured (on narrow blocks) and says upgrade-rich, re-seed the
@@ -12441,12 +13283,24 @@ pub fn take_link_tag() -> (u64, u64) {
 #[allow(unsafe_code)]
 fn push_lits_range(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize) {
     debug_assert!(from <= to && to <= src.len());
+    // NO wildcopy here, deliberately. A 16-byte fixed-width copy WAS added to
+    // this function and measured 1,625,446 avoided `memcpy` calls at L9 -- and
+    // then turned out to be a TWIN of `push_literals`' tier 1. The real defect
+    // was that `find_lazy_impl` never routed its per-sequence emits through
+    // `push_literals` at all; fixing that gives L9 the full 16/32/64 tiering
+    // instead of a second copy of tier 1. This helper is now what its name
+    // says: the per-block tail flush, a few hundred calls per corpus.
     lits.extend_from_slice(unsafe { src.get_unchecked(from..to) });
 }
 
 /// Attribute only when the walk RAN and produced enough samples -- a block
 /// that measured nothing must not move the EWMA (the Gate 14 rule).
-fn update_walk_first_share(tables: &mut MatchTables, walked: bool, cls: (u32, u32), attempts: usize) {
+fn update_walk_first_share(
+    tables: &mut MatchTables,
+    walked: bool,
+    cls: (u32, u32),
+    attempts: usize,
+) {
     let n = cls.0 + cls.1;
     if !walked || n < 64 {
         return;
@@ -12554,7 +13408,10 @@ pub static WALK_CONT_UPGRADE: core::sync::atomic::AtomicU64 = core::sync::atomic
 #[cfg(feature = "profile")]
 pub fn take_walk_classes() -> (u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
-    (WALK_CONT_FIRST.swap(0, Relaxed), WALK_CONT_UPGRADE.swap(0, Relaxed))
+    (
+        WALK_CONT_FIRST.swap(0, Relaxed),
+        WALK_CONT_UPGRADE.swap(0, Relaxed),
+    )
 }
 #[cfg(feature = "profile")]
 pub fn take_walk_census() -> (u64, u64) {
@@ -12588,7 +13445,11 @@ fn match_ok(
     // own 8-byte reads are in bounds (m < ip from the order check above).
     if mls <= 8 && ip + 8 <= src.len() {
         debug_assert!(m + 8 <= src.len());
-        let mask = if mls == 8 { u64::MAX } else { (1u64 << (8 * mls)) - 1 };
+        let mask = if mls == 8 {
+            u64::MAX
+        } else {
+            (1u64 << (8 * mls)) - 1
+        };
         return (load_u64le(src, m) ^ load_u64le(src, ip)) & mask == 0;
     }
     match_ok_cold_tail(src, m, ip, mls)
@@ -12607,6 +13468,39 @@ fn match_ok_cold_tail(src: &[u8], m: usize, ip: usize, mls: usize) -> bool {
         return mls == 4 || src[m + 4..m + mls] == src[ip + 4..ip + mls];
     }
     src[m..m + mls] == src[ip..ip + mls]
+}
+
+/// The sub-8 boundary tail of [`count_match`]: under one call in 2000
+/// (`eqwidth`: 99.956% of calls have `max >= 64`).
+///
+/// `#[cold]` + `#[inline(never)]` so its seven-step byte ladder is sunk out of
+/// `count_match`'s straight line instead of padding it. One masked compare
+/// answers this whenever the frame has 8-byte room past `ip`
+/// (`m + 8 <= ip + 8 <= len` via `m <= ip`); the byte loop survives only at
+/// the true frame edge.
+#[cold]
+#[inline(never)]
+fn count_match_sub8(src: &[u8], m: usize, ip: usize, max: usize) -> usize {
+    if ip + 8 <= src.len() {
+        let x = load_u64le(src, m) ^ load_u64le(src, ip);
+        let n = if x == 0 {
+            max
+        } else {
+            ((x.trailing_zeros() as usize) >> 3).min(max)
+        };
+        #[cfg(feature = "profile")]
+        crate::simd::note_eqlen(n);
+        return n;
+    }
+    let a = &src[m..m + max];
+    let b = &src[ip..ip + max];
+    let mut n = 0usize;
+    while n < max && a[n] == b[n] {
+        n += 1;
+    }
+    #[cfg(feature = "profile")]
+    crate::simd::note_eqlen(n);
+    n
 }
 
 /// The per-candidate fast head of `count_match`: the first-word peek fully
@@ -12647,7 +13541,7 @@ fn count_match_fast(src: &[u8], m: usize, ip: usize, limit: usize) -> usize {
     }
 }
 
-fn count_match(src: &[u8], m: usize, ip: usize, limit: usize) -> usize {
+pub(crate) fn count_match(src: &[u8], m: usize, ip: usize, limit: usize) -> usize {
     // Same invariants as `count_match_fast`. They make every min redundant:
     // `len - m > len - ip >= limit - ip`, so max IS `limit - ip`, and the
     // three range guards collapse to `ip >= limit`. The slice constructions
@@ -12667,23 +13561,20 @@ fn count_match(src: &[u8], m: usize, ip: usize, limit: usize) -> usize {
     // (`m + 8 <= ip + 8 <= len` via `m < ip`); the byte loop survives only
     // at the true frame edge.
     if max < 8 {
-        if ip + 8 <= src.len() {
-            let x = load_u64le(src, m) ^ load_u64le(src, ip);
-            let n = if x == 0 { max } else { ((x.trailing_zeros() as usize) >> 3).min(max) };
-            #[cfg(feature = "profile")]
-            crate::simd::note_eqlen(n);
-            return n;
-        }
-        let mut n = 0usize;
-        while n < max && a[n] == b[n] {
-            n += 1;
-        }
-        #[cfg(feature = "profile")]
-        crate::simd::note_eqlen(n);
-        return n;
+        // OUTLINED AND COLD. `max` is the room left in the BLOCK, so it drops
+        // under 8 only at the very last bytes of one: the `eqwidth` counter
+        // reads `max >= 64` on 99.956% of calls, which puts this whole arm --
+        // a masked compare plus a SEVEN-step unrolled byte ladder -- at under
+        // one call in 2000. It was sitting inline in the encoder's hottest
+        // function, which runs once per match CANDIDATE.
+        return count_match_sub8(src, m, ip, max);
     }
     // The slices have PROVEN equal length `max >= 8`; the known-length inner
     // skips the re-min / zero-test / sub-8 re-branch the public entry does.
+    //
+    // These two subslices are NOT removable: passing `(src, m, ip, max)` and
+    // proving the bound inside `simd` measured WORSE (209 -> 244 instructions
+    // in this function) -- see `count_eq_len_ge8`'s doc for the receipt.
     let n = crate::simd::count_eq_len_ge8(a, b, max);
     #[cfg(feature = "profile")]
     crate::simd::note_eqlen(n);
@@ -12779,7 +13670,6 @@ fn hash8(src: &[u8], ip: usize, hash_log: u32) -> usize {
     let shift = 64u32.saturating_sub(hash_log.min(32));
     (v.wrapping_mul(0xCF1B_BCDC_B7A5_6463) >> shift) as usize
 }
-
 
 #[inline(always)]
 fn hash_mls(src: &[u8], ip: usize, mls: usize, hash_log: u32) -> usize {
@@ -12928,6 +13818,847 @@ fn clamp_reps(mut reps: [u32; 3], content_len: u32) -> [u32; 3] {
         }
     }
     reps
+}
+
+/// Clear every cached env-var arm so a later `std::env::set_var` is observed.
+///
+/// Each arm caches its env read in an atomic on first use -- bricks 49/64/77
+/// removed those reads from hot loops. That makes an IN-PROCESS A/B that flips
+/// an env var read stale: the second arm silently re-measures the first. Only
+/// needed by probes that set env vars mid-process; the shipped paths never do.
+pub fn reset_env_arms() {
+    use core::sync::atomic::Ordering;
+    STEP0_ARM.store(0, Ordering::Relaxed);
+    PIPE_ARM.store(0, Ordering::Relaxed);
+    LAZY_FILL_ENABLED_ARM.store(0, Ordering::Relaxed);
+    FAST_LAZY_ARM.store(0, Ordering::Relaxed);
+    PAIR_GAIN_ARM.store(u32::MAX, Ordering::Relaxed);
+    PAIR_HI_ARM.store(u32::MAX, Ordering::Relaxed);
+}
+
+/// Arm for the `find_dfast` HLOG specialisation, so it can be A/B'd IN-PROCESS
+/// rather than across two binaries (a cross-binary compare buries the kernel
+/// delta under process-start cost). `RZSTD_DFAST_SPEC=0` selects the old
+/// runtime-shift path.
+static DFAST_SPEC_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for in-process ABBA.
+pub fn set_dfast_spec_arm(on: bool) {
+    DFAST_SPEC_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn dfast_spec_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match DFAST_SPEC_ARM.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::env_knob("RZSTD_DFAST_SPEC")
+                .map(|v| v.trim() != "0")
+                .unwrap_or(true);
+            DFAST_SPEC_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// GATE 4 arm: the `find_fast` HLOG/STEP specialisation itself.
+///
+/// With this OFF the shipping configuration falls through to the generic
+/// `go!(false, false, 0, 0, true)` arm -- runtime HLOG, runtime STEP -- which is
+/// the "constant" alternative to the 13-way dispatch. Default ON, so an A/B
+/// setting it to 0 differs from the default and is not a null comparison.
+static FAST_SPEC_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for in-process ABBA.
+pub fn set_fast_spec_arm(on: bool) {
+    FAST_SPEC_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn fast_spec_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match FAST_SPEC_ARM.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::env_knob("RZSTD_FAST_SPEC")
+                .map(|v| v.trim() != "0")
+                .unwrap_or(true);
+            FAST_SPEC_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Which `find_dfast` body actually executed. Probe counts and output bytes are
+/// IDENTICAL between the two, by design -- they examine the same candidates in
+/// the same order -- so neither can show which one ran. These can.
+pub static DFAST_SPEC_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_RUNTIME_CALLS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear both call counters.
+pub fn take_dfast_calls() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        DFAST_SPEC_CALLS.swap(0, Ordering::Relaxed),
+        DFAST_RUNTIME_CALLS.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Calls into `find_fast`'s Gate-4 dispatcher, for reachability proofs.
+pub static FAST_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Calls into `find_opt` (L16+).
+pub static OPT_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear the finder reachability counters: `(find_fast, find_opt)`.
+pub fn take_finder_calls() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        FAST_CALLS.swap(0, Ordering::Relaxed),
+        OPT_CALLS.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Which `bt_find_best` body ran: `(specialised, runtime_fallback)`.
+pub static BT_SPEC_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BT_RUNTIME_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear the bt-path body counters.
+pub fn take_bt_calls() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        BT_SPEC_CALLS.swap(0, Ordering::Relaxed),
+        BT_RUNTIME_CALLS.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// GATE 5 arm for the BT path (L13-L22).
+///
+/// **DEFAULT OFF — the specialisation MEASURED WORSE and was reverted here.**
+///
+/// It was shipped in 727e503 on deterministic instruction counts alone: 214
+/// instructions per call against the runtime arm's 237, and 3 of 4 variable
+/// shifts eliminated. Those numbers are correct and they were the wrong
+/// measure. Twelve monomorphizations are 2,580 instructions of code where there
+/// was 238, and at L19 the binary-tree walk is the hot loop, so I-cache
+/// pressure decides rather than per-call instruction count.
+///
+/// Tested properly -- three independent ABBA runs per corpus, 18 corpora, a
+/// stable sign in all three runs required to count:
+///
+/// ```text
+/// L19   stable-generic 5   stable-spec 0   (nci +3.9..+5.6%, x-ray +5.1..+10.8%)
+/// L13   stable-generic 2   stable-spec 3   -- a wash, not a case for a dispatch
+/// ```
+///
+/// Loses on five corpora at L19 and wins on none, so CONSTANT OFF. Same
+/// precedent as `tag_enabled`: the code stays so the arm can be re-tested, the
+/// default ships the arm that measured better.
+///
+/// The `find_dfast` specialisation is NOT affected -- tested the same way it
+/// came out 6 stable-spec / 0 stable-generic and remains on.
+static BT_SPEC_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for in-process ABBA.
+pub fn set_bt_spec_arm(on: bool) {
+    BT_SPEC_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn bt_spec_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match BT_SPEC_ARM.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::env_knob("RZSTD_BT_SPEC")
+                .map(|v| v.trim() != "0")
+                .unwrap_or(true);
+            BT_SPEC_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// GATE 6 @ L3 arm: C's `_search_next_long` ip+1 long-hash probe in DFast.
+/// Default OFF until measured, so enabling it differs from the default.
+static NEXT_LONG_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for in-process ABBA.
+pub fn set_next_long_arm(on: bool) {
+    NEXT_LONG_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn next_long_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match NEXT_LONG_ARM.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::env_knob("RZSTD_NEXT_LONG")
+                .map(|v| v.trim() != "0")
+                .unwrap_or(true);
+            NEXT_LONG_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// GATE 6 @ L3 dispatch threshold: minimum share of next-long probes that must
+/// have WON on the previous block for the probe to run on this one.
+/// `RZSTD_NEXT_LONG_T` sweeps it.
+fn next_long_min() -> f32 {
+    #[cfg(feature = "profile")]
+    ENVHIT[11].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "std")]
+    {
+        use core::sync::atomic::Ordering;
+        let c = NEXT_LONG_MIN_CACHE.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_NEXT_LONG_T")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.10);
+        NEXT_LONG_MIN_CACHE.store(v.to_bits(), Ordering::Relaxed);
+        v
+    }
+    #[cfg(not(feature = "std"))]
+    0.10
+}
+#[cfg(feature = "std")]
+static NEXT_LONG_MIN_CACHE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// GATE 6 @ L1: pair-search dispatch. Default ON; `RZSTD_PAIR=0` disables.
+static PAIR_ON_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for in-process ABBA.
+pub fn set_pair_on_arm(on: bool) {
+    PAIR_ON_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn pair_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match PAIR_ON_ARM.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::env_knob("RZSTD_PAIR")
+                .map(|v| v.trim() != "0")
+                .unwrap_or(true);
+            PAIR_ON_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Above this previous-block repcode yield the pair search is switched OFF: the
+/// repcode path already holds those matches, so pairing spends probes to reach a
+/// worse parse. `RZSTD_PAIR_T` sweeps it.
+/// 4.72: below this `pair_gain` the PAIR route is net CHEAPER in total search ops.
+///
+/// Counter-intuitive until you read the probe COUNT rather than the rate.
+/// `pair_gain` is bytes-per-probe, and across the corpus it runs INVERSELY to
+/// how often the pair search fires. Forcing route 1 -> 2:
+///
+/// ```text
+///   corpus     pair_gain   d positions      d pair     NET ops
+///   x-ray         0.3674        -15608       11826       -3782   cheaper
+///   sao           0.4404      -1592127      162900    -1429227   cheaper
+///   mozilla       0.6835       -663818      394230     -269588   cheaper
+///   ---------------------------------------------------- 0.71 --
+///   ooffice       0.7406      -1491034     1713353     +222319   costs
+///   incomp-32m    0.8056          -889        3740       +2851   costs
+///   dickens       0.8735      -2193266     2193539        +273   costs
+///   mr            0.9012      -1723724     2132991     +409267   costs
+///   samba         1.5846       -447848      513447      +65599   costs
+/// ```
+///
+/// At low gain the pair search barely fires, so the step-2 position saving is
+/// nearly free; at high gain it fires millions of times and the saving is more
+/// than repaid in probes. **8/8 on the work sign**, including the two corpora
+/// that were not in the set that suggested the threshold.
+///
+/// This makes the gate non-monotonic in `pair_gain` (2 below 0.20 is route 0,
+/// then 2, then 1, then 2 above 1.00) -- correct, because the two route-2
+/// branches are selected for DIFFERENT reasons: this one for cheapness, the
+/// `pair_rate_hi` one for the bytes the search returns.
+#[inline(always)]
+fn pair_gain_lo() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        use core::sync::atomic::Ordering;
+        let c = PAIR_LO_ARM.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_PAIR_LO")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.71);
+        PAIR_LO_ARM.store(v.to_bits(), Ordering::Relaxed);
+        v
+    }
+    #[cfg(not(feature = "std"))]
+    0.71
+}
+
+static PAIR_LO_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Pin `pair_gain_lo`. `f32::NAN` restores the env/default path.
+pub fn set_pair_lo_arm(v: f32) {
+    use core::sync::atomic::Ordering;
+    PAIR_LO_ARM.store(
+        if v.is_nan() { u32::MAX } else { v.to_bits() },
+        Ordering::Relaxed,
+    );
+}
+
+fn pair_rep_max() -> f32 {
+    #[cfg(feature = "profile")]
+    ENVHIT[12].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // ffanat: cached (the tag_min pattern). This is read per BLOCK on the
+    // find_fast path -- an uncached `std::env::var` is 115.6 ns and a String
+    // allocation per read, for a process constant.
+    #[cfg(feature = "std")]
+    {
+        use core::sync::atomic::Ordering;
+        let c = PAIR_T_CACHE.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_PAIR_T")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.7);
+        PAIR_T_CACHE.store(v.to_bits(), Ordering::Relaxed);
+        v
+    }
+    #[cfg(not(feature = "std"))]
+    0.7
+}
+
+static PAIR_T_CACHE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// PROMETHEUS PREREQ: how often is each fitted constant actually READ?
+/// Each of these accessors calls `std::env::var` with no cache -- a
+/// GetEnvironmentVariableW plus a String allocation for a process constant.
+#[cfg(feature = "profile")]
+pub static ENVHIT: [core::sync::atomic::AtomicU64; 14] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Read and clear the fitted-constant read counts.
+#[cfg(feature = "profile")]
+pub fn take_envhits() -> [u64; 14] {
+    let mut o = [0u64; 14];
+    for i in 0..14 {
+        o[i] = ENVHIT[i].swap(0, core::sync::atomic::Ordering::Relaxed);
+    }
+    o
+}
+
+/// Diagnostic counters for Gate 6 candidate variables: how often the pair probe
+/// fires, how often it HITS, and how many bytes those hits cover. Activity vs
+/// outcome -- the campaign's law says the signal must predict the outcome.
+pub static PAIR_PROBES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PAIR_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PAIR_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Split the pair probe by the MAIN probe's slot state -- `m0 == 0` means that
+/// hash bucket has never been written, which is free information already in a
+/// register at the probe site.
+pub static PAIR_M0_EMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PAIR_M0_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PAIR_HIT_EMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PAIR_HIT_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PAIR_BYTES_EMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PAIR_BYTES_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `(probes_empty, probes_live, hits_empty, hits_live, bytes_empty, bytes_live)`
+pub fn take_pair_split() -> (u64, u64, u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        PAIR_M0_EMPTY.swap(0, Relaxed),
+        PAIR_M0_LIVE.swap(0, Relaxed),
+        PAIR_HIT_EMPTY.swap(0, Relaxed),
+        PAIR_HIT_LIVE.swap(0, Relaxed),
+        PAIR_BYTES_EMPTY.swap(0, Relaxed),
+        PAIR_BYTES_LIVE.swap(0, Relaxed),
+    )
+}
+
+pub static MAIN_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear: `(probes, hits, pair_match_bytes, all_match_bytes)`.
+static ROUTE_HIST: [core::sync::atomic::AtomicU64; 3] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+static ROUTE_GAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ROUTE_REP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ROUTE_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+static SIG_GAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SIG_REP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SIG_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SIG_TAG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SIG_REPLEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SIG_NSEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SIG_OPTREP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// EVERY per-block content signal the encoder already maintains, as block means:
+/// `(pair_gain, rep_yield, tag_yield, rep_len_ratio, last_nseq, opt_rep_rate)`.
+///
+/// The campaign's 4.72 law in tool form: before inventing a dispatch signal,
+/// dump the ones already in `MatchTables`. Four invented signals were refuted in
+/// 4.70 while the working one (`pair_gain`) sat in the struct the whole time.
+///
+/// SCOPE: `pair_gain` is maintained ONLY in `find_fast_impl` (L1/L2).
+/// `rep_yield` is maintained in all five finders (L1-L15). Check a signal EXISTS
+/// at the level you are dispatching before reading meaning into its value.
+pub fn take_content_signals() -> (f64, f64, f64, f64, f64, f64) {
+    use core::sync::atomic::Ordering;
+    let n = SIG_N.swap(0, Ordering::Relaxed).max(1) as f64;
+    let g = SIG_GAIN.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n;
+    let y = SIG_REP.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n;
+    let t = SIG_TAG.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n;
+    let r = SIG_REPLEN.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n;
+    let q = SIG_NSEQ.swap(0, Ordering::Relaxed) as f64 / n;
+    let o = SIG_OPTREP.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n;
+    (g, y, t, r, q, o)
+}
+
+/// Per-block route histogram and the mean state that decided it.
+/// Returns `(route0, route1, route2, mean pair_gain, mean rep_yield)`.
+pub fn take_route_hist() -> (u64, u64, u64, f64, f64) {
+    use core::sync::atomic::Ordering;
+    let n = ROUTE_N.swap(0, Ordering::Relaxed).max(1);
+    (
+        ROUTE_HIST[0].swap(0, Ordering::Relaxed),
+        ROUTE_HIST[1].swap(0, Ordering::Relaxed),
+        ROUTE_HIST[2].swap(0, Ordering::Relaxed),
+        ROUTE_GAIN.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n as f64,
+        ROUTE_REP.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n as f64,
+    )
+}
+
+pub fn take_pair_stats() -> (u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        PAIR_PROBES.swap(0, Ordering::Relaxed),
+        PAIR_HITS.swap(0, Ordering::Relaxed),
+        PAIR_BYTES.swap(0, Ordering::Relaxed),
+        MAIN_BYTES.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// GATE 7 arm. Default OFF until measured; `RZSTD_TAG=1` enables.
+static TAG_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for in-process ABBA.
+pub fn set_tag_arm(on: bool) {
+    TAG_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn tag_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match TAG_ARM.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::env_knob("RZSTD_TAG")
+                .map(|v| v.trim() != "0")
+                .unwrap_or(true);
+            TAG_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// GATE 7 dispatch threshold: minimum share of the previous block's candidates
+/// the tag must have rejected for the filter to run. `RZSTD_TAG_T` sweeps.
+/// PROMETHEUS ADJUDICATION: this was MIS-FITTED at 0.50, and cached besides.
+///
+/// The tag is a PURE FILTER -- it cannot hide a match, and 0 false rejects were
+/// measured across the whole board -- so its only axis is WORK. Swept on that
+/// axis at L1 (candidate loads avoided out of 8,248,621 probes):
+///
+///   tag_min 0.00 -> 4,538,058 avoided (55.0%)   <- best
+///           0.25 -> 2,055,500 (24.9%)
+///           0.50 -> 1,859,598 (22.5%)           <- was shipped
+///           0.90 ->   356,859 (4.3%)
+///           1.00 ->    29,487 (0.4%)
+///
+/// Lowering it to 0 more than DOUBLES the loads the filter avoids, for no size
+/// change at all. The threshold was forfeiting benefit for nothing, because
+/// `store_fast` writes the tag UNCONDITIONALLY whenever the array exists -- only
+/// the COMPARE was gated. So a high `tag_min` pays the store and then declines
+/// to use it. That asymmetry is the same one 190ad8b documents from the other
+/// direction.
+///
+/// Also cached: this was one of 19 accessors calling `std::env::var` per read --
+/// 115.6 ns each, ~1,875 reads per 32 MiB pass -- for a process constant.
+static TAG_MIN_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+fn tag_min() -> f32 {
+    #[cfg(feature = "profile")]
+    ENVHIT[13].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "std")]
+    {
+        use core::sync::atomic::Ordering;
+        let c = TAG_MIN_ARM.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_TAG_T")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.0);
+        TAG_MIN_ARM.store(v.to_bits(), Ordering::Relaxed);
+        v
+    }
+    #[cfg(not(feature = "std"))]
+    0.0
+}
+
+/// Consume the counters and return the reject share.
+///
+/// Candidates a tag could reject without loading `src[m]`, and those it cannot:
+/// the share rejected by the 4-byte compare is Gate 7's dispatch input.
+#[inline]
+fn cand_yield((f, t): (u64, u64)) -> f32 {
+    if f + t == 0 {
+        1.0
+    } else {
+        f as f32 / (f + t) as f32
+    }
+}
+
+/// L19-native accounting: tree probes, those too SHORT to use, and those that
+/// could not IMPROVE on the best so far.
+pub static BT_PROBE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BT_SHORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BT_NOGAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `(probes, too_short, no_gain)`
+pub fn take_bt_probe_stats() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        BT_PROBE.swap(0, Ordering::Relaxed),
+        BT_SHORT.swap(0, Ordering::Relaxed),
+        BT_NOGAIN.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// GATE 6 second threshold: minimum share of the previous block covered by pair
+/// matches for the search to run. `RZSTD_PAIR_G` sweeps; 0 disables the term.
+/// Blocks between forced pair re-probes when the gain term has the gate shut.
+const PAIR_PROBE_PERIOD: u32 = 16;
+
+/// Above this exchange rate the pair path is worth its lost pipelining.
+fn pair_rate_hi() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        use core::sync::atomic::Ordering;
+        let c = PAIR_HI_ARM.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_PAIR_HI")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1.0);
+        PAIR_HI_ARM.store(v.to_bits(), Ordering::Relaxed);
+        v
+    }
+    #[cfg(not(feature = "std"))]
+    1.0
+}
+
+static PAIR_HI_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Set the pair-vs-step1 crossover in-process.
+pub fn set_pair_hi_arm(v: f32) {
+    PAIR_HI_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
+}
+
+fn pair_gain_min() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        use core::sync::atomic::Ordering;
+        // Cached as raw bits: this is read once per BLOCK on the shipped path,
+        // and an `env::var` there allocates a String per block for a constant.
+        let c = PAIR_GAIN_ARM.load(Ordering::Relaxed);
+        if c != u32::MAX {
+            return f32::from_bits(c);
+        }
+        let v: f32 = std::env::var("RZSTD_PAIR_G")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.20);
+        PAIR_GAIN_ARM.store(v.to_bits(), Ordering::Relaxed);
+        v
+    }
+    #[cfg(not(feature = "std"))]
+    0.20
+}
+
+static TAG_ALLOC_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// A/B whether the Fast tag array is ALLOCATED at all (and therefore whether
+/// the per-probe tag store happens). Distinct from `set_tag_arm`, which only
+/// controls whether the filter READS it.
+pub fn set_tag_alloc_arm(on: bool) {
+    TAG_ALLOC_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn tag_alloc_enabled() -> bool {
+    TAG_ALLOC_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
+}
+
+static PAIR_GAIN_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Set the Gate 6 earning threshold in-process (A/B without a rebuild).
+pub fn set_pair_gain_arm(v: f32) {
+    PAIR_GAIN_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
+}
+
+/// GATE 6 deep arm: how `find_opt`'s parse-backtrace buffer is sized.
+/// 0/2 = exact (pre-walk the chain), 1 = neither, 3 = blanket `n + 1`.
+static OPT_OPS_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook. 0 = reuse only, 1 = exact pre-walk, 2 = blanket n+1.
+pub fn set_opt_ops_arm(v: u8) {
+    OPT_OPS_ARM.store(v + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn opt_ops_exact() -> bool {
+    matches!(
+        OPT_OPS_ARM.load(core::sync::atomic::Ordering::Relaxed),
+        0 | 2
+    )
+}
+
+fn opt_ops_blanket() -> bool {
+    OPT_OPS_ARM.load(core::sync::atomic::Ordering::Relaxed) == 3
+}
+
+/// GATE 6 @ L1 arm: keep the finder's sequence/literal buffers on the frame
+/// instead of building them fresh per block. Default ON.
+static FINDER_SCRATCH_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for GATE 6 @ L1.
+pub fn set_finder_scratch_arm(on: bool) {
+    FINDER_SCRATCH_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn finder_scratch_enabled() -> bool {
+    !matches!(
+        FINDER_SCRATCH_ARM.load(core::sync::atomic::Ordering::Relaxed),
+        1
+    )
+}
+
+/// T1 arm: give DFast the packed rejection tag that the Fast ladder already
+/// uses. DEFAULT ON -- byte-identical on 18/18 at L3 and 72/72 across the board,
+/// and it strictly removes work: 2,938,472 candidate loads avoided per board
+/// pass (29.8% of non-empty short slots) for no added load, store, or byte of
+/// memory, because the tag rides in the word the finder already touches.
+static DFAST_TAG_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for T1.
+pub fn set_dfast_tag_arm(on: bool) {
+    DFAST_TAG_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn dfast_tag_enabled() -> bool {
+    !matches!(DFAST_TAG_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
+}
+
+/// 1a arm: the LONG-table rejection tag (packed frames only). DEFAULT ON.
+static LONG_TAG_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for 1a.
+pub fn set_long_tag_arm(on: bool) {
+    LONG_TAG_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn long_tag_enabled() -> bool {
+    !matches!(LONG_TAG_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
+}
+
+/// 1a ledger: (nonempty long probes, rejections, FALSE rejections). Three
+/// counters with one meaning each -- see the tag audit's instrument trap.
+#[cfg(feature = "profile")]
+pub static LTAG_NONEMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static LTAG_REJECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static LTAG_FALSE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear the 1a ledger.
+#[cfg(feature = "profile")]
+pub fn take_long_tag() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        LTAG_NONEMPTY.swap(0, Relaxed),
+        LTAG_REJECT.swap(0, Relaxed),
+        LTAG_FALSE.swap(0, Relaxed),
+    )
+}
+
+/// 1a residual: survivors of the 4-byte tag that (failed, passed) acceptance
+/// at the MAIN long consume site. The fail share is the ceiling on what a
+/// stronger tag could still remove.
+#[cfg(feature = "profile")]
+pub static LTAG_SURV_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static LTAG_SURV_WFAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static LTAG_SURV_ACC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// SHORT-table consume-site residual, mirror of the long table's.
+#[cfg(feature = "profile")]
+pub static STAG_SURV_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static STAG_SURV_WFAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static STAG_SURV_ACC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// `(bytes_fail, window_fail, accepted)` for the SHORT consume site.
+#[cfg(feature = "profile")]
+pub fn take_short_tag_residual() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        STAG_SURV_FAIL.swap(0, Relaxed),
+        STAG_SURV_WFAIL.swap(0, Relaxed),
+        STAG_SURV_ACC.swap(0, Relaxed),
+    )
+}
+
+/// `(bytes_fail, window_fail, accepted)` -- only `bytes_fail` paid a load.
+#[cfg(feature = "profile")]
+pub fn take_long_tag_residual() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        LTAG_SURV_FAIL.swap(0, Relaxed),
+        LTAG_SURV_WFAIL.swap(0, Relaxed),
+        LTAG_SURV_ACC.swap(0, Relaxed),
+    )
+}
+
+/// ffanat 5a receipt counters: which representation served each tag compare.
+/// `TAGARR_READS` is a load from a SECOND random cache line; `PACKED_TAG_READS`
+/// reads the byte that arrived with the position.
+#[cfg(feature = "profile")]
+pub static TAGARR_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static PACKED_TAG_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear `(tag-array reads, packed reads)`.
+#[cfg(feature = "profile")]
+pub fn take_tag_reads() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        TAGARR_READS.swap(0, Relaxed),
+        PACKED_TAG_READS.swap(0, Relaxed),
+    )
+}
+
+/// ffanat 5a arm: pack the Fast ladder's rejection tag into the hash slot
+/// (dropping the separate `tags` array). DEFAULT ON; the guard in
+/// `enable_packed_tags` still refuses frames >= 16 MiB.
+static FAST_PACK_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for the packed Fast tag.
+pub fn set_fast_pack_arm(on: bool) {
+    FAST_PACK_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn fast_pack_enabled() -> bool {
+    !matches!(FAST_PACK_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
+}
+
+/// ffanat hash-width census: candidates whose FOUR bytes matched (`cand.1`)
+/// versus matches actually ACCEPTED (`ml >= mls`). The difference is work a
+/// 4-byte hash creates that an `mls`-byte hash (C's `ZSTD_hashPtr`) would not:
+/// every such candidate costs a random `src[m]` load, a compare, and a
+/// `count_match` that dies below `mls`.
+#[cfg(feature = "profile")]
+pub static FF_LAZY_FIRES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static FF_LATCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static FF_CAND4: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static FF_ACCEPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear `(four-byte passes, accepted matches)`.
+#[cfg(feature = "profile")]
+pub fn take_ff_waste() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (FF_CAND4.swap(0, Relaxed), FF_ACCEPT.swap(0, Relaxed))
+}
+
+/// ffanat hash-width arm -- **DEFAULT ON, by explicit campaign decision.**
+/// OFF = the historical 4-byte hash; ON = key the Fast table on `mls` bytes
+/// (C's `ZSTD_hashPtr` design) with the versions protections (switch-latch +
+/// window re-seed + anchor bar on rep-dominated blocks).
+///
+/// Final adjudication, protected: L1 TOTAL -2.49%, HOLDOUT -4.92% (reymont
+/// -10.2%, mr -7.2%, dickens -6.3%); L2 TOTAL -2.82%, versions itself a -8.1%
+/// WIN at L2. The one standing exception: versions-16m at L1 **+6.33%** --
+/// the floor of a six-design refutation ladder (per-block key switch, clear
+/// latch, full probe veto, rep-cold hysteresis, dense re-seed for fast, near
+/// bar), each recorded at its site. The waste receipt: 82.9% -> 0.1% of
+/// candidate passes wasted. Worst-corpus law is waived HERE ONLY, explicitly,
+/// by the campaign owner; `set_fast_hash_arm(false)` restores the old bytes
+/// exactly.
+static FAST_HASH_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for the mls-wide Fast hash.
+pub fn set_fast_hash_arm(on: bool) {
+    FAST_HASH_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn fast_hash_wide_enabled() -> bool {
+    !matches!(FAST_HASH_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
 }
 
 #[cfg(test)]
@@ -13099,8 +14830,9 @@ mod tests {
             match bh.ty {
                 BlockType::Compressed => {
                     let mut lr = Reader::new(payload);
-                    let got_lits = crate::compressed::decode_literals(&mut lr, &mut state)
-                        .unwrap_or_else(|e| panic!("block {block_i} literals: {e:?}"));
+                    let got_lits =
+                        crate::compressed::decode_literals(Vec::new(), &mut lr, &mut state)
+                            .unwrap_or_else(|e| panic!("block {block_i} literals: {e:?}"));
                     let lit_pos = got_lits
                         .iter()
                         .zip(lits.iter())
@@ -13174,7 +14906,7 @@ mod tests {
                     }
                 }
                 BlockType::Raw => {
-                    assert_eq!(&payload[..], &src[off..end], "block {block_i} raw");
+                    assert_eq!(payload, &src[off..end], "block {block_i} raw");
                     decoded.extend_from_slice(payload);
                 }
                 BlockType::Rle => {
@@ -13418,6 +15150,74 @@ mod tests {
             assert!(zst.len() >= 4);
             let got = u32::from_le_bytes(zst[zst.len() - 4..].try_into().unwrap());
             assert_eq!(got, content_checksum(src), "len {}", src.len());
+        }
+    }
+
+    /// D8a gate (inline-execution V1). `Xxh64::update` now routes its bulk
+    /// through the AVX2 hybrid, which consumes whole 256-byte TILES, while the
+    /// hasher itself buffers on a 32-byte STRIPE boundary. Those two boundaries
+    /// must agree for every possible phase between them, so the streaming
+    /// digest is driven at chunk sizes that land on, just under and just over
+    /// each of them -- and compared against the one-shot, which takes a
+    /// different route through the same arithmetic.
+    ///
+    /// This is a FORMAT checksum. A single differing bit is a corrupt frame, so
+    /// the gate is exhaustive over the boundary phases rather than sampled.
+    #[test]
+    fn streaming_xxh64_matches_oneshot_at_every_boundary_phase() {
+        let mut data = Vec::new();
+        for i in 0usize..(3 * 1024 + 37) {
+            data.push((i.wrapping_mul(2654435761) >> 11) as u8);
+        }
+        // 1/7/31/32/33 straddle the stripe boundary, 127/128/129 the scalar
+        // chunk, 255/256/257 the AVX2 tile, 1024 clears several tiles at once.
+        const CHUNKS: &[usize] = &[
+            1, 7, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1024,
+        ];
+        for &len in &[
+            0usize,
+            1,
+            31,
+            32,
+            33,
+            255,
+            256,
+            257,
+            511,
+            512,
+            1000,
+            3072,
+            3 * 1024 + 37,
+        ] {
+            let src = &data[..len];
+            let want = content_checksum(src);
+            for &c in CHUNKS {
+                let mut h = Xxh64::new();
+                for part in src.chunks(c) {
+                    h.update(part);
+                }
+                assert_eq!(
+                    checksum_u32(&h),
+                    want,
+                    "streaming digest diverged: len {len}, chunk {c}"
+                );
+            }
+            // Uneven schedule: a big feed, then a byte, then the rest -- the
+            // case a fixed chunk size cannot produce.
+            for &split in &[1usize, 31, 32, 33, 255, 256, 257] {
+                if split >= len {
+                    continue;
+                }
+                let mut h = Xxh64::new();
+                h.update(&src[..split]);
+                h.update(&src[split..split + 1]);
+                h.update(&src[split + 1..]);
+                assert_eq!(
+                    checksum_u32(&h),
+                    want,
+                    "streaming digest diverged: len {len}, split {split}"
+                );
+            }
         }
     }
 
@@ -14203,9 +16003,16 @@ mod tests {
 
     #[test]
     fn min_gain_matches_c_fast() {
-        assert_eq!(min_gain(128 * 1024, Strategy::Fast), (128 * 1024 >> 6) + 2);
+        assert_eq!(
+            min_gain(128 * 1024, Strategy::Fast),
+            ((128 * 1024) >> 6) + 2
+        );
         assert_eq!(min_gain(100, Strategy::Greedy), (100 >> 6) + 2);
-        assert_eq!(min_gain(100, Strategy::BtUltra), (100 >> 7) + 2);
+        // Written as the formula, not its value: the point of the assert is that
+        // `min_gain` IS `(src >> shift) + 2` at BtUltra's shift of 7.
+        #[allow(clippy::identity_op)]
+        let bt_ultra_100 = (100 >> 7) + 2;
+        assert_eq!(min_gain(100, Strategy::BtUltra), bt_ultra_100);
     }
 
     #[test]
@@ -14255,815 +16062,4 @@ mod tests {
             "skip-on should dump at least as many raw blocks"
         );
     }
-}
-
-/// Clear every cached env-var arm so a later `std::env::set_var` is observed.
-///
-/// Each arm caches its env read in an atomic on first use -- bricks 49/64/77
-/// removed those reads from hot loops. That makes an IN-PROCESS A/B that flips
-/// an env var read stale: the second arm silently re-measures the first. Only
-/// needed by probes that set env vars mid-process; the shipped paths never do.
-pub fn reset_env_arms() {
-    use core::sync::atomic::Ordering;
-    STEP0_ARM.store(0, Ordering::Relaxed);
-    PIPE_ARM.store(0, Ordering::Relaxed);
-    LAZY_FILL_ENABLED_ARM.store(0, Ordering::Relaxed);
-    FAST_LAZY_ARM.store(0, Ordering::Relaxed);
-    PAIR_GAIN_ARM.store(u32::MAX, Ordering::Relaxed);
-    PAIR_HI_ARM.store(u32::MAX, Ordering::Relaxed);
-}
-
-/// Arm for the `find_dfast` HLOG specialisation, so it can be A/B'd IN-PROCESS
-/// rather than across two binaries (a cross-binary compare buries the kernel
-/// delta under process-start cost). `RZSTD_DFAST_SPEC=0` selects the old
-/// runtime-shift path.
-static DFAST_SPEC_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// Bench hook for in-process ABBA.
-pub fn set_dfast_spec_arm(on: bool) {
-    DFAST_SPEC_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
-}
-
-#[inline]
-fn dfast_spec_enabled() -> bool {
-    use core::sync::atomic::Ordering;
-    match DFAST_SPEC_ARM.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = std::env::var("RZSTD_DFAST_SPEC")
-                .map(|v| v.trim() != "0")
-                .unwrap_or(true);
-            DFAST_SPEC_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// GATE 4 arm: the `find_fast` HLOG/STEP specialisation itself.
-///
-/// With this OFF the shipping configuration falls through to the generic
-/// `go!(false, false, 0, 0, true)` arm -- runtime HLOG, runtime STEP -- which is
-/// the "constant" alternative to the 13-way dispatch. Default ON, so an A/B
-/// setting it to 0 differs from the default and is not a null comparison.
-static FAST_SPEC_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// Bench hook for in-process ABBA.
-pub fn set_fast_spec_arm(on: bool) {
-    FAST_SPEC_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
-}
-
-#[inline]
-fn fast_spec_enabled() -> bool {
-    use core::sync::atomic::Ordering;
-    match FAST_SPEC_ARM.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = std::env::var("RZSTD_FAST_SPEC")
-                .map(|v| v.trim() != "0")
-                .unwrap_or(true);
-            FAST_SPEC_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// Which `find_dfast` body actually executed. Probe counts and output bytes are
-/// IDENTICAL between the two, by design -- they examine the same candidates in
-/// the same order -- so neither can show which one ran. These can.
-pub static DFAST_SPEC_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static DFAST_RUNTIME_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Read and clear both call counters.
-pub fn take_dfast_calls() -> (u64, u64) {
-    use core::sync::atomic::Ordering;
-    (
-        DFAST_SPEC_CALLS.swap(0, Ordering::Relaxed),
-        DFAST_RUNTIME_CALLS.swap(0, Ordering::Relaxed),
-    )
-}
-
-/// Calls into `find_fast`'s Gate-4 dispatcher, for reachability proofs.
-pub static FAST_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// Calls into `find_opt` (L16+).
-pub static OPT_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Read and clear the finder reachability counters: `(find_fast, find_opt)`.
-pub fn take_finder_calls() -> (u64, u64) {
-    use core::sync::atomic::Ordering;
-    (
-        FAST_CALLS.swap(0, Ordering::Relaxed),
-        OPT_CALLS.swap(0, Ordering::Relaxed),
-    )
-}
-
-/// Which `bt_find_best` body ran: `(specialised, runtime_fallback)`.
-pub static BT_SPEC_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static BT_RUNTIME_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Read and clear the bt-path body counters.
-pub fn take_bt_calls() -> (u64, u64) {
-    use core::sync::atomic::Ordering;
-    (
-        BT_SPEC_CALLS.swap(0, Ordering::Relaxed),
-        BT_RUNTIME_CALLS.swap(0, Ordering::Relaxed),
-    )
-}
-
-/// GATE 5 arm for the BT path (L13-L22).
-///
-/// **DEFAULT OFF — the specialisation MEASURED WORSE and was reverted here.**
-///
-/// It was shipped in 727e503 on deterministic instruction counts alone: 214
-/// instructions per call against the runtime arm's 237, and 3 of 4 variable
-/// shifts eliminated. Those numbers are correct and they were the wrong
-/// measure. Twelve monomorphizations are 2,580 instructions of code where there
-/// was 238, and at L19 the binary-tree walk is the hot loop, so I-cache
-/// pressure decides rather than per-call instruction count.
-///
-/// Tested properly -- three independent ABBA runs per corpus, 18 corpora, a
-/// stable sign in all three runs required to count:
-///
-/// ```text
-/// L19   stable-generic 5   stable-spec 0   (nci +3.9..+5.6%, x-ray +5.1..+10.8%)
-/// L13   stable-generic 2   stable-spec 3   -- a wash, not a case for a dispatch
-/// ```
-///
-/// Loses on five corpora at L19 and wins on none, so CONSTANT OFF. Same
-/// precedent as `tag_enabled`: the code stays so the arm can be re-tested, the
-/// default ships the arm that measured better.
-///
-/// The `find_dfast` specialisation is NOT affected -- tested the same way it
-/// came out 6 stable-spec / 0 stable-generic and remains on.
-static BT_SPEC_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// Bench hook for in-process ABBA.
-pub fn set_bt_spec_arm(on: bool) {
-    BT_SPEC_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
-}
-
-#[inline]
-fn bt_spec_enabled() -> bool {
-    use core::sync::atomic::Ordering;
-    match BT_SPEC_ARM.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = std::env::var("RZSTD_BT_SPEC")
-                .map(|v| v.trim() != "0")
-                .unwrap_or(true);
-            BT_SPEC_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// GATE 6 @ L3 arm: C's `_search_next_long` ip+1 long-hash probe in DFast.
-/// Default OFF until measured, so enabling it differs from the default.
-static NEXT_LONG_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// Bench hook for in-process ABBA.
-pub fn set_next_long_arm(on: bool) {
-    NEXT_LONG_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
-}
-
-#[inline]
-fn next_long_enabled() -> bool {
-    use core::sync::atomic::Ordering;
-    match NEXT_LONG_ARM.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = std::env::var("RZSTD_NEXT_LONG").map(|v| v.trim() != "0").unwrap_or(true);
-            NEXT_LONG_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// GATE 6 @ L3 dispatch threshold: minimum share of next-long probes that must
-/// have WON on the previous block for the probe to run on this one.
-/// `RZSTD_NEXT_LONG_T` sweeps it.
-fn next_long_min() -> f32 {
-    #[cfg(feature = "profile")]
-    ENVHIT[11].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    #[cfg(feature = "std")]
-    {
-        use core::sync::atomic::Ordering;
-        let c = NEXT_LONG_MIN_CACHE.load(Ordering::Relaxed);
-        if c != u32::MAX {
-            return f32::from_bits(c);
-        }
-        let v: f32 = std::env::var("RZSTD_NEXT_LONG_T")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0.10);
-        NEXT_LONG_MIN_CACHE.store(v.to_bits(), Ordering::Relaxed);
-        v
-    }
-    #[cfg(not(feature = "std"))]
-    0.10
-}
-#[cfg(feature = "std")]
-static NEXT_LONG_MIN_CACHE: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
-
-/// GATE 6 @ L1: pair-search dispatch. Default ON; `RZSTD_PAIR=0` disables.
-static PAIR_ON_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// Bench hook for in-process ABBA.
-pub fn set_pair_on_arm(on: bool) {
-    PAIR_ON_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
-}
-
-#[inline]
-fn pair_enabled() -> bool {
-    use core::sync::atomic::Ordering;
-    match PAIR_ON_ARM.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = std::env::var("RZSTD_PAIR").map(|v| v.trim() != "0").unwrap_or(true);
-            PAIR_ON_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// Above this previous-block repcode yield the pair search is switched OFF: the
-/// repcode path already holds those matches, so pairing spends probes to reach a
-/// worse parse. `RZSTD_PAIR_T` sweeps it.
-/// 4.72: below this `pair_gain` the PAIR route is net CHEAPER in total search ops.
-///
-/// Counter-intuitive until you read the probe COUNT rather than the rate.
-/// `pair_gain` is bytes-per-probe, and across the corpus it runs INVERSELY to
-/// how often the pair search fires. Forcing route 1 -> 2:
-///
-/// ```text
-///   corpus     pair_gain   d positions      d pair     NET ops
-///   x-ray         0.3674        -15608       11826       -3782   cheaper
-///   sao           0.4404      -1592127      162900    -1429227   cheaper
-///   mozilla       0.6835       -663818      394230     -269588   cheaper
-///   ---------------------------------------------------- 0.71 --
-///   ooffice       0.7406      -1491034     1713353     +222319   costs
-///   incomp-32m    0.8056          -889        3740       +2851   costs
-///   dickens       0.8735      -2193266     2193539        +273   costs
-///   mr            0.9012      -1723724     2132991     +409267   costs
-///   samba         1.5846       -447848      513447      +65599   costs
-/// ```
-///
-/// At low gain the pair search barely fires, so the step-2 position saving is
-/// nearly free; at high gain it fires millions of times and the saving is more
-/// than repaid in probes. **8/8 on the work sign**, including the two corpora
-/// that were not in the set that suggested the threshold.
-///
-/// This makes the gate non-monotonic in `pair_gain` (2 below 0.20 is route 0,
-/// then 2, then 1, then 2 above 1.00) -- correct, because the two route-2
-/// branches are selected for DIFFERENT reasons: this one for cheapness, the
-/// `pair_rate_hi` one for the bytes the search returns.
-#[inline(always)]
-fn pair_gain_lo() -> f32 {
-    #[cfg(feature = "std")]
-    {
-        use core::sync::atomic::Ordering;
-        let c = PAIR_LO_ARM.load(Ordering::Relaxed);
-        if c != u32::MAX {
-            return f32::from_bits(c);
-        }
-        let v: f32 = std::env::var("RZSTD_PAIR_LO")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0.71);
-        PAIR_LO_ARM.store(v.to_bits(), Ordering::Relaxed);
-        v
-    }
-    #[cfg(not(feature = "std"))]
-    0.71
-}
-
-static PAIR_LO_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
-
-/// Pin `pair_gain_lo`. `f32::NAN` restores the env/default path.
-pub fn set_pair_lo_arm(v: f32) {
-    use core::sync::atomic::Ordering;
-    PAIR_LO_ARM.store(if v.is_nan() { u32::MAX } else { v.to_bits() }, Ordering::Relaxed);
-}
-
-fn pair_rep_max() -> f32 {
-    #[cfg(feature = "profile")]
-    ENVHIT[12].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    // ffanat: cached (the tag_min pattern). This is read per BLOCK on the
-    // find_fast path -- an uncached `std::env::var` is 115.6 ns and a String
-    // allocation per read, for a process constant.
-    #[cfg(feature = "std")]
-    {
-        use core::sync::atomic::Ordering;
-        let c = PAIR_T_CACHE.load(Ordering::Relaxed);
-        if c != u32::MAX {
-            return f32::from_bits(c);
-        }
-        let v: f32 = std::env::var("RZSTD_PAIR_T")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0.7);
-        PAIR_T_CACHE.store(v.to_bits(), Ordering::Relaxed);
-        v
-    }
-    #[cfg(not(feature = "std"))]
-    0.7
-}
-
-static PAIR_T_CACHE: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
-
-/// PROMETHEUS PREREQ: how often is each fitted constant actually READ?
-/// Each of these accessors calls `std::env::var` with no cache -- a
-/// GetEnvironmentVariableW plus a String allocation for a process constant.
-#[cfg(feature = "profile")]
-pub static ENVHIT: [core::sync::atomic::AtomicU64; 14] = [
-    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
-];
-
-/// Read and clear the fitted-constant read counts.
-#[cfg(feature = "profile")]
-pub fn take_envhits() -> [u64; 14] {
-    let mut o = [0u64; 14];
-    for i in 0..14 { o[i] = ENVHIT[i].swap(0, core::sync::atomic::Ordering::Relaxed); }
-    o
-}
-
-/// Diagnostic counters for Gate 6 candidate variables: how often the pair probe
-/// fires, how often it HITS, and how many bytes those hits cover. Activity vs
-/// outcome -- the campaign's law says the signal must predict the outcome.
-pub static PAIR_PROBES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static PAIR_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static PAIR_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// Split the pair probe by the MAIN probe's slot state -- `m0 == 0` means that
-/// hash bucket has never been written, which is free information already in a
-/// register at the probe site.
-pub static PAIR_M0_EMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static PAIR_M0_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static PAIR_HIT_EMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static PAIR_HIT_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static PAIR_BYTES_EMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static PAIR_BYTES_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// `(probes_empty, probes_live, hits_empty, hits_live, bytes_empty, bytes_live)`
-pub fn take_pair_split() -> (u64, u64, u64, u64, u64, u64) {
-    use core::sync::atomic::Ordering::Relaxed;
-    (
-        PAIR_M0_EMPTY.swap(0, Relaxed),
-        PAIR_M0_LIVE.swap(0, Relaxed),
-        PAIR_HIT_EMPTY.swap(0, Relaxed),
-        PAIR_HIT_LIVE.swap(0, Relaxed),
-        PAIR_BYTES_EMPTY.swap(0, Relaxed),
-        PAIR_BYTES_LIVE.swap(0, Relaxed),
-    )
-}
-
-pub static MAIN_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Read and clear: `(probes, hits, pair_match_bytes, all_match_bytes)`.
-static ROUTE_HIST: [core::sync::atomic::AtomicU64; 3] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-];
-static ROUTE_GAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static ROUTE_REP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static ROUTE_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-static SIG_GAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static SIG_REP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static SIG_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static SIG_TAG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static SIG_REPLEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static SIG_NSEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static SIG_OPTREP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// EVERY per-block content signal the encoder already maintains, as block means:
-/// `(pair_gain, rep_yield, tag_yield, rep_len_ratio, last_nseq, opt_rep_rate)`.
-///
-/// The campaign's 4.72 law in tool form: before inventing a dispatch signal,
-/// dump the ones already in `MatchTables`. Four invented signals were refuted in
-/// 4.70 while the working one (`pair_gain`) sat in the struct the whole time.
-///
-/// SCOPE: `pair_gain` is maintained ONLY in `find_fast_impl` (L1/L2).
-/// `rep_yield` is maintained in all five finders (L1-L15). Check a signal EXISTS
-/// at the level you are dispatching before reading meaning into its value.
-pub fn take_content_signals() -> (f64, f64, f64, f64, f64, f64) {
-    use core::sync::atomic::Ordering;
-    let n = SIG_N.swap(0, Ordering::Relaxed).max(1) as f64;
-    let g = SIG_GAIN.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n;
-    let y = SIG_REP.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n;
-    let t = SIG_TAG.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n;
-    let r = SIG_REPLEN.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n;
-    let q = SIG_NSEQ.swap(0, Ordering::Relaxed) as f64 / n;
-    let o = SIG_OPTREP.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n;
-    (g, y, t, r, q, o)
-}
-
-/// Per-block route histogram and the mean state that decided it.
-/// Returns `(route0, route1, route2, mean pair_gain, mean rep_yield)`.
-pub fn take_route_hist() -> (u64, u64, u64, f64, f64) {
-    use core::sync::atomic::Ordering;
-    let n = ROUTE_N.swap(0, Ordering::Relaxed).max(1);
-    (
-        ROUTE_HIST[0].swap(0, Ordering::Relaxed),
-        ROUTE_HIST[1].swap(0, Ordering::Relaxed),
-        ROUTE_HIST[2].swap(0, Ordering::Relaxed),
-        ROUTE_GAIN.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n as f64,
-        ROUTE_REP.swap(0, Ordering::Relaxed) as f64 / 1000.0 / n as f64,
-    )
-}
-
-pub fn take_pair_stats() -> (u64, u64, u64, u64) {
-    use core::sync::atomic::Ordering;
-    (
-        PAIR_PROBES.swap(0, Ordering::Relaxed),
-        PAIR_HITS.swap(0, Ordering::Relaxed),
-        PAIR_BYTES.swap(0, Ordering::Relaxed),
-        MAIN_BYTES.swap(0, Ordering::Relaxed),
-    )
-}
-
-/// GATE 7 arm. Default OFF until measured; `RZSTD_TAG=1` enables.
-static TAG_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// Bench hook for in-process ABBA.
-pub fn set_tag_arm(on: bool) {
-    TAG_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
-}
-
-#[inline]
-fn tag_enabled() -> bool {
-    use core::sync::atomic::Ordering;
-    match TAG_ARM.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = std::env::var("RZSTD_TAG").map(|v| v.trim() != "0").unwrap_or(true);
-            TAG_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// GATE 7 dispatch threshold: minimum share of the previous block's candidates
-/// the tag must have rejected for the filter to run. `RZSTD_TAG_T` sweeps.
-/// PROMETHEUS ADJUDICATION: this was MIS-FITTED at 0.50, and cached besides.
-///
-/// The tag is a PURE FILTER -- it cannot hide a match, and 0 false rejects were
-/// measured across the whole board -- so its only axis is WORK. Swept on that
-/// axis at L1 (candidate loads avoided out of 8,248,621 probes):
-///
-///   tag_min 0.00 -> 4,538,058 avoided (55.0%)   <- best
-///           0.25 -> 2,055,500 (24.9%)
-///           0.50 -> 1,859,598 (22.5%)           <- was shipped
-///           0.90 ->   356,859 (4.3%)
-///           1.00 ->    29,487 (0.4%)
-///
-/// Lowering it to 0 more than DOUBLES the loads the filter avoids, for no size
-/// change at all. The threshold was forfeiting benefit for nothing, because
-/// `store_fast` writes the tag UNCONDITIONALLY whenever the array exists -- only
-/// the COMPARE was gated. So a high `tag_min` pays the store and then declines
-/// to use it. That asymmetry is the same one 190ad8b documents from the other
-/// direction.
-///
-/// Also cached: this was one of 19 accessors calling `std::env::var` per read --
-/// 115.6 ns each, ~1,875 reads per 32 MiB pass -- for a process constant.
-static TAG_MIN_ARM: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
-
-fn tag_min() -> f32 {
-    #[cfg(feature = "profile")]
-    ENVHIT[13].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    #[cfg(feature = "std")]
-    {
-        use core::sync::atomic::Ordering;
-        let c = TAG_MIN_ARM.load(Ordering::Relaxed);
-        if c != u32::MAX {
-            return f32::from_bits(c);
-        }
-        let v: f32 = std::env::var("RZSTD_TAG_T")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0.0);
-        TAG_MIN_ARM.store(v.to_bits(), Ordering::Relaxed);
-        v
-    }
-    #[cfg(not(feature = "std"))]
-    0.0
-}
-
-/// Candidates a tag could reject without loading `src[m]`, and those it cannot.
-
-/// Consume the counters and return the reject share.
-/// Share of candidates rejected by the 4-byte compare -- Gate 7's dispatch input.
-#[inline]
-fn cand_yield((f, t): (u64, u64)) -> f32 {
-    if f + t == 0 {
-        1.0
-    } else {
-        f as f32 / (f + t) as f32
-    }
-}
-
-/// L19-native accounting: tree probes, those too SHORT to use, and those that
-/// could not IMPROVE on the best so far.
-pub static BT_PROBE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static BT_SHORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static BT_NOGAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// `(probes, too_short, no_gain)`
-pub fn take_bt_probe_stats() -> (u64, u64, u64) {
-    use core::sync::atomic::Ordering;
-    (
-        BT_PROBE.swap(0, Ordering::Relaxed),
-        BT_SHORT.swap(0, Ordering::Relaxed),
-        BT_NOGAIN.swap(0, Ordering::Relaxed),
-    )
-}
-
-/// GATE 6 second threshold: minimum share of the previous block covered by pair
-/// matches for the search to run. `RZSTD_PAIR_G` sweeps; 0 disables the term.
-/// Blocks between forced pair re-probes when the gain term has the gate shut.
-const PAIR_PROBE_PERIOD: u32 = 16;
-
-/// Above this exchange rate the pair path is worth its lost pipelining.
-fn pair_rate_hi() -> f32 {
-    #[cfg(feature = "std")]
-    {
-        use core::sync::atomic::Ordering;
-        let c = PAIR_HI_ARM.load(Ordering::Relaxed);
-        if c != u32::MAX {
-            return f32::from_bits(c);
-        }
-        let v: f32 = std::env::var("RZSTD_PAIR_HI")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(1.0);
-        PAIR_HI_ARM.store(v.to_bits(), Ordering::Relaxed);
-        v
-    }
-    #[cfg(not(feature = "std"))]
-    1.0
-}
-
-static PAIR_HI_ARM: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
-
-/// Set the pair-vs-step1 crossover in-process.
-pub fn set_pair_hi_arm(v: f32) {
-    PAIR_HI_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
-}
-
-fn pair_gain_min() -> f32 {
-    #[cfg(feature = "std")]
-    {
-        use core::sync::atomic::Ordering;
-        // Cached as raw bits: this is read once per BLOCK on the shipped path,
-        // and an `env::var` there allocates a String per block for a constant.
-        let c = PAIR_GAIN_ARM.load(Ordering::Relaxed);
-        if c != u32::MAX {
-            return f32::from_bits(c);
-        }
-        let v: f32 = std::env::var("RZSTD_PAIR_G")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0.20);
-        PAIR_GAIN_ARM.store(v.to_bits(), Ordering::Relaxed);
-        v
-    }
-    #[cfg(not(feature = "std"))]
-    0.20
-}
-
-static TAG_ALLOC_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// A/B whether the Fast tag array is ALLOCATED at all (and therefore whether
-/// the per-probe tag store happens). Distinct from `set_tag_arm`, which only
-/// controls whether the filter READS it.
-pub fn set_tag_alloc_arm(on: bool) {
-    TAG_ALLOC_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
-}
-
-#[inline]
-fn tag_alloc_enabled() -> bool {
-    match TAG_ALLOC_ARM.load(core::sync::atomic::Ordering::Relaxed) {
-        1 => false,
-        _ => true,
-    }
-}
-
-static PAIR_GAIN_ARM: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
-
-/// Set the Gate 6 earning threshold in-process (A/B without a rebuild).
-pub fn set_pair_gain_arm(v: f32) {
-    PAIR_GAIN_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
-}
-
-/// GATE 6 deep arm: how `find_opt`'s parse-backtrace buffer is sized.
-/// 0/2 = exact (pre-walk the chain), 1 = neither, 3 = blanket `n + 1`.
-static OPT_OPS_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// Bench hook. 0 = reuse only, 1 = exact pre-walk, 2 = blanket n+1.
-pub fn set_opt_ops_arm(v: u8) {
-    OPT_OPS_ARM.store(v + 1, core::sync::atomic::Ordering::Relaxed);
-}
-
-fn opt_ops_exact() -> bool {
-    matches!(OPT_OPS_ARM.load(core::sync::atomic::Ordering::Relaxed), 0 | 2)
-}
-
-fn opt_ops_blanket() -> bool {
-    OPT_OPS_ARM.load(core::sync::atomic::Ordering::Relaxed) == 3
-}
-
-
-
-/// GATE 6 @ L1 arm: keep the finder's sequence/literal buffers on the frame
-/// instead of building them fresh per block. Default ON.
-static FINDER_SCRATCH_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// Bench hook for GATE 6 @ L1.
-pub fn set_finder_scratch_arm(on: bool) {
-    FINDER_SCRATCH_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
-}
-
-fn finder_scratch_enabled() -> bool {
-    !matches!(FINDER_SCRATCH_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
-}
-
-
-/// T1 arm: give DFast the packed rejection tag that the Fast ladder already
-/// uses. DEFAULT ON -- byte-identical on 18/18 at L3 and 72/72 across the board,
-/// and it strictly removes work: 2,938,472 candidate loads avoided per board
-/// pass (29.8% of non-empty short slots) for no added load, store, or byte of
-/// memory, because the tag rides in the word the finder already touches.
-static DFAST_TAG_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// Bench hook for T1.
-pub fn set_dfast_tag_arm(on: bool) {
-    DFAST_TAG_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
-}
-
-fn dfast_tag_enabled() -> bool {
-    !matches!(DFAST_TAG_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
-}
-
-/// 1a arm: the LONG-table rejection tag (packed frames only). DEFAULT ON.
-static LONG_TAG_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// Bench hook for 1a.
-pub fn set_long_tag_arm(on: bool) {
-    LONG_TAG_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
-}
-
-fn long_tag_enabled() -> bool {
-    !matches!(LONG_TAG_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
-}
-
-/// 1a ledger: (nonempty long probes, rejections, FALSE rejections). Three
-/// counters with one meaning each -- see the tag audit's instrument trap.
-#[cfg(feature = "profile")]
-pub static LTAG_NONEMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "profile")]
-pub static LTAG_REJECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "profile")]
-pub static LTAG_FALSE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Read and clear the 1a ledger.
-#[cfg(feature = "profile")]
-pub fn take_long_tag() -> (u64, u64, u64) {
-    use core::sync::atomic::Ordering::Relaxed;
-    (
-        LTAG_NONEMPTY.swap(0, Relaxed),
-        LTAG_REJECT.swap(0, Relaxed),
-        LTAG_FALSE.swap(0, Relaxed),
-    )
-}
-
-/// 1a residual: survivors of the 4-byte tag that (failed, passed) acceptance
-/// at the MAIN long consume site. The fail share is the ceiling on what a
-/// stronger tag could still remove.
-#[cfg(feature = "profile")]
-pub static LTAG_SURV_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "profile")]
-pub static LTAG_SURV_WFAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "profile")]
-pub static LTAG_SURV_ACC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// SHORT-table consume-site residual, mirror of the long table's.
-#[cfg(feature = "profile")]
-pub static STAG_SURV_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "profile")]
-pub static STAG_SURV_WFAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "profile")]
-pub static STAG_SURV_ACC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// `(bytes_fail, window_fail, accepted)` for the SHORT consume site.
-#[cfg(feature = "profile")]
-pub fn take_short_tag_residual() -> (u64, u64, u64) {
-    use core::sync::atomic::Ordering::Relaxed;
-    (
-        STAG_SURV_FAIL.swap(0, Relaxed),
-        STAG_SURV_WFAIL.swap(0, Relaxed),
-        STAG_SURV_ACC.swap(0, Relaxed),
-    )
-}
-
-/// `(bytes_fail, window_fail, accepted)` -- only `bytes_fail` paid a load.
-#[cfg(feature = "profile")]
-pub fn take_long_tag_residual() -> (u64, u64, u64) {
-    use core::sync::atomic::Ordering::Relaxed;
-    (
-        LTAG_SURV_FAIL.swap(0, Relaxed),
-        LTAG_SURV_WFAIL.swap(0, Relaxed),
-        LTAG_SURV_ACC.swap(0, Relaxed),
-    )
-}
-
-
-/// ffanat 5a receipt counters: which representation served each tag compare.
-/// `TAGARR_READS` is a load from a SECOND random cache line; `PACKED_TAG_READS`
-/// reads the byte that arrived with the position.
-#[cfg(feature = "profile")]
-pub static TAGARR_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "profile")]
-pub static PACKED_TAG_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Read and clear `(tag-array reads, packed reads)`.
-#[cfg(feature = "profile")]
-pub fn take_tag_reads() -> (u64, u64) {
-    use core::sync::atomic::Ordering::Relaxed;
-    (TAGARR_READS.swap(0, Relaxed), PACKED_TAG_READS.swap(0, Relaxed))
-}
-
-/// ffanat 5a arm: pack the Fast ladder's rejection tag into the hash slot
-/// (dropping the separate `tags` array). DEFAULT ON; the guard in
-/// `enable_packed_tags` still refuses frames >= 16 MiB.
-static FAST_PACK_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// Bench hook for the packed Fast tag.
-pub fn set_fast_pack_arm(on: bool) {
-    FAST_PACK_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
-}
-
-fn fast_pack_enabled() -> bool {
-    !matches!(FAST_PACK_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
-}
-
-
-/// ffanat hash-width census: candidates whose FOUR bytes matched (`cand.1`)
-/// versus matches actually ACCEPTED (`ml >= mls`). The difference is work a
-/// 4-byte hash creates that an `mls`-byte hash (C's `ZSTD_hashPtr`) would not:
-/// every such candidate costs a random `src[m]` load, a compare, and a
-/// `count_match` that dies below `mls`.
-#[cfg(feature = "profile")]
-pub static FF_LAZY_FIRES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "profile")]
-pub static FF_LATCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "profile")]
-pub static FF_CAND4: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "profile")]
-pub static FF_ACCEPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Read and clear `(four-byte passes, accepted matches)`.
-#[cfg(feature = "profile")]
-pub fn take_ff_waste() -> (u64, u64) {
-    use core::sync::atomic::Ordering::Relaxed;
-    (FF_CAND4.swap(0, Relaxed), FF_ACCEPT.swap(0, Relaxed))
-}
-
-
-/// ffanat hash-width arm -- **DEFAULT ON, by explicit campaign decision.**
-/// OFF = the historical 4-byte hash; ON = key the Fast table on `mls` bytes
-/// (C's `ZSTD_hashPtr` design) with the versions protections (switch-latch +
-/// window re-seed + anchor bar on rep-dominated blocks).
-///
-/// Final adjudication, protected: L1 TOTAL -2.49%, HOLDOUT -4.92% (reymont
-/// -10.2%, mr -7.2%, dickens -6.3%); L2 TOTAL -2.82%, versions itself a -8.1%
-/// WIN at L2. The one standing exception: versions-16m at L1 **+6.33%** --
-/// the floor of a six-design refutation ladder (per-block key switch, clear
-/// latch, full probe veto, rep-cold hysteresis, dense re-seed for fast, near
-/// bar), each recorded at its site. The waste receipt: 82.9% -> 0.1% of
-/// candidate passes wasted. Worst-corpus law is waived HERE ONLY, explicitly,
-/// by the campaign owner; `set_fast_hash_arm(false)` restores the old bytes
-/// exactly.
-static FAST_HASH_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// Bench hook for the mls-wide Fast hash.
-pub fn set_fast_hash_arm(on: bool) {
-    FAST_HASH_ARM.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
-}
-
-fn fast_hash_wide_enabled() -> bool {
-    !matches!(FAST_HASH_ARM.load(core::sync::atomic::Ordering::Relaxed), 1)
 }

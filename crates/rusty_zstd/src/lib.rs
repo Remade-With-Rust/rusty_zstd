@@ -1,13 +1,53 @@
 //! Pure-Rust Zstandard (RFC 8878) codec.
 //!
-//! M6: multi-thread (`-T#` / job size / overlap) and CLI completeness, on top of
-//! M5 LDM/seekable, M4 dictionaries, and M3's full level/strategy range.
-
+//! The crate README is the module documentation, so its examples are compiled
+//! and run by `cargo test --doc` -- an install guide that cannot go stale.
+#![doc = include_str!("../README.md")]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]
+// Under `no_std` the runtime ISA dispatch and every env knob compile out -- both
+// need `std` -- which strands the caches, `*_on()` predicates and SIMD entry
+// points they are the only callers of. They are live in every `std`
+// configuration; see `env_knob` below.
+#![cfg_attr(
+    not(feature = "std"),
+    allow(dead_code, unused_variables, unused_imports)
+)]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
+
+// The supported floor is `no_std + alloc` (docs/plans/rusty-zstd-mission.md
+// §3.6: "Core decode + one-shot encode: no_std + alloc"). Core-only is NOT a
+// configuration this crate has ever built in -- every entry point returns or
+// fills a `Vec`. Say so in one line instead of emitting 64 confusing errors
+// about `Vec` and missing modules.
+#[cfg(not(feature = "alloc"))]
+compile_error!(
+    "rusty_zstd requires the `alloc` feature (implied by `std`). \
+     The minimum supported configuration is `--no-default-features --features alloc`."
+);
+
+/// `std::env::var` where there is a `std`, `Err(())` where there is not.
+///
+/// Every env knob in this crate is a BENCH ARM with a shipping default, and
+/// `no_std + alloc` is a supported target with no `std::env` -- so 20 of them
+/// were hard build errors there. Routing them all through one shim keeps the
+/// call sites unchanged, keeps the knobs working under `std`, and stops the
+/// next knob anyone adds from breaking the no_std build again.
+#[cfg(all(feature = "alloc", feature = "std"))]
+#[inline]
+pub(crate) fn env_knob(name: &str) -> Result<alloc::string::String, ()> {
+    std::env::var(name).map_err(|_| ())
+}
+
+/// No-std twin: every knob reads as unset, so every call site takes its
+/// shipping default.
+#[cfg(all(feature = "alloc", not(feature = "std")))]
+#[inline]
+pub(crate) fn env_knob(_name: &str) -> Result<alloc::string::String, ()> {
+    Err(())
+}
 
 mod bit;
 mod block;
@@ -33,6 +73,8 @@ mod params;
 mod prof;
 mod reader;
 #[cfg(feature = "alloc")]
+mod scratch;
+#[cfg(feature = "alloc")]
 mod seekable;
 /// Tiny documented `unsafe` island: runtime-dispatched AVX2/NEON kernels.
 /// Callers stay safe. Scalar twins remain the oracle and the fallback.
@@ -45,9 +87,13 @@ mod train;
 mod xxh64;
 pub use xxh64::xxh64;
 
-pub use compressed::{set_litcopy_arm, set_lut_arm, set_matchcopy_arm, set_seqcheck_arm};
+// ---------------------------------------------------------------------------
+// Public API -- the codec surface. Everything below this block is the
+// product; everything in the `#[doc(hidden)]` block at the bottom of this file
+// is campaign instrumentation and is NOT part of the semver contract.
+// ---------------------------------------------------------------------------
 
-pub use decode::{content_size, set_ck_stream_arm, set_ck_fuse_arm, decompress_with, find_frame_compressed_size, DecompressOptions};
+pub use decode::{content_size, decompress_with, find_frame_compressed_size, DecompressOptions};
 pub use error::Error;
 pub use frame::{
     get_frame_header, FrameHeader, FrameKind, BLOCKSIZE_MAX, DEFAULT_WINDOW_MAX, MAGIC,
@@ -56,68 +102,19 @@ pub use frame::{
 
 #[cfg(feature = "alloc")]
 pub use decode::{
-    decompress, decompress_using_dict, decompress_using_dict_with, decompress_using_prefix,
-    decompress_into, decompress_into_with, decompress_using_prefix_with, frame_block_census,
-    inspect_frames, BlockCensus, ListedFrame,
+    decompress, decompress_into, decompress_into_with, decompress_using_dict,
+    decompress_using_dict_with, decompress_using_prefix, decompress_using_prefix_with,
+    inspect_frames, ListedFrame,
 };
 #[cfg(feature = "alloc")]
 pub use dict::{
     public_dict_id, Dictionary, DICT_ID_PUBLIC_MAX, DICT_ID_PUBLIC_MIN, MAGIC_DICTIONARY,
 };
 #[cfg(feature = "alloc")]
-#[cfg(feature = "profile")]
-pub use simd::{set_eqlen_arm, take_eqlen_stats, take_eq_ops, bench_eq_avx2, bench_eq_words};
-pub use compressed::set_seqloop_avx2_arm;
-pub use encode::set_fast_pack_arm;
-pub use encode::set_fast_hash_arm;
-#[cfg(feature = "profile")]
-pub use encode::take_envhits;
-#[cfg(feature = "profile")]
-pub use encode::take_ff_arms;
-#[cfg(feature = "profile")]
-pub use encode::take_tag_reads;
-#[cfg(feature = "profile")]
-pub use encode::take_long_tag;
-#[cfg(feature = "profile")]
-pub use encode::take_long_tag_residual;
-#[cfg(feature = "profile")]
-pub use encode::take_short_tag_residual;
-#[cfg(feature = "profile")]
-pub use encode::take_walk_census;
-#[cfg(feature = "profile")]
-pub use encode::take_walk_classes;
-#[cfg(feature = "profile")]
-pub use encode::take_link_tag;
-#[cfg(feature = "profile")]
-pub use encode::take_walk_signals;
-#[cfg(feature = "profile")]
-pub use encode::take_bext;
-#[cfg(feature = "profile")]
-pub use encode::take_ff_waste;
-#[cfg(feature = "profile")]
-pub use encode::FF_LATCH;
-#[cfg(feature = "profile")]
-pub use encode::FF_LAZY_FIRES;
-#[cfg(feature = "profile")]
-pub use compressed::take_dec_copies;
-#[cfg(feature = "profile")]
-pub use compressed::take_dec_bands;
-#[cfg(feature = "profile")]
-pub use encode::{take_raw_margin, take_raw_exits, take_step_forfeit};
 pub use encode::{
-    BT_SPEC_PAIRS, set_bt_depth_cached_arm, set_bt_depth_target_arm, take_opt_signals, set_bt_deep_min_arm, set_bt_deep_arm, set_dfast_litpush_arm, take_lit_push, take_lit_hist, take_lit_tiers, set_lit_push_tiers_arm,
     compress, compress_using_dict, compress_using_dict_with, compress_using_prefix, compress_with,
     compress_with_advanced, compress_with_history, compress_with_params, AdvancedOptions,
     CompressOptions,
-};
-#[cfg(feature = "alloc")]
-pub use encode::{
-    reset_env_arms, set_opt_lit_arm, set_pair_gain_arm, set_pair_hi_arm, set_pair_lo_arm, set_tag_arm, set_tag_alloc_arm, set_bt_spec_arm, set_next_long_arm, set_pair_on_arm, take_pair_stats, take_route_hist, take_g5, set_g5_tiny_arm, set_g5_band_arm, set_g5_fast_len_arm, take_g5_inputs, take_content_signals, take_pair_split, set_dfast_spec_arm, set_dfast_pipe_arm, set_dfast_step_arm, set_dfast_spec_min_arm, set_fast_spec_arm, take_bt_calls, take_bt_iters, take_lazy_fill, take_bt_probe_stats, take_dfast_calls, take_dfast_spec, take_dfast_match_stats, take_dfast_rep_blocks, take_opt_rep, take_opt_bt, take_opt_skips, set_opt_rep_arm, take_finder_calls,
-    set_huff_fast_arm, set_lazy_fill_arm, set_lazy_fill_stride_arm, set_litpush_arm, set_litpush_hoist_arm, set_payload_arm, set_pipe_arm, set_pipe_rep1_arm, take_ff_pipe, take_mm, take_rep_rate, take_tag_rejects,
-    set_fast_lazy_arm, set_incomp_skip_arm, set_raw_skip_arm, set_raw_run_min_arm, set_raw_probe_arm, set_rep1_mode,
-    set_lazy_fill_threshold_arm, set_prefix_bound_arm, set_prefix_window_arm, take_next_long, take_nl_band, take_nl_off, set_nl_off_worse_arm, set_nl_dispatch_arm, set_dfast_good_ml_arm, set_dfast_good_ml2_arm, set_dfast_fill_stride_arm, set_dfast_fill_anchor_arm, set_dfast_fill_n_arm, take_dfast_endfill, set_replen_pipe_arm, set_accel_shift_arm, set_opt_hoist_arm, set_opt_ops_arm, set_finder_scratch_arm, set_dfast_tag_arm, set_long_tag_arm, set_walk_cont_arm, set_walk_rep_max_arm, set_lazy_gain_arm, set_walk_first_max_arm, set_chain_tag_arm, set_rep_reprobe_arm, set_wide_chain_arm, set_wide_first_max_arm, set_opt_mlbits_arm, set_wide_spb_min_arm, set_opt_fill_stride_arm, set_opt_fill_max_arm, take_opt_fill_ins, take_dfast_fill, set_prime_bt_arm, set_prime_bt_tree_arm, set_prime_bt_depth_arm, set_prime_bt_extent_arm, set_prime_stride_arm, take_prime_iters,
-    set_search_log_delta,
-    set_step0_arm, set_step_probe_arm, set_step_forfeit_arm, set_step_seq_arm, set_g5_arms, set_g5_fast_arms, set_g5_opt_arms, set_lit_short_arm, take_lp_guard,  take_lp_stats,
 };
 #[cfg(all(feature = "alloc", feature = "std"))]
 pub use in_bench::{
@@ -132,14 +129,7 @@ pub use mt::{
     JOB_SIZE_MIN, NB_WORKERS_MAX,
 };
 #[cfg(feature = "alloc")]
-pub use params::{compression_params, set_cparam_clamp_arm, set_strategy_arm, CompressionParameters, Strategy};
-#[cfg(feature = "alloc")]
-pub use prof::{
-    dump as prof_dump, encode_counts as prof_encode_counts, note_hash_fill as prof_note_hash_fill,
-    stage_ns as prof_stage_ns,
-    reset as prof_reset, scope as prof_scope, take_block_taps as prof_take_block_taps,
-    BlockTap as ProfBlockTap, EncodeCounts as ProfEncodeCounts, Stage as ProfStage,
-};
+pub use params::{compression_params, CompressionParameters, Strategy};
 #[cfg(feature = "alloc")]
 pub use seekable::{
     compress_seekable, compress_seekable_adv, decompress_frame_at, parse_seek_table, SeekEntry,
@@ -178,6 +168,119 @@ pub fn compress_bound(src_len: usize) -> usize {
         .saturating_add(if src_len < 128 * 1024 { 32 } else { 0 })
 }
 
+// ---------------------------------------------------------------------------
+// Campaign instrumentation -- `#[doc(hidden)]`, NOT public API.
+//
+// These are the A/B arms and counters the M7 speed campaign drives from
+// `rusty_zstd-bench`. Every one has a shipping default and exists to be flipped
+// inside a measurement harness. They are hidden from the rendered docs and
+// carry NO semver promise: they may be renamed or removed in any release.
+// Nothing here changes a default or an output byte.
+// ---------------------------------------------------------------------------
+
+#[doc(hidden)]
+pub use compressed::set_block_avx2_arm;
+#[doc(hidden)]
+#[cfg(feature = "dupladder")]
+pub use compressed::{set_dup_arm, set_dup_k};
+#[doc(hidden)]
+pub use compressed::{
+    set_litcopy_arm, set_lut_arm, set_matchcopy_arm, set_seqcheck_arm, set_seqloop_avx2_arm,
+};
+#[doc(hidden)]
+#[cfg(feature = "profile")]
+pub use compressed::{
+    take_d3_iters, take_d4_paths, take_dec_bands, take_dec_copies, take_dec_lit64,
+    take_dec_untiered, take_n21_predef,
+};
+#[doc(hidden)]
+#[cfg(feature = "alloc")]
+pub use decode::{frame_block_census, BlockCensus};
+#[doc(hidden)]
+pub use decode::{set_ck_fuse_arm, set_ck_stream_arm};
+#[doc(hidden)]
+pub use encode::{set_enc_avx2_arm, set_fast_hash_arm, set_fast_pack_arm};
+#[doc(hidden)]
+#[cfg(feature = "profile")]
+pub use encode::{
+    take_bext, take_envhits, take_ff_arms, take_ff_waste, take_link_tag, take_long_tag,
+    take_long_tag_residual, take_raw_exits, take_raw_margin, take_short_tag_residual,
+    take_step_forfeit, take_tag_reads, take_walk_census, take_walk_classes, take_walk_signals,
+    FF_LATCH, FF_LAZY_FIRES,
+};
+#[doc(hidden)]
+pub use encode::{take_ent_save, take_n9_basic};
+#[doc(hidden)]
+#[cfg(feature = "profile")]
+pub use fse::take_d6_spread;
+#[doc(hidden)]
+#[cfg(feature = "profile")]
+pub use huffman::{take_e11_walked, take_e12_scan, take_n13_stats, take_x2_stats};
+#[doc(hidden)]
+#[cfg(feature = "alloc")]
+pub use params::set_cparam_clamp_arm;
+#[doc(hidden)]
+#[cfg(feature = "std")]
+pub use params::set_strategy_arm;
+#[doc(hidden)]
+#[cfg(all(feature = "alloc", feature = "profile"))]
+pub use simd::{bench_eq_avx2, bench_eq_words, set_eqlen_arm, take_eq_ops, take_eqlen_stats};
+#[doc(hidden)]
+#[cfg(feature = "profile")]
+pub use xxh64::census as xxh_census;
+#[doc(hidden)]
+pub use xxh64::{set_xxh_avx2_arm, Xxh64 as Xxh64Pub};
+
+/// Bench-only re-export of the frame checksum hash (GATE 20 ceiling work).
+#[doc(hidden)]
+pub fn xxh64_pub(d: &[u8]) -> u64 {
+    xxh64::xxh64(d)
+}
+
+#[doc(hidden)]
+#[cfg(feature = "alloc")]
+pub use encode::{
+    reset_env_arms, set_accel_shift_arm, set_bt_spec_arm, set_chain_tag_arm,
+    set_dfast_fill_anchor_arm, set_dfast_fill_n_arm, set_dfast_fill_stride_arm,
+    set_dfast_good_ml2_arm, set_dfast_good_ml_arm, set_dfast_pipe_arm, set_dfast_spec_arm,
+    set_dfast_spec_min_arm, set_dfast_step_arm, set_dfast_tag_arm, set_fast_lazy_arm,
+    set_fast_spec_arm, set_finder_scratch_arm, set_g5_arms, set_g5_band_arm, set_g5_fast_arms,
+    set_g5_fast_len_arm, set_g5_opt_arms, set_g5_tiny_arm, set_huff_fast_arm, set_incomp_skip_arm,
+    set_lazy_fill_arm, set_lazy_fill_stride_arm, set_lazy_fill_threshold_arm, set_lazy_gain_arm,
+    set_lit_short_arm, set_litpush_arm, set_litpush_hoist_arm, set_long_tag_arm, set_next_long_arm,
+    set_nl_dispatch_arm, set_nl_off_worse_arm, set_opt_fill_max_arm, set_opt_fill_stride_arm,
+    set_opt_hoist_arm, set_opt_lit_arm, set_opt_mlbits_arm, set_opt_ops_arm, set_opt_rep_arm,
+    set_pair_gain_arm, set_pair_hi_arm, set_pair_lo_arm, set_pair_on_arm, set_payload_arm,
+    set_pipe_arm, set_pipe_rep1_arm, set_prefix_bound_arm, set_prefix_window_arm, set_prime_bt_arm,
+    set_prime_bt_depth_arm, set_prime_bt_extent_arm, set_prime_bt_tree_arm, set_prime_stride_arm,
+    set_raw_probe_arm, set_raw_run_min_arm, set_raw_skip_arm, set_rep1_mode, set_rep_reprobe_arm,
+    set_replen_pipe_arm, set_search_log_delta, set_step0_arm, set_step_forfeit_arm,
+    set_step_probe_arm, set_step_seq_arm, set_tag_alloc_arm, set_tag_arm, set_walk_cont_arm,
+    set_walk_first_max_arm, set_walk_rep_max_arm, set_wide_chain_arm, set_wide_first_max_arm,
+    set_wide_spb_min_arm, take_bt_calls, take_bt_iters, take_bt_probe_stats, take_content_signals,
+    take_dfast_calls, take_dfast_endfill, take_dfast_fill, take_dfast_match_stats,
+    take_dfast_rep_blocks, take_dfast_spec, take_ff_pipe, take_finder_calls, take_g5,
+    take_g5_inputs, take_lazy_fill, take_lp_guard, take_lp_stats, take_mm, take_next_long,
+    take_nl_band, take_nl_off, take_opt_bt, take_opt_fill_ins, take_opt_rep, take_opt_skips,
+    take_pair_split, take_pair_stats, take_prime_iters, take_rep_rate, take_route_hist,
+    take_tag_rejects,
+};
+#[doc(hidden)]
+pub use encode::{
+    set_bt_deep_arm, set_bt_deep_min_arm, set_bt_depth_cached_arm, set_bt_depth_target_arm,
+    set_dfast_litpush_arm, set_lit_push_tiers_arm, take_lit_hist, take_lit_push, take_lit_tiers,
+    take_opt_signals, BT_SPEC_PAIRS,
+};
+#[doc(hidden)]
+#[cfg(feature = "alloc")]
+pub use prof::{
+    dump as prof_dump, encode_counts as prof_encode_counts, note_hash_fill as prof_note_hash_fill,
+    reset as prof_reset, scope as prof_scope, stage_calls as prof_stage_calls,
+    stage_ns as prof_stage_ns, take_block_taps as prof_take_block_taps,
+    take_lit_margin as prof_take_lit_margin, BlockTap as ProfBlockTap,
+    EncodeCounts as ProfEncodeCounts, Stage as ProfStage,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,8 +311,3 @@ mod tests {
         assert!(compress_bound(1_000_000) > 1_000_000);
     }
 }
-
-/// Bench-only re-export of the frame checksum hash (GATE 20 ceiling work).
-pub fn xxh64_pub(d: &[u8]) -> u64 { xxh64::xxh64(d) }
-
-pub use xxh64::set_xxh_avx2_arm;

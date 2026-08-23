@@ -23,8 +23,8 @@ fn main() {
             mb += s.len() as f64 / 1_048_576.0;
         }
         let finder = match strat.as_str() {
-            "Fast" => "find_fast_impl (140 twins)",
-            "DFast" => "find_dfast_impl (12 twins)",
+            "Fast" => "find_fast_impl (48 base + 8 twin)",
+            "DFast" => "find_dfast_impl (5 base + 1 twin)",
             "Greedy" => "find_greedy + chain_find_best",
             "Lazy" | "Lazy2" => "find_lazy + chain_find_best",
             "BtLazy2" => "find_bt_lazy + bt ladder",
