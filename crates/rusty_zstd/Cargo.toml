@@ -7,14 +7,15 @@ repository.workspace = true
 authors.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-description = "A ground-up, pure-Rust Zstandard (RFC 8878) compressor and decompressor. Levels -7..22 with all nine libzstd strategies, dictionaries + trainer, long-distance matching, seekable frames, multi-threading. Interoperable both directions with facebook/zstd v1.5.7, dual-gated per commit. Zero dependencies, no C, no *-sys, no FFI; builds on no_std + alloc and wasm32. MIT OR Apache-2.0."
+description = "A ground-up, pure-Rust Zstandard (RFC 8878) compressor and decompressor. Levels -7..22 with all nine libzstd strategies, dictionaries + trainer, long-distance matching, seekable frames, multi-threading. Interoperable both directions with facebook/zstd v1.5.7, dual-gated per commit. Zero dependencies by default, no C, no *-sys, no FFI; builds on no_std + alloc and wasm32. MIT OR Apache-2.0."
 documentation = "https://docs.rs/rusty_zstd"
 readme = "README.md"
 keywords = ["zstd", "zstandard", "compression", "codec", "no-std"]
 categories = ["compression", "encoding", "no-std"]
 
-# The crate has no dependencies and no build script, so nothing docs.rs lacks is
-# needed; document the default (std) surface.
+# The default build still has no dependencies and no build script; the optional
+# `rusty-alloc` feature is the only thing that adds one. Document the default
+# (std) surface.
 [package.metadata.docs.rs]
 all-features = false
 
@@ -31,6 +32,23 @@ seekable = ["std"]
 train = ["std"]
 mt = ["std"]
 profile = ["std"]
+# Install rusty_alloc as the process-wide allocator.
+#
+# OFF by default, and that is deliberate rather than cautious. `rusty_alloc_default`
+# declares the `#[global_allocator]`, and a program may define exactly ONE. Around
+# twenty deliverables in this portfolio install their own seam -- deputy-alloc,
+# atlas-alloc, faceless-alloc, mata-alloc, ffai-cli and the rest -- and every one of
+# them embeds a codec. Turning this on by default would stop them linking until each
+# added `default-features = false` here.
+#
+# It also cannot be made automatic. Cargo unifies features across a build, so one
+# consumer enabling this imposes it on every other consumer in the same graph; the
+# feature is a property of the build, not of one dependent. There is no
+# `cfg(has_global_allocator)` to test either -- but nothing is silent about it:
+# a build that ends up with two installers fails to compile with
+# `the #[global_allocator] in this crate conflicts with global allocator in:
+# rusty_alloc_default`, which names the culprit.
+rusty-alloc = ["dep:rusty_alloc_default"]
 # DecSeq loop anatomy ladder (`dsloop.rs`). Adds a per-sequence arm dispatch to
 # the decode loop, so it is NOT part of `profile`: it perturbs the very loop it
 # measures and must be built on purpose.
@@ -40,6 +58,12 @@ dupladder = ["profile"]
 # build read D9 at +14.3% when the untaxed brick reads +0.2%. The tap must
 # not be in the build that measures the thing (codec-measurement 6).
 pfcensus = ["profile"]
+
+[dependencies]
+# Optional, and off unless `rusty-alloc` is enabled: with the feature off this
+# crate still resolves to zero dependencies, which is the property the crate
+# description claims.
+rusty_alloc_default = { version = "0.1.1", optional = true }
 
 [lints]
 workspace = true
