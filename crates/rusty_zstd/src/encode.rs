@@ -6433,6 +6433,11 @@ pub fn set_nl_off_worse_arm(v: f32) {
 }
 
 #[inline(always)]
+/// MEASURED INERT (`dispatchaudit.rs`, every level): this bar is UNREACHABLE
+/// on the default path. Its only reader is `nl_cut_for`, which opens with
+/// `if NL_DISPATCH_ON != 2 { return 8; }` -- and `NL_DISPATCH_ON` initialises
+/// to 0, so the function returns before the bar is consulted. Tuning it does
+/// nothing until `set_nl_dispatch_arm(true)` is called.
 fn nl_off_worse_max() -> f32 {
     let v = NL_OFF_WORSE_ARM.load(core::sync::atomic::Ordering::Relaxed);
     if v == u32::MAX {
@@ -7053,6 +7058,14 @@ pub fn set_step_forfeit_arm(v: f32) {
 }
 
 #[inline(always)]
+/// MEASURED INERT (`dispatchaudit.rs`, every level): unreachable on the
+/// default path. Its only reader is `note_step_probe`, which runs only inside
+/// `encode_block`'s `probing` branch -- gated on `step_probe_on()`, i.e.
+/// `STEP_PROBE_ARM == 2`, and that arm initialises to 0. The whole GATE 18
+/// step-probe cluster (the `tables.clone()`, the second `find_sequences`, the
+/// `step_pick`/`step_reprobe` route at `find_fast`) is off unless a bench
+/// enables it. Its sibling knob `set_step_seq_arm` was removed outright: it had
+/// no reader at all.
 fn step_forfeit_max() -> f64 {
     let v = STEP_FORFEIT_ARM.load(core::sync::atomic::Ordering::Relaxed);
     if v == u32::MAX {
@@ -7062,13 +7075,11 @@ fn step_forfeit_max() -> f64 {
     }
 }
 
-static STEP_SEQ_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
-
-/// Bench hook: the share of sequences that may SURVIVE step 2 before it is
-/// refused.
-pub fn set_step_seq_arm(v: f32) {
-    STEP_SEQ_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
-}
+// STEP_SEQ_ARM REMOVED. It was a `pub` setter storing into a static that
+// nothing read: the sequence-ratio signal it tuned was abandoned (see the
+// `let _ = mean_seq` note at the `step_pick` site), and the knob outlived it.
+// `dispatchaudit.rs` reports it INERT at every level for the same reason
+// `set_block_avx2_arm` was: there is no reader to be inert against.
 
 fn step0_default() -> usize {
     use core::sync::atomic::Ordering;
@@ -9721,6 +9732,13 @@ const DFAST_PROBE_PERIOD: u32 = 16;
 
 /// Minimum share of speculated loads that must be CONSUMED for the DFast
 /// pipeline to run. Below it the speculation is net added work.
+/// MEASURED INERT (`dispatchaudit.rs`, every level INCLUDING L3/L4, its own
+/// strategy). Unlike the two above this bar IS reached -- `dpipe` evaluates it
+/// per block -- but `dfast_spec_yield` never falls to the 0.70 bar on the
+/// board, so the guard is one-sided and the branch always goes the same way.
+/// Same shape as `walk_rep_max`, whose signal also never approaches its bar,
+/// and the opposite of `walk_first_max`, whose signal sits right on top of
+/// its own. A bar is only a dispatch if its signal crosses it.
 fn dfast_spec_min() -> f32 {
     #[cfg(feature = "std")]
     {
@@ -9936,13 +9954,22 @@ fn find_greedy_impl<const MLS: usize>(
     // fixed-width `copy_nonoverlapping` since brick 38. W5 is its
     // precondition: the fast path declines unless spare capacity proves the
     // wide store in bounds. Byte-identical -- only `n` bytes are published.
-    let lp_copy = if tables.blocks_done == 0 || tables.lit_short_share >= lit_short_min() {
-        lit_width_for(tables)
-    } else {
-        0
-    }; // BRICK 71: repcode-1 search in find_greedy -- L5-L6 had none
-       // C checks `offset_1` at every position in `_greedy`/`_lazy` exactly as in
-       // `_fast`/`_doubleFast`. Same dispatch on measured yield as bricks 67/70.
+    // GATE 13's literal-width guard, FOLDED -- it has never fired on this path.
+    // `lit_short_share` has exactly TWO writes in the crate,
+    // `fast_pipe_epilogue` and `fast_finder_epilogue`, both on the L1 Fast
+    // ladder. Greedy, Lazy and BtLazy2 never write it, so it holds its initial
+    // 1.0 and `>= LIT_SHORT_MIN` (0.25) is permanently true here.
+    // `dispatchaudit.rs` shows the same thing from outside: sweeping the
+    // `lit_short` bar from 0.0 to 1.0 moves neither the compressed bytes nor
+    // the probe count at ANY level, and bytegate holds across 18 corpora x 9
+    // levels with the guard folded.
+    //
+    // Folded rather than left alone because as written it is a TRAP: if this
+    // path ever starts maintaining that field, the branch begins firing and
+    // moves the bitstream with no edit here to explain why.
+    let lp_copy = lit_width_for(tables); // BRICK 71: repcode-1 search in find_greedy -- L5-L6 had none
+                                         // C checks `offset_1` at every position in `_greedy`/`_lazy` exactly as in
+                                         // `_fast`/`_doubleFast`. Same dispatch on measured yield as bricks 67/70.
     let use_rep = rep_search_on(tables.rep_yield, params.strategy)
         || (rep_reprobe_enabled() && tables.rep_probe == 0);
     if rep_reprobe_enabled() {
@@ -10621,6 +10648,22 @@ fn chain_find_best_inner<const MLS: usize>(
                 }
                 break;
             }
+            // The next-link load, issued at the TOP rather than the bottom: it
+            // depends only on `m`, which is already in hand, and its result is
+            // not consumed until the end of the body, so hoisting lets it
+            // overlap the tag compare and `mls_eq`'s own random `src[m]`
+            // access instead of serialising behind them.
+            //
+            // MEASURED NO-OP, recorded so it is not "discovered" again: the
+            // emitted code is byte-for-byte what the bottom-placed version
+            // produced (`find_lazy` 1568, `find_greedy` 1494, unchanged).
+            // `chain_masked` is a pure read with no aliasing barrier, so LLVM's
+            // scheduler was already free to hoist it and had. The source form
+            // is kept because it states the intent; it buys nothing.
+            //
+            // Byte-identical: `chain_masked` is a pure read and nothing in the
+            // body writes `chain` (the insert happens before the loop).
+            let link = tables.chain_masked(m & chain_mask);
             // Link-tag reject: skip `mls_eq`'s src[m] load on a tag byte the
             // link load already delivered. Sound: mls_eq true => 4 bytes
             // equal => tags equal.
@@ -10712,7 +10755,6 @@ fn chain_find_best_inner<const MLS: usize>(
                     }
                 }
             }
-            let link = tables.chain_masked(m & chain_mask);
             let next = if cp {
                 (link & 0x00FF_FFFF) as usize
             } else {
@@ -10994,11 +11036,20 @@ fn find_lazy_impl<const MLS: usize>(
     // per-sequence literal appends went out through `extend_from_slice` -- a
     // `memcpy` CALL, measured at 1,632,910 of them at L9 for a mean run of
     // 3.51 bytes. Same expression as `find_greedy_impl` and `find_bt_lazy`.
-    let lp_copy = if tables.blocks_done == 0 || tables.lit_short_share >= lit_short_min() {
-        lit_width_for(tables)
-    } else {
-        0
-    };
+    // GATE 13's literal-width guard, FOLDED -- it has never fired on this path.
+    // `lit_short_share` has exactly TWO writes in the crate,
+    // `fast_pipe_epilogue` and `fast_finder_epilogue`, both on the L1 Fast
+    // ladder. Greedy, Lazy and BtLazy2 never write it, so it holds its initial
+    // 1.0 and `>= LIT_SHORT_MIN` (0.25) is permanently true here.
+    // `dispatchaudit.rs` shows the same thing from outside: sweeping the
+    // `lit_short` bar from 0.0 to 1.0 moves neither the compressed bytes nor
+    // the probe count at ANY level, and bytegate holds across 18 corpora x 9
+    // levels with the guard folded.
+    //
+    // Folded rather than left alone because as written it is a TRAP: if this
+    // path ever starts maintaining that field, the branch begins firing and
+    // moves the bitstream with no edit here to explain why.
+    let lp_copy = lit_width_for(tables);
     let gain_cmp = lazy_gain_enabled();
     while ip <= ilimit {
         if use_rep {
@@ -12437,11 +12488,20 @@ fn find_bt_lazy(
     // guarantees. The capability has been in find_fast since brick 38 and in
     // find_dfast since 4.46; the Bt ladder never got it. Byte-identical: only
     // `n` bytes are ever published.
-    let lp_copy = if tables.blocks_done == 0 || tables.lit_short_share >= lit_short_min() {
-        lit_width_for(tables)
-    } else {
-        0
-    };
+    // GATE 13's literal-width guard, FOLDED -- it has never fired on this path.
+    // `lit_short_share` has exactly TWO writes in the crate,
+    // `fast_pipe_epilogue` and `fast_finder_epilogue`, both on the L1 Fast
+    // ladder. Greedy, Lazy and BtLazy2 never write it, so it holds its initial
+    // 1.0 and `>= LIT_SHORT_MIN` (0.25) is permanently true here.
+    // `dispatchaudit.rs` shows the same thing from outside: sweeping the
+    // `lit_short` bar from 0.0 to 1.0 moves neither the compressed bytes nor
+    // the probe count at ANY level, and bytegate holds across 18 corpora x 9
+    // levels with the guard folded.
+    //
+    // Folded rather than left alone because as written it is a TRAP: if this
+    // path ever starts maintaining that field, the branch begins firing and
+    // moves the bitstream with no edit here to explain why.
+    let lp_copy = lit_width_for(tables);
     // BRICK 73: repcode-1 in BtLazy2 (L13-L14) -- the last finder without it.
     // Per-call arm reads hoisted to once per block (the chain_find_best rule):
     // attempts (an arm atomic inside bt_depth_apply/search_attempts) ran per
@@ -13899,6 +13959,22 @@ static ROW_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new
 pub(crate) fn row_find_enabled() -> bool {
     ROW_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
 }
+/// WIDE-CHAIN LATCH census: `[events, positions_rescanned]`. The latch does a
+/// full O(window) chain rebuild when it fires; this is what that costs.
+#[cfg(feature = "profile")]
+pub static WIDE_LATCH: [core::sync::atomic::AtomicU64; 2] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Read and clear `(latch_events, positions_rescanned)`.
+#[cfg(feature = "profile")]
+pub fn take_wide_latch() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        WIDE_LATCH[0].swap(0, Relaxed),
+        WIDE_LATCH[1].swap(0, Relaxed),
+    )
+}
+
 /// CHAIN-WALK EXIT CENSUS. Which of the seven ways the walk can end actually
 /// fires, indexed:
 ///   0 empty bucket (`prev` is None -- the walk never starts)
@@ -14170,6 +14246,17 @@ fn maybe_latch_wide_chain(
     let from = block_start.saturating_sub(window).max(tables.frame_start);
     let to = block_start.saturating_sub(8);
     let chain_mask = tables.chain.len() - 1;
+    // WIDE-LATCH CENSUS. This is an O(window) REBUILD of the chain, run once
+    // per frame when the latch fires -- at L9 the window is 2^22, so it can
+    // rescan up to 4M positions doing a FULL `lz_insert` each. Nothing counted
+    // it, so its cost has never appeared beside the per-position work it is
+    // meant to improve.
+    #[cfg(feature = "profile")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        WIDE_LATCH[0].fetch_add(1, Relaxed);
+        WIDE_LATCH[1].fetch_add(to.saturating_sub(from) as u64, Relaxed);
+    }
     let mut p = from;
     while p <= to && p + 8 <= src.len() {
         let (h, g) = hash_wide_link_tag(src, p, hash_log, smask);

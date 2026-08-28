@@ -255,6 +255,8 @@ pub use encode::take_dfast_bext;
 #[cfg(feature = "profile")]
 pub use encode::take_walk_exit;
 #[cfg(feature = "profile")]
+pub use encode::take_wide_latch;
+#[cfg(feature = "profile")]
 pub use huffman::{take_e11_walked, take_e12_scan, take_n13_stats, take_x2_stats};
 #[cfg(feature = "profile")]
 pub use huffman::{take_f4x2_arm, take_x4_arms, take_x4_x1_calls};
@@ -300,15 +302,15 @@ pub use encode::{
     set_prime_bt_depth_arm, set_prime_bt_extent_arm, set_prime_bt_tree_arm, set_prime_stride_arm,
     set_raw_probe_arm, set_raw_run_min_arm, set_raw_skip_arm, set_rep1_mode, set_rep_reprobe_arm,
     set_replen_pipe_arm, set_row_arm, set_row_fill_stride_arm, set_search_log_delta, set_step0_arm,
-    set_step_forfeit_arm, set_step_probe_arm, set_step_seq_arm, set_tag_alloc_arm, set_tag_arm,
-    set_walk_cont_arm, set_walk_first_max_arm, set_walk_rep_max_arm, set_wide_chain_arm,
-    set_wide_first_max_arm, set_wide_spb_min_arm, take_bt_calls, take_bt_iters,
-    take_bt_probe_stats, take_content_signals, take_dfast_calls, take_dfast_endfill,
-    take_dfast_fill, take_dfast_match_stats, take_dfast_rep_blocks, take_dfast_spec, take_ff_pipe,
-    take_finder_calls, take_g5, take_g5_inputs, take_lazy_fill, take_lp_guard, take_lp_stats,
-    take_mm, take_next_long, take_nl_band, take_nl_off, take_opt_bt, take_opt_fill_ins,
-    take_opt_rep, take_opt_skips, take_pair_split, take_pair_stats, take_prime_iters,
-    take_rep_rate, take_route_hist, take_tag_rejects,
+    set_step_forfeit_arm, set_step_probe_arm, set_tag_alloc_arm, set_tag_arm, set_walk_cont_arm,
+    set_walk_first_max_arm, set_walk_rep_max_arm, set_wide_chain_arm, set_wide_first_max_arm,
+    set_wide_spb_min_arm, take_bt_calls, take_bt_iters, take_bt_probe_stats, take_content_signals,
+    take_dfast_calls, take_dfast_endfill, take_dfast_fill, take_dfast_match_stats,
+    take_dfast_rep_blocks, take_dfast_spec, take_ff_pipe, take_finder_calls, take_g5,
+    take_g5_inputs, take_lazy_fill, take_lp_guard, take_lp_stats, take_mm, take_next_long,
+    take_nl_band, take_nl_off, take_opt_bt, take_opt_fill_ins, take_opt_rep, take_opt_skips,
+    take_pair_split, take_pair_stats, take_prime_iters, take_rep_rate, take_route_hist,
+    take_tag_rejects,
 };
 #[doc(hidden)]
 pub use encode::{
