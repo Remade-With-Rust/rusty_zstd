@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.2.2...rusty_zstd-v0.2.3) - 2026-08-28
+
+### Added
+
+- *(encode)* ship DFast back-extension, and trade ~1% size for up to 38% encode speed
+
+### Other
+
+- name the release 0.2.3, which is what release-plz actually cuts
+
 ## [0.2.2](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.2.1...rusty_zstd-v0.2.2) - 2026-08-28
 
 ### Fixed
