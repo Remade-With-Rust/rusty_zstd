@@ -17,7 +17,9 @@ fn main(){
         let a=rusty_zstd::compress(src,1).unwrap().len() as i64;
         // step 2 only: probe latches to 2 (thresholds wide open), route untouched
         rusty_zstd::set_step_probe_arm(true);
-        rusty_zstd::set_step_seq_arm(99.0);
+        // This used to open TWO gates wide (`step_seq` and `step_forfeit`). The
+        // `step_seq` knob has since been removed -- it stored into a static with no
+        // reader, so opening it was already a no-op when this board was written.
         rusty_zstd::set_step_forfeit_arm(99.0);
         let b=rusty_zstd::compress(src,1).unwrap().len() as i64;
         // tlen=1: step 2 AND pair_route forced to 2
@@ -29,5 +31,5 @@ fn main(){
         let tl=100.0*(c-a) as f64/a as f64;
         println!("{id:<12}{s2:>15.3}%{tl:>17.3}%{:>11.3}%", s2-tl);
     }
-    rusty_zstd::set_step_seq_arm(0.85); rusty_zstd::set_step_forfeit_arm(0.50);
+    rusty_zstd::set_step_forfeit_arm(0.50);
 }

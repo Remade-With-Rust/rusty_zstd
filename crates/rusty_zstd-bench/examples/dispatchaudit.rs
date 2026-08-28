@@ -36,7 +36,10 @@ fn bars() -> Vec<Setter> {
         ("lazy_fill_threshold", rusty_zstd::set_lazy_fill_threshold_arm as fn(f32)),
         ("nl_off_worse", rusty_zstd::set_nl_off_worse_arm),
         ("step_forfeit", rusty_zstd::set_step_forfeit_arm),
-        ("step_seq", rusty_zstd::set_step_seq_arm),
+        // `step_seq` was a row here until its knob was removed -- the setter stored
+        // into a static nothing read, so sweeping it to both extremes moved nothing.
+        // That is exactly the finding this board exists to make, so it is recorded
+        // rather than silently dropped.
         ("lit_short", rusty_zstd::set_lit_short_arm),
         ("dfast_spec_min", rusty_zstd::set_dfast_spec_min_arm),
         ("bt_deep_min", rusty_zstd::set_bt_deep_min_arm),
