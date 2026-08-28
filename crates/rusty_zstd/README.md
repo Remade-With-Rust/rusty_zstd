@@ -142,7 +142,7 @@ other's output (cross-checked every run).
 | L9 | 0.34–0.38× | **2.32–2.85×** | +2.45% |
 | L19 | **1.22–1.40×** | **2.64–2.76×** | +3.82% |
 
-The two columns come from different runs. **Size** was re-measured for 0.3.0
+The two columns come from different runs. **Size** was re-measured for 0.2.3
 over the full 19-file corpus, 355,593,492 bytes — deterministic, reproduces
 bit-for-bit. **Speed** is carried over from the 0.2.0 run, which used the same
 files in a capped 143.9 MB staging, and was not re-measured: this host has been
@@ -162,7 +162,7 @@ non-quiescent host, so they are ranges rather than point estimates. The size
 column is deterministic and exact. Encode trails C at L1–L9 and leads at L19;
 closing the mid-level gap is the open work.
 
-**0.3.0 moved the size column deliberately, in both directions.** DFast back
+**0.2.3 moved the size column deliberately, in both directions.** DFast back
 extension took L3 −1.28% and L4 −1.15%, a pure win on the default level with no
 corpus regressing. Tightening the chain walk's first-find bar traded +0.35% to
 +1.39% size for +5.2% to +38.1% encode throughput at L5–L12 — the one

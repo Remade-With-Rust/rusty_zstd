@@ -78,7 +78,7 @@ other's output; the cross-check passed on every run below.
 
 <sub>**The two columns come from different runs, and mixing them would be
 sloppy, so here is exactly which is which.** The **size** column was
-re-measured for 0.3.0 over the **full 19-file corpus, 355,593,492 bytes**,
+re-measured for 0.2.3 over the **full 19-file corpus, 355,593,492 bytes**,
 both CLIs at their defaults: at L1 we emit 116,548,162 bytes against C's
 114,259,341. It is deterministic and reproduces bit-for-bit. The **speed**
 ranges are carried over from the 0.2.0 measurement, which ran the same 19
@@ -94,7 +94,7 @@ sample and 1.57× on the next, and even at N=10 the L3 encode cell moved 0.63×
 to 0.93× *between batches*. Anything quoted here as a single number would be
 one draw from that spread.</sub>
 
-<sub>**0.3.0 moved the size column on purpose, in both directions.** DFast
+<sub>**0.2.3 moved the size column on purpose, in both directions.** DFast
 back-extension took **L3 −1.28%** and L4 −1.15% — a pure win on the default
 level's ladder, no corpus regressing. Tightening the chain walk's first-find
 bar traded **+0.35% to +1.39% size for +5.2% to +38.1% encode throughput** at
