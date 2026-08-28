@@ -112,12 +112,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusty_alloc_default"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca0c6742832d23b2b2a0647903d8ff867d0681e189fdc0f74774fed871a026db"
+dependencies = [
+ "rusty_alloc-api",
+]
+
+[[package]]
 name = "rusty_zstd"
-version = "0.2.0"
+version = "0.2.1"
+dependencies = [
+ "rusty_alloc_default",
+]
 
 [[package]]
 name = "rusty_zstd-bench"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rusty_zstd",
  "rzstd-alloc",
@@ -129,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_zstd-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rusty_zstd",
  "rzstd-alloc",
@@ -138,7 +150,7 @@ dependencies = [
 
 [[package]]
 name = "rzstd-alloc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rusty_alloc-api",
 ]
