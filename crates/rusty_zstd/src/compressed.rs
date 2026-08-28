@@ -149,6 +149,12 @@ pub(crate) struct BlockState {
     pub reps: [u32; 3],
 }
 
+/// One outlined copy of `FseTable`'s derived `Clone`. See `BlockState::from_dict`.
+#[inline(never)]
+fn clone_dtable(t: &crate::fse::FseTable) -> crate::fse::FseTable {
+    t.clone()
+}
+
 impl BlockState {
     pub(crate) fn new() -> Self {
         Self {
@@ -168,12 +174,17 @@ impl BlockState {
         let Some(e) = d.entropy() else {
             return Self::new();
         };
+        // C8: `FseTable`'s derived `Clone` has no symbol of its own -- it was
+        // inlined at each of these three sites, so the dictionary load carried
+        // three copies of a Vec-cloning body. Routing them through one
+        // `#[inline(never)]` helper leaves the derive inlined ONCE, inside the
+        // helper, and makes these three calls. Runs once per dictionary.
         Self {
             lit_buf: Vec::new(),
             huff: Some(e.huff_d.clone()),
-            ll: Some(e.ll_d.clone()),
-            of: Some(e.of_d.clone()),
-            ml: Some(e.ml_d.clone()),
+            ll: Some(clone_dtable(&e.ll_d)),
+            of: Some(clone_dtable(&e.of_d)),
+            ml: Some(clone_dtable(&e.ml_d)),
             reps: e.reps,
         }
     }
@@ -189,110 +200,26 @@ pub(crate) fn decode_compressed_block(
     frame_start: usize,
     frame_skipped: usize,
 ) -> Result<(), Error> {
-    // Wholesale BMI2 twin -- the decode-side analog of encode_block: the
-    // block driver carried 100 variable shifts of its own (section headers,
-    // direct-weights table reads) outside every finer-grained twin.
-    // SIMD-2: AVX2 arm FIRST, kept for ISA CONTINUITY across the decode path.
+    // BOTH ISA ARMS RETIRED. The avx2 arm's premise was explicit: "the
+    // literal-section work inlined into it was emitted as 57 LEGACY SSE
+    // instructions ... this arm converts all 57 to VEX and emits 71 ymm ops."
+    // That work is no longer inlined here -- `decode_literals` became a shared
+    // `#[inline(never)]` symbol -- and the emitted asm now reads:
     //
-    // The bmi2-only twin below is `enable = "bmi2,lzcnt"`, which does NOT imply
-    // avx2, so the literal-section work inlined into it was emitted as **57
-    // LEGACY SSE instructions** (27 `movdqa`, 9 `movaps`, 7 `movdqu`, plus a
-    // `pshufd`/`punpcklbw` group). This arm converts all 57 to VEX encoding and
-    // emits **71 ymm** ops -- deterministic, verified from the emitted asm, and
-    // byte-identical by construction (same `#[inline(always)]` body).
+    //   decode_compressed_block_bmi2   147 instrs   0 BMI2 ops   0 ymm  0 VEX
+    //   decode_compressed_block_avx2   147 instrs   0 BMI2 ops   0 ymm  2 VEX
     //
-    // HONEST LEDGER: on THIS box it measured +0.3% DecLits / +0.5% decode over
-    // the bmi2-only arm -- i.e. no speed win, inside noise (`simd2ab.rs`,
-    // 14-corpus in-process ABBA x9). It is kept on the DETERMINISTIC ground:
-    // the whole decode path is then uniformly VEX-encoded, with no legacy-SSE
-    // island sitting beside the AVX2 sequence twin. `BLOCK_AVX2_ARM` keeps it
-    // adjudicable on other microarchitectures without a rebuild.
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if block_avx2_on() && crate::simd::has_avx2() && crate::simd::has_bmi2() {
-        // SAFETY: runtime CPUID guard; identical body.
-        #[allow(unsafe_code)]
-        return unsafe {
-            decode_compressed_block_avx2(
-                payload,
-                out,
-                window_size,
-                block_max,
-                state,
-                dict,
-                frame_start,
-                frame_skipped,
-            )
-        };
-    }
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if crate::simd::has_bmi2() {
-        // SAFETY: runtime CPUID guard; identical body.
-        #[allow(unsafe_code)]
-        return unsafe {
-            decode_compressed_block_bmi2(
-                payload,
-                out,
-                window_size,
-                block_max,
-                state,
-                dict,
-                frame_start,
-                frame_skipped,
-            )
-        };
-    }
-    decode_compressed_block_inner(
-        payload,
-        out,
-        window_size,
-        block_max,
-        state,
-        dict,
-        frame_start,
-        frame_skipped,
-    )
-}
+    // Neither converts anything. The bmi2 arm's own justification -- "the
+    // block driver carried 100 variable shifts of its own" -- is equally gone:
+    // there are zero `shrx` in either body. And the avx2 arm carried an HONEST
+    // LEDGER admitting it measured +0.3% DecLits / +0.5% decode, i.e. no win,
+    // inside noise. It was kept for "ISA CONTINUITY"; with nothing left to be
+    // continuous about, that is 294 instructions of duplicate block driver.
+    //
+    // The finer-grained twins that do the real work are untouched:
+    // `decode_sequences` dispatches its own avx2 arm (23 BMI2 ops), and
+    // `decode_4x_bmi2` keeps 36 in 702.
 
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "bmi2,lzcnt")]
-#[allow(unsafe_code)]
-unsafe fn decode_compressed_block_bmi2(
-    payload: &[u8],
-    out: &mut Vec<u8>,
-    window_size: u64,
-    block_max: u32,
-    state: &mut BlockState,
-    dict: &[u8],
-    frame_start: usize,
-    frame_skipped: usize,
-) -> Result<(), Error> {
-    decode_compressed_block_inner(
-        payload,
-        out,
-        window_size,
-        block_max,
-        state,
-        dict,
-        frame_start,
-        frame_skipped,
-    )
-}
-
-/// SIMD-2: the AVX2 + BMI2 block driver. Byte-identical by construction -- it
-/// calls the same `#[inline(always)]` body as the other two arms.
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "avx2,bmi2,lzcnt")]
-#[allow(unsafe_code)]
-unsafe fn decode_compressed_block_avx2(
-    payload: &[u8],
-    out: &mut Vec<u8>,
-    window_size: u64,
-    block_max: u32,
-    state: &mut BlockState,
-    dict: &[u8],
-    frame_start: usize,
-    frame_skipped: usize,
-) -> Result<(), Error> {
     decode_compressed_block_inner(
         payload,
         out,
@@ -347,13 +274,11 @@ fn decode_compressed_block_inner(
     r
 }
 
-// The literal chain is inline(always) into the twinned block driver -- outlined, it ran baseline (transitive trap trace).
-#[inline(always)]
-pub(crate) fn decode_literals(
-    recycle: Vec<u8>,
-    r: &mut Reader<'_>,
-    state: &mut BlockState,
-) -> Result<Vec<u8>, Error> {
+/// The literals-section header: type, sizes, stream count. Pure byte
+/// arithmetic, factored out of `decode_literals` so the three ISA twins of
+/// `decode_compressed_block` share one copy. Runs once per block.
+#[inline(never)]
+fn parse_lit_header(r: &mut Reader<'_>) -> Result<(u8, u32, u32, u32), Error> {
     let first = r.u8()?;
     let lit_type = first & 3;
     let size_fmt = (first >> 2) & 3;
@@ -420,6 +345,31 @@ pub(crate) fn decode_literals(
     };
     let _ = header_rest;
 
+    let _ = header_rest;
+    Ok((lit_type, regen, csize, n_streams))
+}
+
+// HISTORY: this was `#[inline(always)]` with the note "outlined, it ran
+// baseline (transitive trap trace)" -- from the era when the huffman kernels
+// inherited their ISA from the CALLER's `#[target_feature]` context, so
+// outlining the chain silently dropped every stream to baseline. The kernels
+// now carry their OWN per-section CPUID dispatch (`decode_stream` and
+// `decode_4x` both guard internally), so the trap cannot recur: outlining
+// changes where the parse code sits, not which kernel runs. Un-inlining
+// removes two stamps of this body (and of `decode_huff_streams` below) from
+// the three `decode_compressed_block` twins.
+#[inline(never)]
+pub(crate) fn decode_literals(
+    recycle: Vec<u8>,
+    r: &mut Reader<'_>,
+    state: &mut BlockState,
+) -> Result<Vec<u8>, Error> {
+    // THE HEADER PARSE IS ONE NON-ISA CALL. `decode_literals` stays
+    // `#[inline(always)]` into the three `decode_compressed_block` twins BY
+    // DESIGN (the huffman chain must inherit the twin's ISA -- see the comment
+    // above this function), but the sizes/streams parse is pure byte
+    // arithmetic and was being stamped into each twin along with it.
+    let (lit_type, regen, csize, n_streams) = parse_lit_header(r)?;
     match lit_type {
         // W37 -- the RAW and RLE literal arms recycle too.
         //
@@ -455,7 +405,12 @@ pub(crate) fn decode_literals(
             // mr's decode, and mr takes this arm on nearly every block.
             state.huff = Some(table);
             let table = state.huff.as_ref().ok_or(Error::Corruption)?;
-            decode_huff_streams(recycle, table, &section[tree_size..], regen, n_streams)
+            // D22: `tree_size` is whatever `read_table` consumed -- opaque to
+            // LLVM, so this slice carried a bounds test and a panic pad.
+            // `get` states it once and turns a truncated tree description into
+            // `Corruption` instead of an unwind. D17's case, not D19's.
+            let body = section.get(tree_size..).ok_or(Error::Corruption)?;
+            decode_huff_streams(recycle, table, body, regen, n_streams)
         }
         3 => {
             let table = state.huff.as_ref().ok_or(Error::Corruption)?;
@@ -466,7 +421,10 @@ pub(crate) fn decode_literals(
     }
 }
 
-#[inline(always)]
+// Outlined for the same reason as `decode_literals` above: the 4x kernel
+// dispatches its own ISA per section, so the stream-split arithmetic gains
+// nothing from living inside the twins.
+#[inline(never)]
 fn decode_huff_streams(
     recycle: Vec<u8>,
     table: &HuffmanTable,
@@ -516,6 +474,16 @@ fn decode_huff_streams(
     if d0.is_empty() || d1.is_empty() || d2.is_empty() || d3.is_empty() {
         return Err(Error::Corruption);
     }
+    // D13 REFUTED, recorded: replacing these four running-offset slices with a
+    // `split_at` chain measured **+45** and grew the function 308 -> 310. It
+    // did drive the pads to zero -- and that was not worth it. `split_at`
+    // returns a tuple of two borrows per cut, and the extra pointer/length
+    // pairs cost more than the four bounds tests they replaced.
+    //
+    // Pairs with C1/C2, which won: a FIXED-SIZE array turns a dynamic bound
+    // static and the checks vanish. `split_at` keeps both halves dynamic and
+    // just adds bookkeeping. Removing pads is not the goal; removing
+    // instructions is.
     table.decode_4x(
         &rest[..s1],
         &rest[s1..s1 + s2],
@@ -577,6 +545,18 @@ const fn pack_ml() -> [u32; 53] {
     o
 }
 pub(crate) const LL_PACK: [u32; 36] = pack_ll();
+/// WIN 9 (megafuse round): `1 << of_code` was a variable `shll %cl` -- 3 uops
+/// on baseline x86-64 plus two setup moves, per sequence. The offset bases are
+/// a 32-entry constant; a load is 1 uop.
+const OF_PACK: [u32; 32] = {
+    let mut o = [0u32; 32];
+    let mut i = 0;
+    while i < 32 {
+        o[i] = 1u32 << i;
+        i += 1;
+    }
+    o
+};
 pub(crate) const ML_PACK: [u32; 53] = pack_ml();
 
 /// Baseline half of a packed LL/ML entry.
@@ -621,7 +601,9 @@ pub(crate) fn decode_sequences(
     frame_skipped: usize,
 ) -> Result<(), Error> {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if seqloop_avx2_on() && crate::simd::has_avx2() && crate::simd::has_bmi2() {
+    // D15: gate matches payload -- see the twin. It was `has_avx2() &&
+    // has_bmi2()` for a body with zero ymm.
+    if seqloop_avx2_on() && crate::simd::has_bmi2() {
         // SAFETY: guarded by a runtime AVX2 check; the body is identical.
         #[allow(unsafe_code)]
         return unsafe {
@@ -660,7 +642,16 @@ pub(crate) fn decode_sequences(
 // exactly the instruction class the sequence decode loop lives on (DecSeq
 // is the m7 decode leader in 16/18 corpora). Runtime guard extended to
 // has_bmi2; the body is unchanged, so this is byte-identical by construction.
-#[target_feature(enable = "avx2,bmi2,lzcnt")]
+// D15: THE `avx2` FEATURE IS DROPPED FROM THIS TWIN, and the runtime gate with
+// it. Measured on the emitted asm: this body contains **0 `%ymm`** and 23 BMI2
+// ops. Its entire payload is BMI2 -- `avx2` bought 8 VEX encodings and cost the
+// fast path every CPU that ships BMI2 with AVX2 fused off (the Skylake
+// Pentium/Celeron parts `decode_4x`'s own comment names). Those machines were
+// falling back to a baseline with no `shrx` at all.
+//
+// The name stays for API/knob compatibility (`set_seqloop_avx2_arm` is
+// `pub use`d); what changes is that the gate now matches the payload.
+#[target_feature(enable = "bmi2,lzcnt")]
 #[allow(unsafe_code)]
 unsafe fn decode_sequences_avx2(
     src: &[u8],
@@ -724,24 +715,39 @@ fn seqloop_avx2_on() -> bool {
     )
 }
 
-#[inline(always)]
-fn decode_sequences_inner(
+/// The per-block sequence-section header: nseq varint, modes byte, and the
+/// three FSE table resolutions. Factored out of `decode_sequences_inner` so the
+/// three ISA twins of `decode_compressed_block` share ONE copy -- nothing here
+/// touches the bit reader the twins are compiled for. Runs once per block.
+///
+/// `Ok(None)` = a literals-only block (nseq == 0); the literals have already
+/// been flushed to `out`.
+#[inline(never)]
+#[allow(clippy::type_complexity)]
+// D14 REFUTED, recorded: moving the three `FseTable`s from this return type
+// into `&mut Option<FseTable>` out-params measured **+383**
+// (`decode_compressed_block` 955 -> 1,227, `decode_sequences_avx2` 875 ->
+// 1,042). The premise looked sound -- that function is 60% MOVE instructions
+// (571 of 955) and returns three `Vec`-owning structs by value.
+//
+// It was wrong twice over. LLVM already passes this tuple through the return
+// slot without copying it; and `Option<FseTable>` adds a discriminant to each
+// table plus an unwrap match at the call site, which costs more than the
+// moves it was meant to remove.
+//
+// This BOUNDS the `select_seq_tables` lesson (+348) rather than extending it.
+// There the interface was NINE values including three `Vec<u8>` headers built
+// inside the callee. Here it is three structs the callee already owns and the
+// caller immediately consumes. **"Large returns are expensive" is not a rule;
+// measure the specific interface.**
+fn decode_seq_header(
     src: &[u8],
     literals: &[u8],
     out: &mut Vec<u8>,
-    window_size: u64,
-    block_max: u32,
     state: &mut BlockState,
-    dict: &[u8],
-    frame_start: usize,
-    frame_skipped: usize,
-) -> Result<(), Error> {
-    if src.is_empty() {
-        return Err(Error::Corruption);
-    }
-    // DecSeq anatomy: four PER-BLOCK guards partition this function. Never per
-    // sequence -- see `Stage::DecSeqHeader`.
+) -> Result<Option<(usize, u32, FseTable, FseTable, FseTable)>, Error> {
     let g_hdr = crate::prof::scope(crate::prof::Stage::DecSeqHeader);
+    let _ = &g_hdr;
     let mut pos = 0usize;
     let byte0 = src[0];
     pos += 1;
@@ -750,7 +756,7 @@ fn decode_sequences_inner(
         drop(g_hdr);
         let _g = crate::prof::scope(crate::prof::Stage::DecSeqTail);
         out.extend_from_slice(literals);
-        return Ok(());
+        return Ok(None);
     } else if byte0 < 128 {
         byte0 as u32
     } else if byte0 < 255 {
@@ -782,9 +788,33 @@ fn decode_sequences_inner(
     let ml_mode = (modes >> 2) & 3;
 
     drop(g_hdr);
-    let g_tab = crate::prof::scope(crate::prof::Stage::DecSeqTables);
+    let _g_tab = crate::prof::scope(crate::prof::Stage::DecSeqTables);
+    // D19 REFUTED, recorded: converting the three `&src[pos..]` slices to
+    // `get(..).ok_or(Corruption)` drove this function's pads 2 -> 0 and
+    // measured **+3** (324 -> 327). Reverted.
+    //
+    // It pairs with D17/D18, which used the SAME transform and won (-44, -10).
+    // The difference is what the pad guards. There, `st.opN`/`iN` reach the
+    // slice through a struct or a loop counter and LLVM emits a real test on a
+    // hot path. Here `pos` is already fenced by an explicit
+    // `pos >= src.len()` check a few lines up, so the pad was already
+    // near-free and the `Option` plumbing cost more than it removed.
+    //
+    // **Removing a pad pays when the bound is genuinely opaque, not when it is
+    // merely spelled with brackets.**
     let (ll, n) = seq_table(
         &src[pos..],
+        // D33: the SECOND and THIRD `&src[pos..]` only -- located by decoding the
+        // landing pads' `Location` operands (`anon.*.90` -> 817:13,
+        // `anon.*.89` -> 826:13), not by reading source.
+        //
+        // The FIRST one is deliberately left alone: at that point `pos` is still
+        // fenced by the explicit `pos >= src.len()` test above, so it carries no
+        // pad and `get` would only add cost. After `pos += n` it becomes opaque,
+        // and the next two do.
+        //
+        // This is why D19 measured +3: it converted all THREE sites, paying for
+        // the one that was already free. **Find the pad before removing it.**
         ll_mode,
         35,
         9,
@@ -793,7 +823,7 @@ fn decode_sequences_inner(
     )?;
     pos += n;
     let (of, n) = seq_table(
-        &src[pos..],
+        src.get(pos..).ok_or(Error::Corruption)?,
         of_mode,
         31,
         8,
@@ -802,7 +832,7 @@ fn decode_sequences_inner(
     )?;
     pos += n;
     let (ml, n) = seq_table(
-        &src[pos..],
+        src.get(pos..).ok_or(Error::Corruption)?,
         ml_mode,
         52,
         9,
@@ -811,12 +841,50 @@ fn decode_sequences_inner(
     )?;
     pos += n;
 
-    let bitstream = &src[pos..];
+    Ok(Some((pos, nseq, ll, of, ml)))
+}
+
+#[inline(always)]
+fn decode_sequences_inner(
+    src: &[u8],
+    literals: &[u8],
+    out: &mut Vec<u8>,
+    window_size: u64,
+    block_max: u32,
+    state: &mut BlockState,
+    dict: &[u8],
+    frame_start: usize,
+    frame_skipped: usize,
+) -> Result<(), Error> {
+    if src.is_empty() {
+        return Err(Error::Corruption);
+    }
+    // DecSeq anatomy: four PER-BLOCK guards partition this function. Never per
+    // sequence -- see `Stage::DecSeqHeader`.
+    // THE SEQUENCE-HEADER PARSE IS ONE NON-ISA CALL. `decode_sequences_inner`
+    // is compiled into all three `decode_compressed_block` twins, and this
+    // region -- the nseq varint, the modes byte, and the three FSE table
+    // resolutions -- was stamped into each. None of it touches the bitstream
+    // ISA the twins exist for. `None` = literals-only block, already flushed.
+    let (pos, nseq, ll, of, ml) = match decode_seq_header(src, literals, out, state)? {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    // D32: the pad six earlier attempts could not find. Located by decoding
+    // the landing pad's `Location` operand out of the asm -- `anon.*.95`
+    // holds {file_ptr, len 0x23, line 0x360, col 0x19} = compressed.rs:864:25
+    // -- rather than by reading source, which had failed repeatedly.
+    //
+    // `pos` is whatever `decode_seq_header` consumed: a parser return value,
+    // opaque to LLVM, so this carried a bounds test and a pad, inlined into
+    // BOTH `decode_sequences` twins. D17/D22's case exactly. (D19 failed on
+    // the different `&src[pos..]` sites INSIDE the header parser, where `pos`
+    // is already fenced a few lines up.)
+    let bitstream = src.get(pos..).ok_or(Error::Corruption)?;
     let mut br = BitRev::new(bitstream)?;
     let mut ll_s = ll.init_state(&mut br);
     let mut of_s = of.init_state(&mut br);
     let mut ml_s = ml.init_state(&mut br);
-    drop(g_tab);
 
     let mut lit_pos = 0usize;
     // Built ONCE per block; the loop then passes a single reference.
@@ -844,9 +912,54 @@ fn decode_sequences_inner(
     let seqcheck = seqcheck_hoisted();
     // W7: is this the common shape? Decided ONCE per block.
     let nodict = dict.is_empty() && frame_start == 0 && frame_skipped == 0;
-    let win_sz = window_size;
-    let blk_max = block_max;
     let wide_arm = matchcopy_on();
+    // COPYMATCH CUT 1 -- one reserve makes capacity a BLOCK INVARIANT. Nothing
+    // reserved `out` before this; both copy tiers paid a capacity test per
+    // SEQUENCE as their only guard. One `reserve` per block plus CUT 2's
+    // budget bound (`len - block_start <= block_max`, below) gives
+    // `capacity - len >= 64` at every sequence, and the hot tiers assert it
+    // instead of testing it.
+    const COPY_PAD: usize = 64;
+    out.reserve(block_max as usize + COPY_PAD);
+    // COPYMATCH CUT 2 -- the RFC block bound, enforced as a RUNNING BUDGET.
+    // One subtract-and-branch per sequence replaces the old per-sequence
+    // `len > block_max` (a weak proxy: no single length exceeded it while the
+    // SUM could), covers BOTH copies' destination space under CUT 1's
+    // reserve, and rejects a hostile over-long block at the first sequence
+    // that overruns instead of at frame end.
+    let mut budget = block_max as usize;
+    // COPYMATCH CUT 5's right-hand side, hoisted: the window bound as a
+    // usize, clamped, once per block.
+    let win_lim: usize = window_size.min(usize::MAX as u64) as usize;
+    // WIN 3: the per-sequence `nodict` test DELETED from the hot path. Dict
+    // blocks get `win_eff == 0`, so CUT 5's guard (`off-1 >= min(dst, 0)`)
+    // routes EVERY dictionary match into its reject arm -- where the real
+    // `nodict` test lives, off the 99%-path. Plain frames pay nothing.
+    let win_eff = if nodict { win_lim } else { 0 };
+    // WIN 11: the fast predicate's arm conjunction, once per block. Shipping
+    // folds both to `true`; profile builds save an AND per sequence.
+    let fast_arms = litcopy_arm & wide_arm;
+    // COPYMATCH-III WIN 7: the literal buffer's length, hoisted -- the tier
+    // tests compare against a register instead of re-deriving per sequence.
+    let lits_len = literals.len();
+    // WIN 6: the literal SOURCE as two register recurrences -- a read pointer
+    // and a remaining count -- instead of a spilled `lit_pos` re-loaded and
+    // re-subtracted per sequence. `lit_pos` is derived (`lits_len - lit_rem`)
+    // only at cold boundaries and the tail.
+    // WIN 12: `lit_rem` is DELETED as a loop variable -- its per-sequence
+    // update (subtract + spill store) is gone. The tier test `lit_rem >= 16`
+    // becomes a guard compare against `lit_guard`, and the slow arm derives
+    // the remaining count from the pointers when it needs it.
+    // SAFETY: `lit_pos <= lits_len`, so the offset is in bounds.
+    #[allow(unsafe_code)]
+    let mut lit_p = unsafe { literals.as_ptr().add(lit_pos) };
+    let lit_start = literals.as_ptr();
+    // Wrapping on tiny buffers; the fused wrapping compare handles it.
+    let lit_guard = lits_len.wrapping_sub(16);
+    // Hoisted for the reason `litcopy_arm` is: an atomic load will not leave a loop.
+    let prefetch_arm = prefetch_on();
+    let pipeline_arm = pipeline_on();
+    let pipe1_arm = pipe1_on();
     // WIN 1: resolve each table's (ptr, mask) ONCE per block instead of 3x per
     // sequence. See `FseTable::view`.
     let llv = ll.view();
@@ -868,6 +981,284 @@ fn decode_sequences_inner(
     // the same `rem == 0`. One fewer live value in a loop the spill map shows
     // reloading 203 times.
     let mut rem = nseq;
+    // DECSEQ CUT 7: `state.reps` lives behind the `&mut BlockState` pointer, so
+    // every `resolve_offset` call read and wrote the history through memory the
+    // optimiser must keep current across the copy calls. A local array is
+    // promotable; it is written back once when the loop is done. (Error paths
+    // return without the write-back -- a failed block poisons the whole frame,
+    // so no caller reads the state after an Err.)
+    let mut reps = state.reps;
+    // ---------------------------------------------------------------------
+    // D10: the decode-ahead PIPELINE -- our `ZSTD_decompressSequencesLong`.
+    //
+    // D9 prefetched the match source ~9.4 ns before `copy_match` wanted it and
+    // measured nothing (+0.2%, z = -0.91): the out-of-order window already
+    // covers that distance unaided. The fix is DISTANCE, and the reason zstd
+    // needs a whole second decoder to get it is that the match ADDRESS looks
+    // like it depends on execution. It does not:
+    //
+    //   * `resolve_offset(offset_value, litlen, reps)` reads `reps` and
+    //     `litlen` only -- it never touches `out`. So offsets can be resolved
+    //     for many sequences ahead, in order, before any byte is copied.
+    //   * the output position each sequence will execute AT is just a running
+    //     sum: `pred += litlen + matchlen`.
+    //
+    // So the source address `pred + litlen - offset` is fully known PIPE
+    // sequences early. At PIPE = 8 that is ~8 x 30 ns = ~240 ns of distance
+    // against a 13-40 ns miss, versus D9's 9.4 ns.
+    //
+    // BYTE-IDENTICAL: the same sequences are executed in the same order with
+    // the same values; only DECODE moves earlier relative to EXECUTE, and the
+    // bit reader never reads `out`. `examples/bytegate.rs` (GOLD
+    // BE0071FB0CB0CED9, the GOLD of the day; see bytegate.rs for the
+    // history) plus the round-trip suite are the gate.
+    //
+    // The original loop below stays in the tree as the oracle and the arm-off
+    // path, per codec-optimize's "the slow version stays forever" rule.
+    if pipeline_arm && nseq > 0 {
+        const PIPE: usize = 8;
+        let (mut q_ll, mut q_ml, mut q_off) = ([0u32; PIPE], [0u32; PIPE], [0u32; PIPE]);
+        let (mut n_dec, mut n_exe) = (0u32, 0u32);
+        // Predicted `out.len()` at the moment the next DECODED sequence runs.
+        let mut pred = out.len();
+        macro_rules! decode_one {
+            () => {{
+                let _ = br.reload();
+                let ll_w = llv.entry_u32(ll_s);
+                let of_w = ofv.entry_u32(of_s);
+                let ml_w = mlv.entry_u32(ml_s);
+                let ll_code = crate::fse::fse_symbol(ll_w) as usize;
+                let of_code = u32::from(crate::fse::fse_symbol(of_w));
+                let ml_code = crate::fse::fse_symbol(ml_w) as usize;
+                debug_assert!(ll_code <= 35 && ml_code <= 52 && of_code <= 31);
+                if !seqcheck && (ll_code > 35 || ml_code > 52 || of_code > 31) {
+                    return Err(Error::Corruption);
+                }
+                let offset_add = br.read_bits(of_code);
+                #[allow(unsafe_code)]
+                let (ll_w2, ml_w2) = unsafe {
+                    debug_assert!(ll_code < LL_PACK.len() && ml_code < ML_PACK.len());
+                    (
+                        *LL_PACK.get_unchecked(ll_code),
+                        *ML_PACK.get_unchecked(ml_code),
+                    )
+                };
+                let (ml_bits, ll_bits) = (pk_bits(ml_w2), pk_bits(ll_w2));
+                let (ll_base, ml_base) = (pk_base(ll_w2), pk_base(ml_w2));
+                let ml_add = br.read_bits(u32::from(ml_bits));
+                let ll_add = br.read_bits(u32::from(ll_bits));
+                let litlen = ll_base + ll_add;
+                let matchlen = ml_base + ml_add;
+                // CUT 4 applies here too: `read_bits(0) == 0`, so no 0-branch.
+                let offset_value = {
+                    // WIN 9: LUT load, not a %cl shift. `of_code <= 31` is the same
+                    // build-time bound the seqcheck fold rests on (T4).
+                    debug_assert!((of_code as usize) < OF_PACK.len());
+                    #[allow(unsafe_code)]
+                    let b = *unsafe { OF_PACK.get_unchecked(of_code as usize) };
+                    b + offset_add
+                };
+                // Safe to run early: reads `reps` and `litlen`, never `out`.
+                let offset = resolve_offset(offset_value, litlen, &mut reps)?;
+                n_dec += 1;
+                if n_dec != nseq {
+                    let _ = br.reload();
+                    ll_s = FseTable::advance_w(ll_w, &mut br);
+                    ml_s = FseTable::advance_w(ml_w, &mut br);
+                    of_s = FseTable::advance_w(of_w, &mut br);
+                }
+                // Issue the history load now, ~PIPE sequences before use.
+                // Only into the ALREADY-DECODED region: a nearer match is in
+                // cache anyway, and this keeps the pointer provably in-bounds.
+                let at = pred + litlen as usize;
+                let off = offset as usize;
+                if off <= at && at - off < out.len() {
+                    note_pf(0);
+                    prefetch_addr(out, at - off);
+                } else {
+                    note_pf(1);
+                }
+                pred = at + matchlen as usize;
+                let slot = (n_dec as usize - 1) % PIPE;
+                q_ll[slot] = litlen;
+                q_ml[slot] = matchlen;
+                q_off[slot] = offset;
+            }};
+        }
+        while n_dec < nseq && n_dec - n_exe < PIPE as u32 {
+            decode_one!();
+        }
+        while n_exe < nseq {
+            let slot = (n_exe as usize) % PIPE;
+            let (litlen, matchlen, offset) = (q_ll[slot], q_ml[slot], q_off[slot]);
+            let need = litlen as usize + matchlen as usize;
+            if need > budget {
+                return Err(Error::Corruption);
+            }
+            budget -= need;
+            let dst0 = out.len();
+            copy_literals_hot(literals, &mut lit_pos, litlen, out, litcopy_arm, dst0)?;
+            if nodict {
+                copy_match_nodict(
+                    out,
+                    dst0 + litlen as usize,
+                    offset,
+                    matchlen,
+                    win_lim,
+                    wide_arm,
+                )?;
+            } else {
+                copy_match_dict_cold(out, &mctx, offset, matchlen)?;
+            }
+            n_exe += 1;
+            if n_dec < nseq {
+                decode_one!();
+            }
+        }
+        rem = 0;
+    }
+    // ---------------------------------------------------------------------
+    // D11: the DEPTH-1 interleave. One pending sequence held in registers;
+    // per iteration: advance states past it, decode the NEXT sequence's
+    // symbols, issue the NEXT match source's prefetch, THEN execute the
+    // pending copies -- so the ~13-40 ns history miss overlaps a full
+    // sequence (~30 ns) of real work instead of D9's 9.4 ns, with none of
+    // D10's queue (three arrays and a modulo per step, which cost more than
+    // the latency they hid, monotonically in depth).
+    //
+    // BYTE-IDENTICAL by construction: the bitstream is consumed in exactly
+    // the classic order (decode N, advance N, decode N+1, ...), the same
+    // copies run with the same values in the same output order, and a
+    // prefetch has no architectural effect. `bytegate` GOLD is the gate.
+    // (On a CORRUPT stream the classic loop had executed sequence N before
+    // rejecting N+1 where this rejects first; failed blocks are discarded by
+    // every caller, so partial content on error is outside the contract.)
+    if pipe1_arm && rem != 0 {
+        macro_rules! d11_decode {
+            () => {{
+                let _ = br.reload();
+                let ll_w = llv.entry_u32(ll_s);
+                let of_w = ofv.entry_u32(of_s);
+                let ml_w = mlv.entry_u32(ml_s);
+                let ll_code = crate::fse::fse_symbol(ll_w) as usize;
+                let of_code = u32::from(crate::fse::fse_symbol(of_w));
+                let ml_code = crate::fse::fse_symbol(ml_w) as usize;
+                debug_assert!(ll_code <= 35 && ml_code <= 52 && of_code <= 31);
+                if !seqcheck && (ll_code > 35 || ml_code > 52 || of_code > 31) {
+                    return Err(Error::Corruption);
+                }
+                let offset_add = br.read_bits(of_code);
+                #[allow(unsafe_code)]
+                let (ll_w2, ml_w2) = unsafe {
+                    debug_assert!(ll_code < LL_PACK.len() && ml_code < ML_PACK.len());
+                    (
+                        *LL_PACK.get_unchecked(ll_code),
+                        *ML_PACK.get_unchecked(ml_code),
+                    )
+                };
+                let ml_add = br.read_bits(u32::from(pk_bits(ml_w2)));
+                let ll_add = br.read_bits(u32::from(pk_bits(ll_w2)));
+                let litlen = pk_base(ll_w2) + ll_add;
+                let matchlen = pk_base(ml_w2) + ml_add;
+                // CUT 4's identity, as in the classic loop.
+                let offset_value = {
+                    // WIN 9: LUT load, not a %cl shift. `of_code <= 31` is the same
+                    // build-time bound the seqcheck fold rests on (T4).
+                    debug_assert!((of_code as usize) < OF_PACK.len());
+                    #[allow(unsafe_code)]
+                    let b = *unsafe { OF_PACK.get_unchecked(of_code as usize) };
+                    b + offset_add
+                };
+                (ll_w, ml_w, of_w, litlen, matchlen, offset_value)
+            }};
+        }
+        macro_rules! d11_exec {
+            ($lit:expr, $off:expr, $mat:expr) => {{
+                let need = $lit as usize + $mat as usize;
+                if need > budget {
+                    return Err(Error::Corruption);
+                }
+                budget -= need;
+                let dst0 = out.len();
+                copy_literals_hot(literals, &mut lit_pos, $lit, out, litcopy_arm, dst0)?;
+                if nodict {
+                    copy_match_nodict(out, dst0 + $lit as usize, $off, $mat, win_lim, wide_arm)?;
+                } else {
+                    copy_match_dict_cold(out, &mctx, $off, $mat)?;
+                }
+            }};
+        }
+        // Prologue: decode the first sequence; it becomes the pending one.
+        let (mut cw_ll, mut cw_ml, mut cw_of, mut c_lit, mut c_mat, ov0) = d11_decode!();
+        let mut c_off = resolve_offset(ov0, c_lit, &mut reps)?;
+        rem -= 1;
+        while rem != 0 {
+            rem -= 1;
+            // Advance past the pending sequence, then decode the next --
+            // identical bit order to the classic loop.
+            let _ = br.reload();
+            ll_s = FseTable::advance_w(cw_ll, &mut br);
+            ml_s = FseTable::advance_w(cw_ml, &mut br);
+            of_s = FseTable::advance_w(cw_of, &mut br);
+            let (nw_ll, nw_ml, nw_of, n_lit, n_mat, n_ov) = d11_decode!();
+            // Runs a sequence early on purpose: reads `reps` and `litlen`
+            // only, never `out` (the D10 block proves the same property).
+            let n_off = resolve_offset(n_ov, n_lit, &mut reps)?;
+            // The whole point: the NEXT match source's address is fully known
+            // before the pending copies run. Prefetch only into the
+            // already-decoded region -- a nearer source is cache-warm anyway.
+            let pred = out.len() + c_lit as usize + c_mat as usize + n_lit as usize;
+            let n_off_us = n_off as usize;
+            if n_off_us <= pred {
+                let at = pred - n_off_us;
+                if at < out.len() {
+                    prefetch_addr(out, at);
+                }
+            }
+            // Execute the pending sequence; the next one's miss is in flight.
+            d11_exec!(c_lit, c_off, c_mat);
+            (cw_ll, cw_ml, cw_of) = (nw_ll, nw_ml, nw_of);
+            (c_lit, c_mat, c_off) = (n_lit, n_mat, n_off);
+        }
+        // Epilogue: the last pending sequence (no advance after the last
+        // decode, exactly as the classic loop skips it).
+        d11_exec!(c_lit, c_off, c_mat);
+    }
+    // COPYMATCH-III WIN 1 -- the loop runs on RAW CURSORS, C's `op`/`oend`
+    // discipline. The emitted asm showed `out` living behind TWO levels of
+    // indirection (`344(%rbp)` -> Vec -> `8`/`16(%rdx)`), its `ptr` and `len`
+    // fields reloaded TWICE per sequence and `set_len` stored twice more.
+    // `base`/`dst` live in registers; `set_len` publishes only at a COLD
+    // boundary (whose callee may reallocate, so `base` is refetched after),
+    // at the loop exit, and ahead of the profile-only taps. On an `Err`
+    // return `out.len()` may lag bytes physically written past it -- those
+    // are unpublished spare capacity, and every caller discards the block.
+    // WIN 10: the cursor is `op` -- C's own form -- so every tier store
+    // addresses `op` DIRECTLY instead of computing `base + dst` per copy; the
+    // integer `dst` is derived only where the guard needs it.
+    let mut base = out.as_mut_ptr();
+    #[allow(unsafe_code)]
+    let mut op = unsafe { base.add(out.len()) };
+    macro_rules! publish {
+        () => {{
+            // SAFETY: `dst` counts only initialised bytes (every tier writes
+            // before advancing it) and the block invariant keeps it within
+            // capacity.
+            #[allow(unsafe_code)]
+            unsafe {
+                out.set_len(op.offset_from(base) as usize)
+            };
+        }};
+    }
+    macro_rules! refetch {
+        () => {{
+            base = out.as_mut_ptr();
+            #[allow(unsafe_code)]
+            unsafe {
+                op = base.add(out.len());
+            }
+        }};
+    }
     while rem != 0 {
         rem -= 1;
         let _ = br.reload();
@@ -914,15 +1305,33 @@ fn decode_sequences_inner(
         let ll_add = br.read_bits(u32::from(ll_bits));
         let litlen = ll_base + ll_add;
         let matchlen = ml_base + ml_add;
-        let offset_value = if of_code == 0 {
-            1
-        } else {
-            (1u32 << of_code) + offset_add
+        // DECSEQ CUT 4: the old `if of_code == 0 { 1 } else { ... }` restated
+        // what the expression already computes -- `read_bits(0)` returns 0 by
+        // definition (bit.rs) and `1u32 << 0` is 1, so the branch and the
+        // else-arm were byte-for-byte the same value. One branch per sequence,
+        // deleted by algebra rather than prediction.
+        let offset_value = {
+            // WIN 9: LUT load, not a %cl shift. `of_code <= 31` is the same
+            // build-time bound the seqcheck fold rests on (T4).
+            debug_assert!((of_code as usize) < OF_PACK.len());
+            #[allow(unsafe_code)]
+            let b = *unsafe { OF_PACK.get_unchecked(of_code as usize) };
+            b + offset_add
         };
 
+        // D9: start the history load NOW, so its miss overlaps the ~9.4 ns of
+        // literal copy and offset resolution that run before `copy_match`.
+        // (Profile-armed tap: it reads `out.len()`, so publish first.)
+        if prefetch_arm {
+            publish!();
+            prefetch_hist(out, litlen, offset_value);
+        }
+
         // ---- DecSeq loop anatomy: duplicate ONE op, then undo it ----
+        // (Anatomy taps drive the Vec API, so the cursors publish around them.)
         #[cfg(feature = "dupladder")]
         {
+            publish!();
             use core::hint::black_box;
             for _ in 0..dup_k {
                 match dup {
@@ -947,11 +1356,12 @@ fn decode_sequences_inner(
                     }
                     4 => {
                         let sv = br.dup_save();
-                        black_box(br.reload());
-                        black_box(br.reload());
+                        let _ = black_box(br.reload());
+                        let _ = black_box(br.reload());
                         br.dup_restore(sv);
                     }
                     5 => {
+                        let mut lit_pos = (lit_p as usize).wrapping_sub(lit_start as usize);
                         let (lp, len) = (lit_pos, out.len());
                         let _ = copy_literals(literals, &mut lit_pos, litlen, out, litcopy_arm);
                         lit_pos = lp;
@@ -960,30 +1370,212 @@ fn decode_sequences_inner(
                     _ => {}
                 }
             }
+            refetch!();
         }
-        copy_literals(literals, &mut lit_pos, litlen, out, litcopy_arm)?;
+        // COPYMATCH CUT 2 -> MEGAFUSE: the budget test now lives inside the
+        // fused fast-path predicate below; the slow arm re-derives it.
+        let need = litlen as usize + matchlen as usize;
+        let n = litlen as usize;
         #[cfg(feature = "dupladder")]
         if dup == 6 {
             for _ in 0..dup_k {
-                let sv = state.reps;
-                let _ =
-                    core::hint::black_box(resolve_offset(offset_value, litlen, &mut state.reps));
-                state.reps = sv;
+                let sv = reps;
+                let _ = core::hint::black_box(resolve_offset(offset_value, litlen, &mut reps));
+                reps = sv;
             }
         }
-        let offset = resolve_offset(offset_value, litlen, &mut state.reps)?;
+        let offset = resolve_offset(offset_value, litlen, &mut reps)?;
         #[cfg(feature = "dupladder")]
         if dup == 7 {
+            publish!();
             for _ in 0..dup_k {
                 let len = out.len();
                 let _ = copy_match(out, &mctx, offset, matchlen);
                 out.truncate(len);
             }
+            refetch!();
         }
-        if nodict {
-            copy_match_nodict(out, offset, matchlen, win_sz, blk_max, wide_arm)?;
+        let off = offset as usize;
+        let mlen = matchlen as usize;
+        let b_ok = budget.wrapping_sub(need);
+        let dst = (op as usize).wrapping_sub(base as usize);
+        let lit_off = (lit_p as usize).wrapping_sub(lit_start as usize);
+        // ---- THE JOINT-SEQUENCE MEGAFUSE ----------------------------------
+        // SEVEN borrow-free differences, ONE sign test, for the [79.6%, 80.4%]
+        // of sequences (`jointrate.rs`) where both copies take their 16-byte
+        // tiers. What each term retires on the fast path:
+        //   b_ok            = budget - (lit+match)   CUT 2's reject branch
+        //   16 - n                                    lit tier, half
+        //   lit_rem - 16                              lit tier, half -- and it
+        //                                             IMPLIES the input bound
+        //                                             (n <= 16 <= lit_rem), so
+        //                                             that reject's term is
+        //                                             DROPPED as redundant
+        //   16 - mlen, off - 16                       match tier
+        //   dst - off, win_eff - off                  CUT 5's guard with the
+        //                                             `min`/cmov DECOMPOSED
+        //                                             into two terms; `off>=16`
+        //                                             subsumes the `off >= 1`
+        //                                             wrap-guard
+        // Every magnitude is < 2^32, so the OR's sign bit is exactly "some
+        // condition failed". The slow arm below re-derives everything -- it is
+        // the pre-fuse code, verbatim, and byte-identity holds because the
+        // fused predicate is precisely the conjunction of the tests it
+        // replaces.
+        let fused = b_ok
+            | 16usize.wrapping_sub(n)
+            | lit_guard.wrapping_sub(lit_off)
+            | 16usize.wrapping_sub(mlen)
+            | off.wrapping_sub(16)
+            | dst.wrapping_sub(off)
+            | win_eff.wrapping_sub(off);
+        if fast_arms & ((fused as isize) >= 0) {
+            budget = b_ok;
+            // SAFETY: `lit_rem >= 16` gives 16 readable literal bytes;
+            // `off >= 16` with `off <= dst` gives 16 readable, disjoint match
+            // bytes; the block invariant gives `need + 64` writable bytes past
+            // `dst`; only `n + mlen` are published. `dst - off` is reused from
+            // the predicate as the match source.
+            #[allow(unsafe_code)]
+            unsafe {
+                #[cfg(feature = "profile")]
+                {
+                    DEC_LIT16.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    DEC_MATCH16.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                note_band(2, mlen);
+                core::ptr::copy_nonoverlapping(lit_p, op, 16);
+                lit_p = lit_p.add(n);
+                let d = op.add(n);
+                core::ptr::copy_nonoverlapping(d.sub(off), d, 16);
+                // ONE cursor advance for both copies (WIN 12 killed the
+                // `lit_rem` update that used to sit beside it).
+                op = op.add(need);
+            }
         } else {
-            copy_match(out, &mctx, offset, matchlen)?;
+            // ---- SLOW ARM: the pre-fuse path, verbatim ------------------------
+            // D31 REFUTED: `saturating_sub` here measured **+4** and did not move
+            // the pad count -- so this subtraction was never the remaining pad in
+            // `decode_compressed_block`, and its check was already folded into the
+            // `(b_ok | l_ok) < 0` test below. Seventh and last refutation in the
+            // pad class.
+            let lit_rem = lits_len - lit_off;
+            let l_ok = lit_rem.wrapping_sub(n);
+            if ((b_ok | l_ok) as isize) < 0 {
+                return Err(Error::Corruption);
+            }
+            budget = b_ok;
+            // WIN 4: single branch, FORCED arithmetically like WIN 5 -- the setcc
+            // form proved allocator-unstable (LLVM re-split it on a later build).
+            // `n <= 16` and `lit_rem >= 16` are both borrow-free subtractions.
+            if litcopy_arm
+                & ((((16usize.wrapping_sub(n)) | (lit_rem.wrapping_sub(16))) as isize) >= 0)
+            {
+                // SAFETY: as the fused path's literal half.
+                #[allow(unsafe_code)]
+                unsafe {
+                    #[cfg(feature = "profile")]
+                    DEC_LIT16.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    core::ptr::copy_nonoverlapping(lit_p, op, 16);
+                    lit_p = lit_p.add(n);
+                    op = op.add(n);
+                }
+            } else {
+                // WIN 10: the fallback goes STRAIGHT to the cold rungs -- routing
+                // it back through the inline tier re-asked (and re-emitted) the
+                // exact test that just failed. The input bound above already
+                // holds, so the cold precondition (`end <= lits_len`) does too.
+                // SECTION 27: literal raw protocol first. SAFETY: `lit_rem`
+                // literals are readable (the input bound just passed); the block
+                // invariant gives `n + 64` writable bytes.
+                #[allow(unsafe_code)]
+                let raw = if litcopy_arm {
+                    unsafe { lit_cold_raw(lit_p, lit_rem, op, n) }
+                } else {
+                    None
+                };
+                match raw {
+                    Some((np, nop)) => {
+                        lit_p = np;
+                        op = nop;
+                    }
+                    None => {
+                        publish!();
+                        let mut lit_pos = lit_off;
+                        let end = lit_pos + n;
+                        if litcopy_arm {
+                            copy_literals_cold::<true>(literals, &mut lit_pos, end, n, out, dst)?;
+                        } else {
+                            copy_literals_cold::<false>(literals, &mut lit_pos, end, n, out, dst)?;
+                        }
+                        #[allow(unsafe_code)]
+                        unsafe {
+                            lit_p = literals.as_ptr().add(lit_pos);
+                        }
+                        refetch!();
+                    }
+                }
+            }
+            {
+                // WIN 1's match side: CUT 5's fused guard and the 16-byte tier on
+                // the raw cursors; everything else publishes and takes the cold
+                // monomorph, refetching `base` because the cold rungs may grow.
+                // WIN 3 folded the dict dispatch into this guard via `win_eff`.
+                let dst = (op as usize).wrapping_sub(base as usize);
+                if off.wrapping_sub(1) >= dst.min(win_eff) {
+                    if nodict {
+                        return Err(Error::Corruption);
+                    }
+                    publish!();
+                    copy_match_dict_cold(out, &mctx, offset, matchlen)?;
+                    refetch!();
+                } else {
+                    // WIN 5: ONE branch, forced arithmetically -- the `&` form still
+                    // emitted two compare-and-branch pairs here. `off >= 16` leaves
+                    // `off - 16` borrow-free; `mlen <= 16` leaves `16 - mlen`
+                    // borrow-free; both magnitudes are far below 2^63, so the OR of
+                    // the two wrapping differences is sign-negative exactly when
+                    // either condition fails. One `or`, one sign test.
+                    if wide_arm
+                        & ((((off.wrapping_sub(16)) | (16usize.wrapping_sub(mlen))) as isize) >= 0)
+                    {
+                        // SAFETY: `off >= 16` = readable + disjoint (CUT 5 proved
+                        // `off <= dst`); 16 writable bytes by the block invariant;
+                        // only `mlen <= 16` published via `dst`.
+                        #[allow(unsafe_code)]
+                        unsafe {
+                            #[cfg(feature = "profile")]
+                            DEC_MATCH16.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            note_band(2, mlen);
+                            core::ptr::copy_nonoverlapping(op.sub(off), op, 16);
+                            op = op.add(mlen);
+                        }
+                    } else {
+                        // SECTION 27: the raw protocol first -- ~99% of cold calls
+                        // skip the publish/refetch boundary entirely. SAFETY: the
+                        // guard above proved `1 <= off <= dst`; the block invariant
+                        // gives `mlen + 64` writable bytes.
+                        #[allow(unsafe_code)]
+                        let raw = if wide_arm {
+                            unsafe { match_cold_raw(op, off, mlen) }
+                        } else {
+                            None
+                        };
+                        match raw {
+                            Some(nop) => op = nop,
+                            None => {
+                                publish!();
+                                if wide_arm {
+                                    copy_from_decoded_cold(true, true, out, dst, off, mlen)?;
+                                } else {
+                                    copy_from_decoded_cold(true, false, out, dst, off, mlen)?;
+                                }
+                                refetch!();
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if rem != 0 {
@@ -994,9 +1586,35 @@ fn decode_sequences_inner(
         }
     }
     drop(g_loop);
+    // WIN 1's exit publish: the cursors return to the Vec; WIN 6's literal
+    // cursor returns to `lit_pos` for the tail.
+    publish!();
+    lit_pos = (lit_p as usize).wrapping_sub(lit_start as usize);
+    // CUT 7's write-back: the loop is done, the history returns to the state.
+    state.reps = reps;
+    // COPYMATCH CUT 7: the trailing literals complete the block bound -- a
+    // conformant block's total regenerated size (sequences + tail) is within
+    // `block_max`, so a tail that overruns the remaining budget is corrupt.
+    // One compare per BLOCK, and the invariant CUTS 3/4 rely on holds through
+    // the tail as well.
+    // D20: TWO checks become one. `lit_pos` is computed by `wrapping_sub` on
+    // raw pointers a few lines up, so it is genuinely opaque -- LLVM cannot
+    // relate it to `literals.len()`. That cost a subtraction-underflow check on
+    // `literals.len() - lit_pos` AND a bounds test on `&literals[lit_pos..]`,
+    // each with its own panic pad, inlined into both `decode_sequences` twins.
+    //
+    // One `get` proves the bound once and yields the remainder, whose `len()`
+    // is exactly what the budget test wanted. Identical behaviour: an out-of-
+    // range `lit_pos` reached both old checks and now returns `Corruption`.
+    // This is D17's case, not D19's -- the bound here is opaque, not merely
+    // spelled with brackets.
+    let rest = literals.get(lit_pos..).ok_or(Error::Corruption)?;
+    if rest.len() > budget {
+        return Err(Error::Corruption);
+    }
     {
         let _g = crate::prof::scope(crate::prof::Stage::DecSeqTail);
-        out.extend_from_slice(&literals[lit_pos..]);
+        out.extend_from_slice(rest);
     }
     state.ll = Some(ll);
     state.of = Some(of);
@@ -1100,7 +1718,6 @@ pub(crate) fn debug_seq_codes(
     Ok((nseq, modes, out))
 }
 
-#[inline(always)]
 // W18 -- the per-block table SETUP is cold relative to the sequence loop.
 //
 // `seq_table` -> `read_ncount` -> `from_norm` are all `inline(always)`, so the
@@ -1121,6 +1738,18 @@ pub(crate) fn debug_seq_codes(
 // measure this outlining. The dead attribute is removed rather than the live
 // one so the shipped binary is the one that was measured. Re-run the W18 A/B
 // before promoting `seq_table` to `inline(never)`.
+//
+// PROMOTED, and here is why the pending A/B is no longer the gate it was.
+// W18's own caveat draws the line at FREQUENCY: "outlining anything reachable
+// PER SEQUENCE measured 2.5% SLOWER ... per-block is the safe side of that
+// line." `seq_table` runs three times per BLOCK, on the safe side by its own
+// test. And its stated mechanism -- "inlined into BOTH `decode_sequences`
+// twins beside the hot loop, costing the loop its register budget" -- was
+// already fixed from the other end: `decode_seq_header` is `#[inline(never)]`
+// since Trans VII, so this build no longer sits beside the sequence loop at
+// all. What is left is pure code size: SIX shipping call sites, each inlining
+// 51 lines, with no symbol of its own.
+#[inline(never)]
 fn seq_table(
     src: &[u8],
     mode: u8,
@@ -1185,6 +1814,13 @@ pub fn set_seqcheck_arm(on: bool) {
     );
 }
 
+/// DECSEQ CUT 3 -- pattern A (see section 10.1 of the plan): this arm guards a
+/// PER-SEQUENCE test, so in the shipping build it folds to the constant `true`
+/// (the range test stays hoisted to table build, which has been the default
+/// since brick 45) and the whole `!seqcheck && (...)` body vanishes from both
+/// sequence-loop twins. The tri-state read and the `RZSTD_SEQCHECK_HOIST`
+/// escape survive under `--features profile`, where the A/B harness lives.
+#[cfg(feature = "profile")]
 #[inline(always)]
 fn seqcheck_hoisted() -> bool {
     use core::sync::atomic::Ordering;
@@ -1199,6 +1835,11 @@ fn seqcheck_hoisted() -> bool {
             on
         }
     }
+}
+#[cfg(not(feature = "profile"))]
+#[inline(always)]
+fn seqcheck_hoisted() -> bool {
+    true
 }
 
 /// Copy one literal run into the output.
@@ -1228,6 +1869,10 @@ fn seqcheck_hoisted() -> bool {
 /// path is a 16/32-byte copy, so inlining it removes the boundary without
 /// meaningful code growth.
 #[inline(always)]
+#[cfg_attr(
+    not(any(test, feature = "dupladder")),
+    allow(dead_code) // the checked oracle of `copy_literals_hot`; tests + the dupladder anatomy drive it.
+)]
 fn copy_literals(
     literals: &[u8],
     lit_pos: &mut usize,
@@ -1236,10 +1881,17 @@ fn copy_literals(
     arm: bool,
 ) -> Result<(), Error> {
     let n = litlen as usize;
-    let end = lit_pos.checked_add(n).ok_or(Error::Corruption)?;
-    if end > literals.len() {
+    // DECSEQ CUT 8: the old `checked_add(n)?` paid an add-plus-overflow-branch
+    // per sequence to guard a sum the compare below already bounds. Phrased as
+    // a REMAINING-LENGTH test, no addition can overflow on any pointer width:
+    // `lit_pos <= literals.len()` is this function's own postcondition (it
+    // only ever advances `lit_pos` to a validated `end`), so the subtraction
+    // is in range, and `end` is computed only after `n` is proven to fit.
+    debug_assert!(*lit_pos <= literals.len());
+    if n > literals.len() - *lit_pos {
         return Err(Error::Corruption);
     }
+    let end = *lit_pos + n;
     let len = out.len();
     if arm && n <= 16 && *lit_pos + 16 <= literals.len() && out.capacity() - len >= 16 {
         // SAFETY: `lit_pos + 16 <= literals.len()` gives 16 readable source
@@ -1271,7 +1923,64 @@ fn copy_literals(
     // stamped into every copy. Measured share (`declit`, 8 corpora):
     // tier1 99.7%, tier2 0.12%, tier3 0.09%, fallback ~0.1% -- so <0.4% of
     // copies were paying for the other 99.6%'s code size.
-    copy_literals_cold(literals, lit_pos, end, n, out, arm, len)
+    if arm {
+        copy_literals_cold::<true>(literals, lit_pos, end, n, out, len)
+    } else {
+        copy_literals_cold::<false>(literals, lit_pos, end, n, out, len)
+    }
+}
+
+/// COPYMATCH CUTS 4 and 6 -- the sequence loop's literal copy. Two things the
+/// general `copy_literals` above pays per call are BLOCK INVARIANTS inside the
+/// budgeted loop and drop out here:
+///
+/// * the capacity test: cut 1 reserves `block_max + 64` at loop entry and
+///   cut 2's budget bounds `len - block_start` by `block_max`, so
+///   `capacity - len >= 64` holds at EVERY sequence -- asserted, not tested;
+/// * the `out.len()` re-read: the caller passes `dst_at` in a register.
+///
+/// The general fn stays as the oracle for the tests and the unbudgeted paths.
+#[inline(always)]
+#[allow(unsafe_code)]
+fn copy_literals_hot(
+    literals: &[u8],
+    lit_pos: &mut usize,
+    litlen: u32,
+    out: &mut Vec<u8>,
+    arm: bool,
+    dst_at: usize,
+) -> Result<(), Error> {
+    let n = litlen as usize;
+    debug_assert!(*lit_pos <= literals.len());
+    debug_assert_eq!(dst_at, out.len());
+    debug_assert!(out.capacity() - dst_at >= 64, "block reserve invariant");
+    if n > literals.len() - *lit_pos {
+        return Err(Error::Corruption);
+    }
+    let end = *lit_pos + n;
+    if arm && n <= 16 && *lit_pos + 16 <= literals.len() {
+        // SAFETY: the test above gives 16 readable source bytes; the block
+        // invariant (reserve + budget, see the doc comment) gives 16 writable
+        // destination bytes inside the allocation; `literals` and `out` are
+        // distinct buffers; exactly `n <= 16` bytes are published.
+        unsafe {
+            #[cfg(feature = "profile")]
+            DEC_LIT16.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            core::ptr::copy_nonoverlapping(
+                literals.as_ptr().add(*lit_pos),
+                out.as_mut_ptr().add(dst_at),
+                16,
+            );
+            out.set_len(dst_at + n);
+        }
+        *lit_pos = end;
+        return Ok(());
+    }
+    if arm {
+        copy_literals_cold::<true>(literals, lit_pos, end, n, out, dst_at)
+    } else {
+        copy_literals_cold::<false>(literals, lit_pos, end, n, out, dst_at)
+    }
 }
 
 /// Tiers 2 and 3 plus the `extend_from_slice` fallback: under 0.4% of literal
@@ -1279,15 +1988,19 @@ fn copy_literals(
 #[allow(unsafe_code)]
 #[inline(never)]
 #[cold]
-fn copy_literals_cold(
+fn copy_literals_cold<const A: bool>(
     literals: &[u8],
     lit_pos: &mut usize,
     end: usize,
     n: usize,
     out: &mut alloc::vec::Vec<u8>,
-    arm: bool,
     len: usize,
 ) -> Result<(), Error> {
+    // COPYMATCH-III WIN 9: `arm` was a runtime ARGUMENT tested by every rung
+    // of this OUTLINED symbol -- across a call boundary the caller's folded
+    // constant cannot propagate. As a const parameter the shipping monomorph
+    // tests nothing and drops the dead rungs outright.
+    let arm = A;
     // BRICK 80: a 32-byte tier above the 16-byte one.
     //
     // MEASURED FIRST (19.6M literal copies across the corpus):
@@ -1340,7 +2053,10 @@ fn copy_literals_cold(
         *lit_pos = end;
         return Ok(());
     }
-    out.extend_from_slice(&literals[*lit_pos..end]);
+    // D22, second site: both ends are runtime and the fast tiers above have
+    // already returned, so nothing here proves the range to LLVM.
+    let chunk = literals.get(*lit_pos..end).ok_or(Error::Corruption)?;
+    out.extend_from_slice(chunk);
     *lit_pos = end;
     Ok(())
 }
@@ -1374,28 +2090,97 @@ pub fn set_dup_k(k: u8) {
     DUP_K.store(k.max(1), core::sync::atomic::Ordering::Relaxed);
 }
 
-/// SIMD-2 arm: the AVX2 block driver. Kept so the in-process ABBA harness can
-/// re-adjudicate it on other microarchitectures. 1 = off, 2 = on (default).
-static BLOCK_AVX2_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
-
-/// Bench hook: `false` routes the block driver to the bmi2-only twin.
-pub fn set_block_avx2_arm(on: bool) {
-    BLOCK_AVX2_ARM.store(
-        if on { 2 } else { 1 },
-        core::sync::atomic::Ordering::Relaxed,
-    );
-}
-
-#[inline(always)]
-fn block_avx2_on() -> bool {
-    BLOCK_AVX2_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
-}
+// SIMD-2 ARM REMOVED, knob and all. The AVX2 block driver it selected was
+// retired; `block_avx2_on` was left with no readers and `set_block_avx2_arm`
+// with no callers, so the public setter stored a value nothing consulted.
+// Silencing the dead reader would have kept a write-only knob in the API,
+// which is worse than removing it -- a caller could set it and reasonably
+// believe something changed.
 
 /// Runtime arms for the pre-2026-08-15 bricks, so the in-process ABBA
 /// harness can re-adjudicate them. Each defaults ON (shipping behaviour).
 static LUT_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
 static LITCOPY_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
 static MATCHCOPY_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
+/// D9 COVERAGE census: prefetches issued, vs skipped because the offset is a
+/// REP code (needs `state.reps`, resolved after the prefetch point), vs skipped
+/// as out-of-range. Deterministic -- this is what SIZES D9, because a prefetch
+/// only helps the sequences it is actually issued for.
+#[cfg(feature = "pfcensus")]
+pub static PF_CENSUS: [core::sync::atomic::AtomicU64; 3] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+/// Read and clear `(issued, skipped_rep, skipped_oob)`.
+#[cfg(feature = "pfcensus")]
+pub fn take_pf_census() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        PF_CENSUS[0].swap(0, Relaxed),
+        PF_CENSUS[1].swap(0, Relaxed),
+        PF_CENSUS[2].swap(0, Relaxed),
+    )
+}
+#[cfg(feature = "pfcensus")]
+#[inline(always)]
+fn note_pf(i: usize) {
+    PF_CENSUS[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(not(feature = "pfcensus"))]
+#[inline(always)]
+fn note_pf(_i: usize) {}
+
+/// D9 arm: issue the match source's history load one step early.
+///
+/// **Defaults OFF, and that is a NOISE verdict, not a quality one** -- see
+/// codec-measurement 12, which requires saying which kind of revert this was.
+/// `examples/d9cover.rs` sizes the brick deterministically at **94.1% coverage,
+/// 21.9% of DecSeqLoop** if every issued prefetch fully hid its miss -- a large
+/// effect, and one `examples/d9probe.rs` could not see: **+0.2%, z = -0.91,
+/// against a NULL ARM of 27.7%** on a box carrying `faucet.exe` at 86,147 CPU-s
+/// and eight `Code.exe` at 40-90k each.
+///
+/// The point estimate leans mildly negative (129/273 pairs), so it does not ship
+/// on by default. The likely mechanism is that 9.4 ns is simply not far enough:
+/// the out-of-order window already reaches past `copy_literals` to the
+/// `copy_match` load without help, so the software prefetch buys an instruction
+/// and no latency. Closing that needs a FULL SEQUENCE of distance (~40 ns),
+/// i.e. the depth-1 decode-ahead pipeline in plan section 13.6.
+///
+/// Kept behind the arm so re-testing on a quiet box is one call, per
+/// codec-measurement 12.
+static PREFETCH_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+/// D10 arm: the decode-ahead PIPELINE -- our `ZSTD_decompressSequencesLong`.
+///
+/// **MEASURED WORSE. Defaults OFF. This is a revert-because-WORSE, not a
+/// revert-because-noise** (codec-measurement 12 requires saying which).
+///
+/// Correct: `examples/d10gate.rs` compares both arms byte-for-byte over 90
+/// release cells (5 levels x 18 corpora) and 36 debug cells -- ALL MATCH. The
+/// pipeline is a faithful implementation, not a broken one.
+///
+/// Slower, at every distance tried (`examples/d10probe.rs`, L3, DecSeqLoop
+/// stage isolated, ABBA):
+///
+/// | brick | prefetch distance | delta | z | pairs won |
+/// |---|---|---:|---:|---:|
+/// | D9 (plain prefetch) | ~9.4 ns | +0.2% | -0.91 | 129/273 |
+/// | D10, PIPE = 4 | ~120 ns | **+15.8%** | -13.25 | 5/195 |
+/// | D10, PIPE = 8 | ~240 ns | **+18.4%** | -14.59 | 16/273 |
+///
+/// Three probes, three distances, monotone the WRONG way -- so this is a
+/// three-probe refutation of the DIRECTION (codec-measurement 11), not one bad
+/// number. The z-scores are far too large to be the 26-33% null arm.
+///
+/// Why: the queue (three arrays, a head/tail pair, the macro expanded at two
+/// sites) costs more than the latency it hides, and its cost GROWS with depth
+/// while the latency saved does not. Same shape as brick 64's finding a few
+/// lines below -- a structural change that removed real work and still lost,
+/// because the structure was the expensive part.
+///
+/// zstd needs this decoder because its short path differs from ours; ours does
+/// not benefit. Kept behind the arm per codec-measurement 12 so a future
+/// restructure can re-test it in one call.
+/// Set on to enable; see the table above before doing so.
+static PIPELINE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
 
 /// Brick 35 arm: LL/ML code LUT vs the linear-scan oracle.
 pub fn set_lut_arm(on: bool) {
@@ -1407,6 +2192,57 @@ pub fn set_lut_arm(on: bool) {
 /// Brick 36 arm: fixed-width literal copy.
 pub fn set_litcopy_arm(on: bool) {
     LITCOPY_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+/// D10 arm: the decode-ahead pipeline.
+pub fn set_pipeline_arm(on: bool) {
+    PIPELINE_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// D11 arm: the DEPTH-1 interleave -- decode sequence N+1's symbols and issue
+/// its history prefetch BEFORE executing N's copies. Section 13.6's original
+/// shape, held in registers with no queue (the queue is what refuted D10), at
+/// the distance (~one sequence, ~30 ns) that D9's 9.4 ns lacked. Section 21's
+/// density probe is the motive: C handles MORE sequences 1.71x faster, so the
+/// per-sequence stall is ours to hide, and C's own interleaved short decoder
+/// is the existence proof.
+static PIPE1_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+/// D11 arm: depth-1 decode-ahead. See `PIPE1_ARM`.
+pub fn set_pipe1_arm(on: bool) {
+    PIPE1_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+/// **MEASURED WORSE -- the THIRD distance, closing the direction.** d11probe,
+/// L3, 21 ABBA rounds, DecSeqLoop isolated, null median 2.16%:
+/// **OFF 30.27 -> ON 30.56 ns/seq = +0.9%, 110/273 pairs, z = -3.21** (xml
+/// z = -3.71, mozilla z = -2.84; best corpus ooffice only +1.96). With D9
+/// (9.4 ns, null) and D10 (~240 ns + queue, -18%), software decode-ahead is
+/// now refuted at THREE distances on this core (codec-measurement 11): the
+/// OoO window already overlaps adjacent sequences' misses, and any software
+/// shape only adds instructions to a loop that is instruction-THROUGHPUT
+/// bound. The lever for the C gap is FEWER instructions per sequence, not
+/// hidden latency. Kept behind the arm (codec-measurement 12), folded to
+/// const in shipping builds like its siblings.
+#[cfg(feature = "profile")]
+#[inline(always)]
+fn pipe1_on() -> bool {
+    PIPE1_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
+}
+#[cfg(not(feature = "profile"))]
+#[inline(always)]
+fn pipe1_on() -> bool {
+    false
+}
+/// D9 arm: history prefetch in the sequence loop.
+pub fn set_prefetch_arm(on: bool) {
+    PREFETCH_ARM.store(
         if on { 2 } else { 1 },
         core::sync::atomic::Ordering::Relaxed,
     );
@@ -1424,17 +2260,175 @@ pub fn set_matchcopy_arm(on: bool) {
 /// atomic loads per sequence, ~15M across the corpus. `litcopy_on` and
 /// `matchcopy_on` are both resolved once per block and passed down; this one
 /// never was. Callers now hoist it the same way.
+/// DECSEQ-II CUT 6 -- pattern A, like the four arms above: the brick-35 LUT
+/// has been the shipping default since it landed, so the non-`profile` build
+/// folds the arm to `true` and the linear-scan alternative drops out of the
+/// `write_sequences` twins that hoist this per block.
+#[cfg(feature = "profile")]
 #[inline(always)]
 pub(crate) fn lut_on() -> bool {
     LUT_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
 }
+#[cfg(not(feature = "profile"))]
+#[inline(always)]
+pub(crate) fn lut_on() -> bool {
+    true
+}
+/// DECSEQ CUTS 1, 2 and 6 -- pattern A (plan section 10.1), applied to the four
+/// arms `decode_sequences_inner` hoists per block. Their READERS fold to the
+/// shipping constants in a non-`profile` build; the setters and statics stay,
+/// API-unchanged, so the A/B probes (`d9probe`, `d10probe`, the copy-tier
+/// harnesses -- all of which build with `--features profile`) keep their knobs.
+///
+/// What the constants delete from BOTH sequence-loop twins:
+///   - `pipeline_on() == false`: the ENTIRE parked D10 decode-ahead block,
+///     including two macro expansions of the full symbol-decode body.
+///   - `prefetch_on() == false`: the parked D9 `prefetch_hist` call and its
+///     per-sequence branch.
+///   - `litcopy_on() / matchcopy_on() == true`: the per-sequence `arm` tests in
+///     the literal and match copy tiers become tautologies and vanish.
+///
+/// This is the same fold `eqlen_arm()` has used since it was measured at 247M
+/// per-call loads (10.1: "any site inside a hot loop"), applied late to four
+/// arms that were added at block frequency and then reached into per-sequence
+/// bodies.
+#[cfg(feature = "profile")]
 #[inline(always)]
 fn litcopy_on() -> bool {
     LITCOPY_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
 }
+#[cfg(not(feature = "profile"))]
+#[inline(always)]
+fn litcopy_on() -> bool {
+    true
+}
+#[cfg(feature = "profile")]
 #[inline(always)]
 fn matchcopy_on() -> bool {
     MATCHCOPY_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
+}
+#[cfg(not(feature = "profile"))]
+#[inline(always)]
+fn matchcopy_on() -> bool {
+    true
+}
+
+#[cfg(feature = "profile")]
+#[inline(always)]
+fn prefetch_on() -> bool {
+    PREFETCH_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
+}
+#[cfg(not(feature = "profile"))]
+#[inline(always)]
+fn prefetch_on() -> bool {
+    false
+}
+
+#[cfg(feature = "profile")]
+#[inline(always)]
+fn pipeline_on() -> bool {
+    PIPELINE_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
+}
+#[cfg(not(feature = "profile"))]
+#[inline(always)]
+fn pipeline_on() -> bool {
+    false
+}
+
+/// Pull `out[at]` toward L1. `at` MUST be inside the initialised region.
+#[inline(always)]
+#[allow(unsafe_code)]
+fn prefetch_addr(out: &[u8], at: usize) {
+    debug_assert!(at < out.len());
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: caller guarantees `at < out.len()`, so the pointer is in-bounds.
+    // `_mm_prefetch` reads nothing and cannot fault.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(
+            out.as_ptr().add(at) as *const i8,
+            core::arch::x86_64::_MM_HINT_T0,
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as above; `prfm pldl1keep` is architecturally a no-op.
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{0}]",
+            in(reg) out.as_ptr().add(at),
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = at;
+}
+
+/// D9: pull the match source into L1 one step before `copy_match` needs it.
+///
+/// The `dsloop` ladder prices `copy_match` at **23.29 ns/sequence, 57.6% of
+/// DecSeqLoop**, for a mean match length of 7.4 bytes (86.6% of copies are
+/// `len <= 16`). A 16-byte `movups` pair is ~1 ns, so that 23 ns is not copy
+/// work -- it is the load of `out[len - offset]`, a random address up to the
+/// whole window back. At L3 the window is 2 MiB, which overflows L2.
+///
+/// The address is knowable BEFORE the literal copy runs, so the miss can
+/// overlap `copy_literals` + `resolve_offset` (7.11 + 2.28 = 9.4 ns of the
+/// ~13 ns L2 miss) instead of stalling in front of `copy_match`.
+///
+/// Only the LITERAL-offset case is prefetched (`offset_value > 3`), where
+/// `offset == offset_value - 3` exactly and needs no `reps`. Rep codes would
+/// need the resolution this deliberately runs ahead of; they are skipped rather
+/// than guessed, because a wrong guess evicts a line the real load then wants.
+///
+/// **This cannot change an output byte** -- a prefetch has no architectural
+/// effect and the address is bounds-checked into the already-decoded region
+/// purely to keep the pointer arithmetic in-bounds. `examples/bytegate.rs` is
+/// the gate (GOLD BE0071FB0CB0CED9, the value current when this brick landed --
+/// see bytegate.rs for the history), and per section 13.2 of the plan the brick
+/// is also WORK-identical, so it has no deterministic counter of its own: the
+/// `dsloop` ladder's `copy_match` line is the instrument, not a whole-decode
+/// clock against a 10.88-16.74% null arm.
+#[inline(always)]
+#[allow(unsafe_code)]
+fn prefetch_hist(out: &[u8], litlen: u32, offset_value: u32) {
+    // Rep codes (1..=3) need `state.reps`, which is resolved after this point.
+    if offset_value <= 3 {
+        note_pf(1);
+        return;
+    }
+    let off = (offset_value - 3) as usize;
+    // Where `copy_match` will read from, once `copy_literals` has published
+    // `litlen` more bytes: `(out.len() + litlen) - off`.
+    let end = out.len() + litlen as usize;
+    if off > end {
+        note_pf(2);
+        return; // corrupt stream; `copy_match` rejects it a few ns from now
+    }
+    let at = end - off;
+    if at >= out.len() {
+        note_pf(2);
+        return; // source not decoded yet -- also corrupt, same reasoning
+    }
+    note_pf(0);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `at < out.len()`, so the pointer is inside the initialised
+    // region. `_mm_prefetch` reads nothing and faults on nothing.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(
+            out.as_ptr().add(at) as *const i8,
+            core::arch::x86_64::_MM_HINT_T0,
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as above. `prfm pldl1keep` is architecturally a no-op.
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{0}]",
+            in(reg) out.as_ptr().add(at),
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = at;
 }
 
 /// Highest table code whose base is `<= val`. **The oracle.**
@@ -1554,46 +2548,73 @@ pub(crate) fn resolve_offset(
     litlen: u32,
     reps: &mut [u32; 3],
 ) -> Result<u32, Error> {
-    let offset = if offset_value > 3 {
-        offset_value - 3
-    } else if litlen == 0 {
+    // DECSEQ CUT 5: single dispatch. The old body selected the offset in one
+    // `if`/`match`, then re-derived which case it had been in a SECOND time --
+    // `is_new` re-tested `offset_value > 3` and `== 3 && litlen == 0`, and a
+    // second `match` on `which` re-decoded the rep index -- to apply the
+    // history update the first match had already determined. Every arm below
+    // is one case of the RFC 8878 repcode table with its update fused, so each
+    // condition is tested exactly once. Case-for-case against the old body:
+    if offset_value > 3 {
+        // New offset (old: `> 3` arm, then `is_new` shift).
+        let o = offset_value - 3;
+        reps[2] = reps[1];
+        reps[1] = reps[0];
+        reps[0] = o;
+        return Ok(o);
+    }
+    let o = if litlen != 0 {
         match offset_value {
-            1 => reps[1],
-            2 => reps[2],
-            3 => reps[0]
-                .checked_sub(1)
-                .filter(|&o| o > 0)
-                .ok_or(Error::Corruption)?,
+            // rep1 (old: offset reps[0], `which == 1`, no reorder).
+            1 => reps[0],
+            // rep2 (old: offset reps[1], `which == 2`, swap(0, 1)).
+            2 => {
+                reps.swap(0, 1);
+                reps[0]
+            }
+            // rep3 (old: offset reps[2], `which == 3`, rotate_right(1)).
+            3 => {
+                let o = reps[2];
+                reps[2] = reps[1];
+                reps[1] = reps[0];
+                reps[0] = o;
+                o
+            }
             _ => return Err(Error::Corruption),
         }
     } else {
+        // litlen == 0 shifts the meaning of each value by one.
         match offset_value {
-            1 => reps[0],
-            2 => reps[1],
-            3 => reps[2],
+            // value 1 is rep2 (old: offset reps[1], `which == 2`, swap).
+            1 => {
+                reps.swap(0, 1);
+                reps[0]
+            }
+            // value 2 is rep3 (old: offset reps[2], `which == 3`, rotate).
+            2 => {
+                let o = reps[2];
+                reps[2] = reps[1];
+                reps[1] = reps[0];
+                reps[0] = o;
+                o
+            }
+            // value 3 is rep1 - 1 -- a NEW offset (old: checked_sub + filter,
+            // then the `is_new` shift). `reps[0] <= 1` is exactly the set the
+            // old `checked_sub(1).filter(|&o| o > 0)` rejected.
+            3 => {
+                if reps[0] <= 1 {
+                    return Err(Error::Corruption);
+                }
+                let o = reps[0] - 1;
+                reps[2] = reps[1];
+                reps[1] = reps[0];
+                reps[0] = o;
+                o
+            }
             _ => return Err(Error::Corruption),
         }
     };
-
-    let is_new = offset_value > 3 || (offset_value == 3 && litlen == 0);
-    if is_new {
-        reps[2] = reps[1];
-        reps[1] = reps[0];
-        reps[0] = offset;
-    } else {
-        let which = if litlen == 0 {
-            offset_value + 1
-        } else {
-            offset_value
-        };
-        match which {
-            1 => {}
-            2 => reps.swap(0, 1),
-            3 => reps.rotate_right(1),
-            _ => {}
-        }
-    }
-    Ok(offset)
+    Ok(o)
 }
 
 /// BRICK 66: the five FRAME-CONSTANT arguments of `copy_match`, bundled.
@@ -1665,28 +2686,27 @@ struct MatchCtx<'a> {
 #[inline(always)]
 fn copy_match_nodict(
     out: &mut Vec<u8>,
+    dst_at: usize,
     offset: u32,
     matchlen: u32,
-    window_size: u64,
-    block_max: u32,
+    win_lim: usize,
     wide: bool,
 ) -> Result<(), Error> {
+    debug_assert_eq!(dst_at, out.len());
     let off = offset as usize;
-    if off == 0 {
+    // COPYMATCH CUT 5: THREE rejects, ONE compare. Cut 10 already fused
+    // `off == 0` and `off > produced` via the wrapping subtract; folding the
+    // window bound into the right-hand side with `min` takes the third:
+    // `off - 1 >= min(produced, win_lim)` is true exactly when `off == 0`
+    // (wraps to usize::MAX) OR `off > produced` OR `off > win_lim`, and all
+    // three were `Err(Corruption)`. The old per-sequence `len > block_max`
+    // test is gone entirely -- CUT 2's running budget in the sequence loop
+    // subsumes it with a strictly TIGHTER bound (the RFC block bound over the
+    // whole block, not one length at a time).
+    if off.wrapping_sub(1) >= dst_at.min(win_lim) {
         return Err(Error::Corruption);
     }
-    let produced = out.len();
-    if off > produced {
-        return Err(Error::Corruption);
-    }
-    if (off as u64) > window_size {
-        return Err(Error::Corruption);
-    }
-    let len = matchlen as usize;
-    if len > block_max as usize {
-        return Err(Error::Corruption);
-    }
-    copy_from_decoded(out, produced - off, len, wide)
+    copy_from_decoded_hot(out, dst_at, off, matchlen as usize, wide)
 }
 
 /// N21 probe: rebuilds of the RFC-constant Predefined FSE decode tables.
@@ -1727,6 +2747,26 @@ pub fn take_d4_paths() -> [u64; 3] {
         D4_PATHS[1].swap(0, Ordering::Relaxed),
         D4_PATHS[2].swap(0, Ordering::Relaxed),
     ]
+}
+
+/// DECSEQ CUT 9: the dictionary-path arm of the sequence loop, outlined.
+///
+/// `copy_match` is `inline(always)`, so as the `else` arm of `if nodict` its
+/// whole body -- dict-crossing split included -- was stamped into BOTH
+/// sequence-loop twins, though dictionary decode is the rare shape (`nodict`
+/// covers every plain frame). Round five's rule: outlining pays in proportion
+/// to how many times the HOST is reproduced. Here the host is duplicated per
+/// twin and the arm is block-rare, so the body moves behind one cold call and
+/// the hot loop keeps only `copy_match_nodict`.
+#[cold]
+#[inline(never)]
+fn copy_match_dict_cold(
+    out: &mut Vec<u8>,
+    mctx: &MatchCtx<'_>,
+    offset: u32,
+    matchlen: u32,
+) -> Result<(), Error> {
+    copy_match(out, mctx, offset, matchlen)
 }
 
 #[inline(always)]
@@ -1795,8 +2835,16 @@ fn copy_match(
     // `frame_skipped == 0` the frame source starts at `frame_start`, which is
     // what the pure-frame early return above passes too.
     out.reserve(len);
-    let from_dict = core::cmp::min(len, dict.len() - src_pos0);
-    out.extend_from_slice(&dict[src_pos0..src_pos0 + from_dict]);
+    // D28: THREE checks become one. `src_pos0` is derived from the match
+    // offset against the dictionary boundary -- opaque -- so
+    // `dict.len() - src_pos0` carried an underflow test and
+    // `&dict[src_pos0..src_pos0 + from_dict]` a bounds test, each with a pad.
+    // Taking the tail ONCE proves the offset, `tail.len()` is exactly the
+    // remaining-bytes figure the `min` wanted, and `&tail[..from_dict]` is then
+    // provably in range because `from_dict <= tail.len()` by that same `min`.
+    let tail = dict.get(src_pos0..).ok_or(Error::Corruption)?;
+    let from_dict = core::cmp::min(len, tail.len());
+    out.extend_from_slice(&tail[..from_dict]);
     let rest = len - from_dict;
     #[cfg(feature = "profile")]
     D4_PATHS[usize::from(rest > 0) + 1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1822,18 +2870,73 @@ fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize, wide: bool) -> R
     if len == 0 {
         return Ok(());
     }
-    let offset = out.len() - src;
-    if offset == 0 {
-        return Err(Error::Corruption);
-    }
-    // Offset 1 is a byte splat (C wildcopy / ZSTD_overlapCopy8). Doubling
-    // extend_from_within would memcpy 1, then 2, then 4, ...
-    if offset == 1 {
-        note_band(0, len);
-        let b = out[src];
-        out.resize(out.len() + len, b);
+    copy_from_decoded_body(out, src, len, wide)
+}
+
+/// DECSEQ-II CUT 9 + COPYMATCH CUTS 3 and 6 -- the hot-path tier, every check
+/// either discharged by the caller or a block invariant:
+///
+/// * `1 <= off <= dst_at` -- `copy_match_nodict`'s fused compare;
+/// * `len > 0` -- RFC matchlen >= 3 (`ML_PACK[0]` is 3);
+/// * capacity -- CUT 1's `reserve(block_max + 64)` + CUT 2's budget bound
+///   `len - block_start <= block_max`, so `capacity - dst_at >= 64` at every
+///   sequence (CUT 3: the per-sequence capacity test is DELETED);
+/// * `dst_at` and `off` arrive in registers -- no `out.len()` re-read after
+///   the literal copy's `set_len`, no `offset`/`src` re-derivation (CUT 6).
+///
+/// The checked `copy_from_decoded` above remains the general entry for the
+/// dictionary path and the tests.
+#[inline(always)]
+#[allow(unsafe_code)]
+fn copy_from_decoded_hot(
+    out: &mut Vec<u8>,
+    dst_at: usize,
+    off: usize,
+    len: usize,
+    wide: bool,
+) -> Result<(), Error> {
+    debug_assert_eq!(dst_at, out.len());
+    debug_assert!(off >= 1 && off <= dst_at && len > 0);
+    debug_assert!(out.capacity() - dst_at >= 64, "block reserve invariant");
+    if wide && len <= 16 && off >= 16 {
+        // SAFETY: `off >= 16` puts 16 readable initialised bytes at the
+        // source AND makes source/destination disjoint; the block invariant
+        // (see doc comment) gives 16 writable bytes past `dst_at`; exactly
+        // `len <= 16` bytes are published by `set_len`.
+        unsafe {
+            let p = out.as_mut_ptr();
+            #[cfg(feature = "profile")]
+            DEC_MATCH16.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            note_band(2, len);
+            core::ptr::copy_nonoverlapping(p.add(dst_at - off), p.add(dst_at), 16);
+            out.set_len(dst_at + len);
+        }
         return Ok(());
     }
+    if wide {
+        copy_from_decoded_cold(true, true, out, dst_at, off, len)
+    } else {
+        copy_from_decoded_cold(true, false, out, dst_at, off, len)
+    }
+}
+
+#[inline(always)]
+#[allow(unsafe_code)]
+fn copy_from_decoded_body(
+    out: &mut Vec<u8>,
+    src: usize,
+    len: usize,
+    wide: bool,
+) -> Result<(), Error> {
+    // `src < out.len()` on both entries, so `offset >= 1` -- the old
+    // `offset == 0` reject was already unreachable and is simply gone.
+    let offset = out.len() - src;
+    // DECSEQ-II CUT 10 -- the `offset == 1` byte-splat test ran per SEQUENCE
+    // ahead of tier 1 for a band the census puts at 0.01% of calls (band 0).
+    // Offset 1 can never satisfy tier 1's `offset >= 16`, so moving the splat
+    // into the cold fn changes NOTHING about which path any call takes -- it
+    // only takes its test off the 86.6% path. It now lives at the top of
+    // `copy_from_decoded_cold`.
     // FAST PATH: fixed-width 32-byte move for the common short match.
     // `extend_from_within` is a runtime-length copy and the measured mean match
     // run is only ~21 bytes, so the call overhead dominates (same shape as the
@@ -1887,75 +2990,176 @@ fn copy_from_decoded(out: &mut Vec<u8>, src: usize, len: usize, wide: bool) -> R
     // census over 12 corpora at L3 puts **86.6% of ALL match copies** there
     // with `len <= 16`, at a mean of 7.4 bytes." The other 13% was paying for
     // the 87%'s code size.
-    copy_from_decoded_cold(out, src, len, wide, offset)
+    if wide {
+        copy_from_decoded_cold(false, true, out, out.len(), offset, len)
+    } else {
+        copy_from_decoded_cold(false, false, out, out.len(), offset, len)
+    }
 }
 
-/// Match-copy tiers 2 and 3 plus the `extend_from_within` fallback: the ~13%
-/// of match copies that tier 1 declines. Outlined and cold so tier 1 keeps
-/// its inlining.
+/// Match-copy tiers 2 and 3 plus the fallbacks: the ~19.6% of match copies
+/// that tier 1 declines. Outlined and cold so tier 1 keeps its inlining.
+///
+/// COPYMATCH-II: monomorphised over `G` -- `G == true` is the budgeted
+/// sequence-loop path, where section 23's reserve + budget give
+/// `capacity - (dst_at + len) >= 64` and the capacity tests fold away;
+/// `G == false` keeps every runtime test for the dictionary path and the
+/// oracle tests. Same source, two symbols, no drift.
+///
+/// Rung ORDER is call-weighted from `bandcensus` (L3, 8 corpora): the 32-tier
+/// takes 13.0% of all copies, the 64-tier 4.6%, `within` 1.8%, overlap 0.24%,
+/// splat 0.01% -- so the splat test moved from FIRST (where 19.6% of copies
+/// paid it) to after the fixed tiers (where ~2% do). The brick-82 sub-census
+/// branch (`band 5`) read ZERO after the 16-first reorder -- tier 1 provably
+/// takes every `len <= 16, off >= 32` copy -- and is deleted.
+/// SECTION 27 -- the RAW cold protocol for the byte-weighted middle rungs.
+///
+/// The cold bands carry HALF the match bytes, and every call paid the full
+/// Vec boundary: publish (`set_len`), a `&mut Vec` argument, and a refetch.
+/// Under the block invariant the fixed-width rungs CANNOT grow `out`, so none
+/// of that is needed: `op` in, new `op` out, no Vec anywhere. `None` marks
+/// the genuinely Vec-needing leftovers (the overlap band at 0.24% of copies
+/// and the `off < 32` within-cases); ~99% of cold calls skip the boundary.
+///
+/// Rungs are call-ordered from `bandcensus` (t32 12.99%, t64 4.57%, within
+/// 1.79%, splat 0.01%) and each test is ONE or-sign branch. The within rungs
+/// need no length test at all: reaching them past t32/t64 IMPLIES `len > 32`
+/// (resp. `> 64`). `within` takes 64-byte strides when `off >= 64` -- the
+/// old path strode 32 for every offset, so iterations on the 12.9%-of-bytes
+/// band halve. Stride overshoot is at most 63 bytes into the invariant's
+/// 64-byte pad; every stride's source read ends at or before the write
+/// cursor, so it reads only initialised bytes.
+///
+/// SAFETY (caller): the sequence-loop invariants -- `1 <= off <= op - base`,
+/// `len + 64` writable bytes past `op`, `wide` arm on.
+#[cold]
+#[inline(never)]
+#[allow(unsafe_code)]
+unsafe fn match_cold_raw(op: *mut u8, off: usize, len: usize) -> Option<*mut u8> {
+    unsafe {
+        if (((32usize.wrapping_sub(len)) | (off.wrapping_sub(32))) as isize) >= 0 {
+            #[cfg(feature = "profile")]
+            DEC_MATCH32.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            note_band(1, len);
+            core::ptr::copy_nonoverlapping(op.sub(off), op, 32);
+            return Some(op.add(len));
+        }
+        if (((64usize.wrapping_sub(len)) | (off.wrapping_sub(64))) as isize) >= 0 {
+            note_band(6, len);
+            core::ptr::copy_nonoverlapping(op.sub(off), op, 64);
+            return Some(op.add(len));
+        }
+        if off >= 64 {
+            // len > 64 is implied (t64 would have taken it).
+            note_band(3, len);
+            note_untiered(len);
+            let mut done = 0usize;
+            while done < len {
+                core::ptr::copy_nonoverlapping(op.sub(off).add(done), op.add(done), 64);
+                done += 64;
+            }
+            return Some(op.add(len));
+        }
+        if off >= 32 {
+            // len > 32 implied; off in 32..64 keeps the 32-byte stride sound.
+            note_band(3, len);
+            note_untiered(len);
+            let mut done = 0usize;
+            while done < len {
+                core::ptr::copy_nonoverlapping(op.sub(off).add(done), op.add(done), 32);
+                done += 32;
+            }
+            return Some(op.add(len));
+        }
+        if off == 1 {
+            note_band(0, len);
+            core::ptr::write_bytes(op, *op.sub(1), len);
+            return Some(op.add(len));
+        }
+    }
+    None
+}
+
+/// The literal side of the raw protocol: tiers 2/3 without the Vec boundary.
+/// `rem` is the caller's already-derived remaining literal count, so the
+/// bound tests are register compares; `None` falls back to the checked cold
+/// (the `extend_from_slice` tail and near-end cases).
+/// SAFETY (caller): `rem` literals readable at `lit_p`; `n + 64` writable
+/// bytes past `op`; literal arm on.
+#[cold]
+#[inline(never)]
+#[allow(unsafe_code)]
+unsafe fn lit_cold_raw(
+    lit_p: *const u8,
+    rem: usize,
+    op: *mut u8,
+    n: usize,
+) -> Option<(*const u8, *mut u8)> {
+    unsafe {
+        if (((32usize.wrapping_sub(n)) | (rem.wrapping_sub(32))) as isize) >= 0 {
+            #[cfg(feature = "profile")]
+            DEC_LIT32.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            core::ptr::copy_nonoverlapping(lit_p, op, 32);
+            return Some((lit_p.add(n), op.add(n)));
+        }
+        if (((64usize.wrapping_sub(n)) | (rem.wrapping_sub(64))) as isize) >= 0 {
+            #[cfg(feature = "profile")]
+            DEC_LIT64.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            core::ptr::copy_nonoverlapping(lit_p, op, 64);
+            return Some((lit_p.add(n), op.add(n)));
+        }
+    }
+    None
+}
+
 #[allow(unsafe_code)]
 #[inline(never)]
 #[cold]
+// D8: THE `g`/`w` CONST AXES GO RUNTIME -- three copies of this body become
+// one. Both consts are load-bearing (`w` gates the 32/64-byte tiers, `g` elides
+// a capacity test), but this is the COLD tier: the fast paths live in
+// `copy_from_decoded_hot`, and this is its fallback. Paying two predictable
+// branches here to stop stamping a 208-instruction copier three times is the
+// same trade W7/W9/W10 made for REP/WIDE/PACKED on the fast finder.
 fn copy_from_decoded_cold(
+    g: bool,
+    w: bool,
     out: &mut Vec<u8>,
-    src: usize,
+    dst_at: usize,
+    off: usize,
     len: usize,
-    wide: bool,
-    offset: usize,
 ) -> Result<(), Error> {
-    if wide && len <= 32 && offset >= 32 && out.capacity() - out.len() >= 32 {
-        let dst_at = out.len();
-        // SAFETY: `offset >= 32` means `src + 32 <= out.len() == dst_at`, so
-        // the source is fully initialised and disjoint from the destination.
-        // `capacity - len >= 32` gives 32 writable bytes inside the
-        // allocation. Only `len <= 32` bytes are published by `set_len`.
+    // WIN 8: the match-side twin of WIN 9 -- `wide` as a const, not a tested
+    // runtime argument, in the outlined symbol.
+    let wide = w;
+    debug_assert_eq!(dst_at, out.len());
+    debug_assert!(off >= 1 && off <= dst_at && len > 0);
+    let src = dst_at - off;
+    // D29 REFUTED, recorded: `saturating_sub` on both tier guards'
+    // `out.capacity() - dst_at` measured **+4**. The underflow check was
+    // already cheap here -- it sits inside a `&&` chain LLVM had folded -- and
+    // the saturating form blocked that folding.
+    if wide && len <= 32 && off >= 32 && (g || out.capacity() - dst_at >= 32) {
+        // SAFETY: `off >= 32` means `src + 32 <= dst_at`, so the source is
+        // fully initialised and disjoint from the destination. Writable
+        // space: the block invariant under `g`, the runtime test otherwise.
+        // Only `len <= 32` bytes are published by `set_len`.
+        // (AVX2 AUDIT 4.56: a `target_feature` copy helper here measured
+        // WORSE -- call overhead vs 4 inline SSE instructions. Not retried.)
         unsafe {
             let p = out.as_mut_ptr();
             #[cfg(feature = "profile")]
             DEC_MATCH32.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            // AVX2 AUDIT (4.56): routing this through a runtime-dispatched
-            // `#[target_feature(enable = "avx2")]` copy makes it SLOWER. A
-            // target_feature function cannot be inlined into a baseline caller,
-            // so the 32-byte copy became `2 movs + callq` (3) plus a 4-
-            // instruction callee = 7, against 4 for the two inline SSE `movups`
-            // pairs. Measured, not assumed. Left as the baseline copy.
-            // Sub-census: how much of the 32-byte tier would a 16-byte copy
-            // have served? The tier is tested BEFORE the 16-byte one, so any
-            // short match with a large offset lands here regardless.
-            note_band(if len <= 16 { 5 } else { 1 }, len);
+            note_band(1, len);
             core::ptr::copy_nonoverlapping(p.add(src), p.add(dst_at), 32);
             out.set_len(dst_at + len);
         }
         return Ok(());
     }
-    // BRICK 82: a 16-byte tier for short matches with SHORT offsets.
-    //
-    // The 32-byte path above needs `offset >= 32` so the 32-byte source read
-    // cannot overlap the destination. The census found **1,153,839 copies
-    // (5.8%)** with `len <= 32` and `2 <= offset < 32` falling past it to
-    // `extend_from_within` -- a runtime-length memcpy CALL.
-    //
-    // Halving the width halves the requirement: `offset >= 16` guarantees the
-    // 16-byte regions are disjoint, capturing the `len <= 16` part of that
-    // slice. Same invariant as the 32-byte tier, same shape as brick 80 on
-    // literals.
-    // 64-BYTE TIER. The census that motivated it: `extend_from_within` was the
-    // only UN-TIERED band and it carried ~34% of all match bytes. Its length
-    // distribution is not diffuse -- **65.9% of its calls and 46.9% of its bytes
-    // are 33-64 bytes** (`dsuntier.rs`), i.e. exactly one 2x ymm move pair. The
-    // mean of that band is ~67 and would have chosen the wrong width; the
-    // histogram chose it.
-    //
-    // `offset >= 64` does the same double duty as the narrower tiers: it
-    // guarantees 64 readable source bytes (`src + 64 <= out.len()`) AND that the
-    // source range ends at or before the destination start, so the two 64-byte
-    // regions cannot overlap.
-    if wide && len <= 64 && offset >= 64 && out.capacity() - out.len() >= 64 {
-        let dst_at = out.len();
-        // SAFETY: `offset >= 64` means `src + 64 <= out.len() == dst_at`, so the
-        // source is fully initialised and disjoint from the destination.
-        // `capacity - len >= 64` gives 64 writable bytes inside the allocation.
-        // Only `len <= 64` bytes are published by `set_len`.
+    // 64-BYTE TIER (history in `dsuntier.rs`: 65.9% of the once-untiered
+    // band's calls were 33..=64 bytes). `off >= 64` = readable + disjoint.
+    if wide && len <= 64 && off >= 64 && (g || out.capacity() - dst_at >= 64) {
+        // SAFETY: as the 32-tier, at width 64.
         unsafe {
             let p = out.as_mut_ptr();
             note_band(6, len);
@@ -1964,23 +3168,80 @@ fn copy_from_decoded_cold(
         }
         return Ok(());
     }
-    if offset >= len {
+    // Splat (C ZSTD_overlapCopy8's offset-1 case), band 0 at 0.01% of copies.
+    if off == 1 {
+        note_band(0, len);
+        if g {
+            // SAFETY: budget accounting gives `capacity - (dst_at + len) >=
+            // 64`, so `len` bytes past `dst_at` are writable; `src < dst_at`
+            // is the entry invariant. One memset replaces `resize`'s
+            // element-wise extend.
+            unsafe {
+                let b = *out.as_ptr().add(src);
+                core::ptr::write_bytes(out.as_mut_ptr().add(dst_at), b, len);
+                out.set_len(dst_at + len);
+            }
+        } else {
+            let b = out[src];
+            out.resize(dst_at + len, b);
+        }
+        return Ok(());
+    }
+    if off >= len {
         note_band(3, len);
         note_untiered(len);
-        out.extend_from_within(src..src + len);
+        // COPYMATCH-II: the untiered band carried 12.9% of ALL match BYTES
+        // through a runtime-length `extend_from_within` -- an internal
+        // reserve, range checks and a memcpy CALL per copy. Under `g` with
+        // `off >= 32`, a 32-byte strided wildcopy does it inline: every
+        // chunk's source read ends at `src + 32(i+1) <= dst_at + 32i`, i.e.
+        // at or before the write cursor, so it reads only initialised bytes;
+        // the write may overshoot `len` by up to 31 bytes, which the block
+        // invariant's 64-byte pad absorbs; only `len` bytes are published.
+        if g && off >= 32 {
+            unsafe {
+                let p = out.as_mut_ptr();
+                let mut done = 0usize;
+                while done < len {
+                    core::ptr::copy_nonoverlapping(p.add(src + done), p.add(dst_at + done), 32);
+                    done += 32;
+                }
+                out.set_len(dst_at + len);
+            }
+            return Ok(());
+        }
+        // D24: `extend_from_within` has no `get`-shaped API, so the bound is
+        // stated explicitly instead. Naming `end` once lets LLVM carry the
+        // proof into the call rather than re-deriving `src + len` inside it.
+        let end = src.checked_add(len).ok_or(Error::Corruption)?;
+        if end > out.len() {
+            return Err(Error::Corruption);
+        }
+        out.extend_from_within(src..end);
         return Ok(());
     }
     note_band(4, len);
     out.reserve(len);
+    // COPYMATCH-II: `avail` is a RECURRENCE (`off`, then `+= take`), not a
+    // re-read -- the per-iteration `out.len() - src` load-and-subtract is
+    // gone, and with it the `avail == 0` reject: `off >= 2` here (the splat
+    // rung took `off == 1`, the entry invariant `off >= 1`), so the first
+    // iteration always progresses and `avail` only grows. D3's refutation of
+    // the pattern-replicate rewrite stands; this only slims the loop it kept.
+    let mut avail = off;
     let mut copied = 0usize;
     while copied < len {
-        let avail = out.len() - src;
-        if avail == 0 {
+        // D25: the loop's `extend_from_within`, given the D24 treatment. `take`
+        // is bounded by `avail` and `len - copied`, but neither relates to
+        // `out.len()` in a way LLVM can see across the iteration.
+        let take = (len - copied).min(avail);
+        let end = src.checked_add(take).ok_or(Error::Corruption)?;
+        if end > out.len() {
             return Err(Error::Corruption);
         }
-        let take = (len - copied).min(avail);
-        out.extend_from_within(src..src + take);
+        out.extend_from_within(src..end);
         copied += take;
+        avail += take;
         #[cfg(feature = "profile")]
         D3_ITERS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }

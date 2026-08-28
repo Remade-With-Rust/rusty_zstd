@@ -8,7 +8,7 @@
 :root{
   --bg:#f7f7f8; --panel:#fff; --ink:#14161a; --dim:#5d6470; --line:#e2e5ea;
   --us:#2f6fed; --c:#8a8f98; --good:#128a5b; --bad:#c0392b; --warn:#b26a00;
-  --bar:#e8edf7; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --bar:#e8edf7; --ship:#7a3fb8; --shipbar:#f0e8fa; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
   --bg:#0f1115; --panel:#171a20; --ink:#e8eaee; --dim:#9aa1ad; --line:#262b34;
@@ -67,6 +67,13 @@ tbody tr:hover{background:var(--bar)}
   background:var(--panel);border-radius:0 8px 8px 0;font-size:12.5px;color:var(--dim);max-width:95ch}
 .note b{color:var(--ink)}
 tfoot td{font-weight:600;border-top:2px solid var(--line);border-bottom:0}
+th.ship,td.ship{color:var(--ship)}
+th.ship{font-weight:700}
+.bar-inner.ship{background:var(--ship);opacity:.55}
+.warn-note{background:#fff6e5;border-left:3px solid var(--warn);padding:.6rem .8rem;margin:.6rem 0}
+table.mini{border-collapse:collapse;margin:.5rem 0}
+table.mini th,table.mini td{border:1px solid var(--line);padding:.3rem .6rem;text-align:right}
+table.mini th:first-child,table.mini td:first-child{text-align:left}
 </style>
 </head>
 <body>
@@ -127,6 +134,26 @@ tfoot td{font-weight:600;border-top:2px solid var(--line);border-bottom:0}
     <tfoot id="tfoot"></tfoot>
   </table></div>
 
+
+  <div class="note" id="deploycard">
+    <h3 style="margin:.2rem 0 .5rem">Default deployment — both CLIs, real defaults, nothing switched off</h3>
+    <p><b>This is the only true default-vs-default comparison available.</b>
+    <code>zstd -b</code> cannot include a checksum — <code>-b --check</code> is accepted and
+    ignored, and <code>zstd -b3</code> emits byte-for-byte what <code>zstd -3 --no-check</code>
+    emits — yet <b>both projects default to checksum ON</b> (C's own <code>-l</code> reports
+    XXH64 on a plain <code>zstd -3</code> frame, and on ours). So the table above compares two
+    configurations neither project ships. This panel runs
+    <code>zstd -&lt;lvl&gt; &lt;files&gt;</code> against <code>rzstd -&lt;lvl&gt; &lt;files&gt;</code>,
+    no flags beyond the level, one invocation each so startup is paid once.</p>
+    <p class="warn-note"><b>READ THIS BEFORE OPTIMISING FROM IT.</b> These are whole-program
+    numbers: read + codec + write. On this host the DECODE figure is dominated by each CLI's
+    file-WRITING strategy, not by the codec. Measured: decoding the same 24 MiB to files took
+    C 398 ms and us 93 ms — but decoding to stdout, with the write removed, took C 171 ms and
+    us 194 ms. <b>The 4× is the write path; with it removed C is faster.</b> Judge codec work
+    from the in-process table above; judge end-user experience from here.</p>
+    <div id="deployout" class="mono"></div>
+    <button id="deployrun">Run default-deployment comparison</button>
+  </div>
   <div class="note" id="note">
     <b>R is us, C is zstd v1.5.7.</b> Each phase shows both arms and the ratio between
     them: <b>R/C enc</b> and <b>R/C dec</b> are <i>our MB/s ÷ C's MB/s</i>, so
@@ -175,18 +202,20 @@ function header(){
          '<th rowspan="2" onclick="sortBy(\'bytes\')">Size</th>';
   let h2='<tr>';
   for(const L of LEVELS){
-    h1+=`<th class="grp" colspan="${c?7:2}">L${L}</th>`;
+    h1+=`<th class="grp" colspan="${c?9:4}">L${L}</th>`;
     h2+=`<th class="grp" onclick="sortBy('e:${L}')" title="rusty_zstd encode throughput, MB/s">R enc</th>`;
     if(c){
       h2+=`<th onclick="sortBy('ce:${L}')" title="C v1.5.7 encode throughput, MB/s">C enc</th>`+
           `<th onclick="sortBy('re:${L}')" title="R enc divided by C enc. Above 1.00 WE ARE FASTER. (Note: m7-anatomy.md prints the inverse, C/us, where above 1.00 means C is faster.)">R/C enc</th>`;
     }
-    h2+=`<th class="${c?'grp':''}" onclick="sortBy('d:${L}')" title="rusty_zstd decode throughput, MB/s">R dec</th>`;
+    h2+=`<th class="ship" onclick="sortBy('se:${L}')" title="rusty_zstd encode with checksum ON -- the SHIPPED DEFAULT. Strictly MORE work than the C arm does (an xxh64 pass over every input byte), so there is no C counterpart and this must not be read as a comparison.">R enc*</th>`;
+    h2+=`<th class="${c?'grp':''}" onclick="sortBy('d:${L}')" title="rusty_zstd decode throughput, MB/s, checksum OFF -- comparable to C.">R dec</th>`;
     if(c){
       h2+=`<th onclick="sortBy('cd:${L}')" title="C v1.5.7 decode throughput, MB/s">C dec</th>`+
           `<th onclick="sortBy('rd:${L}')" title="R dec divided by C dec. Above 1.00 WE ARE FASTER.">R/C dec</th>`+
           `<th class="grp" onclick="sortBy('s:${L}')" title="our output bytes divided by C's output bytes. BELOW 1.000 we emit the smaller file. Deterministic - carries no spread at any cap.">R/C size</th>`;
     }
+    h2+=`<th class="ship" onclick="sortBy('sd:${L}')" title="rusty_zstd decode with checksum ON -- the SHIPPED DEFAULT. Verifies an xxh64 over every output byte, which C's -b arm does not do. No C counterpart.">R dec*</th>`;
   }
   $('thead').innerHTML=h1+'</tr>'+h2+'</tr>';
 }
@@ -210,6 +239,8 @@ function val(row,key){
   switch(k){
     case 'e':  return d.enc_mbps;
     case 'd':  return d.dec_mbps;
+    case 'se': return d.ship_enc_mbps||null;
+    case 'sd': return d.ship_dec_mbps||null;
     case 'ce': return d.c_enc_mbps||null;
     case 'cd': return d.c_dec_mbps||null;
     case 're': return d.c_enc_mbps? d.enc_mbps/d.c_enc_mbps : null;
@@ -234,7 +265,7 @@ function render(){
     return sortDir*(x-y);
   });
   const mx={};
-  for(const L of LEVELS) ['e','d','ce','cd'].forEach(k=>mx[k+':'+L]=maxOf(k+':'+L));
+  for(const L of LEVELS) ['e','d','ce','cd','se','sd'].forEach(k=>mx[k+':'+L]=maxOf(k+':'+L));
 
   let html='';
   for(const name of keys){
@@ -250,7 +281,7 @@ function render(){
           `</td>`;
     for(const L of LEVELS){
       const d=R.lv[L];
-      if(!d){ html+=`<td class="grp pending num" colspan="${c?7:2}">…</td>`; continue; }
+      if(!d){ html+=`<td class="grp pending num" colspan="${c?9:4}">…</td>`; continue; }
       const sc=d.spread_pct>25?'style="color:var(--bad);font-weight:700"'
               :d.spread_pct>10?'style="color:var(--warn)"':'';
       const noisy=d.spread_pct>10
@@ -268,6 +299,11 @@ function render(){
               `title="${fmt(d.enc_mbps)} / ${fmt(d.c_enc_mbps)} MB/s">`+
               `${re==null?'—':re.toFixed(2)+'×'}</td>`;
       }
+      // SHIPPED DEFAULT encode (checksum on). No C counterpart BY DESIGN:
+      // `zstd -b` cannot enable a checksum (`-b --check` is accepted and
+      // ignored), so this is not a comparison -- it is what a user gets.
+      html+=`<td class="ship num" title="checksum ON, the shipped default: ${fmt(d.ship_enc_mbps)} MB/s against ${fmt(d.enc_mbps)} MB/s with it off. C's -b arm computes no checksum at all, so there is nothing to compare this to.">`+
+            `${fmt(d.ship_enc_mbps)}${bar(d.ship_enc_mbps,mx['se:'+L],'ship')}</td>`;
       // --- decode triple ---
       html+=`<td class="${c?'grp ':''}num">${fmt(d.dec_mbps)}${bar(d.dec_mbps,mx['d:'+L])}</td>`;
       if(c){
@@ -281,11 +317,14 @@ function render(){
         // the tooltip so the column set stays the requested seven.
         const us=d.c_csize? d.csize/d.c_csize : null;
         const grew=d.csize>=d.bytes;
+        // shipped-default decode is emitted after the size cell, below.
         html+=`<td class="grp num ${us==null?'':(us<1?'win':(us>1.05?'lose':''))}" `+
               `title="in ${d.bytes.toLocaleString()} B → ours ${d.csize.toLocaleString()} B, C ${(d.c_csize||0).toLocaleString()} B`+
               `  |  shrank by ${grew?'nothing (grew '+(d.csize-d.bytes)+' B)':d.ratio.toFixed(2)+'×'}">`+
               `${us==null?'—':us.toFixed(3)}</td>`;
       }
+      html+=`<td class="ship num" title="checksum ON, the shipped default: ${fmt(d.ship_dec_mbps)} MB/s against ${fmt(d.dec_mbps)} MB/s with it off. Verifies an xxh64 over every output byte, which C's -b arm does not do.">`+
+            `${fmt(d.ship_dec_mbps)}${bar(d.ship_dec_mbps,mx['sd:'+L],'ship')}</td>`;
     }
     html+='</tr>';
   }
@@ -297,22 +336,23 @@ function footer(keys){
   const c=$('carm').checked;
   let f='<tr><td>aggregate (throughput-weighted)</td><td></td>';
   for(const L of LEVELS){
-    let tb=0,te=0,td=0,cb=0,ce=0,cd=0,n=0,zs=0,czs=0;
+    let tb=0,te=0,td=0,cb=0,ce=0,cd=0,n=0,zs=0,czs=0,se=0,sd=0;
     for(const k of keys){
       const d=ROWS[k].lv[L]; if(!d)continue;
       const mb=d.bytes/1048576;               // bytes ACTUALLY compressed
-      tb+=mb; te+=mb/d.enc_mbps; td+=mb/d.dec_mbps; n++;
+      tb+=mb; te+=mb/d.enc_mbps; td+=mb/d.dec_mbps; n++; se+=mb/d.ship_enc_mbps; sd+=mb/d.ship_dec_mbps;
       if(d.c_enc_mbps){cb+=mb; ce+=mb/d.c_enc_mbps; cd+=mb/d.c_dec_mbps;}
       if(d.c_csize){zs+=d.csize; czs+=d.c_csize;}
     }
-    if(!n){ f+=`<td class="grp" colspan="${c?7:2}"></td>`; continue; }
-    const Re=tb/te, Rd=tb/td, Ce=cb?cb/ce:null, Cd=cb?cb/cd:null;
+    if(!n){ f+=`<td class="grp" colspan="${c?9:4}"></td>`; continue; }
+    const Re=tb/te, Rd=tb/td, Se=tb/se, Sd=tb/sd, Ce=cb?cb/ce:null, Cd=cb?cb/cd:null;
     f+=`<td class="grp num">${fmt(Re)}</td>`;
     if(c){
       f+=`<td class="num" style="color:var(--c)">${Ce==null?'—':fmt(Ce)}</td>`;
       const r=Ce?Re/Ce:null;
       f+=`<td class="num ${r==null?'':(r>=1?'win':'lose')}">${r==null?'—':r.toFixed(2)+'×'}</td>`;
     }
+    f+=`<td class="ship num">${fmt(Se)}</td>`;
     f+=`<td class="${c?'grp ':''}num">${fmt(Rd)}</td>`;
     if(c){
       f+=`<td class="num" style="color:var(--c)">${Cd==null?'—':fmt(Cd)}</td>`;
@@ -321,6 +361,7 @@ function footer(keys){
       // aggregate size ratio is SUM(ours)/SUM(C), never a mean of ratios
       f+=`<td class="grp num ${czs&&zs/czs<1?'win':''}">${czs?(zs/czs).toFixed(3):'—'}</td>`;
     }
+    f+=`<td class="ship num">${fmt(Sd)}</td>`;
   }
   $('tfoot').innerHTML=f+'</tr>';
 }
@@ -383,6 +424,34 @@ $('scan').onclick=()=>{
 $('dir').addEventListener('keydown',e=>{if(e.key==='Enter')$('scan').click()});
 $('reset').onclick=()=>{$('dir').value='';loadCorpora('?reset=1')};
 loadCorpora();
+
+if($('deployrun')) $('deployrun').onclick=async()=>{
+  const b=$('deployrun'); b.disabled=true; b.textContent='running…';
+  const lvl=(LEVELS&&LEVELS.length?LEVELS[LEVELS.length-1]:3);
+  const cap=+$('cap').value||(8<<20);
+  const names=CORPORA.map(c=>c.name).join(',');
+  try{
+    const r=await fetch(`/api/deploy?level=${lvl}&cap=${cap}&n=3&files=${encodeURIComponent(names)}`);
+    const d=await r.json();
+    if(!d.ok){ $('deployout').textContent='error: '+d.error; }
+    else{
+      const f=v=>v>=100?v.toFixed(0):v.toFixed(1);
+      $('deployout').innerHTML=
+        `<table class="mini"><tr><th></th><th>zstd -${d.level}</th><th>rzstd -${d.level}</th><th>ratio</th></tr>`+
+        `<tr><td>encode, end-to-end</td><td>${f(d.c_enc_mbps)} MB/s</td><td>${f(d.r_enc_mbps)} MB/s</td>`+
+        `<td class="${d.r_enc_mbps>=d.c_enc_mbps?'win':'lose'}">${(d.r_enc_mbps/d.c_enc_mbps).toFixed(2)}×</td></tr>`+
+        `<tr><td>decode, end-to-end <b>(I/O-dominated)</b></td><td>${f(d.c_dec_mbps)} MB/s</td><td>${f(d.r_dec_mbps)} MB/s</td>`+
+        `<td>${(d.r_dec_mbps/d.c_dec_mbps).toFixed(2)}×</td></tr>`+
+        `<tr><td>compressed size</td><td>${d.c_bytes.toLocaleString()} B</td><td>${d.r_bytes.toLocaleString()} B</td>`+
+        `<td class="${d.size_ratio<1?'win':'lose'}">${d.size_ratio.toFixed(3)}</td></tr></table>`+
+        `<p>${d.files} files, ${(d.bytes/1048576).toFixed(0)} MiB. Startup is `+
+        `${d.c_startup_pct.toFixed(1)}% of C's encode time and ${d.r_startup_pct.toFixed(1)}% of ours. `+
+        `Cross-decode (we read C's default frames): <b>${d.cross_ok?'OK':'FAILED'}</b>. `+
+        `Both frames carry XXH64 — the shipped configuration on both sides.</p>`;
+    }
+  }catch(e){ $('deployout').textContent='error: '+e; }
+  b.disabled=false; b.textContent='Run default-deployment comparison';
+};
 </script>
 </body>
 </html>

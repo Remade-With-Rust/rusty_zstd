@@ -87,23 +87,18 @@ pub fn compress_seekable_adv(
     let max_frame = max_frame_size.max(1);
     let mut out = Vec::new();
     let mut entries: Vec<SeekEntry> = Vec::new();
-    if src.is_empty() {
-        let zst = encode_oneshot(src, params, checksum, Some(0), None, &[], true, adv)?;
-        entries.push(SeekEntry {
-            compressed_size: zst.len() as u32,
-            decompressed_size: 0,
-            checksum: if checksum {
-                Some(content_checksum(src))
-            } else {
-                None
-            },
-        });
-        out.extend_from_slice(&zst);
-        append_seek_table(&mut out, &entries, checksum);
-        return Ok(out);
-    }
+    // C6: THE EMPTY-INPUT SPECIAL CASE IS DELETED. It was a full copy of the
+    // loop body below -- `encode_oneshot`, an entry push, an `extend_from_slice`
+    // and its own `append_seek_table` + return -- for a case that IS exactly
+    // one iteration of that loop with `chunk = &[]`: `Some(0)` content size,
+    // `decompressed_size` 0 (which `try_from(0)` also yields), and the same
+    // `content_checksum` of the same empty slice.
+    //
+    // Making the loop do-while covers it: `off = 0`, `end = 0`, one iteration,
+    // then `off >= src.len()` breaks. Non-empty input is unaffected -- the
+    // final chunk still ends with `off == len`.
     let mut off = 0usize;
-    while off < src.len() {
+    loop {
         let end = (off + max_frame).min(src.len());
         let chunk = &src[off..end];
         let zst = encode_oneshot(
@@ -129,6 +124,9 @@ pub fn compress_seekable_adv(
         });
         out.extend_from_slice(&zst);
         off = end;
+        if off >= src.len() {
+            break;
+        }
     }
     append_seek_table(&mut out, &entries, checksum);
     Ok(out)
@@ -136,20 +134,31 @@ pub fn compress_seekable_adv(
 
 /// Parse a seek table from the end of a seekable blob.
 pub fn parse_seek_table(src: &[u8]) -> Result<SeekTable, Error> {
+    // C1: TWELVE bounds checks and their panic pads came from indexing `src`
+    // one byte at a time -- `src[n - 4]`, `src[start + 1]`, `src[p + 3]` and so
+    // on. Each is a separate test LLVM cannot fold, because nothing in the
+    // source proves the relationship between the indices and `src.len()`.
+    //
+    // The fix is safe Rust, not `unsafe`: take FIXED-SIZE arrays through
+    // `try_into` (one check, then every element is proven), and walk the
+    // entries with `chunks_exact` at a CONST chunk size, which guarantees the
+    // slice length the compiler needs. Same parse, same errors, no pads.
     if src.len() < 17 {
         return Err(Error::Corruption);
     }
     let n = src.len();
-    let magic = u32::from_le_bytes([src[n - 4], src[n - 3], src[n - 2], src[n - 1]]);
+    // Trailing 9 bytes: [num:4][descriptor:1][magic:4].
+    let tail: [u8; 9] = src[n - 9..].try_into().map_err(|_| Error::Corruption)?;
+    let magic = u32::from_le_bytes([tail[5], tail[6], tail[7], tail[8]]);
     if magic != SEEKABLE_MAGIC {
         return Err(Error::BadMagic);
     }
-    let descriptor = src[n - 5];
+    let descriptor = tail[4];
     if descriptor & 0x7C != 0 {
         return Err(Error::ReservedBitSet);
     }
     let has_sum = descriptor & 0x80 != 0;
-    let num = u32::from_le_bytes([src[n - 9], src[n - 8], src[n - 7], src[n - 6]]) as usize;
+    let num = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]) as usize;
     let entry_size = if has_sum { 12 } else { 8 };
     let payload = num
         .checked_mul(entry_size)
@@ -163,37 +172,40 @@ pub fn parse_seek_table(src: &[u8]) -> Result<SeekTable, Error> {
         return Err(Error::Corruption);
     }
     let start = n - skippable_len;
-    let sm = u32::from_le_bytes([src[start], src[start + 1], src[start + 2], src[start + 3]]);
+    // Skippable-frame header: [magic:4][stated:4].
+    let hdr: [u8; 8] = src[start..start + 8]
+        .try_into()
+        .map_err(|_| Error::Corruption)?;
+    let sm = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
     if sm != SEEKABLE_SKIPPABLE_MAGIC && !is_skippable_magic(sm) {
         return Err(Error::BadMagic);
     }
-    let stated = u32::from_le_bytes([
-        src[start + 4],
-        src[start + 5],
-        src[start + 6],
-        src[start + 7],
-    ]) as usize;
+    let stated = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
     if stated != payload {
         return Err(Error::Corruption);
     }
+    let body = src
+        .get(start + 8..start + 8 + num * entry_size)
+        .ok_or(Error::Corruption)?;
     let mut entries = Vec::with_capacity(num);
-    let mut p = start + 8;
-    for _ in 0..num {
-        let csize = u32::from_le_bytes([src[p], src[p + 1], src[p + 2], src[p + 3]]);
-        let dsize = u32::from_le_bytes([src[p + 4], src[p + 5], src[p + 6], src[p + 7]]);
-        p += 8;
-        let checksum = if has_sum {
-            let c = u32::from_le_bytes([src[p], src[p + 1], src[p + 2], src[p + 3]]);
-            p += 4;
-            Some(c)
-        } else {
-            None
-        };
-        entries.push(SeekEntry {
-            compressed_size: csize,
-            decompressed_size: dsize,
-            checksum,
-        });
+    // Split on `has_sum` so the chunk width is a CONSTANT in each arm; that is
+    // what lets the compiler drop the per-field checks.
+    if has_sum {
+        for ch in body.chunks_exact(12) {
+            entries.push(SeekEntry {
+                compressed_size: u32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]),
+                decompressed_size: u32::from_le_bytes([ch[4], ch[5], ch[6], ch[7]]),
+                checksum: Some(u32::from_le_bytes([ch[8], ch[9], ch[10], ch[11]])),
+            });
+        }
+    } else {
+        for ch in body.chunks_exact(8) {
+            entries.push(SeekEntry {
+                compressed_size: u32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]),
+                decompressed_size: u32::from_le_bytes([ch[4], ch[5], ch[6], ch[7]]),
+                checksum: None,
+            });
+        }
     }
     Ok(SeekTable { entries })
 }
@@ -222,21 +234,36 @@ pub fn decompress_frame_at(src: &[u8], table: &SeekTable, offset: u64) -> Result
 }
 
 fn append_seek_table(out: &mut Vec<u8>, entries: &[SeekEntry], checksums: bool) {
+    // C5: SEVEN `extend_from_slice` call sites became three. Each one inlines
+    // `Vec`'s capacity test and grow path, so the count of SITES is the code
+    // size here -- not the bytes moved. Staging into fixed-size arrays and
+    // extending once per group keeps the wire format byte-for-byte identical
+    // (same fields, same order, same little-endian encoding) while emitting a
+    // third of the grow paths.
     let entry_size = if checksums { 12 } else { 8 };
     let payload = entries.len() * entry_size + 9;
-    out.extend_from_slice(&SEEKABLE_SKIPPABLE_MAGIC.to_le_bytes());
-    out.extend_from_slice(&(payload as u32).to_le_bytes());
+    out.reserve(8 + entries.len() * entry_size + 9);
+
+    let mut hdr = [0u8; 8];
+    hdr[0..4].copy_from_slice(&SEEKABLE_SKIPPABLE_MAGIC.to_le_bytes());
+    hdr[4..8].copy_from_slice(&(payload as u32).to_le_bytes());
+    out.extend_from_slice(&hdr);
+
     for e in entries {
-        out.extend_from_slice(&e.compressed_size.to_le_bytes());
-        out.extend_from_slice(&e.decompressed_size.to_le_bytes());
+        let mut b = [0u8; 12];
+        b[0..4].copy_from_slice(&e.compressed_size.to_le_bytes());
+        b[4..8].copy_from_slice(&e.decompressed_size.to_le_bytes());
         if checksums {
-            out.extend_from_slice(&e.checksum.unwrap_or(0).to_le_bytes());
+            b[8..12].copy_from_slice(&e.checksum.unwrap_or(0).to_le_bytes());
         }
+        out.extend_from_slice(&b[..entry_size]);
     }
-    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    let desc = if checksums { 0x80u8 } else { 0 };
-    out.push(desc);
-    out.extend_from_slice(&SEEKABLE_MAGIC.to_le_bytes());
+
+    let mut ftr = [0u8; 9];
+    ftr[0..4].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+    ftr[4] = if checksums { 0x80u8 } else { 0 };
+    ftr[5..9].copy_from_slice(&SEEKABLE_MAGIC.to_le_bytes());
+    out.extend_from_slice(&ftr);
 }
 
 #[cfg(test)]

@@ -155,6 +155,22 @@ fn fallback_content(samples: &[&[u8]], max_dict: usize) -> Vec<u8> {
 }
 
 fn hash_dmer(src: &[u8], pos: usize, d: usize, f: u32) -> usize {
+    // PAD ELIMINATION REFUTED HERE TWICE. Do not try a third variant.
+    //
+    //   C3  window once as a slice + `iter().take(8)`/`skip(8)`  **+165**, 14 -> 11 pads
+    //   C4  window once as a slice + plain `win[i]` indexing      **+303**, 14 -> 14 pads
+    //
+    // C4 was the "obvious fix" to C3 -- drop the adaptors, keep the subslice,
+    // let the bound come from `win.len()` so LLVM can fold the check. It was
+    // worse, and it removed no pads at all: the two `src[pos..pos + X]`
+    // slicings introduce their own checks, and the `.min()` chain that hides
+    // the bound from LLVM is still there, one level up.
+    //
+    // The class rule this settles: **a fixed-size `try_into` array wins
+    // (`parse_seek_table` 12 -> 0 pads, `parse_trained` 17 -> 6); a
+    // runtime-length subslice does not, by either spelling.** The array turns a
+    // dynamic bound into a static one. A subslice just moves the dynamic bound.
+    // Every remaining pad in this crate is the second shape.
     let mut v = 0u64;
     let n = d.min(8).min(src.len().saturating_sub(pos));
     for i in 0..n {
@@ -265,13 +281,19 @@ where
             break;
         }
         let mut best: Option<(usize, usize, u64)> = None;
+        // C10: `used` is a `Vec<Vec<bool>>`, so every `used[si][i]` was TWO
+        // bounds checks -- one for the outer row, one for the element -- and
+        // `si` is invariant across the whole inner sweep. Borrowing the row
+        // once leaves one check per access instead of two, in the trainer's
+        // innermost loops. Safe Rust; identical selection.
         for (si, sample) in samples.iter().enumerate() {
+            let used_si = &used[si];
             if sample.len() < k {
                 if sample.len() >= d {
                     let mut sc = 0u64;
                     let mut n = 0usize;
                     for i in 0..=sample.len() - d {
-                        if !used[si][i] {
+                        if !used_si[i] {
                             sc = sc.saturating_add(score_at(sample, i));
                             n += 1;
                         }
@@ -283,12 +305,12 @@ where
                 continue;
             }
             for start in 0..=sample.len() - k {
-                if used[si][start] {
+                if used_si[start] {
                     continue;
                 }
                 let mut sc = 0u64;
                 for i in start..=start + k - d {
-                    if !used[si][i] {
+                    if !used_si[i] {
                         sc = sc.saturating_add(score_at(sample, i));
                     }
                 }

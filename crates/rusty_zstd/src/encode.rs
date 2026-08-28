@@ -292,7 +292,15 @@ struct Seq {
     offset: u32,
 }
 
-#[derive(Clone)]
+// Clone is MANUAL, and it is the GATE 18 probe's clone: the one caller
+// (`let mut probe = tables.clone()` in `find_sequences`) needs the SEARCH
+// state -- boards, rows, and every dispatch signal -- from an identical
+// starting point, and then discards the copy. The nine scratch buffers'
+// CONTENTS are dead at every read site (each is take-and-CLEARED or
+// reset/ensure'd before use), so `derive(Clone)`'s deep copy of them was up
+// to ~300 KB of memcpy per probed block to reproduce bytes nobody can read.
+// They clone as empty Vecs; the probe's finder allocates its own on first
+// use, exactly as a fresh encoder would. Byte-identical by construction.
 pub(crate) struct MatchTables {
     hash: Vec<u32>,
     hash_long: Vec<u32>,
@@ -315,6 +323,12 @@ pub(crate) struct MatchTables {
     /// construction, which is what lets the mask go.
     hash_log: u32,
     chain: Vec<u32>,
+    /// E1: the ROW match finder's table -- our `ZSTD_row_match_finder`.
+    ///
+    /// Empty unless the row arm is on. Allocated lazily at the same place the
+    /// chain is, and to the same total size (`1 << hash_log` entries), because
+    /// it REPLACES the chain rather than supplementing it. See `rowfind`.
+    rows: crate::rowfind::RowTable,
     /// Workspace index: matches must start at or after this (MT overlap prime).
     frame_start: usize,
     /// Sequences the previous block produced, used to size the next block's
@@ -574,6 +588,83 @@ pub(crate) struct MatchTables {
     rep_run: u32,
 }
 
+// The BOARD list is probe-scoped too, not just the scratch: the one caller is
+// GATE 18's step probe, which is gated on `params.strategy == Strategy::Fast`,
+// and the fast family reads exactly TWO boards -- `hash` and `tags` (audited:
+// `find_fast_impl_inner` takes those two and `fast_probe`/`fast_probe_wide`
+// touch nothing else). `hash_long`, `chain`, `ltags`, `ctags` and `rows` are
+// dfast/lazy/bt/row state the probe can never reach, so cloning them was more
+// dead bytes -- `chain` alone is up to 64 MB at high chain logs. A future
+// caller that probes a non-fast strategy must widen this list; the debug
+// assert at the clone site is the tripwire.
+impl Clone for MatchTables {
+    fn clone(&self) -> Self {
+        Self {
+            hash: self.hash.clone(),
+            hash_long: Vec::new(),
+            ltags: Vec::new(),
+            rep_yield: self.rep_yield,
+            hash_log: self.hash_log,
+            chain: Vec::new(),
+            rows: crate::rowfind::RowTable::default(),
+            frame_start: self.frame_start,
+            last_nseq: self.last_nseq,
+            step_pick: self.step_pick,
+            step_used: self.step_used,
+            route_force: self.route_force,
+            step_probed: self.step_probed,
+            step_sum1: self.step_sum1,
+            step_sum2: self.step_sum2,
+            step_reprobe: self.step_reprobe,
+            last_search_per_byte: self.last_search_per_byte,
+            walk_first_share: self.walk_first_share,
+            walk_probe: self.walk_probe,
+            walk_share_meas: self.walk_share_meas,
+            wide_ok_blocks: self.wide_ok_blocks,
+            chain_pack: self.chain_pack,
+            ctags: Vec::new(),
+            coded_scratch: Vec::new(),
+            bits_scratch: Vec::new(),
+            chain_wide: self.chain_wide,
+            blocks_done: self.blocks_done,
+            payload_scratch: Vec::new(),
+            seq_scratch: Vec::new(),
+            lit_scratch: Vec::new(),
+            opt_ops: Vec::new(),
+            opt_price: Vec::new(),
+            opt_prev: Vec::new(),
+            opt_om: Vec::new(),
+            next_long_yield: self.next_long_yield,
+            nl_off_worse: self.nl_off_worse,
+            nl_band_meas: self.nl_band_meas,
+            nl_band_probe: self.nl_band_probe,
+            lit_short_share: self.lit_short_share,
+            lit_mid_share: self.lit_mid_share,
+            rep_len_ratio: self.rep_len_ratio,
+            rep_probe: self.rep_probe,
+            raw_run: self.raw_run,
+            raw_probe: self.raw_probe,
+            opt_rep_rate: self.opt_rep_rate,
+            opt_rep_probe: self.opt_rep_probe,
+            opt_rep_peak: self.opt_rep_peak,
+            opt_rep_meas: self.opt_rep_meas,
+            opt_rep_seen: self.opt_rep_seen,
+            opt_lit_price: self.opt_lit_price,
+            dfast_mean_ml: self.dfast_mean_ml,
+            dfast_spec_yield: self.dfast_spec_yield,
+            dfast_probe: self.dfast_probe,
+            pair_gain: self.pair_gain,
+            pair_probe: self.pair_probe,
+            pair_route: self.pair_route,
+            tags: self.tags.clone(),
+            pack_tags: self.pack_tags,
+            fast_hash_legacy: self.fast_hash_legacy,
+            tag_yield: self.tag_yield,
+            rep_run: self.rep_run,
+        }
+    }
+}
+
 impl MatchTables {
     pub(crate) fn new(params: CompressionParameters) -> Self {
         let hash_log = params.hash_log.clamp(6, 24);
@@ -634,6 +725,16 @@ impl MatchTables {
             hash_long: if use_long { vec![0; hsz] } else { Vec::new() },
             ltags: Vec::new(),
             chain: if use_chain { vec![0; csz] } else { Vec::new() },
+            // Sized to the CHAIN it replaces, and only when the arm is on --
+            // an empty `head` is what every hot-path site tests, so the
+            // default build allocates nothing and branches once per insert.
+            rows: {
+                let mut r = crate::rowfind::RowTable::default();
+                if use_chain && row_find_enabled() {
+                    r.reset(params.chain_log.min(24));
+                }
+                r
+            },
             frame_start: 0,
             last_nseq: 0,
             step_pick: 0,
@@ -765,6 +866,10 @@ impl MatchTables {
     }
 
     /// Raw slot, bypassing the tag filter -- diagnostic only.
+    ///
+    /// Its only call site is inside `#[cfg(feature = "profile")]` (the tag
+    /// audit), so it is dead in a shipping build and gated to match.
+    #[cfg(feature = "profile")]
     #[inline(always)]
     fn raw_fast(&self, h: usize) -> u32 {
         let e = self.hash[h];
@@ -1056,6 +1161,7 @@ impl MatchTables {
             }
         }
         self.lz_head_put(h, ip, gtag, cp);
+        self.row_insert(h, ip, gtag);
         (Self::lz_head_pos(raw, cp), old_tag)
     }
 
@@ -1064,7 +1170,15 @@ impl MatchTables {
     /// `Option<usize>` nobody reads.
     #[inline(always)]
     #[allow(unsafe_code)]
-    fn lz_insert_only(
+    /// `ROWS` is a CONST because both callers already know the answer per
+    /// block. The row mirror below ends in `row_insert`, which re-tests
+    /// `!rows.head.is_empty()` -- a Vec length load and a branch on EVERY
+    /// insert. The lazy fill calls this only from the `else` arm of
+    /// `if use_rows`, so rows are provably EMPTY there and the test can never
+    /// fire; `lazyfill.rs` measures 41,742,765 fill inserts at L9, which is
+    /// the frequency it was running at. Greedy's `g_fill` has no such guard
+    /// and passes `true`.
+    fn lz_insert_only<const ROWS: bool>(
         &mut self,
         h: usize,
         ip: usize,
@@ -1091,6 +1205,71 @@ impl MatchTables {
             }
         }
         self.lz_head_put(h, ip, gtag, cp);
+        if ROWS {
+            self.row_insert(h, ip, gtag);
+        }
+    }
+
+    /// Mirror a chain insert into the ROW table, when the row arm allocated it.
+    ///
+    /// Placed here rather than in the finder so EVERY fill path feeds the rows
+    /// -- including the back-fills, which is exactly where a hand-wired finder
+    /// would have silently diverged from the chain it replaces.
+    #[inline(always)]
+    fn row_insert(&mut self, h: usize, ip: usize, gtag: u8) {
+        if !self.rows.head.is_empty() {
+            let r = self.rows.row_of(h);
+            self.rows.insert(r, ip as u32, gtag);
+        }
+    }
+
+    /// W28: the BACK-FILL's row insert. `row_insert` re-tests
+    /// `!rows.head.is_empty()` on every call, but the fill only reaches this
+    /// when `use_rows` is already true -- and `use_rows` is exactly
+    /// `row_find_enabled() && !rows.head.is_empty()`, decided once per block.
+    /// `lazyfill.rs` measures 41,742,765 fill inserts at L9, so that was a
+    /// `Vec` length load and a branch on each one.
+    ///
+    /// SUPERSEDED, kept as the reference shape -- the convention this crate
+    /// already uses for `encode_4_streams` and `segment_histograms`. The fill
+    /// loop now calls `rows.insert_h` directly, which is strictly better: the
+    /// row mask is hoisted, `row_of(h)` is not re-derived, and the emptiness
+    /// test is gone. W28 was superseded, NOT reverted -- worth stating,
+    /// because a dead optimisation helper looks identical to a reverted one.
+    #[allow(dead_code)]
+    #[inline(always)]
+    fn row_insert_live(&mut self, h: usize, ip: usize, gtag: u8) {
+        debug_assert!(!self.rows.head.is_empty());
+        let r = self.rows.row_of(h);
+        self.rows.insert(r, ip as u32, gtag);
+    }
+
+    /// The ROW finder's insert -- and it writes exactly ONE table.
+    ///
+    /// W8 started here by passing `r` in (`row_insert` re-derived `row_of(h)`
+    /// the finder already held) and dropping the `(Option<usize>, u8)` return
+    /// that caller discards. Section 14.8 then took the rest: `row_find_best`
+    /// reads `rows` and NOTHING else, so while the row arm is on, the chain
+    /// link, the chain tags, the hash head and the head tags are all written
+    /// and never read. Proven by removing them and re-boarding: 32 cells --
+    /// 12 corpora at L9, 10 each at L7 and L12 -- all byte-identical.
+    ///
+    /// THE RESIDUAL RISK, STATED: that is an empirical result about the paths
+    /// these boards exercise, not a proof by construction. A future caller
+    /// that reads the chain while rows are active would see a stale table.
+    /// The row arm is bitstream-changing and defaults OFF, and `rowboard` is
+    /// its gate -- any such caller shows up there as a changed cell.
+    ///
+    /// ATTRIBUTE HIJACK, repaired. `row_insert_live` had been inserted BETWEEN
+    /// this doc block and this `fn` line, so the block documented `row_insert_live`
+    /// (which has its own doc), the `#[inline(always)]` below re-parented onto
+    /// it as a duplicate, and THIS function -- the row finder's per-position
+    /// insert -- silently lost its inline hint. The `unused attribute` warning
+    /// on the duplicate was the only signal, and it names the innocent line.
+    #[inline(always)]
+    fn lz_insert_rowknown(&mut self, r: usize, at: usize, head: u32, ip: usize, gtag: u8) {
+        debug_assert!(!self.rows.head.is_empty());
+        self.rows.insert_at(r, at, head, ip as u32, gtag);
     }
 
     /// T2: binary-tree slot read.
@@ -1272,12 +1451,23 @@ pub(crate) struct EntropyState {
     ml: Option<alloc::sync::Arc<RetainedTable>>,
 }
 
+/// One outlined copy of the dictionary-seed table wrap. See
+/// `EntropyState::seed_from_dict`.
+#[inline(never)]
+fn retain_ctable(t: &fse::FseCTable) -> alloc::sync::Arc<RetainedTable> {
+    alloc::sync::Arc::new(RetainedTable::Own(t.clone()))
+}
+
 impl EntropyState {
     pub(crate) fn seed_from_dict(&mut self, e: &crate::dict::DictEntropy) {
+        // C9: the encode-side mirror of C8. `Arc::new(RetainedTable::Own(
+        // t.clone()))` -- an allocation, an enum construction and a table
+        // clone -- was expanded at all three sites. One outlined helper leaves
+        // that body once. Runs once per dictionary.
         self.huff = Some(alloc::sync::Arc::new(e.huff_c.clone()));
-        self.ll = Some(alloc::sync::Arc::new(RetainedTable::Own(e.ll_c.clone())));
-        self.of = Some(alloc::sync::Arc::new(RetainedTable::Own(e.of_c.clone())));
-        self.ml = Some(alloc::sync::Arc::new(RetainedTable::Own(e.ml_c.clone())));
+        self.ll = Some(retain_ctable(&e.ll_c));
+        self.of = Some(retain_ctable(&e.of_c));
+        self.ml = Some(retain_ctable(&e.ml_c));
     }
 }
 
@@ -2262,7 +2452,12 @@ fn g5_drift_min() -> f32 {
     }
 }
 
-#[inline(always)]
+/// OUTLINED. A 223-line dictionary-priming walk that was `#[inline(always)]`
+/// at five shipping call sites -- `encode_oneshot`, two in `stream.rs`'s
+/// compressor setup, and the reset path. Every one of them runs ONCE PER
+/// DICTIONARY or once per stream reset, never per block, so the call is free
+/// and the five stamps were not.
+#[inline(never)]
 pub(crate) fn prime_tables(
     tables: &mut MatchTables,
     src: &[u8],
@@ -2503,63 +2698,15 @@ pub(crate) fn encode_block(
     ldm: Option<&mut crate::ldm::LdmTables>,
     ldm_p: crate::ldm::LdmParams,
 ) -> Result<(), Error> {
-    // Wholesale BMI2 twin: the per-block section packing carried 34
-    // variable shifts of its own, outside every finer-grained twin.
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if crate::simd::has_bmi2() {
-        // SAFETY: runtime CPUID guard; identical body.
-        #[allow(unsafe_code)]
-        return unsafe {
-            encode_block_bmi2(
-                out,
-                src,
-                block_start,
-                block_end,
-                window,
-                params,
-                tables,
-                reps,
-                entropy,
-                last,
-                ldm,
-                ldm_p,
-            )
-        };
-    }
-    encode_block_inner(
-        out,
-        src,
-        block_start,
-        block_end,
-        window,
-        params,
-        tables,
-        reps,
-        entropy,
-        last,
-        ldm,
-        ldm_p,
-    )
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "bmi2,lzcnt")]
-#[allow(clippy::too_many_arguments)]
-#[allow(unsafe_code)]
-unsafe fn encode_block_bmi2(
-    out: &mut Vec<u8>,
-    src: &[u8],
-    block_start: usize,
-    block_end: usize,
-    window: usize,
-    params: CompressionParameters,
-    tables: &mut MatchTables,
-    reps: &mut [u32; 3],
-    entropy: &mut EntropyState,
-    last: bool,
-    ldm: Option<&mut crate::ldm::LdmTables>,
-    ldm_p: crate::ldm::LdmParams,
-) -> Result<(), Error> {
+    // TWIN RETIRED. This carried a wholesale BMI2 twin justified by "the
+    // per-block section packing carried 34 variable shifts of its own,
+    // outside every finer-grained twin". That premise has expired: the
+    // packing moved into `write_sequences` and `write_literals`, which grew
+    // their OWN twins, and every finder now runs its own `has_bmi2()`
+    // dispatch. Measured on the emitted asm before removing it -- the twin
+    // contained 1 `shrx` against 1291 instructions of duplicated
+    // body. It was buying single-digit shift encodings for four figures of
+    // I-cache.
     encode_block_inner(
         out,
         src,
@@ -2660,6 +2807,10 @@ fn encode_block_inner(
         // 2 at +2.3% and +3.2%); counting match bytes at skipped positions
         // overestimates, because a match at a skipped position usually SHIFTS to
         // the next one rather than vanishing.
+        // `Clone` for `MatchTables` is PROBE-SCOPED: it hands over only the
+        // boards the Fast family reads (see the impl). This assert is the
+        // contract's tripwire.
+        debug_assert_eq!(params.strategy, Strategy::Fast);
         let mut probe = tables.clone();
         probe.route_force = 2;
         let (s2, l2) = find_sequences(
@@ -3303,6 +3454,17 @@ pub(crate) fn write_frame_header(
 static ENC_AVX2_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
 
 /// Bench hook: `false` routes the entropy twins back to the bmi2-only arm.
+///
+/// **INERT as of the SIMD-3 retirement.** Both arms this knob selected are
+/// gone: `write_literals_bmi2` was retired (0 BMI2 ops, and its baseline had 0
+/// `%cl` shifts), and `write_sequences_avx2` was retired for growing the body
+/// while emitting 98 `vmovups` and zero vector arithmetic. Nothing reads the
+/// flag any more, so setting it changes no behaviour.
+///
+/// Kept because it is `pub use`d from the crate root and shipped in v0.1.0 --
+/// removing it would be a breaking change for a knob that now costs one
+/// atomic store on a path nobody takes. `crates/rusty_zstd-bench/examples/
+/// simd3ab.rs` drives this and will now A/B two identical arms.
 pub fn set_enc_avx2_arm(on: bool) {
     ENC_AVX2_ARM.store(
         if on { 2 } else { 1 },
@@ -3310,44 +3472,28 @@ pub fn set_enc_avx2_arm(on: bool) {
     );
 }
 
-#[inline(always)]
-fn enc_avx2_on() -> bool {
-    ENC_AVX2_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
-}
-
 fn write_literals(
     dst: &mut Vec<u8>,
     lits: &[u8],
     entropy: &mut EntropyState,
 ) -> Result<bool, Error> {
-    // The literal-section table builders (histogram, ctable, tree write,
-    // normalize, ncount) all carry variable shifts; the BMI2 twin compiles
-    // the whole section in its own ISA context.
-    // SIMD-3 TRIED AND REVERTED HERE. Enabling avx2 on this twin converted all
-    // 283 legacy SSE ops to VEX and produced 799 ymm -- and made Huff **+5.0%
-    // SLOWER** (14-corpus in-process ABBA x7, byte-identity asserted). The
-    // instruction count said so before the clock did: the body GREW 3,659 ->
-    // 4,404 (+745). LLVM vectorised histogram/ctable loops whose trip counts
-    // cannot amortise ymm setup and the vzeroupper on exit. Contrast
-    // `write_sequences`, whose body SHRANK 8,769 -> 8,324 and measured -1.8%.
-    // **Enable avx2 where the instruction count DROPS; revert where it GROWS.**
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if crate::simd::has_bmi2() {
-        // SAFETY: runtime CPUID guard; identical body.
-        #[allow(unsafe_code)]
-        return unsafe { write_literals_bmi2(dst, lits, entropy) };
-    }
-    write_literals_inner(dst, lits, entropy)
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "bmi2,lzcnt")]
-#[allow(unsafe_code)]
-unsafe fn write_literals_bmi2(
-    dst: &mut Vec<u8>,
-    lits: &[u8],
-    entropy: &mut EntropyState,
-) -> Result<bool, Error> {
+    // TWIN RETIRED, on its own measurement. The note this replaces justified a
+    // wholesale BMI2 twin because "the literal-section table builders
+    // (histogram, ctable, tree write, normalize, ncount) all carry variable
+    // shifts". Measured on the emitted asm: the twin contained **zero** BMI2
+    // instructions across 1,661 of body, and this baseline function contains
+    // **zero** `%cl` shifts -- there was nothing on either side for the twin
+    // to improve. The builders it names are separate symbols now (`from_norm`
+    // 4 `%cl` shifts, `write_ncount` 5), and buying those 9 shift encodings
+    // back would cost ~960 instructions of twin -- the trade this file has
+    // rejected everywhere else.
+    //
+    // SIMD-3 REMAINS REFUTED HERE and the reasoning is unchanged: enabling
+    // avx2 grew the body 3,659 -> 4,404 and measured Huff **+5.0% SLOWER**
+    // (14-corpus in-process ABBA x7). Contrast `write_sequences`, which shrank
+    // 8,769 -> 8,324 and measured -1.8% -- and which KEEPS both its twins
+    // (45 BMI2 ops, 98 ymm on the avx2 arm; they earn their place).
+    // **Enable a twin where the ISA count is real; retire it where it is zero.**
     write_literals_inner(dst, lits, entropy)
 }
 
@@ -3397,71 +3543,31 @@ fn write_sequences(
     strategy: Strategy,
     tables: &mut MatchTables,
 ) -> Result<(), Error> {
-    // The encode-side mirror of 621a140: the FSE flush loop and add_bits are
-    // variable-shift chains; the BMI2 twin compiles the same body with
-    // shrx/shlx available. Byte-identity by construction.
-    // SIMD-3: AVX2 arm first -- 526 legacy SSE ops / 0 ymm in the bmi2-only twin.
-    // The per-SEQUENCE transcode and the ll/of/ml histogram walks live in here.
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if enc_avx2_on() && crate::simd::has_avx2() && crate::simd::has_bmi2() {
-        // SAFETY: runtime CPUID guard for BOTH features; identical body.
-        #[allow(unsafe_code)]
-        return unsafe { write_sequences_avx2(dst, seqs, reps, entropy, strategy, tables) };
-    }
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if crate::simd::has_bmi2() {
-        // SAFETY: guarded by runtime CPUID; the body is identical.
-        #[allow(unsafe_code)]
-        return unsafe { write_sequences_bmi2(dst, seqs, reps, entropy, strategy, tables) };
-    }
+    // D7: TWIN RETIRED on its ISA density -- 2,385 instructions of duplicated
+    // body converting FORTY-FIVE BMI2 ops, 56 per op. The avx2 arm above it
+    // went in Trans XI for emitting 98 `vmovups` and zero vector arithmetic;
+    // this one converts real shifts, just not enough of them to justify a
+    // second copy of the sequence-section encoder.
+    //
+    // The line this round has drawn, in instructions per ISA op converted:
+    //   RETIRED  chain 152, greedy 123, lazy 111, bt-rt 97, dfast 72, this 56
+    //   KEPT     find_fast_impl 44, decode_sequences_avx2 37,
+    //            emit_fast_seq 32, compress_using_ctable 26, decode_4x 20
+    // The kept twins are the dense ones on the per-position and per-literal-byte
+    // paths, which is where an ISA fold can actually pay for its I-cache.
     write_sequences_inner(dst, seqs, reps, entropy, strategy, tables)
 }
 
-/// SIMD-3: the AVX2 + BMI2 sequence-section twin. Byte-identical by construction.
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "avx2,bmi2,lzcnt")]
-#[allow(unsafe_code)]
-unsafe fn write_sequences_avx2(
-    dst: &mut Vec<u8>,
+/// The per-sequence coding pass of `write_sequences_inner`, shared by its
+/// three ISA twins. Returns the coded sequences plus the three histograms.
+#[inline(never)]
+#[allow(clippy::type_complexity)]
+fn build_coded_pass(
     seqs: &[Seq],
     reps: &mut [u32; 3],
-    entropy: &mut EntropyState,
-    strategy: Strategy,
     tables: &mut MatchTables,
-) -> Result<(), Error> {
-    write_sequences_inner(dst, seqs, reps, entropy, strategy, tables)
-}
-
-/// The BMI2-compiled twin.
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "bmi2,lzcnt")]
-#[allow(unsafe_code)]
-unsafe fn write_sequences_bmi2(
-    dst: &mut Vec<u8>,
-    seqs: &[Seq],
-    reps: &mut [u32; 3],
-    entropy: &mut EntropyState,
-    strategy: Strategy,
-    tables: &mut MatchTables,
-) -> Result<(), Error> {
-    write_sequences_inner(dst, seqs, reps, entropy, strategy, tables)
-}
-
-#[inline(always)]
-fn write_sequences_inner(
-    dst: &mut Vec<u8>,
-    seqs: &[Seq],
-    reps: &mut [u32; 3],
-    entropy: &mut EntropyState,
-    strategy: Strategy,
-    tables: &mut MatchTables,
-) -> Result<(), Error> {
-    write_nseq(dst, seqs.len() as u32);
-    if seqs.is_empty() {
-        return Ok(());
-    }
-
-    let (coded, ll_count, of_count, ml_count, of_max) = {
+) -> Result<(Vec<CodedSeq>, [u32; 36], [u32; 32], [u32; 53], u8), Error> {
+    let out = {
         let _sc = crate::prof::scope(crate::prof::Stage::EncodeSeqCode);
         // T4/brick-79: hoist the LUT arm out of the per-sequence loop. It was
         // read inside `ll_code` AND `ml_code`, i.e. two atomic loads per
@@ -3530,8 +3636,44 @@ fn write_sequences_inner(
 
         (coded, ll_count, of_count, ml_count, of_max)
     };
+    Ok(out)
+}
+
+#[inline(always)]
+fn write_sequences_inner(
+    dst: &mut Vec<u8>,
+    seqs: &[Seq],
+    reps: &mut [u32; 3],
+    entropy: &mut EntropyState,
+    strategy: Strategy,
+    tables: &mut MatchTables,
+) -> Result<(), Error> {
+    write_nseq(dst, seqs.len() as u32);
+    if seqs.is_empty() {
+        return Ok(());
+    }
+
+    // THE CODED PASS IS ONE NON-GENERIC CALL. `write_sequences_inner` is
+    // compiled into three ISA twins for the FSE BIT-WRITING loop below; this
+    // pass -- rep resolution, ll/ml/of coding and the three histograms -- was
+    // stamped into each. Its only ISA-sensitive ops are the `leading_zeros`
+    // in `ll_code`/`ml_code` (lzcnt vs `bsr`+xor, both a couple of uops), so
+    // one shared copy trades a marginal encoding for two fewer stamps of the
+    // whole pass. Output is identical either way -- the codes are the codes.
+    let (coded, ll_count, of_count, ml_count, of_max) = build_coded_pass(seqs, reps, tables)?;
     let use_low = strategy.id() >= Strategy::Lazy.id();
     let last_i = coded.len() - 1;
+    // REFUTED, recorded: extracting these three `select_seq_table` calls into a
+    // shared non-ISA `select_seq_tables` -- the `build_coded_pass` treatment,
+    // and structurally the same opportunity -- measured **+348**. Each twin did
+    // shrink (bmi2 2,535 -> 2,385), but the helper returns NINE values: three
+    // `SeqTable`s and three `Vec`s. That tuple goes through memory, and the
+    // moves cost more than the duplication saved.
+    //
+    // The lesson generalises: an extraction's win is (copies - 1) x body, and
+    // its cost is the CALLING CONVENTION. When the interface is a handful of
+    // scalars, as in `build_coded_pass`, the trade is free; when it is six
+    // owned heap values, it is not. Price the return, not just the body.
     let (ll_mode, ll_t, ll_hdr, of_mode, of_t, of_hdr, ml_mode, ml_t, ml_hdr) = {
         let _t = crate::prof::scope(crate::prof::Stage::EncodeTableSelect);
         let (ll_mode, ll_t, ll_hdr) = select_seq_table(
@@ -3842,52 +3984,15 @@ fn find_sequences(
     ldm_p: crate::ldm::LdmParams,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if crate::simd::has_bmi2() {
-        // SAFETY: runtime CPUID guard; identical body.
-        #[allow(unsafe_code)]
-        return unsafe {
-            find_sequences_bmi2(
-                src,
-                block_start,
-                block_end,
-                window,
-                params,
-                tables,
-                ldm,
-                ldm_p,
-                reps,
-            )
-        };
-    }
-    find_sequences_inner(
-        src,
-        block_start,
-        block_end,
-        window,
-        params,
-        tables,
-        ldm,
-        ldm_p,
-        reps,
-    )
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "bmi2,lzcnt")]
-#[allow(clippy::too_many_arguments)]
-#[allow(unsafe_code)]
-unsafe fn find_sequences_bmi2(
-    src: &[u8],
-    block_start: usize,
-    block_end: usize,
-    window: usize,
-    params: CompressionParameters,
-    tables: &mut MatchTables,
-    ldm: Option<&mut crate::ldm::LdmTables>,
-    ldm_p: crate::ldm::LdmParams,
-    reps: [u32; 3],
-) -> (Vec<Seq>, Vec<u8>) {
+    // TWIN RETIRED. This carried a wholesale BMI2 twin justified by "the
+    // per-block section packing carried 34 variable shifts of its own,
+    // outside every finer-grained twin". That premise has expired: the
+    // packing moved into `write_sequences` and `write_literals`, which grew
+    // their OWN twins, and every finder now runs its own `has_bmi2()`
+    // dispatch. Measured on the emitted asm before removing it -- the twin
+    // contained 2 `shrx` against 642 instructions of duplicated
+    // body. It was buying single-digit shift encodings for four figures of
+    // I-cache.
     find_sequences_inner(
         src,
         block_start,
@@ -3972,32 +4077,15 @@ fn find_sequences_strategy(
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    // The DP drivers (find_opt / find_bt_lazy) inline HERE, so this twin is
-    // what puts the L13-L22 pricing loops under BMI2.
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if crate::simd::has_bmi2() {
-        // SAFETY: runtime CPUID guard; identical body.
-        #[allow(unsafe_code)]
-        return unsafe {
-            find_sequences_strategy_bmi2(src, block_start, block_end, window, params, tables, reps)
-        };
-    }
-    find_sequences_strategy_sel(src, block_start, block_end, window, params, tables, reps)
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "bmi2,lzcnt")]
-#[allow(clippy::too_many_arguments)]
-#[allow(unsafe_code)]
-unsafe fn find_sequences_strategy_bmi2(
-    src: &[u8],
-    block_start: usize,
-    block_end: usize,
-    window: usize,
-    params: CompressionParameters,
-    tables: &mut MatchTables,
-    reps: [u32; 3],
-) -> (Vec<Seq>, Vec<u8>) {
+    // TWIN RETIRED. This carried a wholesale BMI2 twin justified by "the
+    // per-block section packing carried 34 variable shifts of its own,
+    // outside every finer-grained twin". That premise has expired: the
+    // packing moved into `write_sequences` and `write_literals`, which grew
+    // their OWN twins, and every finder now runs its own `has_bmi2()`
+    // dispatch. Measured on the emitted asm before removing it -- the twin
+    // contained 3 `shrx` against 254 instructions of duplicated
+    // body. It was buying single-digit shift encodings for four figures of
+    // I-cache.
     find_sequences_strategy_sel(src, block_start, block_end, window, params, tables, reps)
 }
 
@@ -4507,58 +4595,79 @@ fn find_fast(
     //
     // The ISA choice also moves HERE, out of the 140 `find_fast_impl` bodies
     // that each re-asked `has_bmi2()` per block.
+    // W4: THE HLOG AXIS IS COLLAPSED ON THE BASELINE PATH TOO -- 48 copies
+    // become 8, and `find_fast_impl` goes 46,327 -> 7,852 instructions.
+    //
+    // W5 (above) removed this axis from the BMI2 twins because `shrx` takes
+    // its count from any GPR. The same audit on the baseline path shows the
+    // axis was never worth its price there either. `HLOG` reaches EXACTLY TWO
+    // lines of `find_fast_impl_inner` -- the `f_mask` and `f_shift`
+    // computations -- and both results then travel as ORDINARY RUNTIME
+    // ARGUMENTS to `fast_hash_tag`. So six-fold monomorphisation of a
+    // ~965-instruction body, twice over PACKED x REP x WIDE, bought one shift
+    // immediate in the hash.
+    //
+    // What the fold is worth, per target:
+    //   x86_64 + std, BMI2      already HLOG-generic (W5). Unaffected.
+    //   x86_64 baseline         `shr %cl` instead of `shr $imm`: 1 uop, 1
+    //                           cycle on every microarchitecture since Core 2.
+    //   aarch64 / wasm32        NOTHING. `LSR Rd, Rn, Rm` costs exactly what
+    //                           the immediate form costs; there is no `%cl`
+    //                           constraint to escape. These targets always
+    //                           take this path, and they were paying the whole
+    //                           48-copy tree for a fold their ISA does not
+    //                           have a problem with.
+    //
+    // And the I-cache argument runs the other way from the fold: 48 copies of
+    // a ~965-instruction body is ~46 KB of code for ONE function, against a
+    // typical 32 KB L1i. The specialisation could not stay resident, so on
+    // the very CPUs it was written for it is likely a net LOSS.
+    //
+    // BYTE-IDENTICAL, for the reason the arms below already state: the const
+    // takes the value the runtime variable already held. `HLOG` chooses how
+    // the shift is ENCODED, never what it computes. (144/144 sha256.)
     macro_rules! go {
-        ($p:expr, $r:expr, $h:expr, $s:expr, $pi:expr) => {{
+        ($p:expr, $r:expr) => {{
             // NOTE: this must stay an EXPRESSION. An earlier revision used
             // `return` here and skipped the `pair_probe` countdown below the
             // match, which froze GATE 6's re-probe and moved L1/L2 bytes.
+            //
+            // REFUTED, recorded: routing this through a per-(PACKED, REP)
+            // `#[inline(never)]` trampoline -- so the arms stamp one thin call
+            // instead of two 10-arg unsafe setups -- measured NEUTRAL (+45
+            // crate-wide: dispatcher -245, trampolines +200). LLVM was already
+            // tail-merging the duplicate call setups across arms.
+            //
+            // W8: ONE call per ISA arm, with `wide_block` passed straight
+            // through. The `if wide_block { f(true, ..) } else { f(false, ..) }`
+            // that stood in each arm was selecting between two
+            // monomorphisations that W7 merged -- so it had become a branch
+            // plus a second 11-argument call setup to reach the same function.
             #[cfg(all(target_arch = "x86_64", feature = "std"))]
             #[allow(unsafe_code)]
             let out = if crate::simd::has_bmi2() {
                 // SAFETY: runtime CPUID guard, identical body.
-                if wide_block {
-                    unsafe {
-                        find_fast_impl_bmi2::<$p, $r, 0, 0, true>(
-                            s0,
-                            pipe_on,
-                            src,
-                            block_start,
-                            block_end,
-                            window,
-                            params,
-                            tables,
-                            reps,
-                        )
-                    }
-                } else {
-                    unsafe {
-                        find_fast_impl_bmi2::<$p, $r, 0, 0, false>(
-                            s0,
-                            pipe_on,
-                            src,
-                            block_start,
-                            block_end,
-                            window,
-                            params,
-                            tables,
-                            reps,
-                        )
-                    }
+                unsafe {
+                    find_fast_impl_bmi2(
+                        $p,
+                        $r,
+                        wide_block,
+                        s0,
+                        pipe_on,
+                        src,
+                        block_start,
+                        block_end,
+                        window,
+                        params,
+                        tables,
+                        reps,
+                    )
                 }
-            } else if wide_block {
-                find_fast_impl::<$p, $r, $h, 0, true>(
-                    s0,
-                    pipe_on,
-                    src,
-                    block_start,
-                    block_end,
-                    window,
-                    params,
-                    tables,
-                    reps,
-                )
             } else {
-                find_fast_impl::<$p, $r, $h, 0, false>(
+                find_fast_impl(
+                    $p,
+                    $r,
+                    wide_block,
                     s0,
                     pipe_on,
                     src,
@@ -4571,31 +4680,20 @@ fn find_fast(
                 )
             };
             #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
-            let out = if wide_block {
-                find_fast_impl::<$p, $r, $h, 0, true>(
-                    s0,
-                    pipe_on,
-                    src,
-                    block_start,
-                    block_end,
-                    window,
-                    params,
-                    tables,
-                    reps,
-                )
-            } else {
-                find_fast_impl::<$p, $r, $h, 0, false>(
-                    s0,
-                    pipe_on,
-                    src,
-                    block_start,
-                    block_end,
-                    window,
-                    params,
-                    tables,
-                    reps,
-                )
-            };
+            let out = find_fast_impl(
+                $p,
+                $r,
+                wide_block,
+                s0,
+                pipe_on,
+                src,
+                block_start,
+                block_end,
+                window,
+                params,
+                tables,
+                reps,
+            );
             out
         }};
     }
@@ -4637,146 +4735,48 @@ fn find_fast(
     // that no threshold can open. `mozilla` and `samba` lost their -2.85% and
     // -6.03% to this, identically at every threshold, which is what gave it
     // away: a real threshold effect moves when the threshold moves.
-    // ffanat census: WHICH monomorphisation class serves the traffic? The
-    // comment on the (false,..) arms calls them "the shipping configuration",
-    // but `ut` is tag_enabled() && tag_yield >= tag_min, which defaults ON --
-    // if that is what usually runs, the shipped path is the GENERIC body.
+    // ffanat census: WHICH monomorphisation serves the traffic?
+    //
+    // REWRITTEN FOR W4/W5. This used to mirror a 70-arm tree and classify on
+    // `(fast_spec_enabled, ut, rep_on, pipe_on, s0)`. That tree is gone: the
+    // dispatch is now `(ut, rep_on)` and nothing else, because those are the
+    // only two keys that still choose a monomorphisation. The census MUST
+    // mirror the dispatch -- the comment the old version carried says exactly
+    // why ("the first version kept its labels when the dispatch gained arms,
+    // and read stale"), and that failure mode is symmetric: it reads stale
+    // when the dispatch LOSES arms too.
     #[cfg(feature = "profile")]
     {
         use core::sync::atomic::Ordering::Relaxed;
-        // MIRRORS THE DISPATCH BELOW exactly -- classify by which arm will
-        // match, not by the inputs alone (the first version of this census
-        // kept its labels when the dispatch gained arms, and read stale).
-        let spec = fast_spec_enabled()
-            && pipe_on
-            && ((!ut && !rep_on && (1..=4).contains(&s0))
-                || ((ut || rep_on) && (1..=2).contains(&s0)));
-        let idx = if spec {
-            0usize
-        } else {
-            match (ut, rep_on, pipe_on) {
-                (true, false, true) => 1,
-                (_, true, true) => 2,
-                _ => 3,
-            }
+        let idx = match (ut, rep_on) {
+            (false, false) => 0usize,
+            (true, false) => 1,
+            (false, true) => 2,
+            (true, true) => 3,
         };
         FF_ARM[idx].fetch_add(1, Relaxed);
     }
-    let r = match (ut, rep_on, pipe_on, s0) {
-        // The shipping configuration: no tag, no rep1, pipelined, default step.
-        // Specialized on hash_log so the shift is an immediate too.
-        (false, false, true, 2) if fast_spec_enabled() => match tables.hash_log {
-            12 => go!(false, false, 12, 2, true),
-            13 => go!(false, false, 13, 2, true),
-            14 => go!(false, false, 14, 2, true),
-            15 => go!(false, false, 15, 2, true),
-            16 => go!(false, false, 16, 2, true),
-            _ => go!(false, false, 0, 2, true),
-        },
-        // Step 1 (probe EVERY position, C's density) gets the same treatment.
-        // Without this it fell through to the runtime-STEP/runtime-HLOG arm,
-        // so any step-1 measurement was comparing a generic loop against a
-        // fully specialized one -- a work-parity break in the instrument, not
-        // a property of the density.
-        (false, false, true, 1) if fast_spec_enabled() => match tables.hash_log {
-            12 => go!(false, false, 12, 1, true),
-            13 => go!(false, false, 13, 1, true),
-            14 => go!(false, false, 14, 1, true),
-            15 => go!(false, false, 15, 1, true),
-            16 => go!(false, false, 16, 1, true),
-            _ => go!(false, false, 0, 1, true),
-        },
-        // Step 3 and 4 get the SAME specialisation as 1 and 2. Without these
-        // arms a step-3 measurement compares a fully generic body (runtime
-        // shift AND runtime step) against a fully specialised step-2 one -- the
-        // work-parity break this file already documents for step-1, and one I
-        // reproduced: it made step 3 read -2.31% when the density's real effect
-        // was masked by the generic arm's own cost.
-        (false, false, true, 3) if fast_spec_enabled() => match tables.hash_log {
-            12 => go!(false, false, 12, 3, true),
-            13 => go!(false, false, 13, 3, true),
-            14 => go!(false, false, 14, 3, true),
-            15 => go!(false, false, 15, 3, true),
-            16 => go!(false, false, 16, 3, true),
-            _ => go!(false, false, 0, 3, true),
-        },
-        (false, false, true, 4) if fast_spec_enabled() => match tables.hash_log {
-            12 => go!(false, false, 12, 4, true),
-            13 => go!(false, false, 13, 4, true),
-            14 => go!(false, false, 14, 4, true),
-            15 => go!(false, false, 15, 4, true),
-            16 => go!(false, false, 16, 4, true),
-            _ => go!(false, false, 0, 4, true),
-        },
-        // ffanat 2026-08-20: the census that added FF_ARM found the arms above
-        // serve ZERO blocks in the shipped configuration. `ut` defaults ON
-        // (tag_enabled() && tag_yield >= tag_min, and tag_min ships 0.0) and
-        // rep_on fires on most of the rest, so 100% of L1 traffic was running
-        // the HLOG=0/STEP=0 GENERIC bodies -- the exact work-parity cost this
-        // file documents for the step arms ("a fully generic body (runtime
-        // shift AND runtime step)"). The live combinations get the same
-        // specialisation the dead ones always had. Byte-identical by the same
-        // argument as `find_dfast_impl`: the consts take the values the runtime
-        // variables already held.
-        (true, false, true, 2) if fast_spec_enabled() => match tables.hash_log {
-            12 => go!(true, false, 12, 2, true),
-            13 => go!(true, false, 13, 2, true),
-            14 => go!(true, false, 14, 2, true),
-            15 => go!(true, false, 15, 2, true),
-            16 => go!(true, false, 16, 2, true),
-            _ => go!(true, false, 0, 2, true),
-        },
-        (true, false, true, 1) if fast_spec_enabled() => match tables.hash_log {
-            12 => go!(true, false, 12, 1, true),
-            13 => go!(true, false, 13, 1, true),
-            14 => go!(true, false, 14, 1, true),
-            15 => go!(true, false, 15, 1, true),
-            16 => go!(true, false, 16, 1, true),
-            _ => go!(true, false, 0, 1, true),
-        },
-        (false, true, true, 2) if fast_spec_enabled() => match tables.hash_log {
-            12 => go!(false, true, 12, 2, true),
-            13 => go!(false, true, 13, 2, true),
-            14 => go!(false, true, 14, 2, true),
-            15 => go!(false, true, 15, 2, true),
-            16 => go!(false, true, 16, 2, true),
-            _ => go!(false, true, 0, 2, true),
-        },
-        (false, true, true, 1) if fast_spec_enabled() => match tables.hash_log {
-            12 => go!(false, true, 12, 1, true),
-            13 => go!(false, true, 13, 1, true),
-            14 => go!(false, true, 14, 1, true),
-            15 => go!(false, true, 15, 1, true),
-            16 => go!(false, true, 16, 1, true),
-            _ => go!(false, true, 0, 1, true),
-        },
-        (true, true, true, 2) if fast_spec_enabled() => match tables.hash_log {
-            12 => go!(true, true, 12, 2, true),
-            13 => go!(true, true, 13, 2, true),
-            14 => go!(true, true, 14, 2, true),
-            15 => go!(true, true, 15, 2, true),
-            16 => go!(true, true, 16, 2, true),
-            _ => go!(true, true, 0, 2, true),
-        },
-        (true, true, true, 1) if fast_spec_enabled() => match tables.hash_log {
-            12 => go!(true, true, 12, 1, true),
-            13 => go!(true, true, 13, 1, true),
-            14 => go!(true, true, 14, 1, true),
-            15 => go!(true, true, 15, 1, true),
-            16 => go!(true, true, 16, 1, true),
-            _ => go!(true, true, 0, 1, true),
-        },
-        (false, false, true, _) => go!(false, false, 0, 0, true),
-        (false, false, false, 2) => go!(false, false, 0, 2, false),
-        (false, false, false, 1) => go!(false, false, 0, 1, false),
-        (false, false, false, _) => go!(false, false, 0, 0, false),
-        (false, true, true, _) => go!(false, true, 0, 0, true),
-        (true, true, true, _) => go!(true, true, 0, 0, true),
-        (true, true, false, _) => go!(true, true, 0, 0, false),
-        (true, false, true, _) => go!(true, false, 0, 0, true),
-        (true, false, false, _) => go!(true, false, 0, 0, false),
-        (false, true, false, _) => go!(false, true, 0, 0, false),
-    };
+    // W5: THE 70-ARM DISPATCH TREE COLLAPSES TO FOUR CALLS.
+    //
+    // With W4 above, `go!`'s `$h`, `$s` and `$pi` parameters appear NOWHERE in
+    // its body -- only in its parameter list. `pipe_on` and `s0` were already
+    // passed as ordinary runtime arguments to `find_fast_impl`, and `$h` died
+    // with the HLOG axis. So every arm sharing a `(PACKED, REP)` pair expanded
+    // to the identical expression, and the tree was 70 arms selecting between
+    // four distinct calls -- a `hash_log` match nested inside a four-way tuple
+    // match, run once per block, to pick something neither key influenced.
+    //
+    // Verified mechanically before the cut: across all 20 outer arms, every
+    // `go!` consts pair agrees with its arm's `(ut, rep_on)` pattern -- zero
+    // mismatches -- so this dispatches to exactly the same monomorphisation
+    // the tree did, for every input.
+    // W14: and now the match itself goes. W9 and W10 made `REP` and `PACKED`
+    // runtime parameters, so these four arms were handing four different
+    // literal bools to the SAME monomorphisation -- four inlined call setups
+    // and a two-way branch to choose between calls that differ only in two
+    // argument registers. The tuple that started this round at 70 arms is one
+    // call.
+    let r = go!(ut, rep_on);
     // AFTER the call: `find_fast_impl` reads `pair_probe == 0` to force a probe,
     // so ticking beforehand would consume the very first one.
     tables.pair_probe = if tables.pair_probe == 0 {
@@ -4799,13 +4799,10 @@ fn find_fast(
 /// C's equivalent is a small standalone function that keeps those in registers,
 /// which is where our ~3x per-probe cost was going. Splitting restores that.
 #[inline(never)]
-fn find_fast_impl<
-    const PACKED: bool,
-    const REP: bool,
-    const HLOG: u32,
-    const STEP: usize,
-    const WIDE: bool,
->(
+fn find_fast_impl(
+    packed: bool,
+    rep: bool,
+    wide: bool,
     step_rt: usize,
     pipe_rt: bool,
     src: &[u8],
@@ -4819,7 +4816,10 @@ fn find_fast_impl<
     // W5: the BMI2 branch used to live here, once per monomorphisation. It is
     // now made ONCE at the dispatch (see the `go!` macro), which is what lets
     // the twin tree drop the HLOG axis. This wrapper is the baseline arm only.
-    find_fast_impl_inner::<PACKED, REP, HLOG, STEP, WIDE, false>(
+    find_fast_impl_inner::<false>(
+        packed,
+        rep,
+        wide,
         step_rt,
         pipe_rt,
         src,
@@ -4837,13 +4837,10 @@ fn find_fast_impl<
 #[allow(clippy::too_many_arguments)]
 #[allow(unsafe_code)]
 #[inline(never)]
-unsafe fn find_fast_impl_bmi2<
-    const PACKED: bool,
-    const REP: bool,
-    const HLOG: u32,
-    const STEP: usize,
-    const WIDE: bool,
->(
+unsafe fn find_fast_impl_bmi2(
+    packed: bool,
+    rep: bool,
+    wide: bool,
     step_rt: usize,
     pipe_rt: bool,
     src: &[u8],
@@ -4854,7 +4851,10 @@ unsafe fn find_fast_impl_bmi2<
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    find_fast_impl_inner::<PACKED, REP, HLOG, STEP, WIDE, true>(
+    find_fast_impl_inner::<true>(
+        packed,
+        rep,
+        wide,
         step_rt,
         pipe_rt,
         src,
@@ -4867,56 +4867,23 @@ unsafe fn find_fast_impl_bmi2<
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-#[inline(always)]
-fn find_fast_impl_inner<
-    const PACKED: bool,
-    const REP: bool,
-    const HLOG: u32,
-    const STEP: usize,
-    const WIDE: bool,
-    // W1: which ISA twin is running, so the outlined emitter can be selected
-    // at compile time instead of re-deciding per match.
-    const BMI2: bool,
->(
-    step_rt: usize,
-    // W16: `PIPE` was a const-generic axis used by EXACTLY ONE per-BLOCK test
-    // (`if PIPE && !pair`) -- and it doubled the whole monomorphisation tree to
-    // do it. A per-block bool costs one branch per 128 KiB; the axis cost half
-    // the copies of the largest function in the library.
-    pipe_rt: bool,
+/// Scratch acquisition + the too-short-block exit of `find_fast_impl_inner`,
+/// factored out of the 48x (+8 bmi2) monomorphisation family -- the prologue
+/// half of `fast_finder_epilogue`. Runs once per BLOCK.
+#[inline(never)]
+#[allow(clippy::type_complexity)]
+fn fast_finder_prologue(
     src: &[u8],
     block_start: usize,
     block_end: usize,
-    window: usize,
-    params: CompressionParameters,
+    block_len: usize,
+    mls: usize,
     tables: &mut MatchTables,
-    reps: [u32; 3],
-) -> (Vec<Seq>, Vec<u8>) {
-    let mls = params.min_match.max(3) as usize;
-    // W12: state the block invariant ONCE, per block, so the body does not
-    // pay for re-proving it per copy.
-    //
-    // `block_start <= block_end <= src.len()` holds for every caller, but
-    // nothing in the signature says so, so LLVM re-derived it nowhere and kept
-    // a bounds test AND a panic landing pad on the early-return slice below --
-    // one per monomorphisation, in the function with the most of them. The two
-    // clamps are no-ops on every real call and cost two cmovs per BLOCK; they
-    // buy the range facts for the whole body.
-    debug_assert!(block_start <= block_end && block_end <= src.len());
-    let block_end = block_end.max(block_start).min(src.len());
-    crate::prof::note_scratch(2);
-    // Reserve both scratch buffers up front. They were `Vec::new()` and grew by
-    // doubling from zero every block: nci runs ~4k sequences per 128 KiB block,
-    // so `seqs` alone re-copied ~95 KiB per block. The `lits` slack also makes
-    // the fixed-width literal push in `emit_fast_seq` always eligible.
-    let block_len = block_end.saturating_sub(block_start);
-    // Size `seqs` from what the previous block actually produced (+25% slack),
-    // capped by the structural maximum of one sequence per `mls` bytes. A flat
-    // fraction over-reserves badly on sparse-match content.
-    // `RZSTD_LIT_PUSH=0` restores the pre-brick-38 shape so both arms can be
-    // measured in ONE interleaved session (codec-measurement 3); the flag is
-    // resolved once per block, never inside the probe loop.
+) -> Result<(Vec<Seq>, Vec<u8>, usize, bool, bool, bool), (Vec<Seq>, Vec<u8>)> {
+    // GATE reads folded from the caller (see the call site): both are pure
+    // per-block signals, independent of anything this helper mutates.
+    let g_rep1 = pipe_rep1_enabled() && tables.rep_yield <= fast_lazy_threshold();
+    let g_pair = tables.rep_yield <= pair_rep_max();
     let reserve = lit_push_enabled();
     // GATE 13 @ L1 DISPATCH. `reserve` still governs the RESERVATION (a separate
     // win worth 1,648 reallocations at L3); this governs only whether the
@@ -4967,7 +4934,6 @@ fn find_fast_impl_inner<
     if reserve && lits.capacity() < block_len + LIT_PUSH_WIDTH_MAX {
         lits = Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX);
     }
-    let mut anchor = block_start;
     let ilimit = block_end.saturating_sub(8);
     if block_start >= ilimit {
         crate::prof::note_huff_path(10);
@@ -4979,8 +4945,81 @@ fn find_fast_impl_inner<
         push_lits_range(&mut lits, src, block_start, block_end);
         crate::prof::note_search(0, 0, 0, 0, lits.len() as u64);
         tables.last_nseq = 0;
-        return (seqs, lits);
+        return Err((seqs, lits));
     }
+    Ok((seqs, lits, lp_copy, reserve, g_rep1, g_pair))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn find_fast_impl_inner<
+    // W1: which ISA twin is running, so the outlined emitter can be selected
+    // at compile time instead of re-deciding per match.
+    const BMI2: bool,
+>(
+    // W7: wide arrives at RUNTIME -- see the note in `find_fast`.
+    // W9: rep joins WIDE at runtime. It gated the `try_rep1` block -- ~25
+    // lines -- and charged a full second copy of the ~1,500-instruction body
+    // for it. The test it replaces, `if rep`, is loop-invariant and therefore
+    // perfectly predicted, exactly like the `pair` and `maintain_rep1` bools
+    // this same loop has always tested per position.
+    // W10: packed joins REP and WIDE at runtime. Its whole reach was ONE
+    // compare -- `if packed && (e >> 24) as u8 != tag` inside the slot
+    // helpers, which already took the layout choice as the runtime `pack`
+    // beside it -- and it charged a second copy of the ~1,700-instruction
+    // body to fold it.
+    packed: bool,
+    rep: bool,
+    wide: bool,
+    step_rt: usize,
+    // W16: `PIPE` was a const-generic axis used by EXACTLY ONE per-BLOCK test
+    // (`if PIPE && !pair`) -- and it doubled the whole monomorphisation tree to
+    // do it. A per-block bool costs one branch per 128 KiB; the axis cost half
+    // the copies of the largest function in the library.
+    pipe_rt: bool,
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
+    let mls = params.min_match.max(3) as usize;
+    // W12: state the block invariant ONCE, per block, so the body does not
+    // pay for re-proving it per copy.
+    //
+    // `block_start <= block_end <= src.len()` holds for every caller, but
+    // nothing in the signature says so, so LLVM re-derived it nowhere and kept
+    // a bounds test AND a panic landing pad on the early-return slice below --
+    // one per monomorphisation, in the function with the most of them. The two
+    // clamps are no-ops on every real call and cost two cmovs per BLOCK; they
+    // buy the range facts for the whole body.
+    debug_assert!(block_start <= block_end && block_end <= src.len());
+    let block_end = block_end.max(block_start).min(src.len());
+    crate::prof::note_scratch(2);
+    // Reserve both scratch buffers up front. They were `Vec::new()` and grew by
+    // doubling from zero every block: nci runs ~4k sequences per 128 KiB block,
+    // so `seqs` alone re-copied ~95 KiB per block. The `lits` slack also makes
+    // the fixed-width literal push in `emit_fast_seq` always eligible.
+    let block_len = block_end.saturating_sub(block_start);
+    // Size `seqs` from what the previous block actually produced (+25% slack),
+    // capped by the structural maximum of one sequence per `mls` bytes. A flat
+    // fraction over-reserves badly on sparse-match content.
+    // `RZSTD_LIT_PUSH=0` restores the pre-brick-38 shape so both arms can be
+    // measured in ONE interleaved session (codec-measurement 3); the flag is
+    // resolved once per block, never inside the probe loop.
+    // SCRATCH ACQUISITION AND THE EMPTY-TAIL EXIT, as ONE non-generic call.
+    // Same reasoning as `fast_finder_epilogue` one screen down: none of this
+    // depends on the const generics, and it was stamped into every one of the
+    // 48+8 copies. `Err` carries the degenerate tail-block result.
+    let (mut seqs, mut lits, lp_copy, _reserve, g_rep1, g_pair) =
+        match fast_finder_prologue(src, block_start, block_end, block_len, mls, tables) {
+            Ok(t) => t,
+            Err(out) => return out,
+        };
+    let mut anchor = block_start;
+    let ilimit = block_end.saturating_sub(8);
     let mut ip = block_start;
     // ffanat: take the table out of `MatchTables` so its data pointer is a
     // LOCAL for the whole loop. The asm showed it spilled and reloaded from the
@@ -4990,11 +5029,11 @@ fn find_fast_impl_inner<
     let mut hash_v = core::mem::take(&mut tables.hash);
     let mut tags_v = core::mem::take(&mut tables.tags);
     let pack = tables.pack_tags;
-    // Guard unification (see the dispatch): WIDE implies pack, so in WIDE
+    // Guard unification (see the dispatch): wide implies pack, so in wide
     // copies this is const-true -- the slot helpers' pack branches fold and
     // `tags_v` is provably untouched.
-    debug_assert!(!WIDE || pack);
-    let pack_eff = if WIDE { true } else { pack };
+    debug_assert!(!wide || pack);
+    let pack_eff = if wide { true } else { pack };
     // W8: hoisted for the slot primitives -- see `fast_slot_swap`.
     // W8 -- CORRECTNESS, found by the debug suite. `tags_v` is `mem::take`n
     // out of `tables.tags` ABOVE, so `tables.tags` is empty from that line on
@@ -5049,7 +5088,12 @@ fn find_fast_impl_inner<
     // the filter on switched the ARM, and the arm silently downgraded a
     // step-1-routed block to step 2. Pinning the filter on cost dickens +7.3%,
     // samba +5.7%, mr +2.4% -- exactly the corpora Gate 6 routes to step 1.
-    let step0 = if STEP != 0 { STEP } else { step_rt };
+    // W15: `HLOG` and `STEP` are gone from the signature. Both were
+    // instantiated as 0 at EVERY site once W4/W5 landed, so `if HLOG != 0` and
+    // `if STEP != 0` were dead branches the compiler folded away -- zero
+    // instructions, but two const parameters that read as live specialisation
+    // axes to anyone auditing this signature next.
+    let step0 = step_rt;
     // Pair-search ip+1 only when step skips it (`--fast=4`, step 5). At step 2
     // that doubles incomp probes for no ratio. Do not grow step without the pair
     // (that blew --fast=4 ratio 0.845 -> 1.272).
@@ -5094,12 +5138,15 @@ fn find_fast_impl_inner<
     // `find_fast` and this read never followed it.
     let route = tables.pair_route;
     // Frame-constant, so it is decided ONCE here rather than tested per match.
-    let maintain_rep1 = pipe_rep1_enabled() && tables.rep_yield <= fast_lazy_threshold();
+    // `maintain_rep1` and the pair gate arrive from the PROLOGUE call now:
+    // three knob atomics and their float compares were stamped per copy for
+    // per-block decisions.
+    let maintain_rep1 = g_rep1;
     // The route is decided in `find_fast` (it also selects the step, which must
     // be known before the specialised body is chosen). `rep_yield` still vetoes:
     // on rep-dominated content the pair search re-finds what the repcode path
     // already has and emits a worse parse.
-    let pair = step0 > 2 || (route == 2 && tables.rep_yield <= pair_rep_max());
+    let pair = step0 > 2 || (route == 2 && g_pair);
     let mut pair_bytes = 0u64;
     let mut pair_probes = 0u64;
     let lowest = block_start.saturating_sub(window).max(tables.frame_start);
@@ -5130,28 +5177,28 @@ fn find_fast_impl_inner<
     // (different early matches shift rep_yield/rep_run and break the repcode
     // chain), not the key itself, which is why key-side protection fails.
     // W14: of the three `FastHash` fields this built, release code consumed
-    // exactly ONE -- `mask`, and only in WIDE copies. `shift` was dead (see
+    // exactly ONE -- `mask`, and only in wide copies. `shift` was dead (see
     // `f_shift`) and `wide` fed a `debug_assert!` alone.
     //
-    // The legacy arm is dead in WIDE copies too: `wide_block` requires
-    // `!fast_hash_legacy`, so a WIDE copy can never be on the legacy key. That
+    // The legacy arm is dead in wide copies too: `wide_block` requires
+    // `!fast_hash_legacy`, so a wide copy can never be on the legacy key. That
     // makes the whole conditional collapse to the spec call in the only copies
     // that read it.
-    debug_assert!(!WIDE || !tables.fast_hash_legacy);
-    // Scalarized AND const-moded: WIDE is a monomorphisation axis, so the
+    debug_assert!(!wide || !tables.fast_hash_legacy);
+    // Scalarized AND const-moded: wide is a monomorphisation axis, so the
     // per-position mode branch is gone and specialised copies emit the shift
     // as an immediate. Only the mask (a function of runtime `mls`) stays in a
     // register.
     // W7 -- A LATENT SHIFT-OVERFLOW, found by running the DEBUG suite.
     //
     // `fh` is built from `fast_hash_spec`, whose `wide` is
-    // `enabled && (5..=8).contains(&mls)`. `WIDE` -- the monomorphisation
+    // `enabled && (5..=8).contains(&mls)`. `wide` -- the monomorphisation
     // axis -- is that AND `!fast_hash_legacy` AND `tables.pack_tags`. The
     // `pack_tags` term is missing from `fh`, so on any frame without a
     // pledged length (streaming, prefix) with `mls` in 5..=8, `fh.wide` is
-    // TRUE while `WIDE` is FALSE.
+    // TRUE while `wide` is FALSE.
     //
-    // `f_mask` and `f_wide` already take `WIDE`, so they were fine. `f_shift`
+    // `f_mask` and `f_wide` already take `wide`, so they were fine. `f_shift`
     // did not: on the runtime-`hash_log` arm it took `fh.shift`, which in
     // that state is `64 - hash_log`. The non-wide hash path then evaluates
     // `u32 >> (64 - hash_log)` -- a shift of 32 or more on a 32-bit value,
@@ -5160,16 +5207,16 @@ fn find_fast_impl_inner<
     // `(64 - hash_log) & 31 == 32 - hash_log` for every reachable
     // `hash_log`, so the hardware silently computed the right index.
     //
-    // Taking the shift from `WIDE`, like its two siblings, is byte-identical
+    // Taking the shift from `wide`, like its two siblings, is byte-identical
     // on x86 by that same identity -- and defined everywhere.
-    let f_wide = WIDE;
-    let f_mask = if WIDE {
-        fast_hash_spec(mls, if HLOG != 0 { HLOG } else { tables.hash_log }).mask
+    let f_wide = wide;
+    let f_mask = if wide {
+        fast_hash_spec(mls, tables.hash_log).mask
     } else {
         0
     };
-    let hlog_eff = if HLOG != 0 { HLOG } else { tables.hash_log };
-    let f_shift = if WIDE {
+    let hlog_eff = tables.hash_log;
+    let f_shift = if wide {
         64u32.saturating_sub(hlog_eff)
     } else {
         32u32.saturating_sub(hlog_eff)
@@ -5195,7 +5242,7 @@ fn find_fast_impl_inner<
     //      And per-position rep-cold hysteresis (27,631) barely moved it,
     //      because the harmful accepts live INSIDE the miss runs where any
     //      hysteresis re-enables.
-    // Design #7 (2026-08-20, REMOVED after census): REP-SUBSTITUTION -- swap an
+    // Design #7 (2026-08-20, REMOVED after census): rep-SUBSTITUTION -- swap an
     // accepted far match for the same gram at rep1 distance (one masked
     // compare; offset_value_for encodes offset==reps[0] as repcode 1). Census:
     // of the veto-block accepts on versions, ALL 80 that reached the check had
@@ -5236,7 +5283,7 @@ fn find_fast_impl_inner<
     // very harm -- 1,824 accepts, broken rep_runs. Lazy keeps the heads; fast
     // is barred from the shorties). `fast_hash_legacy` is only ever set under
     // the wide arm, so the off arm stays byte-identical.
-    let veto_block = (WIDE || tables.fast_hash_legacy)
+    let veto_block = (wide || tables.fast_hash_legacy)
         && (bar_all || (tables.blocks_done > 0 && tables.rep_yield > fast_lazy_threshold()));
     // W6: acceptance was `ml >= mls` INSIDE the probe plus a `.filter` for
     // `!veto_block || ml >= ff_anchor_ml()` OUTSIDE it -- six instructions per
@@ -5288,7 +5335,7 @@ fn find_fast_impl_inner<
     // W1: hoisted for `fill_fast_after_match` -- see its `ends` parameter.
     let f_ends = dfast_fill_ends();
     // W1: every per-block invariant the emitter needs, gathered once. `pack_eff`
-    // (not `pack`) so WIDE copies keep the const-true fold -- see W4.
+    // (not `pack`) so wide copies keep the const-true fold -- see W4.
     let ectx = FastEmitCtx {
         src,
         pack: pack_eff,
@@ -5311,8 +5358,8 @@ fn find_fast_impl_inner<
         // path 93.8% of the time. 4.41's position ledger was an undercount.
         let mut pipe_pos = 0u64;
         let (mut ff_made, mut ff_used) = (0u64, 0u64);
-        let (mut h0, mut g0) = fast_hash_tag::<true>(src, ip, WIDE, f_mask, f_shift);
-        let mut m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, tags_live, h0, g0);
+        let (mut h0, mut g0) = fast_hash_tag::<true>(src, ip, wide, f_mask, f_shift);
+        let mut m0 = fast_slot_load(packed, &hash_v, &tags_v, pack_eff, tags_live, h0, g0);
         loop {
             if COUNT {
                 pipe_pos += 1;
@@ -5320,7 +5367,7 @@ fn find_fast_impl_inner<
             if COUNT {
                 probes += 1;
             }
-            if COUNT && PACKED {
+            if COUNT && packed {
                 let raw = fast_slot_raw(&hash_v, pack_eff, h0);
                 if m0 == 0 && raw != 0 {
                     if fast_probe(&mut (0, 0), src, raw, ip, window, lowest, mls, block_end)
@@ -5332,7 +5379,7 @@ fn find_fast_impl_inner<
                 }
             }
             fast_slot_store(&mut hash_v, &mut tags_v, pack_eff, tags_live, h0, ip, g0);
-            if REP {
+            if rep {
                 // ffanat release-asm read: this unconditional per-position
                 // increment was one of six spilled u64 locals -- `incq (%rbp)`
                 // per miss in SHIPPING builds -- and its only consumers are the
@@ -5374,10 +5421,10 @@ fn find_fast_impl_inner<
                     // bytes and made the tag filter look non-byte-identical,
                     // which is why the packed representation was blamed and
                     // removed. The representation was fine; this caller was not.
-                    let (nh, ng) = fast_hash_tag::<true>(src, ip, WIDE, f_mask, f_shift);
+                    let (nh, ng) = fast_hash_tag::<true>(src, ip, wide, f_mask, f_shift);
                     h0 = nh;
                     g0 = ng;
-                    m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, tags_live, h0, g0);
+                    m0 = fast_slot_load(packed, &hash_v, &tags_v, pack_eff, tags_live, h0, g0);
                     continue;
                 }
             }
@@ -5388,12 +5435,12 @@ fn find_fast_impl_inner<
                 ff_made += 1;
             }
             let (h1, g1, m1) = if nip <= ilimit {
-                let (h, g) = fast_hash_tag::<true>(src, nip, WIDE, f_mask, f_shift);
+                let (h, g) = fast_hash_tag::<true>(src, nip, wide, f_mask, f_shift);
                 // The store above may have just overwritten this slot, so the
                 // value is forwarded by hand rather than re-read.
                 //
-                // IT MUST MIRROR `load_fast` EXACTLY. `load_fast::<PACKED>`
-                // consults the tag ONLY when PACKED; with PACKED = false -- the
+                // IT MUST MIRROR `load_fast` EXACTLY. `load_fast::<packed>`
+                // consults the tag ONLY when packed; with packed = false -- the
                 // SHIPPING Fast configuration -- it returns the raw slot and the
                 // tag is irrelevant. This forward compared tags unconditionally,
                 // so whenever the next position's hash aliased the current one
@@ -5405,19 +5452,19 @@ fn find_fast_impl_inner<
                 // gated differently from the compare; here the FORWARD applies a
                 // compare the LOAD does not.
                 let v = if h == h0 {
-                    if !PACKED || g == g0 {
+                    if !packed || g == g0 {
                         (ip as u32).wrapping_add(1)
                     } else {
                         0
                     }
                 } else {
-                    fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, tags_live, h, g)
+                    fast_slot_load(packed, &hash_v, &tags_v, pack_eff, tags_live, h, g)
                 };
                 (h, g, v)
             } else {
                 (0usize, 0u8, 0u32)
             };
-            if let Some((m, ml)) = if WIDE {
+            if let Some((m, ml)) = if wide {
                 fast_probe_wide::<true>(
                     &mut cand, src, m0, ip, window, lowest, accept_ml, f_mask, block_end,
                 )
@@ -5427,14 +5474,17 @@ fn find_fast_impl_inner<
                 if COUNT {
                     hits += 1;
                 }
-                ip = emit_fast_seq::<PACKED, BMI2>(
+                // W3, pipelined twin -- see the note in the main loop.
+                let found = ip;
+                ip = emit_fast_seq::<BMI2>(
+                    packed,
                     &ectx,
                     &mut hash_v,
                     &mut tags_v,
                     &mut seqs,
                     &mut lits,
                     anchor,
-                    ip,
+                    found,
                     m,
                     ml,
                 );
@@ -5462,17 +5512,15 @@ fn find_fast_impl_inner<
                 // the signal Gate 1 already maintains for exactly this content
                 // class (versions 0.9778 against a real maximum of mr 0.4949).
                 if maintain_rep1 {
-                    if let Some(sq) = seqs.last() {
-                        rep1 = sq.offset as usize;
-                    }
+                    rep1 = found - m;
                 }
                 if ip > ilimit {
                     break;
                 }
-                let (nh, ng) = fast_hash_tag::<true>(src, ip, WIDE, f_mask, f_shift);
+                let (nh, ng) = fast_hash_tag::<true>(src, ip, wide, f_mask, f_shift);
                 h0 = nh;
                 g0 = ng;
-                m0 = fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, tags_live, h0, g0);
+                m0 = fast_slot_load(packed, &hash_v, &tags_v, pack_eff, tags_live, h0, g0);
                 continue;
             }
             if nip > ilimit {
@@ -5486,75 +5534,15 @@ fn find_fast_impl_inner<
             g0 = g1;
             m0 = m1;
         }
-        crate::prof::note_huff_path(12);
-        push_lits_range(&mut lits, src, anchor, block_end);
-        let match_bytes: u64 = if cfg!(feature = "profile") {
-            seqs.iter().map(|s| u64::from(s.matchlen)).sum()
-        } else {
-            0
-        };
-        crate::prof::note_search(
-            probes,
-            hits,
-            seqs.len() as u64,
-            match_bytes,
-            lits.len() as u64,
+        // THE PIPELINED ARM'S PER-BLOCK TAIL, as one non-generic call -- the
+        // same treatment as `fast_finder_epilogue` on the main tail, and worth
+        // the same multiplier: this return was stamped into every one of the
+        // 48+8 copies, and its `push_lits_range` was the `memcpy` call the asm
+        // attribution kept finding twice per copy.
+        fast_pipe_epilogue(
+            tables, src, &seqs, &mut lits, anchor, block_end, rep, rep_hits, rep_bytes, rep_probes,
+            cand, probes, hits, pipe_pos, ff_made, ff_used, hash_v, tags_v,
         );
-        // Decay rather than replace: the FIRST block of a frame has no
-        // history to repeat against, so its yield is unrepresentative and a
-        // straight assignment latched the search off for the whole frame.
-        // Halving gives a ~4-block probe window before it can fall below
-        // REP_YIELD_MIN, and one good block restores it immediately.
-        let y = if seqs.is_empty() {
-            0.0
-        } else {
-            rep_hits as f32 / seqs.len() as f32
-        };
-        tables.rep_yield = y.max(tables.rep_yield * 0.5);
-        // The pipelined loop returns HERE, before the main tail -- so before this
-        // it never refreshed `tag_yield` at all and the old global counters just
-        // accumulated across blocks.
-        tables.tag_yield = cand_yield(cand);
-        let (ls, lm) = lit_shares(&seqs);
-        tables.lit_short_share = ls;
-        tables.lit_mid_share = lm;
-        tables.last_nseq = seqs.len();
-        // DEFECT FIX: the main tail's `rep_len_ratio` update is BELOW this
-        // return, so every pipelined block left Gate 2's second dispatch
-        // variable pinned at its 1.0 initial value -- and the gate is `>= 1.0`.
-        // See `replen_pipe_fixed`.
-        if REP && replen_pipe_fixed() && rep_hits > 0 && !seqs.is_empty() {
-            let all_bytes: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
-            // THREE divisions collapsed to ONE. `rl / al` expands to
-            // `(rep_bytes/rep_hits) / (all_bytes/seqs.len())`, which is
-            // `(rep_bytes * seqs.len()) / (rep_hits * all_bytes)` -- two
-            // multiplies and one `divss` instead of three. The guard moves
-            // from `al > 0.0` to the denominator it actually protects.
-            let num = rep_bytes as f32 * seqs.len() as f32;
-            let den = rep_hits as f32 * all_bytes as f32;
-            if den > 0.0 {
-                tables.rep_len_ratio = 0.75 * tables.rep_len_ratio + 0.25 * (num / den);
-            }
-        }
-        if COUNT {
-            use core::sync::atomic::Ordering::Relaxed;
-            MM_TOTAL.fetch_add(pipe_pos, Relaxed);
-            REP_PROBES.fetch_add(rep_probes, Relaxed);
-            REP_BYTES.fetch_add(rep_bytes, Relaxed);
-            REP_HITS_G.fetch_add(rep_hits, Relaxed);
-            // The DENOMINATORS must be published on the same path as the
-            // numerator. 4.44 added the rep counters here and left these in the
-            // main tail only, so `rep_hits / all_seqs` counted two paths over
-            // one and read as high as 11,516% -- an impossible ratio that
-            // indicted the instrument, not the encoder.
-            let mb: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
-            ALL_MATCH_BYTES.fetch_add(mb, Relaxed);
-            ALL_SEQS.fetch_add(seqs.len() as u64, Relaxed);
-            FF_SPEC_MADE.fetch_add(ff_made, Relaxed);
-            FF_SPEC_USED.fetch_add(ff_used, Relaxed);
-        }
-        tables.hash = hash_v;
-        tables.tags = tags_v;
         return (seqs, lits);
     }
     let (mut mm_total, mut mm_miss) = (0u64, 0u64);
@@ -5565,13 +5553,21 @@ fn find_fast_impl_inner<
         if COUNT {
             probes += 1;
         }
-        let (h0, g0) = fast_hash_tag::<true>(src, ip, WIDE, f_mask, f_shift);
+        let (h0, g0) = fast_hash_tag::<true>(src, ip, wide, f_mask, f_shift);
         // W7: one slot touch instead of a load and a store that each branch
         // on `pack`. The store's value and position are unchanged, and it
         // still precedes the pair probe -- only the two `pack` tests merge.
-        let m0 =
-            fast_slot_swap::<PACKED>(&mut hash_v, &mut tags_v, pack_eff, tags_live, h0, ip, g0);
-        if COUNT && PACKED {
+        let m0 = fast_slot_swap(
+            packed,
+            &mut hash_v,
+            &mut tags_v,
+            pack_eff,
+            tags_live,
+            h0,
+            ip,
+            g0,
+        );
+        if COUNT && packed {
             // Gate 7 is recorded byte-identical: a tag mismatch should imply the
             // 4 bytes differ, so `fast_probe` would have rejected the candidate
             // anyway. Count the cases where it would NOT have.
@@ -5598,16 +5594,16 @@ fn find_fast_impl_inner<
         // nothing between here and the pair branch writes the table -- the rep
         // and match paths both `continue`. Only the issue order moves.
         let pair_pre = if pair && ip < ilimit {
-            let (h1, g1) = fast_hash_tag::<false>(src, ip + 1, WIDE, f_mask, f_shift);
+            let (h1, g1) = fast_hash_tag::<false>(src, ip + 1, wide, f_mask, f_shift);
             Some((
                 h1,
                 g1,
-                fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, tags_live, h1, g1),
+                fast_slot_load(packed, &hash_v, &tags_v, pack_eff, tags_live, h1, g1),
             ))
         } else {
             None
         };
-        if REP {
+        if rep {
             if COUNT {
                 rep_probes += 1;
             }
@@ -5631,7 +5627,7 @@ fn find_fast_impl_inner<
                 continue;
             }
         }
-        if let Some((m, ml)) = if WIDE {
+        if let Some((m, ml)) = if wide {
             fast_probe_wide::<true>(
                 &mut cand, src, m0, ip, window, lowest, accept_ml, f_mask, block_end,
             )
@@ -5641,14 +5637,22 @@ fn find_fast_impl_inner<
             if COUNT {
                 hits += 1;
             }
-            ip = emit_fast_seq::<PACKED, BMI2>(
+            // W3: `rep1` came back through `seqs.last()` -- a length load, an
+            // emptiness branch and a `u32` reload of a value this frame already
+            // holds. The emitter's back-extension walks `ip` and `mm` DOWN
+            // TOGETHER, so the offset it pushes (`ip - mm`) is invariant under
+            // that walk and equals `found - m` at entry. Same value, no reload,
+            // and it drops the only reason this arm touched `seqs` at all.
+            let found = ip;
+            ip = emit_fast_seq::<BMI2>(
+                packed,
                 &ectx,
                 &mut hash_v,
                 &mut tags_v,
                 &mut seqs,
                 &mut lits,
                 anchor,
-                ip,
+                found,
                 m,
                 ml,
             );
@@ -5657,9 +5661,7 @@ fn find_fast_impl_inner<
             // only ONE loop would make the heuristic a property of which loop
             // ran, which is exactly the byte-identity break this gate exposed.
             if maintain_rep1 {
-                if let Some(sq) = seqs.last() {
-                    rep1 = sq.offset as usize;
-                }
+                rep1 = found - m;
             }
             continue;
         }
@@ -5685,15 +5687,15 @@ fn find_fast_impl_inner<
                 let (h1, g1, m1) = match pair_pre {
                     Some(v) => v,
                     None => {
-                        let (h, g) = fast_hash_tag::<false>(src, ip1, WIDE, f_mask, f_shift);
+                        let (h, g) = fast_hash_tag::<false>(src, ip1, wide, f_mask, f_shift);
                         (
                             h,
                             g,
-                            fast_slot_load::<PACKED>(&hash_v, &tags_v, pack_eff, tags_live, h, g),
+                            fast_slot_load(packed, &hash_v, &tags_v, pack_eff, tags_live, h, g),
                         )
                     }
                 };
-                if COUNT && PACKED {
+                if COUNT && packed {
                     let raw = fast_slot_raw(&hash_v, pack_eff, h1);
                     if m1 == 0 && raw != 0 {
                         if fast_probe(&mut (0, 0), src, raw, ip1, window, lowest, mls, block_end)
@@ -5715,7 +5717,7 @@ fn find_fast_impl_inner<
                 // a harmful one, because the harm is a property of the CONTENT
                 // (repcode already covers that span) and not of the candidate.
                 // That is why `rep_yield` is the right and sufficient variable.
-                if let Some((m, ml)) = (if WIDE {
+                if let Some((m, ml)) = (if wide {
                     fast_probe_wide::<false>(
                         &mut cand, src, m1, ip1, window, lowest, accept_ml, f_mask, block_end,
                     )
@@ -5742,7 +5744,8 @@ fn find_fast_impl_inner<
                         hits += 1;
                     }
                     pair_bytes += ml as u64;
-                    ip = emit_fast_seq::<PACKED, BMI2>(
+                    ip = emit_fast_seq::<BMI2>(
+                        packed,
                         &ectx,
                         &mut hash_v,
                         &mut tags_v,
@@ -5763,6 +5766,163 @@ fn find_fast_impl_inner<
         }
         ip += step0 + ((ip - anchor) >> accel);
     }
+    // THE WHOLE PER-BLOCK EPILOGUE IS ONE NON-GENERIC CALL. `find_fast_impl`
+    // is monomorphised 48x (plus 8 bmi2 twins), and every copy carried its own
+    // stamp of this 87-line tail: the census flushes, the rep/pair EWMAs, the
+    // GATE 7/13 signal updates, the tail-literal push and the board hand-back.
+    // None of it depends on the const generics except rep and COUNT -- rep is
+    // now a runtime bool (per block, free), COUNT is a cfg constant the helper
+    // shares. Pure code motion: byte-identical by construction.
+    fast_finder_epilogue(
+        tables,
+        src,
+        &seqs,
+        &mut lits,
+        anchor,
+        block_end,
+        rep,
+        rep_hits,
+        rep_bytes,
+        rep_probes,
+        pair,
+        pair_bytes,
+        pair_probes,
+        cand,
+        probes,
+        hits,
+        mm_total,
+        mm_miss,
+        hash_v,
+        tags_v,
+    );
+    (seqs, lits)
+}
+
+/// The pipelined arm's per-block tail of `find_fast_impl_inner` -- the second
+/// of its two exits, factored out of the 48x (+8) family exactly like
+/// `fast_finder_epilogue` (the main tail). Runs once per block.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn fast_pipe_epilogue(
+    tables: &mut MatchTables,
+    src: &[u8],
+    seqs: &[Seq],
+    lits: &mut Vec<u8>,
+    anchor: usize,
+    block_end: usize,
+    rep: bool,
+    rep_hits: u64,
+    rep_bytes: u64,
+    rep_probes: u64,
+    cand: (u64, u64),
+    probes: u64,
+    hits: u64,
+    pipe_pos: u64,
+    ff_made: u64,
+    ff_used: u64,
+    hash_v: Vec<u32>,
+    tags_v: Vec<u8>,
+) {
+    const COUNT: bool = cfg!(feature = "profile");
+    crate::prof::note_huff_path(12);
+    push_lits_range(lits, src, anchor, block_end);
+    let match_bytes: u64 = if cfg!(feature = "profile") {
+        seqs.iter().map(|s| u64::from(s.matchlen)).sum()
+    } else {
+        0
+    };
+    crate::prof::note_search(
+        probes,
+        hits,
+        seqs.len() as u64,
+        match_bytes,
+        lits.len() as u64,
+    );
+    // Decay rather than replace: the FIRST block of a frame has no
+    // history to repeat against, so its yield is unrepresentative and a
+    // straight assignment latched the search off for the whole frame.
+    // Halving gives a ~4-block probe window before it can fall below
+    // REP_YIELD_MIN, and one good block restores it immediately.
+    let y = if seqs.is_empty() {
+        0.0
+    } else {
+        rep_hits as f32 / seqs.len() as f32
+    };
+    tables.rep_yield = y.max(tables.rep_yield * 0.5);
+    // The pipelined loop returns HERE, before the main tail -- so before this
+    // it never refreshed `tag_yield` at all and the old global counters just
+    // accumulated across blocks.
+    tables.tag_yield = cand_yield(cand);
+    let (ls, lm) = lit_shares(seqs);
+    tables.lit_short_share = ls;
+    tables.lit_mid_share = lm;
+    tables.last_nseq = seqs.len();
+    // DEFECT FIX: the main tail's `rep_len_ratio` update is BELOW this
+    // return, so every pipelined block left Gate 2's second dispatch
+    // variable pinned at its 1.0 initial value -- and the gate is `>= 1.0`.
+    // See `replen_pipe_fixed`.
+    if rep && replen_pipe_fixed() && rep_hits > 0 && !seqs.is_empty() {
+        let all_bytes: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
+        // THREE divisions collapsed to ONE. `rl / al` expands to
+        // `(rep_bytes/rep_hits) / (all_bytes/seqs.len())`, which is
+        // `(rep_bytes * seqs.len()) / (rep_hits * all_bytes)` -- two
+        // multiplies and one `divss` instead of three. The guard moves
+        // from `al > 0.0` to the denominator it actually protects.
+        let num = rep_bytes as f32 * seqs.len() as f32;
+        let den = rep_hits as f32 * all_bytes as f32;
+        if den > 0.0 {
+            tables.rep_len_ratio = 0.75 * tables.rep_len_ratio + 0.25 * (num / den);
+        }
+    }
+    if COUNT {
+        use core::sync::atomic::Ordering::Relaxed;
+        MM_TOTAL.fetch_add(pipe_pos, Relaxed);
+        REP_PROBES.fetch_add(rep_probes, Relaxed);
+        REP_BYTES.fetch_add(rep_bytes, Relaxed);
+        REP_HITS_G.fetch_add(rep_hits, Relaxed);
+        // The DENOMINATORS must be published on the same path as the
+        // numerator. 4.44 added the rep counters here and left these in the
+        // main tail only, so `rep_hits / all_seqs` counted two paths over
+        // one and read as high as 11,516% -- an impossible ratio that
+        // indicted the instrument, not the encoder.
+        let mb: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
+        ALL_MATCH_BYTES.fetch_add(mb, Relaxed);
+        ALL_SEQS.fetch_add(seqs.len() as u64, Relaxed);
+        FF_SPEC_MADE.fetch_add(ff_made, Relaxed);
+        FF_SPEC_USED.fetch_add(ff_used, Relaxed);
+    }
+    tables.hash = hash_v;
+    tables.tags = tags_v;
+}
+
+/// The per-block epilogue of `find_fast_impl_inner`, factored out of the 48x
+/// (+8 bmi2) monomorphisation family. `#[inline(never)]`: it runs once per
+/// BLOCK, and inlined it existed once per COPY.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn fast_finder_epilogue(
+    tables: &mut MatchTables,
+    src: &[u8],
+    seqs: &[Seq],
+    lits: &mut Vec<u8>,
+    anchor: usize,
+    block_end: usize,
+    rep: bool,
+    rep_hits: u64,
+    rep_bytes: u64,
+    rep_probes: u64,
+    pair: bool,
+    pair_bytes: u64,
+    pair_probes: u64,
+    cand: (u64, u64),
+    probes: u64,
+    hits: u64,
+    mm_total: u64,
+    mm_miss: u64,
+    hash_v: Vec<u32>,
+    tags_v: Vec<u8>,
+) {
+    const COUNT: bool = cfg!(feature = "profile");
     if COUNT {
         use core::sync::atomic::Ordering::Relaxed;
         MM_TOTAL.fetch_add(mm_total, Relaxed);
@@ -5784,7 +5944,7 @@ fn find_fast_impl_inner<
         ALL_MATCH_BYTES.fetch_add(mb, Relaxed);
         ALL_SEQS.fetch_add(seqs.len() as u64, Relaxed);
     }
-    if REP && rep_hits > 0 && !seqs.is_empty() {
+    if rep && rep_hits > 0 && !seqs.is_empty() {
         let all_bytes: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
         // Same three-into-one as the pipelined arm above.
         let num = rep_bytes as f32 * seqs.len() as f32;
@@ -5796,7 +5956,7 @@ fn find_fast_impl_inner<
     // GATE 7: feed this block's measured reject share to the next block's gate.
     tables.tag_yield = cand_yield(cand);
     // GATE 13: and this block's share of literal runs the fixed-width copy can catch.
-    let (ls, lm) = lit_shares(&seqs);
+    let (ls, lm) = lit_shares(seqs);
     tables.lit_short_share = ls;
     tables.lit_mid_share = lm;
     // feed this block's pair coverage to the next block's gate
@@ -5821,7 +5981,7 @@ fn find_fast_impl_inner<
     }
 
     crate::prof::note_huff_path(12);
-    push_lits_range(&mut lits, src, anchor, block_end);
+    push_lits_range(lits, src, anchor, block_end);
     let match_bytes: u64 = if cfg!(feature = "profile") {
         seqs.iter().map(|s| u64::from(s.matchlen)).sum()
     } else {
@@ -5848,7 +6008,6 @@ fn find_fast_impl_inner<
     tables.last_nseq = seqs.len();
     tables.hash = hash_v;
     tables.tags = tags_v;
-    (seqs, lits)
 }
 
 /// C zstd_fast: 4-byte probe then ZSTD_count from +4. `ilimit` keeps ip+4 in-bounds.
@@ -6142,6 +6301,53 @@ fn lazy_fill_stride() -> usize {
 
 static LAZY_FILL_S_ARM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// SECTION 14.12: the ROW finder's back-fill stride. Default **2**.
+///
+/// The fill re-inserts every position a match covers (defect B1). At stride 1
+/// that is 41,742,765 inserts at L9 -- 2.31x the finder's own probe count,
+/// each a random write into an 80 MB table -- and `fillsweep.rs` shows the
+/// marginal value falling off a cliff:
+///
+/// | stride | fill inserts | row size |
+/// |---:|---:|---:|
+/// | 1 | 41,742,765 | 1.0000x |
+/// | **2** | **21,749,282 (0.52x)** | **1.0027x** |
+/// | 4 | 11,713,837 (0.28x) | 1.0097x |
+/// | 8 | 6,740,929 | 1.0167x |
+///
+/// **Half the fill removed for 0.27% of size** -- and stride 2 is the KNEE,
+/// which the per-corpus spread is what shows. The aggregate is dominated by
+/// the big poorly-compressing files; on TEXT, stride 4 costs ~1.9% (double
+/// its own mean) while stride 2 costs ~0.5%, and `nci`/`xml` actually get
+/// SMALLER at 2. Going 2 -> 4 buys 10M more inserts for another ~1.2% on
+/// text: half the work for more than twice the price.
+///
+/// The chain keeps stride 1: it pays MORE for the same thinning (+1.16% at
+/// stride 4) and it is the shipping default, so it moves only on its own
+/// board.
+static ROW_FILL_S_ARM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Bench hook for the row back-fill stride; `RZSTD_ROW_FILL_S` overrides.
+pub fn set_row_fill_stride_arm(v: usize) {
+    ROW_FILL_S_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn row_fill_stride() -> usize {
+    use core::sync::atomic::Ordering;
+    let v = ROW_FILL_S_ARM.load(Ordering::Relaxed);
+    if v != 0 {
+        return v;
+    }
+    let s: usize = crate::env_knob("RZSTD_ROW_FILL_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v: &usize| v >= 1)
+        .unwrap_or(2);
+    ROW_FILL_S_ARM.store(s, Ordering::Relaxed);
+    s
+}
+
 /// Set the lazy back-fill stride in-process.
 /// GATE 6 next-long probe outcomes, for GATE 14's dispatch study.
 pub static NL_PROBES_G: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -6424,8 +6630,25 @@ pub fn take_dfast_endfill() -> u64 {
 /// hash -- unconditionally, and nothing has ever asked whether both earn it.
 /// This is the only direction at L3 that REMOVES work.
 ///
-/// 0 = unresolved, 1 = neither, 2 = start+2 only, 3 = today (both), 4 = end-2 only.
-static DFAST_FILL_N_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// 0 = unresolved, 1 = neither, 2 = start+2 only, 3 = both, 4 = end-2 only.
+///
+/// DEFAULT FLIPPED to 2 (start only), 2026-08-27, on the `fillcut.rs` board.
+/// The two per-match positions are NOT worth the same: over 12 corpora the
+/// whole fill buys 1.919% of ratio, of which the START half buys 1.548% and
+/// the END half only 0.371% -- for exactly half the table writes. Boarded per
+/// level (this arm is read by `find_fast` too, so it covers L1 as well as
+/// DFast):
+///
+/// ```text
+///   L1   1,872,359 -> 937,927 fills (0.50x)   size +0.150%
+///   L3   6,448,402 -> 3,230,205 fills (0.50x) size +0.482% (2 MiB cap)
+///   L9/L19  unaffected -- different finders, zero fills through here
+/// ```
+///
+/// This CHANGES THE BITSTREAM. bytegate GOLD moved from BE0071FB0CB0CED9 to
+/// the value recorded in `bytegate.rs`'s header; that is the deliberate
+/// re-gold, not a regression.
+static DFAST_FILL_N_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
 
 /// Bench hook: 0 = no end fills, 1 = start+2 only, 2 = both (today), 3 = end-2 only.
 pub fn set_dfast_fill_n_arm(n: u8) {
@@ -6980,7 +7203,17 @@ fn fast_hash_tag<const SAFE: bool>(
 /// Soundness: acceptance verifies `mls` leading bytes, and the tag is a
 /// function of `min(mls, 8)` of them -- a mismatch cannot hide a match.
 fn hash4_tag_mls(src: &[u8], pos: usize, hash_shift: u32, smask: u64) -> (usize, u8) {
-    let v = load_u64le(src, pos);
+    hash4_tag_from(load_u64le(src, pos), hash_shift, smask)
+}
+
+/// The mixing half of `hash4_tag_mls`, split from the LOAD.
+///
+/// `hash4_tag_mls` and `hash8_shift` both begin `load_u64le(src, pos)`, and
+/// DFast's fill calls both at the SAME position (`match_end - 2`, which both
+/// tables index identically). Splitting the load out lets one `load_u64le`
+/// feed both mixes instead of two.
+#[inline(always)]
+fn hash4_tag_from(v: u64, hash_shift: u32, smask: u64) -> (usize, u8) {
     let hv = (v as u32).wrapping_mul(HASH4_PRIME);
     let tv = (v & smask).wrapping_mul(FAST_HASH_PRIME64);
     ((hv >> hash_shift) as usize, (tv ^ (tv >> 29)) as u8)
@@ -7642,7 +7875,8 @@ fn fast_slot_store(
 /// its stored word from the same registers it just decoded.
 #[inline(always)]
 #[allow(unsafe_code)]
-fn fast_slot_swap<const PACKED: bool>(
+fn fast_slot_swap(
+    packed: bool,
     hash: &mut [u32],
     tags: &mut [u8],
     pack: bool,
@@ -7663,7 +7897,7 @@ fn fast_slot_swap<const PACKED: bool>(
         }
         #[cfg(feature = "profile")]
         PACKED_TAG_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if PACKED && (e >> 24) as u8 != tag {
+        if packed && (e >> 24) as u8 != tag {
             return 0;
         }
         return e & 0x00FF_FFFF;
@@ -7680,7 +7914,7 @@ fn fast_slot_swap<const PACKED: bool>(
         if e == 0 {
             return 0;
         }
-        if PACKED {
+        if packed {
             #[cfg(feature = "profile")]
             TAGARR_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if t != tag {
@@ -7698,7 +7932,8 @@ fn fast_slot_swap<const PACKED: bool>(
 
 #[inline(always)]
 #[allow(unsafe_code)]
-fn fast_slot_load<const PACKED: bool>(
+fn fast_slot_load(
+    packed: bool,
     hash: &[u32],
     tags: &[u8],
     pack: bool,
@@ -7718,12 +7953,12 @@ fn fast_slot_load<const PACKED: bool>(
     if pack {
         #[cfg(feature = "profile")]
         PACKED_TAG_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if PACKED && (e >> 24) as u8 != tag {
+        if packed && (e >> 24) as u8 != tag {
             return 0;
         }
         return e & 0x00FF_FFFF;
     }
-    if !PACKED {
+    if !packed {
         return e;
     }
     // Same provable bound as the store's -- per PROBE, on the hottest loop
@@ -7808,7 +8043,7 @@ fn fast_slot_raw(hash: &[u32], pack: bool, h: usize) -> u32 {
 ///
 /// Same shape `BtCtx` and `ChainCtx` use: the per-block constants ride in a
 /// context built once, and the emitter outlines to FOUR copies (plain/bmi2 x
-/// PACKED) instead of 280. The ISA twin is mandatory, not optional -- an
+/// packed) instead of 280. The ISA twin is mandatory, not optional -- an
 /// outlined callee of a `#[target_feature]` twin compiles BASELINE (the
 /// shim-trap rule), so outlining without a twin would silently downgrade the
 /// end-fill's hashes from `shrx` back to `shr %cl`.
@@ -7830,7 +8065,7 @@ pub(crate) struct FastEmitCtx<'a> {
 /// `fast_slot_store` rule.
 // W2: this carried BOTH `#[inline]` and `#[inline(always)]`.
 #[inline(always)]
-fn fill_fast_after_match<const PACKED: bool>(
+fn fill_fast_after_match(
     hash: &mut [u32],
     tags: &mut [u8],
     pack: bool,
@@ -7880,7 +8115,8 @@ fn fill_fast_after_match<const PACKED: bool>(
 /// `let _ = mls;`. It was set up at every one of the three call sites, on
 /// every match, in all 280 copies.
 #[inline(never)]
-fn emit_fast_seq_plain<const PACKED: bool>(
+fn emit_fast_seq_plain(
+    packed: bool,
     ctx: &FastEmitCtx,
     hash: &mut [u32],
     tags: &mut [u8],
@@ -7891,7 +8127,7 @@ fn emit_fast_seq_plain<const PACKED: bool>(
     m: usize,
     ml: usize,
 ) -> usize {
-    emit_fast_seq_body::<PACKED>(ctx, hash, tags, seqs, lits, anchor, found_ip, m, ml)
+    emit_fast_seq_body(packed, ctx, hash, tags, seqs, lits, anchor, found_ip, m, ml)
 }
 
 /// The ISA twin. See `FastEmitCtx` -- without this the BMI2 `find_fast_impl`
@@ -7900,7 +8136,8 @@ fn emit_fast_seq_plain<const PACKED: bool>(
 #[target_feature(enable = "bmi2,lzcnt")]
 #[allow(unsafe_code)]
 #[inline(never)]
-unsafe fn emit_fast_seq_bmi2<const PACKED: bool>(
+unsafe fn emit_fast_seq_bmi2(
+    packed: bool,
     ctx: &FastEmitCtx,
     hash: &mut [u32],
     tags: &mut [u8],
@@ -7911,14 +8148,15 @@ unsafe fn emit_fast_seq_bmi2<const PACKED: bool>(
     m: usize,
     ml: usize,
 ) -> usize {
-    emit_fast_seq_body::<PACKED>(ctx, hash, tags, seqs, lits, anchor, found_ip, m, ml)
+    emit_fast_seq_body(packed, ctx, hash, tags, seqs, lits, anchor, found_ip, m, ml)
 }
 
 /// `BMI2` is threaded from the wrapper that already made the CPUID decision
 /// for the whole block, so this selection is a compile-time fold, not a
 /// per-match branch.
 #[inline(always)]
-fn emit_fast_seq<const PACKED: bool, const BMI2: bool>(
+fn emit_fast_seq<const BMI2: bool>(
+    packed: bool,
     ctx: &FastEmitCtx,
     hash: &mut [u32],
     tags: &mut [u8],
@@ -7935,14 +8173,15 @@ fn emit_fast_seq<const PACKED: bool, const BMI2: bool>(
         // which the plain wrapper reached under a `has_bmi2()` CPUID guard.
         #[allow(unsafe_code)]
         return unsafe {
-            emit_fast_seq_bmi2::<PACKED>(ctx, hash, tags, seqs, lits, anchor, found_ip, m, ml)
+            emit_fast_seq_bmi2(packed, ctx, hash, tags, seqs, lits, anchor, found_ip, m, ml)
         };
     }
-    emit_fast_seq_plain::<PACKED>(ctx, hash, tags, seqs, lits, anchor, found_ip, m, ml)
+    emit_fast_seq_plain(packed, ctx, hash, tags, seqs, lits, anchor, found_ip, m, ml)
 }
 
 #[inline(always)]
-fn emit_fast_seq_body<const PACKED: bool>(
+fn emit_fast_seq_body(
+    _packed: bool,
     ctx: &FastEmitCtx,
     hash: &mut [u32],
     tags: &mut [u8],
@@ -7993,14 +8232,142 @@ fn emit_fast_seq_body<const PACKED: bool>(
         offset: (ip - mm) as u32,
     });
     let end = ip + n;
-    fill_fast_after_match::<PACKED>(
+    fill_fast_after_match(
         hash, tags, pack, f_wide, f_mask, f_shift, src, found_ip, end, ilimit, tags_live, ends,
     );
     end
 }
 
+/// FUSED DFast fill -- both tables, ONE walk. Replaces the
+/// `fill_hash_after_match` + `fill_hash_long_after_match` pair at DFast's
+/// commit point.
+///
+/// The two tables index the SAME byte at position `b` (`match_end - 2`) always,
+/// and the same byte at position `a` whenever the anchors coincide -- which is
+/// every match except the ones where the next-long probe won. `hash4_tag_mls`
+/// yields `(hash, tag)`: the short store wants both, the long store wants only
+/// the tag, and it was recomputing the pair to get it. Computing it once and
+/// handing the tag to both stores is the whole idea.
+///
+/// `short_ip` and `long_ip` are passed separately rather than assumed equal:
+/// `dfast_fill_anchor_c` defaults OFF, so the long table anchors on the
+/// PRE-probe `ip` while the short anchors on the committed position. They
+/// differ by at most 1 and only when the next-long probe won.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn fill_dfast_after_match(
+    tables: &mut MatchTables,
+    src: &[u8],
+    short_ip: usize,
+    long_ip: usize,
+    match_end: usize,
+    ends: (bool, bool),
+    smask: u64,
+    hash_shift: u32,
+    lshift: u32,
+    ilimit: usize,
+    // BLOCK-HOISTED. These were read through `&mut MatchTables` inside each
+    // helper -- six field reads per match across the pair. `pack_tags` is a
+    // block constant and neither tag array is resized or cleared inside the
+    // match loop (audited), so their emptiness is fixed for the block.
+    packed: bool,
+    stag_live: bool,
+    ltag_live: bool,
+) {
+    // See the pair's note: `wanted` asks whether a tag is worth COMPUTING
+    // (packed frames carry it in the slot), `live` asks whether the array
+    // exists. They differ exactly on the packed case.
+    let ltag_wanted = packed || ltag_live;
+    let (do_a, do_b) = ends;
+    // Pattern A: `n`'s only readers are the `profile` atomic below and
+    // `note_hash_fill`, which is an empty stub in a shipping build. Folding it
+    // to a unit there removes four increments per match.
+    #[cfg(feature = "profile")]
+    let mut n = 0u64;
+    macro_rules! bump {
+        () => {
+            #[cfg(feature = "profile")]
+            {
+                n += 1;
+            }
+        };
+    }
+
+    debug_assert!(short_ip < usize::MAX - 2 && long_ip < usize::MAX - 2);
+    let sa = short_ip + 2;
+    let la = long_ip + 2;
+
+    // Position `a` keeps the pair's independent shape: sharing the tag across
+    // the two anchors needs an `la == sa` test, and MEASURED +31 instructions
+    // -- the branch costs more than the hash it saves on a path LLVM had as
+    // straight-line code. Recorded so it is not retried.
+    if do_a {
+        if sa <= ilimit {
+            let (h, g) = hash4_tag_mls(src, sa, hash_shift, smask);
+            tables.put_h_tag(h, sa, g, packed, stag_live);
+            bump!();
+        }
+        if la <= ilimit {
+            let g = if ltag_wanted {
+                hash4_tag_mls(src, la, hash_shift, smask).1
+            } else {
+                0
+            };
+            tables.put_hl_tag(hash8_shift(src, la, lshift), la, g, packed, ltag_live);
+            bump!();
+        }
+    }
+
+    debug_assert!(match_end >= 2);
+    if do_b {
+        // Computed ONCE where the pair computed it twice, along with its bound.
+        let b = match_end - 2;
+        if b <= ilimit {
+            let want_s = b != sa;
+            let want_l = b != la;
+            if want_s || want_l {
+                // ONE `hash4_tag_mls` serves both stores: `h` for the short
+                // slot, `g` for whichever tags are live.
+                // THE win: ONE `hash4_tag_mls` where the pair ran two. Both
+                // tables index `match_end - 2` identically, always -- the short
+                // store takes `h` and `g`, the long store takes `g` and its own
+                // 8-byte hash. Unconditional because at least one store is
+                // happening (`want_s || want_l`), so the pair is never wasted.
+                // ONE `load_u64le` feeds BOTH mixes. `hash4_tag_mls` and
+                // `hash8_shift` each began with the same load at the same
+                // position; splitting the load out (see `hash4_tag_from`)
+                // removes the duplicate.
+                let v = load_u64le(src, b);
+                let (h, g) = hash4_tag_from(v, hash_shift, smask);
+                if want_s {
+                    tables.put_h_tag(h, b, g, packed, stag_live);
+                    bump!();
+                }
+                if want_l {
+                    tables.put_hl_tag(hash8_from(v, lshift), b, g, packed, ltag_live);
+                    bump!();
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "profile")]
+    {
+        DF_ENDFILL.fetch_add(n, core::sync::atomic::Ordering::Relaxed);
+        crate::prof::note_hash_fill(n);
+    }
+}
+
 /// C `zstd_fast.c` after a match: insert hash(start+2) and hash(end-2) only.
 /// Filling every byte of a long match was ~src_len hash writes on repeating text.
+///
+/// STILL USED by the L1 Fast ladder and DFast's interior back-fill stride; the
+/// DFast COMMIT point now goes through `fill_dfast_after_match`.
+/// SUPERSEDED by `fill_dfast_after_match`, which fuses this with its
+/// sibling and shares the position-`b` hash the two recomputed. Kept as
+/// the reference shape -- the convention this crate uses for
+/// `encode_4_streams` and `segment_histograms`. LLVM drops it.
+#[allow(dead_code)]
 #[inline]
 fn fill_hash_after_match(
     tables: &mut MatchTables,
@@ -8066,13 +8433,23 @@ fn fill_hash_after_match(
     crate::prof::note_hash_fill(n);
 }
 
+/// SUPERSEDED by `fill_dfast_after_match`, which fuses this with its
+/// sibling and shares the position-`b` hash the two recomputed. Kept as
+/// the reference shape -- the convention this crate uses for
+/// `encode_4_streams` and `segment_histograms`. LLVM drops it.
+#[allow(dead_code)]
 #[inline]
 fn fill_hash_long_after_match(
     tables: &mut MatchTables,
     src: &[u8],
     match_ip: usize,
     match_end: usize,
-    hash_log: u32,
+    // W41: the LONG hash shift, RESOLVED. This took `hash_log` and let
+    // `hash8` re-derive `64 - hash_log.min(32)` at each of its two call
+    // sites -- twice per match on the DFast ladder, for a block constant.
+    // Same defect as W40 one function away, and the fourth family of it
+    // found today.
+    lshift: u32,
     ends: (bool, bool),
     smask: u64,
     // 1a: the short-tag shift, for the packed long store. Passed in like
@@ -8109,7 +8486,7 @@ fn fill_hash_long_after_match(
         } else {
             0
         };
-        tables.put_hl_tag(hash8(src, a, hash_log), a, g, packed, ltag_live);
+        tables.put_hl_tag(hash8_shift(src, a, lshift), a, g, packed, ltag_live);
         n += 1;
     }
     debug_assert!(match_end >= 2);
@@ -8121,14 +8498,20 @@ fn fill_hash_long_after_match(
             } else {
                 0
             };
-            tables.put_hl_tag(hash8(src, b, hash_log), b, g, packed, ltag_live);
+            tables.put_hl_tag(hash8_shift(src, b, lshift), b, g, packed, ltag_live);
             n += 1;
         }
     }
     #[cfg(feature = "profile")]
     DF_ENDFILL.fetch_add(n, core::sync::atomic::Ordering::Relaxed);
-    #[cfg(not(feature = "profile"))]
-    let _ = n;
+    // INSTRUMENT DEFECT, repaired. This reported to `DF_ENDFILL` but NOT to
+    // `note_hash_fill`, so `EncodeCounts::hash_fills` -- the crate-wide "table
+    // positions written" counter -- omitted DFast's ENTIRE long-table fill.
+    // DFast writes TWO tables per match; only the short one was counted, so
+    // every per-position figure derived from `hash_fills` understated L3.
+    // Section 7 of m7-anatomy.md was computed on the undercount and its L3
+    // `fills/B` and `pos/B` are corrected there.
+    crate::prof::note_hash_fill(n);
 }
 
 /// Split out for register allocation -- see brick 48 on `find_fast_impl`.
@@ -8155,48 +8538,56 @@ fn find_dfast(
     // keep brick 54's fold on the baseline arm that still needs it.
     //
     // The ISA choice moves here too, out of the five `find_dfast_impl` bodies.
+    // REFUTED HERE, recorded so it is not retried: collapsing this HLOG axis
+    // the way W4 collapsed `find_fast`'s measured **+81 crate-wide** (this
+    // function -245... -178, and ~+259 elsewhere). `find_fast`'s axis was
+    // six-fold over a ~965-instruction body; DFast's five copies had already
+    // been largely merged by LLVM, so there was no duplication left to
+    // recover and the generic form only cost spills. The same lever is not
+    // the same win at a different multiplier -- price the copies, not the
+    // pattern.
     macro_rules! go {
         ($h:expr) => {{
-            #[cfg(all(target_arch = "x86_64", feature = "std"))]
-            #[allow(unsafe_code)]
-            // SAFETY: runtime CPUID guard, identical body.
-            let out = if crate::simd::has_bmi2() {
-                unsafe {
-                    find_dfast_impl_bmi2::<0>(
-                        src,
-                        block_start,
-                        block_end,
-                        window,
-                        params,
-                        tables,
-                        reps,
-                    )
-                }
-            } else {
-                find_dfast_impl::<$h>(src, block_start, block_end, window, params, tables, reps)
-            };
-            #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
+            // D6: TWIN RETIRED on its ISA density -- 1,287 instructions of
+            // duplicated body converting EIGHTEEN BMI2 ops, 72 per op. Same
+            // test that retired the greedy (123/op), lazy (111/op), chain
+            // (152/op) and bt-runtime (97/op) twins, and the same precedent:
+            // W4/W5/W6 retired the HLOG and (hash_log, chain_log) trees on the
+            // argument that `shr %cl` and `shrx` are both one uop on any CPU
+            // that HAS BMI2. DFast pays that shift twice per position, which is
+            // exactly why 18 conversions is all a whole duplicate body bought.
             let out =
                 find_dfast_impl::<$h>(src, block_start, block_end, window, params, tables, reps);
             out
         }};
     }
-    if !dfast_spec_enabled() {
-        return go!(0);
-    }
-    // GATE 5: the MINIMAL COMPLETE set. Enumerated exhaustively over every
-    // input size 0..2^28 plus the unknown-size (streaming) case, DFast reaches
-    // exactly hash_log {14, 15, 16, 17, 18}. The first cut specialised 12..=20,
-    // so 12/13/19/20 were dead monomorphizations -- roughly 2,100 instructions
-    // of code that no input can execute, paid for in I-cache.
-    match tables.hash_log {
-        14 => go!(14),
-        15 => go!(15),
-        16 => go!(16),
-        17 => go!(17),
-        18 => go!(18),
-        _ => go!(0),
-    }
+    // W11: SIX CALL SITES BECOME ONE.
+    //
+    // A FIRST ATTEMPT AT THIS WAS REFUTED AND THE REFUTATION WAS WRONG; the
+    // correction is worth recording because the failure mode is subtle. That
+    // attempt changed only the CONST (`find_dfast_impl::<$h>` -> `::<0>`) and
+    // measured -178, which read as "LLVM had already merged the copies". It
+    // had not. `find_dfast_impl` is `#[inline(always)]`, and inlining happens
+    // PER CALL SITE -- six sites inline six bodies even when all six name the
+    // identical monomorphisation. Collapsing the const made the six copies
+    // identical without making them one.
+    //
+    // So the `find_fast` lesson (W4) needed its other half (W5): kill the
+    // AXIS *and* the DISPATCH. `HLOG` here reaches only
+    // `let hlog = if HLOG == 0 { tables.hash_log } else { HLOG };`, after
+    // which `hlog` and the `dtag_shift` derived from it travel as ordinary
+    // runtime arguments into `dfast_hash_pair`, `hash8` and the fill walk --
+    // so six bodies bought two shift immediates, and DFast pays them twice
+    // per position (4-byte + 8-byte hash).
+    //
+    // GATE 5's census (below, kept for the record) established that only
+    // hash_log {14..18} are reachable and culled 12/13/19/20. That was the
+    // right cut for the wrong axis: reachability decides which SPECIALISATIONS
+    // are dead, never whether the specialisation is worth its I-cache.
+    //
+    // `dfast_spec_enabled()` selected between the specialised arms and the
+    // generic one; with no specialised arms left there is nothing to select.
+    go!(0)
 }
 
 /// GATE 4/5 EXTENDED TO L3 -- the DEFAULT level's finder.
@@ -8227,20 +8618,214 @@ fn find_dfast_impl<const HLOG: u32>(
     find_dfast_impl_inner::<HLOG>(src, block_start, block_end, window, params, tables, reps)
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "bmi2,lzcnt")]
+/// The shipping per-block epilogue of `find_dfast_impl_inner`, factored out of
+/// its five inlined HLOG copies. Runs once per block; `#[inline(never)]`.
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
-#[allow(unsafe_code)]
-unsafe fn find_dfast_impl_bmi2<const HLOG: u32>(
+fn dfast_finder_epilogue(
+    tables: &mut MatchTables,
+    src: &[u8],
+    seqs: &[Seq],
+    lits: &mut Vec<u8>,
+    anchor: usize,
+    block_end: usize,
+    rep_hits: u64,
+    spec_used: u64,
+    spec_made: u64,
+    dpipe: bool,
+    nl_probes: u64,
+    nl_hits: u64,
+    band_worse: u64,
+    band_hits: u64,
+    probes: u64,
+    hits: u64,
+) {
+    const COUNT: bool = cfg!(feature = "profile");
+    tables.rep_yield = if seqs.is_empty() {
+        1.0
+    } else {
+        (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * rep_decay())
+    };
+    tables.rep_probe = if tables.rep_probe == 0 {
+        REP_PROBE_PERIOD
+    } else {
+        tables.rep_probe - 1
+    };
+    // Optimistic when the probe never fired, so a quiet block cannot latch it
+    // off permanently; otherwise the measured hit share, floored at half the
+    // previous value so one bad block does not kill it outright.
+    // GATE 8 signal: share of speculated loads that were actually CONSUMED. A
+    // speculation is discarded whenever the position ends in a match or a rep
+    // hit, so match-dense content pays for loads it never uses.
+    // T2: these three are DIAGNOSTICS, and leaving them ungated kept `mm_total`
+    // live across the whole search loop for no shipping purpose. The gate signal
+    // below is computed from `spec_used`/`spec_made` directly, not from the
+    // atomics, so gating the atomics costs no dispatch anything. The `nl_probes`
+    // block immediately after this one was already gated exactly this way.
+    //
+    // The DFast hot loop is only 151 instructions but carries 27 stack reloads,
+    // 23 of them loop-invariant across 12 slots -- it is short of registers, and
+    // what it is spending them on is the gates' own telemetry.
+    // Attribute only when the pipeline actually RAN: a block that speculated
+    // nothing measures nothing, and scoring it 1.0 would make the gate
+    // oscillate on/off every block. EWMA for the same reason Gate 6 needs one --
+    // one cold or atypical block must not decide the whole frame.
+    if dpipe && spec_made > 0 {
+        let now = spec_used as f32 / spec_made as f32;
+        tables.dfast_spec_yield = 0.75 * tables.dfast_spec_yield + 0.25 * now;
+    }
+    // Periodic re-probe, so a block that scores low cannot latch the gate shut
+    // for the rest of the frame. This epilogue always runs (the only early
+    // return is the empty-block case), unlike `find_fast`'s, where putting the
+    // tick in the tail is exactly what latched Gate 6.
+    tables.dfast_probe = if tables.dfast_probe == 0 {
+        DFAST_PROBE_PERIOD
+    } else {
+        tables.dfast_probe - 1
+    };
+    // The mean-ml EWMA below is the SHIPPING consumer of this sum; the atomic
+    // publishes are gate-harness diagnostics (`take_dfast_match_stats`,
+    // `take_dfast_rep_blocks`) and shipped as EIGHT lock-prefixed RMWs plus a
+    // SECOND O(nseq) walk per block. Sum once, publish under `profile` only.
+    let mb: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
+    {
+        let now = if seqs.is_empty() {
+            0.0
+        } else {
+            mb as f32 / seqs.len() as f32
+        };
+        tables.dfast_mean_ml = if tables.dfast_mean_ml == 0.0 && now == 0.0 {
+            0.0
+        } else {
+            0.75 * tables.dfast_mean_ml + 0.25 * now
+        };
+    }
+    if band_hits > 0 {
+        let now = band_worse as f32 / band_hits as f32;
+        tables.nl_off_worse = if tables.nl_band_meas == 0 {
+            now
+        } else {
+            0.75 * tables.nl_off_worse + 0.25 * now
+        };
+        tables.nl_band_meas = tables.nl_band_meas.saturating_add(1);
+    }
+    tables.nl_band_probe = if tables.nl_band_probe == 0 {
+        NL_BAND_PERIOD
+    } else {
+        tables.nl_band_probe - 1
+    };
+    tables.next_long_yield = if nl_probes == 0 {
+        1.0
+    } else {
+        (nl_hits as f32 / nl_probes as f32).max(tables.next_long_yield * 0.5)
+    };
+    push_lits_range(lits, src, anchor, block_end);
+    // GATE 13 @ L3 FOLLOW-UP: `find_dfast` READ `last_nseq` to size its `seqs`
+    // reservation but never WROTE it -- only `find_fast` did, and L3 never calls
+    // `find_fast`. So the field sat at its initial 0 for the whole frame and the
+    // guess collapsed to the `+ 64` floor, while DFast emits 5,685-13,763
+    // sequences per block: the reservation was ~100x short and `seqs` still grew
+    // by realloc (1,648 growths across the corpus).
+    //
+    // A capacity hint cannot affect output, so this is byte-identical.
+    tables.last_nseq = seqs.len();
+    note_finder_work(COUNT, probes, hits, seqs, lits);
+}
+
+/// The per-block gate decisions of `find_dfast_impl_inner`, resolved ONCE in
+/// `dfast_finder_prologue` instead of once per HLOG monomorphisation.
+struct DfastGates {
+    lp: bool,
+    good_ml: usize,
+    good_ml2: usize,
+    nl_on: bool,
+    dstep: usize,
+    dpipe: bool,
+    lt_on: bool,
+}
+
+/// Scratch acquisition + the too-short-block exit of `find_dfast_impl_inner`,
+/// factored out of its five HLOG copies. Runs once per block.
+#[inline(never)]
+#[allow(clippy::type_complexity)]
+fn dfast_finder_prologue(
     src: &[u8],
     block_start: usize,
     block_end: usize,
-    window: usize,
-    params: CompressionParameters,
+    block_len: usize,
+    mls: usize,
     tables: &mut MatchTables,
-    reps: [u32; 3],
-) -> (Vec<Seq>, Vec<u8>) {
-    find_dfast_impl_inner::<HLOG>(src, block_start, block_end, window, params, tables, reps)
+) -> Result<(Vec<Seq>, Vec<u8>, DfastGates), (Vec<Seq>, Vec<u8>)> {
+    let good_ml = nl_cut_for(tables);
+    let good_ml2 = dfast_good_ml2();
+    let lp = if litpush_hoist_enabled() {
+        dfast_litpush_enabled()
+    } else {
+        lit_push_enabled()
+    };
+    let nl_on = next_long_enabled() && tables.next_long_yield >= next_long_min();
+    let ml = tables.dfast_mean_ml;
+    let dstep = if dfast_step_forced() != 0 {
+        dfast_step_forced()
+    } else if ml == 0.0 || ml >= dfast_ml_min() {
+        2
+    } else {
+        1
+    };
+    let dpipe = dfast_pipe_enabled()
+        && (tables.dfast_probe == 0 || tables.dfast_spec_yield >= dfast_spec_min());
+    let lt_on = long_tag_enabled() && (tables.pack_tags || !tables.ltags.is_empty());
+    let gates = DfastGates {
+        lp,
+        good_ml,
+        good_ml2,
+        nl_on,
+        dstep,
+        dpipe,
+        lt_on,
+    };
+    let seq_guess = (tables.last_nseq + tables.last_nseq / 4 + 64).min(block_len / mls + 16);
+    // GATE 6 family: DFast reserved its buffers but still built them fresh every
+    // block. `find_fast_impl` takes them from the frame; this never did, so the
+    // reservation was paid per block instead of once. Same scratch, same
+    // hand-back in `encode_block`.
+    let keep = finder_scratch_enabled();
+    let mut seqs = if keep {
+        let mut v = core::mem::take(&mut tables.seq_scratch);
+        v.clear();
+        v
+    } else {
+        Vec::new()
+    };
+    if lp && seqs.capacity() < seq_guess {
+        seqs = Vec::with_capacity(seq_guess);
+    }
+    let mut lits = if keep {
+        let mut v = core::mem::take(&mut tables.lit_scratch);
+        v.clear();
+        v
+    } else {
+        Vec::new()
+    };
+    if lp && lits.capacity() < block_len + LIT_PUSH_WIDTH_MAX {
+        lits = Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX);
+    }
+    let ilimit = block_end.saturating_sub(8);
+    if block_start >= ilimit {
+        lits.extend_from_slice(&src[block_start..block_end]);
+        return Err((seqs, lits));
+    }
+    // BRICK 70: repcode-1 search in DFast.
+    //
+    // C checks `offset_1` at every position in `_doubleFast` exactly as it does
+    // in `_fast`; we had it ONLY in `find_fast`, so L3 -- the SHIPPING DEFAULT --
+    // had no repcode search at all. That is the whole of the 4.3x versions-16m
+    // hole at L2-L4 (L1/L2 collapse to 0.07x/0.62x with it on, L3/L4 do not move).
+    //
+    // Dispatched on the same measured yield as brick 67, so content without a
+    // constant stride does not pay for a search that cannot hit.
+    // P0/gg-matchfind: work counter -- see `chain_find_best`.
+    Ok((seqs, lits, gates))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8278,8 +8863,6 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     // at L19, and the 60% the depth gate's four per-call reads cost at L19/L22.
     // GATE 14 @ L3 DISPATCH: raised while the offset trade is paying, held at 8
     // when it is not. See `nl_cut_for`.
-    let good_ml = nl_cut_for(tables);
-    let good_ml2 = dfast_good_ml2();
     // Block-local band accumulators -- never atomics in the loop.
     let mut band_hits = 0u64;
     let mut band_worse = 0u64;
@@ -8293,54 +8876,34 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     // IDENTICAL for `find_fast` (its `arm` is already `lit_push_enabled()`).
     // Brick 77 hoisted the env read out of that guard and left an atomic in its
     // place; this finishes the job.
-    let lp = if litpush_hoist_enabled() {
-        dfast_litpush_enabled()
-    } else {
-        lit_push_enabled()
-    };
     let block_len = block_end - block_start;
-    let seq_guess = (tables.last_nseq + tables.last_nseq / 4 + 64).min(block_len / mls + 16);
-    // GATE 6 family: DFast reserved its buffers but still built them fresh every
-    // block. `find_fast_impl` takes them from the frame; this never did, so the
-    // reservation was paid per block instead of once. Same scratch, same
-    // hand-back in `encode_block`.
-    let keep = finder_scratch_enabled();
-    let mut seqs = if keep {
-        let mut v = core::mem::take(&mut tables.seq_scratch);
-        v.clear();
-        v
-    } else {
-        Vec::new()
-    };
-    if lp && seqs.capacity() < seq_guess {
-        seqs = Vec::with_capacity(seq_guess);
-    }
-    let mut lits = if keep {
-        let mut v = core::mem::take(&mut tables.lit_scratch);
-        v.clear();
-        v
-    } else {
-        Vec::new()
-    };
-    if lp && lits.capacity() < block_len + LIT_PUSH_WIDTH_MAX {
-        lits = Vec::with_capacity(block_len + LIT_PUSH_WIDTH_MAX);
-    }
+    // Scratch + the too-short-block exit, shared across the five HLOG copies
+    // (the `fast_finder_prologue` treatment, dfast's variant: `lp` gates the
+    // reservations here where fast's `reserve` does).
+    // The knob reads (`good_ml`, `good_ml2`, the litpush arm) fold into the
+    // prologue call too: four atomic loads and their branches were stamped
+    // per HLOG copy for values decided once per block.
+    // ALL seven per-block knob atomics arrive from the prologue now (see
+    // `DfastGates`): each was an `Ordering::Relaxed` load plus its branch,
+    // stamped into every HLOG copy to decide something that changes once per
+    // block. None of them can move across the prologue -- it takes only the
+    // two scratch Vecs and touches no signal any of these read.
+    let (mut seqs, mut lits, g) =
+        match dfast_finder_prologue(src, block_start, block_end, block_len, mls, tables) {
+            Ok(t) => t,
+            Err(out) => return out,
+        };
+    let DfastGates {
+        lp,
+        good_ml,
+        good_ml2,
+        nl_on,
+        dstep,
+        dpipe,
+        lt_on,
+    } = g;
     let mut anchor = block_start;
     let ilimit = block_end.saturating_sub(8);
-    if block_start >= ilimit {
-        lits.extend_from_slice(&src[block_start..block_end]);
-        return (seqs, lits);
-    }
-    // BRICK 70: repcode-1 search in DFast.
-    //
-    // C checks `offset_1` at every position in `_doubleFast` exactly as it does
-    // in `_fast`; we had it ONLY in `find_fast`, so L3 -- the SHIPPING DEFAULT --
-    // had no repcode search at all. That is the whole of the 4.3x versions-16m
-    // hole at L2-L4 (L1/L2 collapse to 0.07x/0.62x with it on, L3/L4 do not move).
-    //
-    // Dispatched on the same measured yield as brick 67, so content without a
-    // constant stride does not pay for a search that cannot hit.
-    // P0/gg-matchfind: work counter -- see `chain_find_best`.
     const COUNT: bool = cfg!(feature = "profile");
     let mut probes = 0u64;
     let mut hits = 0u64;
@@ -8366,12 +8929,14 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     // `lowest_rep`'s expression, recomputed at two more.
     let frame_start_c = tables.frame_start;
     let mlx_c = 8.min(mls).max(4);
+    // Block-hoisted, like every other arm here: an atomic load per MATCH is
+    // exactly the cost this finder cannot afford (see section 7 of m7-anatomy).
+    let bext_c = dfast_bext_enabled();
     // W19: `lowest_c` was an unread alias of `lowest_rep`.
     // W4: the literal-copy width, re-selected from a per-block flag on every
     // emitted match.
     let lp_w = if lp { LIT_PUSH_WIDTH } else { 0 };
     // GATE 6 @ L3 DISPATCH: run C's next-long probe only while it is EARNING.
-    let nl_on = next_long_enabled() && tables.next_long_yield >= next_long_min();
     // `accel_shift_for(DFast)` is the constant 8 unless the RZSTD_ACCEL bench
     // pin is set; the pin stays available under `profile` (same treatment as
     // `find_fast_impl`'s loop, and `find_dfast` is dispatched for
@@ -8426,16 +8991,6 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     //   ml == 0   zeros, incomp-32m        step2 size 0.00%
     //   ml <  8   x-ray 5.05, sao 6.28     +12.67%, +3.26%
     //   ml >= 14  osdb .. text-32m         -2.04% .. +1.36%
-    let ml = tables.dfast_mean_ml;
-    let dstep = if dfast_step_forced() != 0 {
-        dfast_step_forced()
-    } else if ml == 0.0 || ml >= dfast_ml_min() {
-        2
-    } else {
-        1
-    };
-    let dpipe = dfast_pipe_enabled()
-        && (tables.dfast_probe == 0 || tables.dfast_spec_yield >= dfast_spec_min());
     // W8: `spec_used` used to be incremented on EVERY position that consumed
     // a speculation -- a memory read-modify-write per position, visible as
     // `incq <slot>` in the emitted loop, feeding only the ratio
@@ -8521,7 +9076,6 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     // Instrument lesson that found this (the "32M" false lead): the residual
     // statics ran during the arm-OFF pass too -- read counters out between
     // arms or the baseline contaminates the treatment 4:1.
-    let lt_on = long_tag_enabled() && (tables.pack_tags || !tables.ltags.is_empty());
     // W1: `pack_tags` is a per-FRAME constant that every tag accessor was
     // re-reading from the struct -- the asm showed offset 523 loaded and
     // tested ELEVEN times per position in one dfast twin. `find_fast_impl`
@@ -8541,6 +9095,13 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     let fill_anchor_c = dfast_fill_anchor_c();
     let fill_stride = dfast_fill_stride();
     let fill_ends = dfast_fill_ends();
+    // Six `&mut MatchTables` field reads per match, hoisted to one each per
+    // block. See `fill_dfast_after_match`.
+    let fill_packed = tables.pack_tags;
+    let fill_stag_live = !tables.tags.is_empty();
+    let fill_ltag_live = !tables.ltags.is_empty();
+    // W40: the LONG hash shift, once per block. See `dfast_hash_pair`.
+    let dlong_shift = 64u32.saturating_sub(hlog.min(32));
     // REFUTED (2026-08-20): the Fast loop's mem::take table surgery, applied
     // here -- take hash/hash_long/tags into locals, slice-based slot twins,
     // slice-signature fill helpers. Byte-identical (dfid L1-L4 exact) but
@@ -8610,14 +9171,30 @@ fn find_dfast_impl_inner<const HLOG: u32>(
             )
         } else {
             {
-                let (a, ga, b) = dfast_hash_pair(src, ip, dtag_shift, smask, hlog);
+                let (a, ga, b) = dfast_hash_pair(src, ip, dtag_shift, smask, dlong_shift);
                 let m = tables.get_h_tag(a, ga, dtag_on, packed);
                 // T1 ledger: a rejection is a candidate load AVOIDED. Counted
                 // only under `profile`, so the shipping loop is untouched.
+                // SECTION 15 INSTRUMENT FIX. `TAG_FALSE_REJECT` is documented
+                // as "tag rejections that `fast_probe` would have ACCEPTED",
+                // but it only ever tested `m.is_none()` -- i.e. it counted
+                // EVERY rejection of a non-empty slot and called it false.
+                // Read that way it says 59% of short-table rejections are
+                // lost matches; verified against the BYTES, as the long-table
+                // audit ten lines below always did, it says something else
+                // entirely. A counter whose name asserts more than its code
+                // checks is worse than no counter.
+                #[cfg(feature = "profile")]
                 if COUNT && dtag_on && tables.raw_fast(a) != 0 {
-                    TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    use core::sync::atomic::Ordering::Relaxed;
+                    TAG_REJECT_TOTAL.fetch_add(1, Relaxed);
                     if m.is_none() {
-                        TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        let mr = (tables.raw_fast(a) as usize) - 1;
+                        if match_ok(src, mr, ip, window, block_start, mlx_c, frame_start_c)
+                            && count_match(src, mr, ip, block_end) >= mls
+                        {
+                            TAG_FALSE_REJECT.fetch_add(1, Relaxed);
+                        }
                     }
                 }
                 let ml8 = tables.get_hl_tag(b, ga, lt_on, packed);
@@ -8659,7 +9236,7 @@ fn find_dfast_impl_inner<const HLOG: u32>(
         if dpipe {
             let nip = ip + dstep + ((ip - anchor) >> accel);
             if nip <= ilimit {
-                let (a, ga, b) = dfast_hash_pair(src, nip, dtag_shift, smask, hlog);
+                let (a, ga, b) = dfast_hash_pair(src, nip, dtag_shift, smask, dlong_shift);
                 // The hand-forward has to respect the filter: `put_h_tag` just
                 // wrote `g4` at slot `h4`, so a speculation landing on that slot
                 // sees `ip` only when its own tag matches what is now stored.
@@ -8755,7 +9332,8 @@ fn find_dfast_impl_inner<const HLOG: u32>(
         let mut best_ip = ip;
         if best_ml < good_ml && nl_on && ip < ilimit {
             nl_probes += 1;
-            let h8b = hash8(src, ip + 1, hlog);
+            // W42: resolved shift, like W40 one branch away.
+            let h8b = hash8_shift(src, ip + 1, dlong_shift);
             // The only long consumer without a free tag: `ip + 1` never
             // computed a short hash. One mul+xor on a path already gated by
             // `best_ml < good_ml && nl_on`.
@@ -8863,6 +9441,43 @@ fn find_dfast_impl_inner<const HLOG: u32>(
             }
         }
         if best_ml >= mls {
+            // BACK-EXTENSION PROBE (profile only, no behaviour change). Mirrors
+            // `emit_fast_seq_body`'s walk exactly -- same guards, same
+            // `back_eq` -- so the number it reports is the number applying it
+            // would recover. See `take_dfast_bext`.
+            #[cfg(feature = "profile")]
+            {
+                use core::sync::atomic::Ordering::Relaxed;
+                let (mut bi, mut bm, mut got) = (best_ip, best_m, 0u64);
+                while bi > anchor && bm > frame_start_c && back_eq(src, bi, bm) {
+                    bi -= 1;
+                    bm -= 1;
+                    got += 1;
+                }
+                DFAST_BEXT_SEQS.fetch_add(1, Relaxed);
+                if got > 0 {
+                    DFAST_BEXT_BYTES.fetch_add(got, Relaxed);
+                    DFAST_BEXT_MATCHES.fetch_add(1, Relaxed);
+                }
+            }
+            // BACK-EXTENSION. Mirrors `emit_fast_seq_body`'s walk: same guards,
+            // same `back_eq`. `best_ip` and `best_m` fall together so the OFFSET
+            // is unchanged, and `best_ip + best_ml` is unchanged -- only the
+            // literal/match split moves, which is the whole point.
+            //
+            // `found_ip` is the PRE-extension position and the fills below use
+            // it, exactly as L1's emitter passes `found_ip` to
+            // `fill_fast_after_match` rather than the walked-back `ip`. Filling
+            // from the extended position would change which slots the table
+            // holds, which is a different change with a different verdict.
+            let found_ip = best_ip;
+            if bext_c {
+                while best_ip > anchor && best_m > frame_start_c && back_eq(src, best_ip, best_m) {
+                    best_ip -= 1;
+                    best_m -= 1;
+                    best_ml += 1;
+                }
+            }
             // commit at `best_ip`, which is `ip+1` when the next-long probe won
             push_literals(&mut lits, src, anchor, best_ip, lp_w);
             seqs.push(Seq {
@@ -8876,23 +9491,25 @@ fn find_dfast_impl_inner<const HLOG: u32>(
             }
             let end = best_ip + best_ml;
             // DFast never sets `packed` (it is gated on Strategy::Fast).
-            fill_hash_after_match(
-                tables, src, best_ip, end, fill_ends, smask, dtag_shift, ilimit,
-            );
             // GATE 12 @ L3: `ip` here is the PRE-probe position; when the
             // next-long probe won, `best_ip == ip + 1` and the two tables index
             // different positions for one match. See `dfast_fill_anchor_c`.
-            let long_anchor = if fill_anchor_c { best_ip } else { ip };
-            fill_hash_long_after_match(
+            let long_anchor = if fill_anchor_c { found_ip } else { ip };
+            // FUSED: one walk over both tables. See `fill_dfast_after_match`.
+            fill_dfast_after_match(
                 tables,
                 src,
+                found_ip,
                 long_anchor,
                 end,
-                hlog,
                 fill_ends,
                 smask,
                 dtag_shift,
+                dlong_shift,
                 ilimit,
+                fill_packed,
+                fill_stag_live,
+                fill_ltag_live,
             );
             // GATE 12 @ L3: the density knob DFast never had. Off by default.
             let dfs = fill_stride;
@@ -8919,7 +9536,10 @@ fn find_dfast_impl_inner<const HLOG: u32>(
                     let ltp = tables.ltags.as_mut_ptr();
                     while p < stop {
                         let (h, g) = hash4_tag_mls(src, p, hash_shift, smask);
-                        let h8 = hash8(src, p, hlog);
+                        // W43: resolved shift -- this loop had hoisted its
+                        // four table BASES and still re-derived the hash shift
+                        // on every stored position.
+                        let h8 = hash8_shift(src, p, dlong_shift);
                         debug_assert!(h < tables.hash.len() && h8 < tables.hash_long.len());
                         // SAFETY: `h` and `h8` are the hash shifts' own outputs,
                         // bounded by the table lengths exactly as the accessors
@@ -8958,35 +9578,10 @@ fn find_dfast_impl_inner<const HLOG: u32>(
             ip += dstep + ((ip - anchor) >> accel);
         }
     }
-    tables.rep_yield = if seqs.is_empty() {
-        1.0
-    } else {
-        (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * rep_decay())
-    };
-    tables.rep_probe = if tables.rep_probe == 0 {
-        REP_PROBE_PERIOD
-    } else {
-        tables.rep_probe - 1
-    };
-    // Optimistic when the probe never fired, so a quiet block cannot latch it
-    // off permanently; otherwise the measured hit share, floored at half the
-    // previous value so one bad block does not kill it outright.
-    // GATE 8 signal: share of speculated loads that were actually CONSUMED. A
-    // speculation is discarded whenever the position ends in a match or a rep
-    // hit, so match-dense content pays for loads it never uses.
-    // T2: these three are DIAGNOSTICS, and leaving them ungated kept `mm_total`
-    // live across the whole search loop for no shipping purpose. The gate signal
-    // below is computed from `spec_used`/`spec_made` directly, not from the
-    // atomics, so gating the atomics costs no dispatch anything. The `nl_probes`
-    // block immediately after this one was already gated exactly this way.
-    //
-    // The DFast hot loop is only 151 instructions but carries 27 stack reloads,
-    // 23 of them loop-invariant across 12 slots -- it is short of registers, and
-    // what it is spending them on is the gates' own telemetry.
-    // Attribute only when the pipeline actually RAN: a block that speculated
-    // nothing measures nothing, and scoring it 1.0 would make the gate
-    // oscillate on/off every block. EWMA for the same reason Gate 6 needs one --
-    // one cold or atypical block must not decide the whole frame.
+    // THE SHIPPING EPILOGUE IS ONE NON-GENERIC CALL, stamped once instead of
+    // once per HLOG copy (five in this symbol) -- the `fast_finder_epilogue`
+    // treatment. The `#[cfg(profile)]` census flushes stay here: they are
+    // cfg'd out of shipping builds and reference profile-only locals.
     let spec_used = spec_made
         .saturating_sub(spec_dropped)
         .saturating_sub(u64::from(carried.live));
@@ -8997,27 +9592,10 @@ fn find_dfast_impl_inner<const HLOG: u32>(
         DFAST_SPEC_MADE.fetch_add(spec_made, Relaxed);
         DFAST_SPEC_USED.fetch_add(spec_used, Relaxed);
     }
-    if dpipe && spec_made > 0 {
-        let now = spec_used as f32 / spec_made as f32;
-        tables.dfast_spec_yield = 0.75 * tables.dfast_spec_yield + 0.25 * now;
-    }
-    // Periodic re-probe, so a block that scores low cannot latch the gate shut
-    // for the rest of the frame. This epilogue always runs (the only early
-    // return is the empty-block case), unlike `find_fast`'s, where putting the
-    // tick in the tail is exactly what latched Gate 6.
-    tables.dfast_probe = if tables.dfast_probe == 0 {
-        DFAST_PROBE_PERIOD
-    } else {
-        tables.dfast_probe - 1
-    };
-    // The mean-ml EWMA below is the SHIPPING consumer of this sum; the atomic
-    // publishes are gate-harness diagnostics (`take_dfast_match_stats`,
-    // `take_dfast_rep_blocks`) and shipped as EIGHT lock-prefixed RMWs plus a
-    // SECOND O(nseq) walk per block. Sum once, publish under `profile` only.
-    let mb: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
     #[cfg(feature = "profile")]
     {
         use core::sync::atomic::Ordering::Relaxed;
+        let mb: u64 = seqs.iter().map(|q| q.matchlen as u64).sum();
         DFAST_MATCH_BYTES.fetch_add(mb, Relaxed);
         DFAST_SEQS.fetch_add(seqs.len() as u64, Relaxed);
         DFAST_BLOCK_BYTES.fetch_add((block_end - block_start) as u64, Relaxed);
@@ -9032,18 +9610,6 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     #[cfg(not(feature = "profile"))]
     let _ = d_rep_bytes;
     // EWMA so one atypical block cannot flip the route -- the Gate 6 lesson.
-    {
-        let now = if seqs.is_empty() {
-            0.0
-        } else {
-            mb as f32 / seqs.len() as f32
-        };
-        tables.dfast_mean_ml = if tables.dfast_mean_ml == 0.0 && now == 0.0 {
-            0.0
-        } else {
-            0.75 * tables.dfast_mean_ml + 0.25 * now
-        };
-    }
     #[cfg(feature = "profile")]
     {
         use core::sync::atomic::Ordering::Relaxed;
@@ -9053,36 +9619,10 @@ fn find_dfast_impl_inner<const HLOG: u32>(
     // GATE 14 @ L3: feed this block's measured offset trade to the next block.
     // Attribute ONLY when the band actually fired -- a block that measured
     // nothing must not move the EWMA, which is what would latch the gate.
-    if band_hits > 0 {
-        let now = band_worse as f32 / band_hits as f32;
-        tables.nl_off_worse = if tables.nl_band_meas == 0 {
-            now
-        } else {
-            0.75 * tables.nl_off_worse + 0.25 * now
-        };
-        tables.nl_band_meas = tables.nl_band_meas.saturating_add(1);
-    }
-    tables.nl_band_probe = if tables.nl_band_probe == 0 {
-        NL_BAND_PERIOD
-    } else {
-        tables.nl_band_probe - 1
-    };
-    tables.next_long_yield = if nl_probes == 0 {
-        1.0
-    } else {
-        (nl_hits as f32 / nl_probes as f32).max(tables.next_long_yield * 0.5)
-    };
-    push_lits_range(&mut lits, src, anchor, block_end);
-    // GATE 13 @ L3 FOLLOW-UP: `find_dfast` READ `last_nseq` to size its `seqs`
-    // reservation but never WROTE it -- only `find_fast` did, and L3 never calls
-    // `find_fast`. So the field sat at its initial 0 for the whole frame and the
-    // guess collapsed to the `+ 64` floor, while DFast emits 5,685-13,763
-    // sequences per block: the reservation was ~100x short and `seqs` still grew
-    // by realloc (1,648 growths across the corpus).
-    //
-    // A capacity hint cannot affect output, so this is byte-identical.
-    tables.last_nseq = seqs.len();
-    note_finder_work(COUNT, probes, hits, &seqs, &lits);
+    dfast_finder_epilogue(
+        tables, src, &seqs, &mut lits, anchor, block_end, rep_hits, spec_used, spec_made, dpipe,
+        nl_probes, nl_hits, band_worse, band_hits, probes, hits,
+    );
     (seqs, lits)
 }
 
@@ -9259,32 +9799,12 @@ fn find_greedy(
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    // The chain-ladder hot loops hash with RUNTIME hash_log -- per-position
-    // CL-shifts. The twin compiles the same selector and impls with BMI2.
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if crate::simd::has_bmi2() {
-        // SAFETY: runtime CPUID guard; identical body.
-        #[allow(unsafe_code)]
-        return unsafe {
-            find_greedy_bmi2(src, block_start, block_end, window, params, tables, reps)
-        };
-    }
-    find_greedy_sel(src, block_start, block_end, window, params, tables, reps)
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "bmi2,lzcnt")]
-#[allow(clippy::too_many_arguments)]
-#[allow(unsafe_code)]
-unsafe fn find_greedy_bmi2(
-    src: &[u8],
-    block_start: usize,
-    block_end: usize,
-    window: usize,
-    params: CompressionParameters,
-    tables: &mut MatchTables,
-    reps: [u32; 3],
-) -> (Vec<Seq>, Vec<u8>) {
+    // TWIN RETIRED on its ISA density. Measured on the emitted asm: 1234
+    // instructions of duplicated body converting 10 BMI2 ops -- 123 instructions
+    // per op. The campaign's own precedent decides this: W4/W5/W6 retired the
+    // HLOG and (hash_log, chain_log) specialisations on exactly the argument
+    // that `shr %cl` and `shrx` are both one uop on every CPU that HAS BMI2,
+    // and those were per-position paths too. Consistency, not a new judgement.
     find_greedy_sel(src, block_start, block_end, window, params, tables, reps)
 }
 
@@ -9303,11 +9823,48 @@ fn find_greedy_sel(
     // mls_eq mask, the mls-branches and the hash path to constants. MLS = 0
     // is the runtime arm, served by the SAME body (the find_dfast_runtime
     // drift lesson).
-    if params.min_match.max(3) == 5 {
-        find_greedy_impl::<5>(src, block_start, block_end, window, params, tables, reps)
+    // W12: ONE CALL SITE. `find_greedy_impl` is `#[inline(always)]`, so the
+    // two arms inlined two ~1,100-instruction bodies; `MLS`'s entire reach is
+    // `let mls = if MLS == 0 { params.min_match.max(3) } else { MLS };`, after
+    // which `mls` is an ordinary runtime value in length comparisons. Same
+    // shape as `find_fast`'s HLOG (W4/W5) and `find_dfast`'s (W11), and the
+    // same correction applies: killing the const is only half of it -- the
+    // second call site has to go too, or six-or-two inline expansions remain.
+    find_greedy_impl::<0>(src, block_start, block_end, window, params, tables, reps)
+}
+
+/// Scratch acquisition + the too-short-block exit shared by `find_greedy_impl`,
+/// `find_lazy_impl` and `find_bt_lazy` (and through them their bmi2 twins).
+/// Runs once per block; `#[inline(never)]`.
+#[inline(never)]
+#[allow(clippy::type_complexity)]
+fn chain_finder_prologue(
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    tables: &mut MatchTables,
+) -> Result<(Vec<Seq>, Vec<u8>), (Vec<Seq>, Vec<u8>)> {
+    let keep = finder_scratch_enabled();
+    let seqs = if keep {
+        let mut v = core::mem::take(&mut tables.seq_scratch);
+        v.clear();
+        v
     } else {
-        find_greedy_impl::<0>(src, block_start, block_end, window, params, tables, reps)
+        Vec::new()
+    };
+    let mut lits = if keep {
+        let mut v = core::mem::take(&mut tables.lit_scratch);
+        v.clear();
+        v
+    } else {
+        Vec::new()
+    };
+    let ilimit = block_end.saturating_sub(8);
+    if block_start >= ilimit {
+        lits.extend_from_slice(&src[block_start..block_end]);
+        return Err((seqs, lits));
     }
+    Ok((seqs, lits))
 }
 
 #[inline(always)]
@@ -9353,27 +9910,15 @@ fn find_greedy_impl<const MLS: usize>(
     // plumbing was in place and only these finders were missing from it.
     // W4: `finder_scratch_enabled()` is an arm read, and it was read TWICE
     // -- once per output buffer -- for one per-block answer.
-    let keep = finder_scratch_enabled();
-    let mut seqs = if keep {
-        let mut v = core::mem::take(&mut tables.seq_scratch);
-        v.clear();
-        v
-    } else {
-        Vec::new()
-    };
-    let mut lits = if keep {
-        let mut v = core::mem::take(&mut tables.lit_scratch);
-        v.clear();
-        v
-    } else {
-        Vec::new()
+    // Scratch + the too-short-block exit, ONE copy for Greedy/Lazy/BtLazy and
+    // their bmi2 twins -- six stamps of the identical idiom become one call
+    // (the `fast_finder_prologue` treatment, chain-finder variant).
+    let (mut seqs, mut lits) = match chain_finder_prologue(src, block_start, block_end, tables) {
+        Ok(t) => t,
+        Err(out) => return out,
     };
     let mut anchor = block_start;
     let ilimit = block_end.saturating_sub(8);
-    if block_start >= ilimit {
-        lits.extend_from_slice(&src[block_start..block_end]);
-        return (seqs, lits);
-    }
 
     // W5: GATE 6 for Greedy. Both output buffers came from the frame but with
     // NO RESERVE, so they grew by repeated `realloc` with LIVE contents --
@@ -9438,6 +9983,12 @@ fn find_greedy_impl<const MLS: usize>(
     // POSITION (the head hash) and per FILLED POSITION, for one per-block
     // answer. `src.len()` beside it is a slice field re-read the same way.
     let wide_h = mls >= 8;
+    // W36/W44: the two hash shifts, once per block. Both the MAIN loop's
+    // per-position hash and the post-match fill re-derived `min` +
+    // `saturating_sub` from `hash_log` -- the fill twice per matched byte,
+    // the loop once per searched position.
+    let g_shift32 = 32u32.saturating_sub(hash_log.min(32));
+    let g_shift64 = 64u32.saturating_sub(hash_log.min(32));
     let src_len = src.len();
     // The searches/byte signal feeds the wide latch's second route; greedy
     // never maintained it, so at L5 the field held its 1.0 INIT and the
@@ -9461,12 +10012,13 @@ fn find_greedy_impl<const MLS: usize>(
             }
         }
         searches += 1;
+        // W44: resolved shifts, same as the fill below.
         let (h, gtag) = if wide_h && ip + 8 <= src_len {
-            (hash8(src, ip, hash_log), 0u8)
+            (hash8_shift(src, ip, g_shift64), 0u8)
         } else if wchain {
-            hash_wide_link_tag(src, ip, hash_log, smask)
+            hash_wide_link_tag_shift(src, ip, g_shift64, smask)
         } else {
-            hash4_link_tag(src, ip, hash_log, smask)
+            hash4_tag_mls(src, ip, g_shift32, smask)
         };
         let (prev, head_tag) = tables.lz_insert(h, ip, gtag, cp, ca, chain_mask);
 
@@ -9480,7 +10032,9 @@ fn find_greedy_impl<const MLS: usize>(
             // See `chain_find_best`: the three per-step validity tests fold
             // to one monotone bound; `m >= ip` is entry-only.
             let low = lowest_rep.max(ip.saturating_sub(window));
-            if m < ip && ip + mls <= src.len() {
+            // W48: `src_len` has been hoisted at block scope since W2; this
+            // walk-entry guard kept re-reading the slice field anyway.
+            if m < ip && ip + mls <= src_len {
                 let mut missed_before = false;
                 for _ in 0..attempts {
                     if m < low {
@@ -9630,20 +10184,34 @@ fn find_greedy_impl<const MLS: usize>(
             // two bounds it tested on every inserted position fold to one.
             let stop = end.min(ilimit + 1);
             let mut p = ip + 1;
-            while p < stop {
-                let (hh, gt) = if wide_h && p + 8 <= src_len {
-                    (hash8(src, p, hash_log), 0u8)
+            // W37: the hash MODE is a block constant; it was re-asked on every
+            // inserted position. Hoisted, so each arm's body is one hash and
+            // one insert -- and the two non-wide arms shed the
+            // `p + 8 <= src_len` test that only the 8-byte hash needs.
+            //
+            // W10 stands: `lz_insert_only` is the entry for callers that
+            // discard the result.
+            macro_rules! g_fill {
+                ($hash:expr) => {{
+                    while p < stop {
+                        let (hh, gt) = $hash;
+                        tables.lz_insert_only::<true>(hh, p, gt, cp, ca, chain_mask);
+                        p += 1;
+                    }
+                }};
+            }
+            if wide_h {
+                g_fill!(if p + 8 <= src_len {
+                    (hash8_shift(src, p, g_shift64), 0u8)
                 } else if wchain {
-                    hash_wide_link_tag(src, p, hash_log, smask)
+                    hash_wide_link_tag_shift(src, p, g_shift64, smask)
                 } else {
-                    hash4_link_tag(src, p, hash_log, smask)
-                };
-                // W10: the fill DISCARDS the insert's result, but `lz_insert`
-                // still built it -- unmasking the old head and wrapping it in
-                // an `Option` -- on every covered position, and this fill
-                // strides ONE byte, so that is once per matched byte.
-                tables.lz_insert_only(hh, p, gt, cp, ca, chain_mask);
-                p += 1;
+                    hash4_tag_mls(src, p, g_shift32, smask)
+                });
+            } else if wchain {
+                g_fill!(hash_wide_link_tag_shift(src, p, g_shift64, smask));
+            } else {
+                g_fill!(hash4_tag_mls(src, p, g_shift32, smask));
             }
             ip = end;
             anchor = ip;
@@ -9651,6 +10219,46 @@ fn find_greedy_impl<const MLS: usize>(
             ip += 1;
         }
     }
+    greedy_finder_epilogue(
+        tables,
+        src,
+        &seqs,
+        &mut lits,
+        anchor,
+        block_start,
+        block_end,
+        rep_hits,
+        walk_cont,
+        wcls,
+        attempts,
+        searches,
+        probes,
+        hits,
+    );
+    (seqs, lits)
+}
+
+/// The per-block tail of `find_greedy_impl`, shared with its bmi2 twin --
+/// the `fast_finder_epilogue` treatment at x2 scale. Runs once per block.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn greedy_finder_epilogue(
+    tables: &mut MatchTables,
+    src: &[u8],
+    seqs: &[Seq],
+    lits: &mut Vec<u8>,
+    anchor: usize,
+    block_start: usize,
+    block_end: usize,
+    rep_hits: u64,
+    walk_cont: bool,
+    wcls: (u32, u32),
+    attempts: usize,
+    searches: u64,
+    probes: u64,
+    hits: u64,
+) {
+    const COUNT: bool = cfg!(feature = "profile");
     tables.rep_yield = if seqs.is_empty() {
         1.0
     } else {
@@ -9659,9 +10267,8 @@ fn find_greedy_impl<const MLS: usize>(
     update_walk_first_share(tables, walk_cont, wcls, attempts);
     let span = (block_end - block_start).max(1) as f32;
     tables.last_search_per_byte = searches as f32 / span;
-    push_lits_range(&mut lits, src, anchor, block_end);
-    note_finder_work(COUNT, probes, hits, &seqs, &lits);
-    (seqs, lits)
+    push_lits_range(lits, src, anchor, block_end);
+    note_finder_work(COUNT, probes, hits, seqs, lits);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9696,6 +10303,20 @@ pub(crate) struct ChainCtx<'a> {
     wchain: bool,
     /// W2: `mls >= 8`, the hash-width question, answered once per block.
     wide_hash: bool,
+    /// W24: `wchain` and `wide_hash` as ONE byte -- bit 0 is the wide-chain
+    /// key, bit 1 the 8-byte hash. `row_find_best` is `inline(never)` behind a
+    /// fn pointer, so nothing hoists across positions and every `ChainCtx`
+    /// field it names is a real per-position load; two bools were two.
+    hash_mode: u8,
+    /// W20: `32 - hash_log` and `64 - hash_log`, the two hash shifts. Both are
+    /// block constants that `hash4_link_tag` and `hash8` re-derived from
+    /// `hash_log` on EVERY position -- a `min` and a `saturating_sub` each.
+    hash_shift32: u32,
+    hash_shift64: u32,
+    /// W21: `lowest.max(1)`. The row walk clamps the window floor to 1 so the
+    /// empty-slot sentinel folds into it (14.7 W6); the `.max(1)` is a block
+    /// constant that was being re-applied per position.
+    lowest1: usize,
     /// W4: `block_start.saturating_sub(window).max(frame_start)` -- a
     /// saturating sub, a max and a struct load, rebuilt on every call for a
     /// value the caller already computes as `lowest_rep`.
@@ -9708,39 +10329,181 @@ pub(crate) struct ChainCtx<'a> {
 type ChainFn =
     for<'a> fn(&ChainCtx<'a>, usize, bool, &mut (u32, u32), &mut MatchTables) -> (usize, usize);
 
+/// E1: the ROW walk -- one dependent load per ROW instead of per CANDIDATE.
+///
+/// Conforms to `ChainFn`, so it is a drop-in for `chain_find_best` at the
+/// dispatch. It does NOT walk the chain at all: the row's 16 tags come back in
+/// one load, `row_tag_mask` compares them in one instruction, and the set bits
+/// are the candidates -- already ordered newest-first, i.e. nearest-offset
+/// first, which is what makes taking the first acceptable match sound.
+///
+/// `walk_cont` and `cls` are the CHAIN walk's amputation-recovery machinery:
+/// the chain broke on the first tag mismatch and `walk_cont` let it carry on.
+/// A row has no links to break, so there is nothing to continue past and
+/// nothing to classify -- every candidate in the row is visited regardless.
+///
+/// Bitstream-CHANGING; see `set_row_arm`.
+#[inline(never)]
+fn row_find_best<const MLS: usize>(
+    ctx: &ChainCtx,
+    ip: usize,
+    _walk_cont: bool,
+    _cls: &mut (u32, u32),
+    tables: &mut MatchTables,
+) -> (usize, usize) {
+    let ChainCtx {
+        src,
+        block_end,
+        window,
+        mls,
+        attempts,
+        smask,
+        hash_mode,
+        hash_shift32,
+        hash_shift64,
+        lowest1,
+        ..
+    } = *ctx;
+    // W23: `hash_log` is gone from this destructure -- W20/W22 handed the two
+    // shifts derived from it straight in, so the finder no longer loads it.
+    // W14: `cp`, `ca` and `chain_mask` are gone from this destructure -- they
+    // existed only to drive the chain writes section 14.8 proved dead, so the
+    // row finder no longer loads them from `ChainCtx` at all.
+    let mls = if MLS == 0 { mls } else { MLS };
+    // W9: `src.len()` is a slice field re-read; both uses below want the same
+    // per-call value.
+    let src_len = src.len();
+    // W20/W22/W24: one mode byte, and all three shifts arrive resolved.
+    // Arm order is exactly the original `wide_hash && fits`, then `wchain`,
+    // then the 4-byte key -- including the case where a wide-hash block near
+    // the buffer end falls through to the wide-chain arm.
+    let (h, gtag) = if hash_mode & 2 != 0 && ip + 8 <= src_len {
+        (hash8_shift(src, ip, hash_shift64), 0u8)
+    } else if hash_mode & 1 != 0 {
+        hash_wide_link_tag_shift(src, ip, hash_shift64, smask)
+    } else {
+        hash4_tag_mls(src, ip, hash_shift32, smask)
+    };
+    // W11: probe returns the WALK STATE, not a collected array. The row is
+    // still read strictly before `ip` is inserted -- the insert now sits below
+    // the walk instead of the walk being pre-materialised above it, which is
+    // the same snapshot with none of the copying.
+    let r = tables.rows.row_of(h);
+    let (mut w, rhead, row, rat) = tables.rows.probe_view(r, gtag);
+    #[cfg(feature = "profile")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        ROW_LOADS.fetch_add(1, Relaxed);
+        ROW_BUCKET[4].fetch_add(1, Relaxed);
+        if gtag == 0 {
+            ROW_BUCKET[3].fetch_add(1, Relaxed);
+        }
+    }
+
+    const COUNT: bool = cfg!(feature = "profile");
+    let mut probes = 0u64;
+    let mut best_m = 0usize;
+    let mut best_ml = 0usize;
+    // W7's acceptance bar, unchanged: `best_ml` is 0 or already >= mls, so one
+    // compare against a running bar replaces two.
+    let mut bar = mls;
+    if ip + mls > src_len {
+        tables.lz_insert_rowknown(r, rat, rhead, ip, gtag);
+        return (0, 0);
+    }
+    // W6: `.max(1)` folds the empty-slot sentinel INTO the window floor.
+    // Position 0 is the sentinel and can never be a real candidate, so
+    // `m == 0` and `m < low` become the same rejection.
+    let low = lowest1.max(ip.saturating_sub(window));
+    // W10: an acceptable candidate needs `low <= m < ip`. When that range is
+    // empty the whole walk cannot produce one, and the old code discovered
+    // this by rejecting every candidate in turn. It also makes W7's fused
+    // compare sound, by guaranteeing `low <= ip`.
+    if ip <= low {
+        tables.lz_insert_rowknown(r, rat, rhead, ip, gtag);
+        return (0, 0);
+    }
+    let span = ip - low;
+    // W15: the attempt budget is applied to the MASK, once, instead of counted
+    // down per candidate. Section 14.9's census measured 4.83 candidates per
+    // probe against `attempts = 1 << search_log` (32 at L9, 64+ at L12), so the
+    // countdown fired on essentially no walk yet cost a decrement, a compare
+    // and a branch on all 86.9M of them. Trimming instead: the walk visits set
+    // bits from the high end, so "the newest `attempts` candidates" is "clear
+    // the lowest set bits until popcount == attempts" -- and `w &= w - 1`
+    // clears exactly the lowest. The fixup loop runs only when a row actually
+    // over-delivers, which the census says is rare; the walk itself is then
+    // unconditional.
+    let mut extra = (w.count_ones() as usize).saturating_sub(attempts);
+    while extra != 0 {
+        w &= w - 1;
+        extra -= 1;
+    }
+    while w != 0 {
+        // W11's walk, inline: highest set bit is the newest slot.
+        let b = (crate::rowfind::ROW as u32 - 1) - w.leading_zeros();
+        w &= !(1u16 << b);
+        let s = ((b + rhead) & (crate::rowfind::ROW as u32 - 1)) as usize;
+        let m = row[s] as usize;
+        // W7: THREE rejects, ONE compare. `m - low` is borrow-free exactly
+        // when `m >= low`, and below `span` exactly when `m < ip`; the
+        // sentinel rides along via W6. Same accepted set, one branch.
+        if m.wrapping_sub(low) >= span {
+            continue;
+        }
+        if COUNT {
+            probes += 1;
+            #[cfg(feature = "profile")]
+            ROW_EXAM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(feature = "profile")]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            ROW_BUCKET[0].fetch_add(1, Relaxed);
+            if m + 8 <= src_len {
+                let hm = if hash_mode & 2 != 0 && m + 8 <= src_len {
+                    hash8_shift(src, m, hash_shift64)
+                } else if hash_mode & 1 != 0 {
+                    hash_wide_link_tag_shift(src, m, hash_shift64, smask).0
+                } else {
+                    hash4_tag_mls(src, m, hash_shift32, smask).0
+                };
+                if hm == h {
+                    ROW_BUCKET[1].fetch_add(1, Relaxed);
+                }
+            }
+            if mls_eq(src, m, ip, mls, smask) {
+                ROW_BUCKET[2].fetch_add(1, Relaxed);
+            }
+        }
+        if mls_eq(src, m, ip, mls, smask) {
+            // C's `match[ml] == ip[ml]` prefilter, same as the chain walk.
+            if best_ml == 0 || pre_eq(src, m, ip, best_ml) {
+                let ml = mls + count_match_fast(src, m + mls, ip + mls, block_end);
+                if ml >= bar {
+                    best_ml = ml;
+                    best_m = m;
+                    bar = ml + 1;
+                    if ip + best_ml >= block_end {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // W11's other half: the insert the walk was moved above. `row` (a borrow of
+    // `tables.rows`) is dead by here, so the mutable borrow is free to start --
+    // and every early return above does its own insert, so this path is reached
+    // exactly when the walk ran.
+    tables.lz_insert_rowknown(r, rat, rhead, ip, gtag);
+    if COUNT {
+        crate::prof::note_probes(probes);
+    }
+    (best_m, best_ml)
+}
+
 #[inline(never)]
 fn chain_find_best<const MLS: usize>(
-    ctx: &ChainCtx,
-    ip: usize,
-    walk_cont: bool,
-    cls: &mut (u32, u32),
-    tables: &mut MatchTables,
-) -> (usize, usize) {
-    chain_find_best_inner::<MLS>(ctx, ip, walk_cont, cls, tables)
-}
-
-/// Safe `ChainFn`-shaped wrapper; handed out only behind `has_bmi2()`.
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-fn chain_find_best_bmi2_ptr<const MLS: usize>(
-    ctx: &ChainCtx,
-    ip: usize,
-    walk_cont: bool,
-    cls: &mut (u32, u32),
-    tables: &mut MatchTables,
-) -> (usize, usize) {
-    // SAFETY: only selected under the caller's CPUID guard.
-    #[allow(unsafe_code)]
-    unsafe {
-        chain_find_best_bmi2::<MLS>(ctx, ip, walk_cont, cls, tables)
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "bmi2,lzcnt")]
-#[allow(clippy::too_many_arguments)]
-#[allow(unsafe_code)]
-#[inline(never)]
-unsafe fn chain_find_best_bmi2<const MLS: usize>(
     ctx: &ChainCtx,
     ip: usize,
     walk_cont: bool,
@@ -9784,6 +10547,10 @@ fn chain_find_best_inner<const MLS: usize>(
         wide_hash,
         lowest,
         tag_filter,
+        // W45: both shifts, resolved by `ChainCtx` since 14.9's W20.
+        hash_shift32,
+        hash_shift64,
+        ..
     } = *ctx;
     debug_assert_eq!(tag_filter, cp || ca);
     let mls = if MLS == 0 { mls } else { MLS };
@@ -9801,12 +10568,18 @@ fn chain_find_best_inner<const MLS: usize>(
             (1u64 << (8 * mls)) - 1
         }
     );
-    let (h, gtag) = if wide_hash && ip + 8 <= src.len() {
-        (hash8(src, ip, hash_log), 0u8)
+    // W45: `ChainCtx` has carried both shifts resolved since 14.9's W20 --
+    // the ROW finder consumed them and the CHAIN walk, one function away, kept
+    // re-deriving them per searched position.
+    // W49: and `src.len()` twice more, for the same reason the row finder
+    // hoisted it (W9).
+    let src_len = src.len();
+    let (h, gtag) = if wide_hash && ip + 8 <= src_len {
+        (hash8_shift(src, ip, hash_shift64), 0u8)
     } else if wchain {
-        hash_wide_link_tag(src, ip, hash_log, smask)
+        hash_wide_link_tag_shift(src, ip, hash_shift64, smask)
     } else {
-        hash4_link_tag(src, ip, hash_log, smask)
+        hash4_tag_mls(src, ip, hash_shift32, smask)
     };
     let (prev, head_tag) = tables.lz_insert(h, ip, gtag, cp, ca, chain_mask);
     // P0/gg-matchfind: candidate examinations are the WORK COUNTER, the primary
@@ -9819,6 +10592,8 @@ fn chain_find_best_inner<const MLS: usize>(
     // W7: the acceptance bar -- see the accept test.
     let mut bar = mls;
     let Some(mut m) = prev else {
+        #[cfg(feature = "profile")]
+        WALK_EXIT[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return (0, 0);
     };
     let mut mtag = head_tag;
@@ -9833,10 +10608,17 @@ fn chain_find_best_inner<const MLS: usize>(
     // per-walk constant. `ip - m > window  <=>  m < ip - window` for m < ip.
     let low = lowest.max(ip.saturating_sub(window));
     let mut missed_before = false;
-    if m < ip && ip + mls <= src.len() {
+    if m < ip && ip + mls <= src_len {
+        // 5 = ran the full depth; each `break` below overwrites it.
+        #[cfg(feature = "profile")]
+        let mut exit_why = 5usize;
         for _ in 0..attempts {
             // Monotone: m only decreases, so one bound test per step.
             if m < low {
+                #[cfg(feature = "profile")]
+                {
+                    exit_why = 2;
+                }
                 break;
             }
             // Link-tag reject: skip `mls_eq`'s src[m] load on a tag byte the
@@ -9857,82 +10639,77 @@ fn chain_find_best_inner<const MLS: usize>(
                 if !walk_cont {
                     break;
                 }
-                let link = tables.chain_masked(m & chain_mask);
-                let next = if cp {
-                    (link & 0x00FF_FFFF) as usize
-                } else {
-                    link as usize
-                };
-                if next >= m {
-                    break;
+                // DUPLICATE ADVANCE REMOVED: this branch carried its own copy
+                // of the chain-link step and `continue`d past the shared one at
+                // the loop bottom. Same code -- `tag_filter == cp || ca`, so
+                // inside this branch `!cp` implies `ca`, and its unconditional
+                // `ctags_masked` IS the bottom's `else if ca`. ~95% of steps at
+                // L9 end in an advance, so the copy was on the hot edge.
+            } else {
+                if COUNT {
+                    probes += 1;
+                    #[cfg(feature = "profile")]
+                    WALK_EXAM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
-                mtag = if cp {
-                    (link >> 24) as u8
-                } else {
-                    tables.ctags_masked(m & chain_mask)
-                };
-                m = next;
-                continue;
-            }
-            if COUNT {
-                probes += 1;
-                #[cfg(feature = "profile")]
-                WALK_EXAM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            }
-            if mls_eq(src, m, ip, mls, smask) {
-                // C's `match[ml] == ip[ml]` prefilter -- see `find_greedy`.
-                if best_ml == 0 || pre_eq(src, m, ip, best_ml) {
-                    // Count from the byte AFTER what mls_eq just verified --
-                    // restarting at 0 re-compared the first word of every
-                    // candidate (the fast_probe_wide rule, applied here).
-                    let ml = mls + count_match_fast(src, m + mls, ip + mls, block_end);
-                    // offset_ok and the frame_start floor are GUARANTEED by
-                    // the walk bound (m >= low >= lowest >= frame_start,
-                    // m >= ip - window, m < ip); re-checking per accept was
-                    // pure redundancy.
-                    //
-                    // W7: `ml >= mls && ml > best_ml` is two compares and two
-                    // branches per accepted candidate, but `best_ml` is only
-                    // ever assigned a value that already cleared `mls` -- so
-                    // it is 0 or >= mls, and the pair is one compare against
-                    // a running bar. (The same fold REGRESSED in the Bt walk,
-                    // where the extra live value spilled `best_m`; this loop
-                    // carries fewer, so it is re-measured here, not assumed.)
-                    if ml >= bar {
-                        if missed_before {
-                            if best_ml == 0 {
-                                cls.0 += 1;
-                            } else {
-                                cls.1 += 1;
-                            }
-                            #[cfg(feature = "profile")]
-                            if COUNT {
-                                use core::sync::atomic::Ordering::Relaxed;
+                if mls_eq(src, m, ip, mls, smask) {
+                    // C's `match[ml] == ip[ml]` prefilter -- see `find_greedy`.
+                    if best_ml == 0 || pre_eq(src, m, ip, best_ml) {
+                        // Count from the byte AFTER what mls_eq just verified --
+                        // restarting at 0 re-compared the first word of every
+                        // candidate (the fast_probe_wide rule, applied here).
+                        let ml = mls + count_match_fast(src, m + mls, ip + mls, block_end);
+                        // offset_ok and the frame_start floor are GUARANTEED by
+                        // the walk bound (m >= low >= lowest >= frame_start,
+                        // m >= ip - window, m < ip); re-checking per accept was
+                        // pure redundancy.
+                        //
+                        // W7: `ml >= mls && ml > best_ml` is two compares and two
+                        // branches per accepted candidate, but `best_ml` is only
+                        // ever assigned a value that already cleared `mls` -- so
+                        // it is 0 or >= mls, and the pair is one compare against
+                        // a running bar. (The same fold REGRESSED in the Bt walk,
+                        // where the extra live value spilled `best_m`; this loop
+                        // carries fewer, so it is re-measured here, not assumed.)
+                        if ml >= bar {
+                            if missed_before {
                                 if best_ml == 0 {
-                                    WALK_CONT_FIRST.fetch_add(1, Relaxed);
+                                    cls.0 += 1;
                                 } else {
-                                    WALK_CONT_UPGRADE.fetch_add(1, Relaxed);
+                                    cls.1 += 1;
+                                }
+                                #[cfg(feature = "profile")]
+                                if COUNT {
+                                    use core::sync::atomic::Ordering::Relaxed;
+                                    if best_ml == 0 {
+                                        WALK_CONT_FIRST.fetch_add(1, Relaxed);
+                                    } else {
+                                        WALK_CONT_UPGRADE.fetch_add(1, Relaxed);
+                                    }
                                 }
                             }
-                        }
-                        best_ml = ml;
-                        best_m = m;
-                        bar = ml + 1;
-                        if ip + best_ml >= block_end {
-                            break;
+                            best_ml = ml;
+                            best_m = m;
+                            bar = ml + 1;
+                            if ip + best_ml >= block_end {
+                                #[cfg(feature = "profile")]
+                                {
+                                    exit_why = 4;
+                                }
+                                break;
+                            }
                         }
                     }
-                }
-            } else {
-                missed_before = true;
-                #[cfg(feature = "profile")]
-                if COUNT {
-                    WALK_BYTEMISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                }
-                // A byte mismatch is a hash collision, not a wall: C steps to
-                // the next link. Legacy arm preserves the historical break.
-                if !walk_cont {
-                    break;
+                } else {
+                    missed_before = true;
+                    #[cfg(feature = "profile")]
+                    if COUNT {
+                        WALK_BYTEMISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    // A byte mismatch is a hash collision, not a wall: C steps to
+                    // the next link. Legacy arm preserves the historical break.
+                    if !walk_cont {
+                        break;
+                    }
                 }
             }
             let link = tables.chain_masked(m & chain_mask);
@@ -9942,6 +10719,10 @@ fn chain_find_best_inner<const MLS: usize>(
                 link as usize
             };
             if next >= m {
+                #[cfg(feature = "profile")]
+                {
+                    exit_why = 3;
+                }
                 break;
             }
             mtag = if cp {
@@ -9953,6 +10734,11 @@ fn chain_find_best_inner<const MLS: usize>(
             };
             m = next;
         }
+        #[cfg(feature = "profile")]
+        WALK_EXIT[exit_why].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    } else {
+        #[cfg(feature = "profile")]
+        WALK_EXIT[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     if COUNT {
         crate::prof::note_probes(probes);
@@ -9972,50 +10758,12 @@ fn find_lazy(
     depth: usize,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    // See `find_greedy`: the twin covers the runtime-hash_log CL-shifts.
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if crate::simd::has_bmi2() {
-        // SAFETY: runtime CPUID guard; identical body.
-        #[allow(unsafe_code)]
-        return unsafe {
-            find_lazy_bmi2(
-                src,
-                block_start,
-                block_end,
-                window,
-                params,
-                tables,
-                depth,
-                reps,
-            )
-        };
-    }
-    find_lazy_sel(
-        src,
-        block_start,
-        block_end,
-        window,
-        params,
-        tables,
-        depth,
-        reps,
-    )
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "bmi2,lzcnt")]
-#[allow(clippy::too_many_arguments)]
-#[allow(unsafe_code)]
-unsafe fn find_lazy_bmi2(
-    src: &[u8],
-    block_start: usize,
-    block_end: usize,
-    window: usize,
-    params: CompressionParameters,
-    tables: &mut MatchTables,
-    depth: usize,
-    reps: [u32; 3],
-) -> (Vec<Seq>, Vec<u8>) {
+    // TWIN RETIRED on its ISA density. Measured on the emitted asm: 1002
+    // instructions of duplicated body converting 9 BMI2 ops -- 111 instructions
+    // per op. The campaign's own precedent decides this: W4/W5/W6 retired the
+    // HLOG and (hash_log, chain_log) specialisations on exactly the argument
+    // that `shr %cl` and `shrx` are both one uop on every CPU that HAS BMI2,
+    // and those were per-position paths too. Consistency, not a new judgement.
     find_lazy_sel(
         src,
         block_start,
@@ -10041,29 +10789,20 @@ fn find_lazy_sel(
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
     // See `find_greedy`: narrow MLS spec, runtime arm from the same body.
-    if params.min_match.max(3) == 5 {
-        find_lazy_impl::<5>(
-            src,
-            block_start,
-            block_end,
-            window,
-            params,
-            tables,
-            depth,
-            reps,
-        )
-    } else {
-        find_lazy_impl::<0>(
-            src,
-            block_start,
-            block_end,
-            window,
-            params,
-            tables,
-            depth,
-            reps,
-        )
-    }
+    // W13: one call site, as W12. Note `MLS` here ALSO chose the chain/row
+    // kernel monomorphisation (`chain_find_best::<MLS>` as a fn pointer), so
+    // this collapse takes those generic too -- `mls` becomes a runtime compare
+    // in the walk instead of an immediate. Measured, not assumed.
+    find_lazy_impl::<0>(
+        src,
+        block_start,
+        block_end,
+        window,
+        params,
+        tables,
+        depth,
+        reps,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10095,14 +10834,29 @@ fn find_lazy_impl<const MLS: usize>(
     let chain_mask = tables.chain.len() - 1;
     let attempts = search_attempts(params);
     // Per-block ISA selection for the outlined walk (brick 48 + twin).
+    // E1: the row finder is selected ONCE per block, never per position -- an
+    // atomic in the walk is the mistake brick 64b already paid for.
+    let use_rows = row_find_enabled() && !tables.rows.head.is_empty();
+    // W25: the back-fill's hash shifts, hoisted. The fill re-derived
+    // `32 - hash_log` / `64 - hash_log` on EVERY inserted position -- and the
+    // fill strides one byte, so that is once per matched byte.
+    let f_shift32 = 32u32.saturating_sub(hash_log.min(32));
+    let f_shift64 = 64u32.saturating_sub(hash_log.min(32));
+    // D4: the BMI2 chain twin is retired -- 457 instructions of duplicated
+    // walk converting THREE BMI2 ops, 152 per op, the worst ratio in the
+    // crate. Same reasoning as W4/W5/W6.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    let cfb: ChainFn = if crate::simd::has_bmi2() {
-        chain_find_best_bmi2_ptr::<MLS>
+    let cfb: ChainFn = if use_rows {
+        row_find_best::<MLS>
     } else {
         chain_find_best::<MLS>
     };
     #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
-    let cfb: ChainFn = chain_find_best::<MLS>;
+    let cfb: ChainFn = if use_rows {
+        row_find_best::<MLS>
+    } else {
+        chain_find_best::<MLS>
+    };
     // GATE 6 family, fourth instance: take the finder buffers from the FRAME.
     //
     // `find_fast_impl` was wired to `MatchTables::seq_scratch`/`lit_scratch`
@@ -10114,27 +10868,15 @@ fn find_lazy_impl<const MLS: usize>(
     //
     // `encode_block` already hands these back at all four of its exits, so the
     // plumbing was in place and only these finders were missing from it.
-    let scratch = finder_scratch_enabled();
-    let mut seqs = if scratch {
-        let mut v = core::mem::take(&mut tables.seq_scratch);
-        v.clear();
-        v
-    } else {
-        Vec::new()
-    };
-    let mut lits = if scratch {
-        let mut v = core::mem::take(&mut tables.lit_scratch);
-        v.clear();
-        v
-    } else {
-        Vec::new()
+    // Scratch + the too-short-block exit, ONE copy for Greedy/Lazy/BtLazy and
+    // their bmi2 twins -- six stamps of the identical idiom become one call
+    // (the `fast_finder_prologue` treatment, chain-finder variant).
+    let (mut seqs, mut lits) = match chain_finder_prologue(src, block_start, block_end, tables) {
+        Ok(t) => t,
+        Err(out) => return out,
     };
     let mut anchor = block_start;
     let ilimit = block_end.saturating_sub(8);
-    if block_start >= ilimit {
-        lits.extend_from_slice(&src[block_start..block_end]);
-        return (seqs, lits);
-    }
     // BRICK 71: repcode-1 search in find_lazy -- L7-L12 had none
     // C checks `offset_1` at every position in `_greedy`/`_lazy` exactly as in
     // `_fast`/`_doubleFast`. Same dispatch on measured yield as bricks 67/70.
@@ -10173,7 +10915,27 @@ fn find_lazy_impl<const MLS: usize>(
         && params.strategy != Strategy::Fast
         && tables.last_search_per_byte >= lazy_fill_threshold();
     // Per-match arm read hoisted to once per block.
-    let fill_stride = lazy_fill_stride();
+    // SECTION 14.12: the back-fill stride is ROW-SCOPED.
+    //
+    // `fillsweep.rs` priced the fill's marginal value at L9 and it is steeply
+    // diminishing -- but the two finders pay different prices for the same
+    // thinning, so one default cannot serve both:
+    //
+    //   stride 2   fill inserts 0.52x   ROW +0.27%   CHAIN +0.34%
+    //   stride 4   fill inserts 0.28x   ROW +0.97%   CHAIN +1.16%
+    //
+    // The row finder ships at stride 2 -- the knee. See `row_fill_stride`.
+    //
+    // The chain is the SHIPPING path; moving its stride moves `bytegate` GOLD
+    // for every user and needs its own board across all 18 corpora and every
+    // level. The row finder is opt-in and already bitstream-changing, so it
+    // can take the thinning on its own gate (`rowboard`) without dragging the
+    // default with it. Two decisions, two boards, attributable separately.
+    let fill_stride = if use_rows {
+        row_fill_stride()
+    } else {
+        lazy_fill_stride()
+    };
     // WALK-CONTINUE dispatch: see `walk_rep_max`.
     let walk_cont = walk_cont_enabled()
         // GATE 3's rule for the L1-routed case: `find_lazy` reachable with
@@ -10219,6 +10981,10 @@ fn find_lazy_impl<const MLS: usize>(
         ca,
         wchain,
         wide_hash: mls >= 8,
+        hash_mode: u8::from(wchain) | (u8::from(mls >= 8) << 1),
+        hash_shift32: 32u32.saturating_sub(tables.hash_log.min(32)),
+        hash_shift64: 64u32.saturating_sub(tables.hash_log.min(32)),
+        lowest1: lowest_rep.max(1),
         lowest: lowest_rep,
         tag_filter: cp || ca,
     };
@@ -10252,15 +11018,19 @@ fn find_lazy_impl<const MLS: usize>(
         }
         searches += 1;
         let (mut best_m, mut best_ml) = cfb(&chain_ctx, ip, walk_cont, &mut wcls, tables);
-        // W3: the in-hand match's gain, carried with it.
-        let mut best_gain = if gain_cmp {
-            lazy_gain(best_ml, ip - best_m)
-        } else {
-            0
-        };
         let mut best_ip = ip;
         let mut look_hi = ip; // PROBE: highest position the look-ahead inserted
         if best_ml >= mls {
+            // W3: the in-hand match's gain, carried with it. MOVED INSIDE this
+            // guard -- its only two readers are in this block, and computing it
+            // above cost a multiply plus a `leading_zeros` on every position
+            // where the walk found NOTHING, which is the common case at L9
+            // (chain hit rate 3-10%).
+            let mut best_gain = if gain_cmp {
+                lazy_gain(best_ml, ip - best_m)
+            } else {
+                0
+            };
             for d in 1..=depth {
                 let ip2 = ip + d;
                 if ip2 > ilimit {
@@ -10282,18 +11052,27 @@ fn find_lazy_impl<const MLS: usize>(
                 // candidate is exactly the new best's gain. It was thrown away
                 // and rebuilt one line later (a multiply and a
                 // `leading_zeros`, on every improvement).
-                let cand_gain = if gain_cmp { lazy_gain(ml, ip2 - m) } else { 0 };
-                let take = if gain_cmp {
-                    // C parity: the +4 favors the match already in hand.
-                    ml != 0 && cand_gain > best_gain + 4
-                } else {
-                    ml > best_ml
-                };
-                if take {
+                // `lazy_gain` is a multiply plus a `leading_zeros`, and it ran
+                // on EVERY look-ahead step -- including the ones where `cfb`
+                // found nothing. At L9 the chain's hit rate is 3-10%, so
+                // `ml == 0` is the COMMON outcome, and the `take` test below
+                // discards the gain in exactly that case. Guarded so the
+                // arithmetic runs only when there is a candidate to describe.
+                if gain_cmp {
+                    if ml != 0 {
+                        let cand_gain = lazy_gain(ml, ip2 - m);
+                        // C parity: the +4 favors the match already in hand.
+                        if cand_gain > best_gain + 4 {
+                            best_ml = ml;
+                            best_m = m;
+                            best_ip = ip2;
+                            best_gain = cand_gain;
+                        }
+                    }
+                } else if ml > best_ml {
                     best_ml = ml;
                     best_m = m;
                     best_ip = ip2;
-                    best_gain = cand_gain;
                 }
             }
         }
@@ -10363,21 +11142,64 @@ fn find_lazy_impl<const MLS: usize>(
                         LF_NONEMPTY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                while p < end && p <= ilimit {
-                    #[cfg(feature = "profile")]
-                    LF_INSERTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    // W6: `mls >= 8` is the same per-block question
-                    // `ChainCtx::wide_hash` answers; the fill re-asked it on
-                    // every inserted position.
-                    let (hh, gt) = if wide_h && p + 8 <= src_len {
-                        (hash8(src, p, hash_log), 0u8)
-                    } else if wchain {
-                        hash_wide_link_tag(src, p, hash_log, smask)
-                    } else {
-                        hash4_link_tag(src, p, hash_log, smask)
-                    };
-                    let _ = tables.lz_insert(hh, p, gt, cp, ca, chain_mask);
-                    p += stride;
+                // W29: ONE bound, not two. `end` and `ilimit` are both fixed
+                // for this fill, so `p < end && p <= ilimit` folds -- exactly
+                // the fold `find_greedy_impl`'s fill already had (its W7) and
+                // this one never received.
+                let stop = end.min(ilimit + 1);
+                // W30/W31/W32: the hash MODE and the table CHOICE are BLOCK
+                // constants, and this loop re-asked both on every inserted
+                // position. Hoisting them leaves each arm with one hash and
+                // one insert in its body -- and the two non-wide arms shed the
+                // `p + 8 <= src_len` test entirely, since only the 8-byte hash
+                // needs it.
+                //
+                // W33/W34 (row arm): the row mask and the table borrow are
+                // hoisted out, and `insert_h` folds `row_of` into the insert,
+                // so a position costs one call rather than two plus a struct
+                // load for the mask.
+                //
+                // W26/W27 stand: the row arm writes ONLY the row table (14.8
+                // proved the rest dead), and the chain arm takes
+                // `lz_insert_only` rather than discarding a built return.
+                macro_rules! fill_body {
+                    ($hash:expr, $ins:expr) => {{
+                        while p < stop {
+                            #[cfg(feature = "profile")]
+                            LF_INSERTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            let (hh, gt) = $hash;
+                            $ins(hh, gt, p);
+                            p += stride;
+                        }
+                    }};
+                }
+                macro_rules! fill_arms {
+                    ($ins:expr) => {{
+                        if wide_h {
+                            fill_body!(
+                                if p + 8 <= src_len {
+                                    (hash8_shift(src, p, f_shift64), 0u8)
+                                } else if wchain {
+                                    hash_wide_link_tag_shift(src, p, f_shift64, smask)
+                                } else {
+                                    hash4_tag_mls(src, p, f_shift32, smask)
+                                },
+                                $ins
+                            );
+                        } else if wchain {
+                            fill_body!(hash_wide_link_tag_shift(src, p, f_shift64, smask), $ins);
+                        } else {
+                            fill_body!(hash4_tag_mls(src, p, f_shift32, smask), $ins);
+                        }
+                    }};
+                }
+                if use_rows {
+                    let rows = &mut tables.rows;
+                    let rmask = rows.mask();
+                    fill_arms!(|hh: usize, gt: u8, q: usize| rows.insert_h(hh, rmask, q as u32, gt));
+                } else {
+                    fill_arms!(|hh: usize, gt: u8, q: usize| tables
+                        .lz_insert_only::<false>(hh, q, gt, cp, ca, chain_mask));
                 }
             }
             ip = end;
@@ -10386,15 +11208,29 @@ fn find_lazy_impl<const MLS: usize>(
             ip += 1;
         }
     }
-    tables.rep_yield = if seqs.is_empty() {
-        1.0
-    } else {
-        (rep_hits as f32 / seqs.len() as f32).max(tables.rep_yield * 0.5)
-    };
-    update_walk_first_share(tables, walk_cont, wcls, attempts);
-    push_lits_range(&mut lits, src, anchor, block_end);
-    let span = (block_end - block_start).max(1) as f32;
-    tables.last_search_per_byte = searches as f32 / span;
+    // Same shipping tail as `find_greedy_impl`, so it is the SAME helper --
+    // one stamp instead of four across the two finders and their bmi2 twins.
+    // Lazy reports probes=0 (its probe count arrives via `note_probes`) and
+    // hits=nseq, exactly as its inline tail did. The profile-only WALK_SIG
+    // stores move BELOW the call: they read the post-update EWMAs, which the
+    // helper has written by the time it returns, and they publish to
+    // independent statics, so order against `note_finder_work` is immaterial.
+    greedy_finder_epilogue(
+        tables,
+        src,
+        &seqs,
+        &mut lits,
+        anchor,
+        block_start,
+        block_end,
+        rep_hits,
+        walk_cont,
+        wcls,
+        attempts,
+        searches,
+        0,
+        seqs.len() as u64,
+    );
     // Signal probe for the wide-chain latch design (profile only): expose
     // the block-signal EWMAs so a harness can see what separates the
     // first-heavy winners (sao) from the first-heavy losers (smallmsg).
@@ -10416,13 +11252,6 @@ fn find_lazy_impl<const MLS: usize>(
     // `searches` is SEARCH POSITIONS, not candidate examinations -- reporting it
     // as `probes` was a work-count parity break against `find_fast`. The real
     // probe count comes from `chain_find_best` via `note_probes`, so pass 0.
-    note_finder_work(
-        cfg!(feature = "profile"),
-        0,
-        seqs.len() as u64,
-        &seqs,
-        &lits,
-    );
     (seqs, lits)
 }
 
@@ -10793,36 +11622,21 @@ fn bt_rt_insert(ctx: &BtCtx, ip: usize, t: &mut MatchTables) -> (usize, usize) {
     bt_find_best_runtime(false, ctx, ip, t)
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-fn bt_rt_search_bmi2(ctx: &BtCtx, ip: usize, t: &mut MatchTables) -> (usize, usize) {
-    // SAFETY: only reachable through `bt_resolve`'s CPUID guard.
-    #[allow(unsafe_code)]
-    unsafe {
-        bt_find_best_runtime_bmi2(true, ctx, ip, t)
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-fn bt_rt_insert_bmi2(ctx: &BtCtx, ip: usize, t: &mut MatchTables) -> (usize, usize) {
-    // SAFETY: only reachable through `bt_resolve`'s CPUID guard.
-    #[allow(unsafe_code)]
-    unsafe {
-        bt_find_best_runtime_bmi2(false, ctx, ip, t)
-    }
-}
-
 /// `bt_resolve` for the insert side -- same table, `BtInsFn` shape.
-fn bt_resolve_ins(hash_log: u32, chain_log: u32) -> BtInsFn {
+fn bt_resolve_ins(_hash_log: u32, _chain_log: u32) -> BtInsFn {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     let bmi2 = crate::simd::has_bmi2();
     #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
     let bmi2 = false;
+    // D11: completes D5. That win retired the bt-runtime SEARCH twins
+    // (`bt_rt_search_bmi2`/`bt_rt_insert_bmi2`) on their ISA density -- 291
+    // instructions converting three BMI2 ops -- and missed this INSERT
+    // selector, which kept `bt_find_best_runtime_bmi2` (316 instrs) alive
+    // through `bt_rt_ins_bmi2`. Same body, same three ops, same verdict.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    let rt: BtInsFn = if bmi2 {
-        bt_rt_ins_bmi2
-    } else {
-        bt_rt_ins_plain
-    };
+    let _ = bmi2;
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    let rt: BtInsFn = bt_rt_ins_plain;
     #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
     let rt: BtInsFn = bt_rt_ins_plain;
     if !bt_spec_enabled() {
@@ -10844,18 +11658,23 @@ fn bt_resolve_ins(hash_log: u32, chain_log: u32) -> BtInsFn {
     if bmi2 {
         return rt;
     }
-    macro_rules! ins_resolve {
-        ($( ($h:literal, $c:literal) )*) => {
-            match (hash_log, chain_log) {
-                $( ($h, $c) => bt_ins_spec::<$h, $c>, )*
-                _ => rt,
-            }
-        };
-    }
-    bt_spec_list!(ins_resolve)
+    // W6, insert-only twin -- see `bt_resolve` above for the full argument.
+    //
+    // The 2026-08-21 census proved all 20 pairs REACHABLE, and that is the
+    // wrong test -- HLOG's six values in `find_fast` were all reachable too
+    // (W4). The right test is what the consts BUY, and here they reach exactly
+    // two places: `HLOG` feeds `hash8`/`hash4` (a shift immediate) and `CLOG`
+    // feeds `btlog` -> `bt_mask` (an AND mask that is loop-invariant and sits
+    // in a register either way). On aarch64/wasm32 neither is worth anything
+    // -- register shifts and register ANDs cost what the immediate forms cost.
+    // On baseline x86 `shr %cl` is 1 uop. And BMI2 hosts never came here at
+    // all: the `if bmi2 { return rt }` above already sent them to `rt`.
+    //
+    // So this table only ever served pre-BMI2 x86 and the non-x86 targets, and
+    // charged them 11,283 instructions of I-cache to fold two immediates.
+    rt
 }
-
-fn bt_resolve<const SEARCH: bool>(hash_log: u32, chain_log: u32) -> BtFn {
+fn bt_resolve<const SEARCH: bool>(_hash_log: u32, _chain_log: u32) -> BtFn {
     // ISA selection happens HERE, once per block, so the per-position bt
     // calls carry no dispatch of their own.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
@@ -10863,12 +11682,11 @@ fn bt_resolve<const SEARCH: bool>(hash_log: u32, chain_log: u32) -> BtFn {
     #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
     let bmi2 = false;
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    let rt: BtFn = match (bmi2, SEARCH) {
-        (true, true) => bt_rt_search_bmi2,
-        (true, false) => bt_rt_insert_bmi2,
-        (false, true) => bt_rt_search,
-        (false, false) => bt_rt_insert,
-    };
+    // D5: the BMI2 bt-runtime twins are retired -- 291 instructions converting
+    // THREE BMI2 ops. `bmi2` is still read above for the specialisation guard
+    // this function keeps; only the twin selection goes.
+    let _ = bmi2;
+    let rt: BtFn = if SEARCH { bt_rt_search } else { bt_rt_insert };
     #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
     let rt: BtFn = if SEARCH { bt_rt_search } else { bt_rt_insert };
     if !bt_spec_enabled() {
@@ -10890,39 +11708,23 @@ fn bt_resolve<const SEARCH: bool>(hash_log: u32, chain_log: u32) -> BtFn {
     if bmi2 {
         return rt;
     }
-    macro_rules! bt_spec_resolve {
-        ($( ($h:literal, $c:literal) )*) => {
-            match (hash_log, chain_log) {
-                $( ($h, $c) => bt_find_best_impl::<$h, $c, SEARCH>, )*
-                _ => rt,
-            }
-        };
-    }
-    bt_spec_list!(bt_spec_resolve)
-}
-
-/// GATE 4/5 EXTENDED TO THE BT PATH (L13-L22).
-///
-/// Same gap `find_dfast` had: `hash_log` and `chain_log` were read from `params`
-/// at run time, so the hash shift and the binary-tree mask were computed with
-/// variable-count shifts on EVERY position. Measured in the emitted assembly,
-/// `bt_find_best` carried 5 variable shifts in 234 instructions.
-///
-/// The payoff here is structurally SMALLER than at L3 and that is worth stating:
-/// this function is called once per position but then drives ~27 tree probes
-/// (xml at L19: 55,988,704 probes over a 2 MiB prefix), each doing a
-/// `count_match`. The shift is amortised over that walk, where `find_dfast` had
-/// only ~2 candidate checks to amortise against.
-///
-/// Byte-identical by construction: HLOG and CLOG take the values the runtime
-/// variables already held.
-#[inline(never)]
-fn bt_find_best_impl<const HLOG: u32, const CLOG: u32, const SEARCH: bool>(
-    ctx: &BtCtx,
-    ip: usize,
-    tables: &mut MatchTables,
-) -> (usize, usize) {
-    bt_find_best_impl_inner::<HLOG, CLOG, SEARCH>(ctx, ip, tables)
+    // W6: THE (hash_log, chain_log) SPECIALISATION IS RETIRED -- 20 copies of
+    // `bt_find_best_impl` (6,003 instructions) and 20 of `bt_ins_spec` (5,280)
+    // become zero, and every caller takes the runtime-generic `rt` above.
+    //
+    // The 2026-08-21 census proved all 20 pairs REACHABLE, and that is the
+    // wrong test -- HLOG's six values in `find_fast` were all reachable too
+    // (W4). The right test is what the consts BUY, and here they reach exactly
+    // two places: `HLOG` feeds `hash8`/`hash4` (a shift immediate) and `CLOG`
+    // feeds `btlog` -> `bt_mask` (an AND mask that is loop-invariant and sits
+    // in a register either way). On aarch64/wasm32 neither is worth anything
+    // -- register shifts and register ANDs cost what the immediate forms cost.
+    // On baseline x86 `shr %cl` is 1 uop. And BMI2 hosts never came here at
+    // all: the `if bmi2 { return rt }` above already sent them to `rt`.
+    //
+    // So this table only ever served pre-BMI2 x86 and the non-x86 targets, and
+    // charged them 11,283 instructions of I-cache to fold two immediates.
+    rt
 }
 
 /// Safe `BtFn`-shaped wrapper for the BMI2 twin; `bt_resolve` hands this out
@@ -10943,22 +11745,8 @@ fn bt_ins_spec_bmi2<const HLOG: u32, const CLOG: u32>(
     }
 }
 
-/// Insert-only, plain-ISA.
-fn bt_ins_spec<const HLOG: u32, const CLOG: u32>(ctx: &BtCtx, ip: usize, tables: &mut MatchTables) {
-    bt_find_best_impl_inner::<HLOG, CLOG, false>(ctx, ip, tables);
-}
-
 fn bt_rt_ins_plain(ctx: &BtCtx, ip: usize, t: &mut MatchTables) {
     bt_find_best_runtime(false, ctx, ip, t);
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-fn bt_rt_ins_bmi2(ctx: &BtCtx, ip: usize, t: &mut MatchTables) {
-    // SAFETY: only reachable through `bt_resolve_ins`'s CPUID guard.
-    #[allow(unsafe_code)]
-    unsafe {
-        bt_find_best_runtime_bmi2(false, ctx, ip, t);
-    }
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
@@ -11047,7 +11835,11 @@ fn bt_find_best_impl_inner<const HLOG: u32, const CLOG: u32, const SEARCH: bool>
         return (0, 0);
     }
     // W6: `hash_mls`'s own `mls >= 8` test, answered per block instead.
-    let h = if wide_hash && ip + 8 <= src.len() {
+    // W50: `src.len()` hoisted. The shifts here are already free -- `HLOG` is
+    // a const generic, so both hashes fold their shift at compile time; the
+    // slice field read was the only per-position cost left on this line.
+    let spec_src_len = src.len();
+    let h = if wide_hash && ip + 8 <= spec_src_len {
         hash8(src, ip, HLOG)
     } else {
         hash4(load_u32le(src, ip), HLOG)
@@ -11298,19 +12090,6 @@ fn bt_find_best_runtime(
     bt_find_best_runtime_inner(search, ctx, ip, tables)
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "bmi2,lzcnt")]
-#[allow(unsafe_code)]
-#[inline(never)]
-unsafe fn bt_find_best_runtime_bmi2(
-    search: bool,
-    ctx: &BtCtx,
-    ip: usize,
-    tables: &mut MatchTables,
-) -> (usize, usize) {
-    bt_find_best_runtime_inner(search, ctx, ip, tables)
-}
-
 #[inline(always)]
 fn bt_find_best_runtime_inner(
     search: bool,
@@ -11363,10 +12142,17 @@ fn bt_find_best_runtime_inner(
         return (0, 0);
     }
     // W6: see the spec impl.
-    let h = if wide_hash && ip + 8 <= src.len() {
-        hash8(src, ip, hash_log)
+    // W46: the SPEC impl gets both shifts folded for free -- it hashes with the
+    // `HLOG` const generic. The RUNTIME twin, which is the arm that actually
+    // executes whenever the (hash_log, chain_log) pair is off the spec list,
+    // re-derived `min` + `saturating_sub` on every searched position.
+    // W47: `src.len()` is a slice field re-read on the same line.
+    let bt_src_len = src.len();
+    let bt_shift32 = 32u32.saturating_sub(hash_log.min(32));
+    let h = if wide_hash && ip + 8 <= bt_src_len {
+        hash8_shift(src, ip, 64u32.saturating_sub(hash_log.min(32)))
     } else {
-        hash4(load_u32le(src, ip), hash_log)
+        hash4_shift(load_u32le(src, ip), bt_shift32)
     };
     if h >= tables.hash.len() {
         return (0, 0);
@@ -11597,7 +12383,9 @@ fn bt_find_best_runtime_inner(
     (best_m, best_ml)
 }
 
-#[inline(always)]
+// Outlined for the same reason as `find_opt` above (same sibling-parity gap,
+// same nil ISA trade -- one `%cl` shift, zero `shrx`).
+#[inline(never)]
 fn find_bt_lazy(
     src: &[u8],
     block_start: usize,
@@ -11622,27 +12410,15 @@ fn find_bt_lazy(
     // plumbing was in place and only these finders were missing from it.
     // W6: `finder_scratch_enabled()` is an arm read, and it was read TWICE --
     // once per buffer -- for one per-block answer.
-    let keep = finder_scratch_enabled();
-    let mut seqs = if keep {
-        let mut v = core::mem::take(&mut tables.seq_scratch);
-        v.clear();
-        v
-    } else {
-        Vec::new()
-    };
-    let mut lits = if keep {
-        let mut v = core::mem::take(&mut tables.lit_scratch);
-        v.clear();
-        v
-    } else {
-        Vec::new()
+    // Scratch + the too-short-block exit, ONE copy for Greedy/Lazy/BtLazy and
+    // their bmi2 twins -- six stamps of the identical idiom become one call
+    // (the `fast_finder_prologue` treatment, chain-finder variant).
+    let (mut seqs, mut lits) = match chain_finder_prologue(src, block_start, block_end, tables) {
+        Ok(t) => t,
+        Err(out) => return out,
     };
     let mut anchor = block_start;
     let ilimit = block_end.saturating_sub(8);
-    if block_start >= ilimit {
-        lits.extend_from_slice(&src[block_start..block_end]);
-        return (seqs, lits);
-    }
     // W8: GATE 6 for BtLazy2 -- every other finder takes its output buffers
     // from the frame WITH A RESERVE; this one grew them by repeated `realloc`
     // with LIVE contents, so every growth is a real memcpy.
@@ -12147,7 +12923,19 @@ fn opt_fill_stride() -> usize {
     1
 }
 
-#[inline(always)]
+// OUTLINED, and it is a SIBLING-PARITY fix: `find_dfast`, `find_greedy` and
+// `find_lazy` all carry their own symbol (plus a bmi2 twin); `find_opt` and
+// `find_bt_lazy` alone stayed `#[inline(always)]` and were therefore stamped
+// into BOTH `find_sequences_strategy` twins -- so every Fast/DFast block paid
+// the optimal parse's stack frame and spills just to reach the dispatcher.
+// The two twins fell 2,707+2,644 -> 311+254.
+//
+// The ISA trade is nil, and was checked rather than assumed: the emitted body
+// contains ONE `%cl` shift and zero `shrx`, so the bmi2 context it used to
+// inherit had nothing to fold -- while the parse's actual ISA-sensitive work,
+// `bt_find_best`, still arrives through `bt_resolve`'s per-block function
+// pointers, whose bmi2 twins are unchanged and still linked.
+#[inline(never)]
 fn find_opt(
     src: &[u8],
     block_start: usize,
@@ -13091,6 +13879,145 @@ fn rep_reprobe_enabled() -> bool {
 static CHAIN_TAG_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Bench hook for the chain-link tag.
+/// E1 arm: the ROW match finder replaces the hash-chain walk on the lazy
+/// ladder. **Bitstream-CHANGING** -- a row holds the last 16 positions for its
+/// bucket where the chain held all of them, so the candidate set differs and
+/// the encoder finds different matches. Ships on `examples/rowboard.rs`
+/// (round-trip + compressed size per corpus) or not at all. Defaults OFF.
+///
+/// Only the LAZY ladder is wired: `find_greedy_impl` carries its own hand-copied
+/// walk rather than going through `ChainFn`. Lazy is where the loads are anyway
+/// -- 139M at L7, 221M at L9, 674M at L12, against greedy's 43M at L5.
+pub fn set_row_arm(on: bool) {
+    ROW_ARM.store(
+        if on { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+static ROW_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+#[inline(always)]
+pub(crate) fn row_find_enabled() -> bool {
+    ROW_ARM.load(core::sync::atomic::Ordering::Relaxed) == 2
+}
+/// CHAIN-WALK EXIT CENSUS. Which of the seven ways the walk can end actually
+/// fires, indexed:
+///   0 empty bucket (`prev` is None -- the walk never starts)
+///   1 entry guard (`m >= ip` or no room for `mls`)
+///   2 window bound (`m < low`)
+///   3 LINK GUARD (`next >= m`) -- the chain link did not go backwards
+///   4 match reached `block_end`
+///   5 attempts exhausted (the walk ran its full depth)
+///   6 `walk_cont` off, stopped on a tag or byte miss
+///
+/// Built to test one claim: that shrinking `hash_log`/`chain_log` collapses the
+/// probe count (1.845 -> 0.553 per byte) by making index 3 fire sooner. A
+/// smaller `chain_mask` aliases many positions onto one slot, so the link a
+/// walk reads may belong to some other position entirely.
+#[cfg(feature = "profile")]
+pub static WALK_EXIT: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Read and clear the walk-exit census.
+#[cfg(feature = "profile")]
+pub fn take_walk_exit() -> [u64; 8] {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut o = [0u64; 8];
+    for (i, sl) in o.iter_mut().enumerate() {
+        *sl = WALK_EXIT[i].swap(0, Relaxed);
+    }
+    o
+}
+
+/// E1 work counter: candidates examined by the ROW walk, the direct
+/// counterpart of `WALK_EXAM`. The row finder's whole claim is that it reaches
+/// the same candidates with FEWER DEPENDENT LOADS, so both numbers are needed:
+/// `ROW_EXAM` is candidates, `ROW_LOADS` is rows touched (one load each).
+#[cfg(feature = "profile")]
+pub static ROW_EXAM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+/// SECTION 14.9 census: the 16-to-1 bucket-sharing cost.
+/// `[examined, same_bucket, mls_eq_pass, gtag0_probes, probes]`.
+/// A row folds 16 hash buckets, so a tag match does NOT imply a bucket match.
+/// This prices how much of the walk is cross-bucket collision -- work that
+/// ends in a random `src` load inside `mls_eq` and (for mls >= 4) cannot
+/// possibly succeed.
+#[cfg(feature = "profile")]
+pub static ROW_BUCKET: [core::sync::atomic::AtomicU64; 5] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+/// Read and clear the bucket-sharing census.
+#[cfg(feature = "profile")]
+pub fn take_row_bucket() -> [u64; 5] {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut o = [0u64; 5];
+    for (i, sl) in o.iter_mut().enumerate() {
+        *sl = ROW_BUCKET[i].swap(0, Relaxed);
+    }
+    o
+}
+
+/// DFast back-extension arm. 0 = undecided, 1 = off, 2 = on. Defaults OFF:
+/// this CHANGES THE BITSTREAM, so it is boarded on size before it can ship.
+static DFAST_BEXT_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: turn DFast's backward match extension on or off in-process.
+pub fn set_dfast_bext_arm(on: bool) {
+    DFAST_BEXT_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read once per BLOCK and hoisted -- never per match.
+pub(crate) fn dfast_bext_enabled() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    match DFAST_BEXT_ARM.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::env_knob("RZSTD_DFAST_BEXT")
+                .map(|v| v != "0")
+                .unwrap_or(false);
+            DFAST_BEXT_ARM.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+    }
+}
+
+/// DFAST BACK-EXTENSION PROBE. `emit_fast_seq_body` back-extends every Fast
+/// match; DFast -- the DEFAULT level's finder -- does not, and C's
+/// `ZSTD_compressBlock_doubleFast` does. These count what that costs: bytes a
+/// backward walk WOULD recover at the commit point, and how many matches could
+/// move at all. Measurement only; the walk is not applied.
+#[cfg(feature = "profile")]
+pub static DFAST_BEXT_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static DFAST_BEXT_MATCHES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static DFAST_BEXT_SEQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear `(bytes_recoverable, matches_that_could_move, matches_seen)`.
+#[cfg(feature = "profile")]
+pub fn take_dfast_bext() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        DFAST_BEXT_BYTES.swap(0, Relaxed),
+        DFAST_BEXT_MATCHES.swap(0, Relaxed),
+        DFAST_BEXT_SEQS.swap(0, Relaxed),
+    )
+}
+
+#[cfg(feature = "profile")]
+pub static ROW_LOADS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Read and clear `(candidates_examined, rows_loaded)`.
+#[cfg(feature = "profile")]
+pub fn take_row_census() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (ROW_EXAM.swap(0, Relaxed), ROW_LOADS.swap(0, Relaxed))
+}
+
 pub fn set_chain_tag_arm(on: bool) {
     CHAIN_TAG_ARM.store(
         if on { 2 } else { 1 },
@@ -13112,13 +14039,20 @@ fn dfast_hash_pair(
     pos: usize,
     dtag_shift: u32,
     smask: u64,
-    hlog: u32,
+    lshift: u32,
 ) -> (usize, u8, usize) {
+    // W40: `lshift` arrives RESOLVED. This took `hlog` and re-derived
+    // `64 - hlog.min(32)` -- a `min` and a `saturating_sub` -- on every
+    // position of the SHIPPING DEFAULT level's finder, and twice per position
+    // whenever the speculation arm is on, for a value fixed for the block.
+    // The short shift (`dtag_shift`) had been passed in resolved since the
+    // dfast cuts; the long one never was. Fourth site of this exact defect
+    // today (14.9 W20 finder, 14.11 W25 lazy fill, 14.13 W36 greedy fill).
+    debug_assert!(lshift < 64);
     let v = load_u64le(src, pos);
     let hv4 = (v as u32).wrapping_mul(HASH4_PRIME);
     let tv = (v & smask).wrapping_mul(FAST_HASH_PRIME64);
-    let h8 =
-        (v.wrapping_mul(0xCF1B_BCDC_B7A5_6463) >> (64u32.saturating_sub(hlog.min(32)))) as usize;
+    let h8 = (v.wrapping_mul(0xCF1B_BCDC_B7A5_6463) >> lshift) as usize;
     ((hv4 >> dtag_shift) as usize, (tv ^ (tv >> 29)) as u8, h8)
 }
 
@@ -13254,12 +14188,16 @@ fn maybe_latch_wide_chain(
 /// take disjoint bit ranges of the same product, the fast-hash shape).
 #[inline(always)]
 fn hash_wide_link_tag(src: &[u8], pos: usize, hash_log: u32, smask: u64) -> (usize, u8) {
+    hash_wide_link_tag_shift(src, pos, 64u32.saturating_sub(hash_log.min(32)), smask)
+}
+
+/// W22: `hash_wide_link_tag` with the shift resolved. Third and last of the
+/// three hash entries that re-derived a BLOCK constant per position.
+#[inline(always)]
+fn hash_wide_link_tag_shift(src: &[u8], pos: usize, shift: u32, smask: u64) -> (usize, u8) {
     let v = load_u64le(src, pos) & smask;
     let hv = v.wrapping_mul(FAST_HASH_PRIME64);
-    (
-        (hv >> (64u32.saturating_sub(hash_log.min(32)))) as usize,
-        (hv ^ (hv >> 29)) as u8,
-    )
+    ((hv >> shift) as usize, (hv ^ (hv >> 29)) as u8)
 }
 
 /// Chain-walk census: src loads the link tag skipped, and (COUNT) the
@@ -13660,14 +14598,34 @@ fn back_eq(src: &[u8], s: usize, mm: usize) -> bool {
 }
 
 fn hash4(v: u32, hash_log: u32) -> usize {
-    let shift = 32u32.saturating_sub(hash_log.min(32));
+    hash4_shift(v, 32u32.saturating_sub(hash_log.min(32)))
+}
+
+/// W46: `hash4` with the shift already resolved -- the 4-byte sibling of
+/// `hash8_shift`. Completes the set, so no hash entry in this crate needs a
+/// `hash_log` when its caller already knows the shift.
+#[inline(always)]
+fn hash4_shift(v: u32, shift: u32) -> usize {
+    debug_assert!(shift < 32);
     (v.wrapping_mul(HASH4_PRIME) >> shift) as usize
 }
 
 #[inline(always)]
 fn hash8(src: &[u8], ip: usize, hash_log: u32) -> usize {
-    let v = load_u64le(src, ip);
-    let shift = 64u32.saturating_sub(hash_log.min(32));
+    hash8_shift(src, ip, 64u32.saturating_sub(hash_log.min(32)))
+}
+
+/// W20: `hash8` with the shift already resolved. The shift is a BLOCK
+/// constant; deriving it inside the hash meant a `min` and a `saturating_sub`
+/// on every position for a value that cannot change until the next block.
+#[inline(always)]
+fn hash8_shift(src: &[u8], ip: usize, shift: u32) -> usize {
+    hash8_from(load_u64le(src, ip), shift)
+}
+
+/// The mixing half of `hash8_shift`. See `hash4_tag_from`.
+#[inline(always)]
+fn hash8_from(v: u64, shift: u32) -> usize {
     (v.wrapping_mul(0xCF1B_BCDC_B7A5_6463) >> shift) as usize
 }
 
@@ -13847,22 +14805,6 @@ pub fn set_dfast_spec_arm(on: bool) {
     DFAST_SPEC_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
 }
 
-#[inline]
-fn dfast_spec_enabled() -> bool {
-    use core::sync::atomic::Ordering;
-    match DFAST_SPEC_ARM.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = crate::env_knob("RZSTD_DFAST_SPEC")
-                .map(|v| v.trim() != "0")
-                .unwrap_or(true);
-            DFAST_SPEC_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
 /// GATE 4 arm: the `find_fast` HLOG/STEP specialisation itself.
 ///
 /// With this OFF the shipping configuration falls through to the generic
@@ -13874,22 +14816,6 @@ static FAST_SPEC_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU
 /// Bench hook for in-process ABBA.
 pub fn set_fast_spec_arm(on: bool) {
     FAST_SPEC_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
-}
-
-#[inline]
-fn fast_spec_enabled() -> bool {
-    use core::sync::atomic::Ordering;
-    match FAST_SPEC_ARM.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = crate::env_knob("RZSTD_FAST_SPEC")
-                .map(|v| v.trim() != "0")
-                .unwrap_or(true);
-            FAST_SPEC_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
 }
 
 /// Which `find_dfast` body actually executed. Probe counts and output bytes are
@@ -14527,6 +15453,19 @@ pub static LTAG_NONEMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 pub static LTAG_REJECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "profile")]
 pub static LTAG_FALSE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear the LONG-table tag audit: `[nonempty, rejected, FALSE]`.
+/// A FALSE rejection is one the byte compare would have ACCEPTED -- i.e. a
+/// match C's untagged `doubleFast` finds and the tag filter loses.
+#[cfg(feature = "profile")]
+pub fn take_ltag_audit() -> [u64; 3] {
+    use core::sync::atomic::Ordering::Relaxed;
+    [
+        LTAG_NONEMPTY.swap(0, Relaxed),
+        LTAG_REJECT.swap(0, Relaxed),
+        LTAG_FALSE.swap(0, Relaxed),
+    ]
+}
 
 /// Read and clear the 1a ledger.
 #[cfg(feature = "profile")]

@@ -6,6 +6,58 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-27
+
+### Changed — compressed output moves at levels 1 through 4
+
+The per-match hash-table fill now writes only the match START position, not both
+ends. Levels 1, 3 and 4 therefore emit **different bytes** than 0.1.0 for the
+same input. Output remains valid RFC 8878 and is still accepted by
+`zstd -t`/`-d`; only the byte sequence differs.
+
+The trade, boarded per level over 12 corpora before the default was flipped:
+
+| level | per-match table writes | compressed size |
+|---|---|---|
+| L1 | **0.50×** | +0.150% |
+| L3 / L4 | **0.50×** | +0.371% / +0.482% |
+| L5 and above | unchanged | unchanged (bit-identical) |
+
+Whole-board effect: 59,760,356 → 59,841,188 bytes (**+0.135%**) across 18
+corpora × 9 levels, for half the fill work at every level that fills through
+this path. Levels 5+ use different finders and are untouched.
+
+### Fixed
+
+- **Portability, x86_64**: `HuffmanTable::decode_4x_bmi2` was compiled with
+  `avx2` enabled while dispatched on `has_bmi2()` alone. Parts that ship BMI2
+  with AVX2 fused off (some Skylake Pentium/Celeron) could have executed VEX
+  instructions. The stray `#[target_feature]` came from a deleted sibling whose
+  attribute block re-parented; no test could observe it, because an ISA twin is
+  byte-identical to its baseline on any host that runs the suite.
+- `simd::has_bmi2()` now tests **LZCNT** as well as BMI2, so the runtime guard
+  covers every feature the twins it gates actually enable.
+- The Huffman weights FSE decode had a BMI2 twin on the once-per-dictionary
+  path (where it compiled to a single `jmp` and did nothing) and none on the
+  per-block path. Retired the former; the latter now has a working twin.
+
+### Added
+
+- `RZSTD_DFAST_BEXT=1` enables backward match extension in the DFast finder
+  (levels 3–4), which every other finder already performs and which C's
+  `ZSTD_compressBlock_doubleFast` does. Boarded at **−1.0047%** size at L3 and
+  −0.777% at L4 with no regression on any corpus. **Defaults off**: it changes
+  the bitstream, and it is offered for evaluation rather than shipped.
+- CI now runs `scripts/twinguard.py`, which checks the two ISA-twin invariants
+  no test can see: orphaned function-only attributes, and a twin enabling a CPU
+  feature its dispatch does not test.
+
+### Removed
+
+- `set_block_avx2_arm` (`#[doc(hidden)]`, no semver promise). The AVX2 block
+  driver it selected was retired; the setter had no callers and its reader had
+  no readers, so it stored a value nothing consulted.
+
 ## [0.1.0] - 2026-08-23
 
 The first public release. `rusty_zstd` has been developed against facebook/zstd

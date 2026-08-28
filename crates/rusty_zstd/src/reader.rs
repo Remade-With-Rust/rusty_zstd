@@ -52,26 +52,56 @@ impl<'a> Reader<'a> {
         Ok(s)
     }
 
+    // DECSEQ-II CUT 8 (N6, finally closed): `take(n)` yields a slice of
+    // statically UNKNOWN length, so element-wise assembly cost one bounds
+    // check per byte. The fixed-size-array conversion states the length
+    // structurally -- `peek_u32_le` above has used the form since T4 and
+    // documents why; these are its three siblings, plus `u24_le` via a
+    // 4-byte-safe variant of the same move. Block headers run once per BLOCK
+    // in the streaming decoder, so this is small and free, not hot.
+
     pub(crate) fn u16_le(&mut self) -> Result<u16, Error> {
-        let s = self.take(2)?;
-        Ok(u16::from_le_bytes([s[0], s[1]]))
+        let s: [u8; 2] = self
+            .data
+            .get(self.pos..self.pos.saturating_add(2))
+            .ok_or(Error::UnexpectedEof)?
+            .try_into()
+            .map_err(|_| Error::UnexpectedEof)?;
+        self.pos += 2;
+        Ok(u16::from_le_bytes(s))
     }
 
     pub(crate) fn u32_le(&mut self) -> Result<u32, Error> {
-        let s = self.take(4)?;
-        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        let s: [u8; 4] = self
+            .data
+            .get(self.pos..self.pos.saturating_add(4))
+            .ok_or(Error::UnexpectedEof)?
+            .try_into()
+            .map_err(|_| Error::UnexpectedEof)?;
+        self.pos += 4;
+        Ok(u32::from_le_bytes(s))
     }
 
     pub(crate) fn u64_le(&mut self) -> Result<u64, Error> {
-        let s = self.take(8)?;
-        Ok(u64::from_le_bytes([
-            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-        ]))
+        let s: [u8; 8] = self
+            .data
+            .get(self.pos..self.pos.saturating_add(8))
+            .ok_or(Error::UnexpectedEof)?
+            .try_into()
+            .map_err(|_| Error::UnexpectedEof)?;
+        self.pos += 8;
+        Ok(u64::from_le_bytes(s))
     }
 
     /// 3-byte little-endian integer (block header).
     pub(crate) fn u24_le(&mut self) -> Result<u32, Error> {
-        let s = self.take(3)?;
+        let s: [u8; 3] = self
+            .data
+            .get(self.pos..self.pos.saturating_add(3))
+            .ok_or(Error::UnexpectedEof)?
+            .try_into()
+            .map_err(|_| Error::UnexpectedEof)?;
+        self.pos += 3;
         Ok(u32::from_le_bytes([s[0], s[1], s[2], 0]))
     }
 }

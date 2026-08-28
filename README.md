@@ -28,8 +28,8 @@ the rest of the stack.
 ## ⚡ The headline
 
 A pure-Rust Zstandard codec that is **interoperable in both directions with the C
-reference**, ships the whole product surface rather than a decoder, and is
-**at parity on ratio at matched settings**:
+reference**, ships the whole product surface rather than a decoder, and lands
+**within ~1-3% of C on compressed size at default settings**:
 
 - **Format: all of RFC 8878.** Raw / RLE / Compressed blocks, Huffman literals
   (1-stream and 4-stream, treeless), FSE sequences in all four modes, repeat
@@ -58,52 +58,63 @@ reference**, ships the whole product surface rather than a decoder, and is
 | `no_std` / `wasm32` | needs a porting layer | **builds as-is** |
 | Levels / strategies | −7…22, 9 strategies | **−7…22, all 9** |
 
-### Performance — measured, and honestly reported
+### Performance — default deployment, measured and honestly reported
 
-The board below is the **2026-08-22 third pass** of
-[`docs/plans/m7-anatomy.md`](docs/plans/m7-anatomy.md): level 1, all 18 corpora,
-against **facebook/zstd v1.5.7** driven as a pinned external binary. Best-of-N on
-both arms, phases timed separately as C's `-b` does, N ≥ 25 per phase, warmup
-discarded. `C/us` **> 1 means C is faster**; `us/c size` **> 1 means we emit more
-bytes**. The session's null arm — the worst same-arm spread — was **6.83%**, the
-lowest this instrument has recorded, which is what makes these cells readable at
-all.
+**Both CLIs at their real defaults.** `zstd -<lvl> <files>` against
+`rzstd -<lvl> <files>`, no flags beyond the level, one invocation each so
+startup is paid once. 19 files, 143.9 MB. This is the only true
+default-vs-default comparison available: `zstd -b` **cannot** include a
+checksum — `-b --check` is accepted and ignored — yet both projects default to
+checksum **ON**, so a `-b` table compares two configurations neither project
+ships. Each arm gets its own staged copy of the inputs, and each decodes the
+other's output; the cross-check passed on every run below.
 
-| | compress speed | decompress speed | **ratio (`us/c size`)** |
-|---|---|---|---|
-| mean over 18 corpora | **1.83× behind C** | **1.49× behind C** | **0.975 — we emit fewer bytes than C** |
-| we match or beat C on | 2 corpora | 4 corpora | 2 corpora |
-| worst cell | `ooffice` 2.61× | `reymont` 2.21× | `text-32m` 1.126 |
+| level | encode vs C | decode vs C | size vs C |
+|---|---:|---:|---:|
+| **L1** | 0.56–0.61× | **2.58–2.82×** | **+1.00%** |
+| **L3** (default) | 0.73–0.75× | **2.20–3.12×** | **+2.56%** |
+| **L9** | 0.34–0.38× | **2.32–2.85×** | **+1.65%** |
+| **L19** | **1.22–1.40×** | **2.64–2.76×** | **+3.05%** |
 
-Selected rows, sorted by ratio (throughput in MB/s):
+<sub>**Speed cells are ranges, not point estimates, and that is deliberate.**
+Min–max over independent samples at N=10 per arm per phase, on a host that was
+not quiescent. The same measurement at N=3 read L1 decode as 2.66× on one
+sample and 1.57× on the next, and even at N=10 the L3 encode cell moved 0.63×
+to 0.93× *between batches*. Anything quoted here as a single number would be
+one draw from that spread. The **size** column carries no such caveat: it is
+deterministic and reproduced bit-for-bit on every run — 143,865,706 bytes in,
+54,111,978 out at L1 against C's 53,631,039.</sub>
 
-| corpus | C comp | us comp | **C/us c** | C decomp | us decomp | **C/us d** | **us/c size** |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| `versions-16m` | 1641.7 | 7057.8 | **0.23** | 3936.3 | 20481.3 | **0.19** | **0.088** |
-| `zeros-32m` | 12579.3 | 31961.6 | **0.39** | 38223.5 | 41710.1 | **0.92** | **0.967** |
-| `incomp-32m` | 5921.6 | 3324.1 | 1.78 | 22293.3 | 24081.9 | **0.93** | 1.000 |
-| `x-ray` | 906.4 | 363.5 | 2.49 | 1322.3 | 1109.4 | 1.19 | 1.000 |
-| `mr` | 481.2 | 205.5 | 2.34 | 1668.0 | 1046.3 | 1.59 | 1.010 |
-| `dickens` | 345.9 | 188.3 | 1.84 | 1648.8 | 867.9 | 1.90 | 1.015 |
-| `mozilla` | 716.8 | 348.8 | 2.06 | 2120.8 | 1270.2 | 1.67 | 1.034 |
-| `nci` | 954.9 | 487.5 | 1.96 | 2689.7 | 1375.8 | 1.95 | 1.106 |
-| `text-32m` | 19454.1 | 12777.5 | 1.52 | 9648.1 | 34379.0 | **0.28** | 1.126 |
+<sub>**READ THIS BEFORE OPTIMISING FROM IT — the decode figure is not a codec
+claim.** These are whole-program numbers: read + codec + write. On this host
+decode is dominated by each CLI's file-**writing** strategy, not by the codec.
+Decoding the same 24 MiB to files took C 398 ms and us 93 ms; the same decode
+to **stdout**, with the write removed, took C 171 ms and us 194 ms. The
+advantage is the write path, and with it removed C is ahead. Measured
+in-process on the codec alone — checksum off on both arms, as `zstd -b` runs —
+C leads **both** phases: by ~1.6× at L1/L3 and by ~2.1–2.8× at L9. The
+in-process encode figures (0.54× / 0.63× / 0.36× at L1/L3/L9) agree closely
+with the CLI encode column above, and two instruments that disagree about
+decode while agreeing about encode is what establishes the encode gap as a
+real codec property rather than an artifact of either harness.
+**Judge end-user experience from this table; judge codec work from**
+[`docs/plans/m7-anatomy.md`](docs/plans/m7-anatomy.md).</sub>
 
-<sub>**Read this as: ratio is at parity; speed is not, and that is the open
-work.** At matched settings the sizes we emit are within ~1.6% of C on eleven of
-eighteen corpora and *smaller* on average — mean `us/c size` is **0.975** at L1
-and **1.012** at L3, and the L3 ratio column has now been identical
-cell-for-cell across **four consecutive boards**, which doubles as an end-to-end
-identity check on the campaign. On speed, C is ahead by ~1.8× compressing and
-~1.5× decompressing in the mean, and we are ahead on the degenerate and
-highly-repetitive corpora where the repcode and match-find work pays off.
-**No claim is made that the optimization campaign made this faster:** every brick
-in it shipped on strictly-less-work plus byte-identity, never on a wall-clock
-delta, and the boards say so explicitly. Method, per-corpus stage shares, and the
-instrument's own repair history:
+<sub>**The speed columns moved between releases and that is NOT attributable to
+this project's changes.** Every level's throughput read higher in the 0.2.0
+measurement than in 0.1.0's — including L9, whose compressed bytes are
+*bit-identical* between the two, so its code path did not change. When an
+unchanged path speeds up, the lift is the host, not the codec. The SIZE column
+carries no such caveat: it is deterministic, and its 0.1.0 → 0.2.0 movement at
+L1 and L3 is exactly the fill-density change described in the changelog.</sub>
+
+<sub>**No claim is made that the optimization campaign made this faster.**
+Every brick in it shipped on strictly-less-work plus byte-identity, never on a
+wall-clock delta, and the boards say so explicitly. The per-file spread is the
+story and these files differ enormously — **never average them**. Method,
+per-corpus stage shares, and the instrument's own repair history:
 [`docs/plans/m7-anatomy.md`](docs/plans/m7-anatomy.md) and
-[`docs/plans/m7-benchmark-repair.md`](docs/plans/m7-benchmark-repair.md).
-**Never average these files** — the per-file spread is the story.</sub>
+[`docs/plans/m7-benchmark-repair.md`](docs/plans/m7-benchmark-repair.md).</sub>
 
 ## What is this?
 
@@ -348,9 +359,12 @@ scalar twins run and the output is identical.
 - [x] **M6 — CLI completeness.** Multi-threading (`-T#`, `--jobsize`,
       `--overlap-log`), `-l` / `-b` / `-r`, env vars, and the `unzstd` /
       `zstdcat` / `zstdmt` aliases — all dual-gated against C
-- [x] **M7 (in progress) — the performance campaign.** Ratio has reached parity
-      (mean `us/c size` **0.975** at L1, **1.012** at L3); the speed gap is
-      ~1.8× compress / ~1.5× decompress and is the open work
+- [x] **M7 (in progress) — the performance campaign.** At default settings we
+      emit **+0.9%** (L1) to **+2.2%** (L3) more than C, and the CLI decodes
+      **faster** than C end-to-end — but that is the write path, not the codec
+      (see Performance above). The codec speed gap, ~1.6× on both phases, is
+      the open work, and it is concentrated in the **mid-level match finders**
+      (L5–L12): the opt-class finders at L19 already reach C's encode rate
 - [ ] Mission §7's exit bars: compress within **1.25×** of C at L1/L3 and
       decompress within **1.11×**, which the current board does not yet clear
 - [ ] Legacy frame decode (v0.1–v0.7), behind the `legacy` feature

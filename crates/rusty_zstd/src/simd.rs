@@ -736,7 +736,21 @@ pub(crate) fn has_bmi2() -> bool {
         #[cold]
         #[inline(never)]
         fn detect(c: &AtomicU8) -> bool {
-            let yes = is_x86_feature_detected!("bmi2");
+            // LZCNT IS TESTED HERE because the twins this gates ENABLE it:
+            // eight `#[target_feature(enable = "bmi2,lzcnt")]` functions hang
+            // off this one predicate. Testing only `bmi2` left the guard
+            // narrower than the code it admits -- the same shape as the
+            // `decode_4x_bmi2` AVX2 hijack, just arrived at by omission rather
+            // than by a stray attribute.
+            //
+            // Every real part that has BMI2 also has LZCNT (Intel introduced
+            // both with Haswell; AMD has had LZCNT since Barcelona, long
+            // before BMI2), so this costs one extra CPUID bit test, once per
+            // process, and rejects nothing that exists. It is tested anyway:
+            // an invariant that holds because of a hardware-history argument
+            // is one nobody can check, and `scripts/twinguard.py` needed a
+            // hand-written exemption to stay quiet about it. Now it does not.
+            let yes = is_x86_feature_detected!("bmi2") && is_x86_feature_detected!("lzcnt");
             c.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
             yes
         }

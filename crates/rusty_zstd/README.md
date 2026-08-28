@@ -129,6 +129,32 @@ Items marked `#[doc(hidden)]` are campaign instrumentation for the repository's
 own benchmark harness. They carry **no semver promise** and may be renamed or
 removed in any release.
 
+## Performance
+
+Both CLIs at their real defaults — `zstd -<lvl> <files>` against
+`rzstd -<lvl> <files>`, no flags beyond the level. 19 files, 143.9 MB, each arm
+decoding the other's output (cross-checked every run).
+
+| level | encode vs C | decode vs C | size vs C |
+|---|---:|---:|---:|
+| L1 | 0.56–0.61× | **2.58–2.82×** | +1.00% |
+| L3 (default) | 0.73–0.75× | **2.20–3.12×** | +2.56% |
+| L9 | 0.34–0.38× | **2.32–2.85×** | +1.65% |
+| L19 | **1.22–1.40×** | **2.64–2.76×** | +3.05% |
+
+**Read the decode column carefully — it is not a codec claim.** These are
+whole-program numbers (read + codec + write), and decode is dominated by each
+CLI's file-*writing* strategy. Decoding 24 MiB to files: C 398 ms, us 93 ms; the
+same decode to *stdout*, with the write removed: C 171 ms, us 194 ms. Measured
+in-process on the codec alone, C leads decode. Judge end-user experience from
+this table; judge codec work from
+[`docs/plans/m7-anatomy.md`](https://github.com/Remade-With-Rust/rusty_zstd/blob/main/docs/plans/m7-anatomy.md).
+
+Speed cells are min–max over independent samples (N=10 per arm per phase) on a
+non-quiescent host, so they are ranges rather than point estimates. The size
+column is deterministic and exact. Encode trails C at L1–L9 and leads at L19;
+closing the mid-level gap is the open work.
+
 ## Correctness
 
 Gated against facebook/zstd **v1.5.7** as an external process, in both

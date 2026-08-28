@@ -30,6 +30,13 @@ use std::time::Instant;
 const PAGE: &str = include_str!("simserver.html");
 const ZSTD: &str = "third_party/zstd/extracted/zstd-v1.5.7-win64/zstd.exe";
 
+/// Absolute, because `deploy_arm` sets `current_dir` on the child.
+static ZSTD_ABS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::current_dir()
+        .map(|d| d.join(ZSTD).to_string_lossy().to_string())
+        .unwrap_or_else(|_| ZSTD.to_string())
+});
+
 /// name, path, bytes, category, provenance
 type Entry = (String, PathBuf, u64, String, &'static str);
 
@@ -215,6 +222,47 @@ fn measure(path: &std::path::Path, lvl: i32, cap: usize, n: usize, want_c: bool)
         return Err("round-trip mismatch".into());
     }
 
+    // ---- THE SHIPPED DEFAULT: checksum ON ----
+    //
+    // The arms above run `checksum: false` to match `ZSTD_c_checksumFlag = 0`
+    // in `zstd -b`, which is the only configuration `-b` can be made to run:
+    // `zstd -b --check` is accepted and IGNORED (the frame comes out the same
+    // size, so no checksum is written). That parity is what makes the C columns
+    // comparable -- and it is NOT what either project ships. zstd's own help
+    // says `--[no-]check ... [Default: Add, Validate]`.
+    //
+    // So measure our real default too, at the same protocol, and let the page
+    // show both. This is strictly MORE work than the C arm does -- an xxh64 pass
+    // over every input byte on both phases -- and it is what a user actually
+    // gets.
+    let z_ck = rusty_zstd::compress_with_params(s, p, true).map_err(|e| format!("{e:?}"))?;
+    let mut ship_enc = f64::MAX;
+    let _ = rusty_zstd::compress_with_params(s, p, true);
+    for _ in 0..n {
+        let t = Instant::now();
+        let q = rusty_zstd::compress_with_params(s, p, true).map_err(|e| format!("{e:?}"))?;
+        let e = t.elapsed().as_secs_f64();
+        std::hint::black_box(q.len());
+        if e < ship_enc {
+            ship_enc = e;
+        }
+    }
+    let mut ship_dec = f64::MAX;
+    buf.clear();
+    rusty_zstd::decompress_into(&mut buf, &z_ck).map_err(|e| format!("{e:?}"))?;
+    for _ in 0..n {
+        buf.clear();
+        let t = Instant::now();
+        rusty_zstd::decompress_into(&mut buf, &z_ck).map_err(|e| format!("{e:?}"))?;
+        let e = t.elapsed().as_secs_f64();
+        if e < ship_dec {
+            ship_dec = e;
+        }
+    }
+    if buf != s {
+        return Err("round-trip mismatch (checksum arm)".into());
+    }
+
     let spread = (enc[0].max(enc[1]) / enc[0].min(enc[1]) - 1.0) * 100.0;
     let (mut ce, mut cd, mut cs) = (0.0, 0.0, 0usize);
     if want_c {
@@ -231,6 +279,7 @@ fn measure(path: &std::path::Path, lvl: i32, cap: usize, n: usize, want_c: bool)
         concat!(
             "{{\"ok\":true,\"level\":{},\"bytes\":{},\"csize\":{},\"ratio\":{:.4},",
             "\"enc_mbps\":{:.3},\"dec_mbps\":{:.3},\"spread_pct\":{:.3},",
+            "\"ship_enc_mbps\":{:.3},\"ship_dec_mbps\":{:.3},\"ship_csize\":{},",
             "\"c_enc_mbps\":{:.3},\"c_dec_mbps\":{:.3},\"c_csize\":{}}}"
         ),
         lvl,
@@ -240,6 +289,9 @@ fn measure(path: &std::path::Path, lvl: i32, cap: usize, n: usize, want_c: bool)
         mb / enc[0],
         mb / dec,
         spread,
+        mb / ship_enc,
+        mb / ship_dec,
+        z_ck.len(),
         ce,
         cd,
         cs
@@ -285,6 +337,127 @@ fn respond(st: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) {
     let _ = st.write_all(h.as_bytes());
     let _ = st.write_all(body);
     let _ = st.flush();
+}
+
+
+/// DEFAULT DEPLOYMENT: both CLIs, real defaults, nothing switched off.
+///
+/// `zstd -b` cannot be made to include a checksum -- `zstd -b --check` is
+/// accepted and ignored, and `zstd -b3` emits byte-for-byte what
+/// `zstd -3 --no-check` emits. Both projects DEFAULT to checksum on (C's own
+/// `-l` reports `XXH64` on a plain `zstd -3` frame, and on ours), so a `-b`
+/// board compares two configurations neither project ships. That is the wrong
+/// thing to optimise against.
+///
+/// So this drives the two CLIs exactly as a user does: `zstd -<lvl> <files>`
+/// against `rzstd -<lvl> <files>`, no flags beyond the level and `-f`.
+///
+/// STARTUP IS AMORTISED, NOT SUBTRACTED. Process launch is ~43 ms for zstd and
+/// ~41 ms for rzstd -- symmetric, but at L3 an 8 MiB file is only ~39 ms of
+/// codec work, so a per-file invocation would measure the loader. Passing the
+/// WHOLE corpus to one invocation pays it once; the fraction is reported so the
+/// reader can see when it still matters.
+fn deploy_arm(cli: &str, lvl: i32, dir: &Path, names: &[String], dec: bool) -> Option<f64> {
+    let mut cmd = Command::new(cli);
+    cmd.current_dir(dir).arg("-q").arg("-f");
+    if dec {
+        cmd.arg("-d");
+    } else {
+        cmd.arg(format!("-{lvl}"));
+    }
+    for n in names {
+        cmd.arg(n);
+    }
+    let t = Instant::now();
+    let st = cmd.status().ok()?;
+    let e = t.elapsed().as_secs_f64();
+    if !st.success() {
+        return None;
+    }
+    Some(e)
+}
+
+fn dir_bytes_ext(d: &Path, ext: &str) -> u64 {
+    std::fs::read_dir(d).into_iter().flatten().flatten()
+        .filter(|e| e.path().extension().map(|x| x == ext).unwrap_or(false))
+        .filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()
+}
+
+fn stage(dir: &Path, files: &[PathBuf], cap: usize) -> Result<(Vec<String>, u64), String> {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let (mut names, mut total) = (Vec::new(), 0u64);
+    for f in files {
+        let b = std::fs::read(f).map_err(|e| e.to_string())?;
+        let b = &b[..b.len().min(cap)];
+        let n = f.file_name().ok_or("bad name")?.to_string_lossy().to_string();
+        std::fs::write(dir.join(&n), b).map_err(|e| e.to_string())?;
+        total += b.len() as u64;
+        names.push(n);
+    }
+    Ok((names, total))
+}
+
+/// Best-of-N whole-corpus invocations of BOTH CLIs at their real defaults.
+fn deploy(files: &[PathBuf], lvl: i32, cap: usize, n: usize) -> Result<String, String> {
+    let rz_cli = rzstd_cli().ok_or(
+        "rzstd CLI not built -- run: cargo build --release -p rusty_zstd-cli")?;
+    let base = std::env::temp_dir().join("rzstd_deploy");
+    let (cdir, rdir) = (base.join("c"), base.join("r"));
+    // Each arm gets its OWN copy, because both CLIs write `<name>.zst` beside
+    // the input by default -- which is exactly the behaviour under test.
+    let (names, total) = stage(&cdir, files, cap)?;
+    let (_, _) = stage(&rdir, files, cap)?;
+    let mb = total as f64 / 1_048_576.0;
+
+    let (mut ce, mut re) = (f64::MAX, f64::MAX);
+    for _ in 0..n {
+        if let Some(t) = deploy_arm(ZSTD_ABS.as_str(), lvl, &cdir, &names, false) { ce = ce.min(t) }
+        if let Some(t) = deploy_arm(&rz_cli, lvl, &rdir, &names, false) { re = re.min(t) }
+    }
+    let cbytes = dir_bytes_ext(&cdir, "zst");
+    let rbytes = dir_bytes_ext(&rdir, "zst");
+    let zn: Vec<String> = names.iter().map(|n| format!("{n}.zst")).collect();
+
+    // Decode each arm's OWN frames, and cross-check that we read C's.
+    let (mut cd, mut rd) = (f64::MAX, f64::MAX);
+    for _ in 0..n {
+        if let Some(t) = deploy_arm(ZSTD_ABS.as_str(), lvl, &cdir, &zn, true) { cd = cd.min(t) }
+        if let Some(t) = deploy_arm(&rz_cli, lvl, &rdir, &zn, true) { rd = rd.min(t) }
+    }
+    let cross = deploy_arm(&rz_cli, lvl, &cdir, &zn, true).is_some();
+
+    // Startup floor, measured identically, so it can be priced not guessed.
+    let tdir = base.join("t");
+    let _ = std::fs::create_dir_all(&tdir);
+    let _ = std::fs::write(tdir.join("t"), b"x");
+    let one = vec!["t".to_string()];
+    let (mut cf, mut rf) = (f64::MAX, f64::MAX);
+    for _ in 0..5 {
+        if let Some(t) = deploy_arm(ZSTD_ABS.as_str(), lvl, &tdir, &one, false) { cf = cf.min(t) }
+        if let Some(t) = deploy_arm(&rz_cli, lvl, &tdir, &one, false) { rf = rf.min(t) }
+    }
+    Ok(format!(
+        concat!(
+            "{{\"ok\":true,\"level\":{},\"files\":{},\"bytes\":{},",
+            "\"c_enc_mbps\":{:.3},\"r_enc_mbps\":{:.3},",
+            "\"c_dec_mbps\":{:.3},\"r_dec_mbps\":{:.3},",
+            "\"c_bytes\":{},\"r_bytes\":{},\"size_ratio\":{:.4},",
+            "\"c_startup_pct\":{:.1},\"r_startup_pct\":{:.1},\"cross_ok\":{}}}"
+        ),
+        lvl, names.len(), total,
+        mb / ce, mb / re, mb / cd, mb / rd,
+        cbytes, rbytes, rbytes as f64 / cbytes.max(1) as f64,
+        100.0 * cf / ce, 100.0 * rf / re, cross
+    ))
+}
+
+fn rzstd_cli() -> Option<String> {
+    for c in ["target/release/rzstd.exe", "target/release/rzstd"] {
+        let p = std::env::current_dir().ok()?.join(c);
+        if p.exists() { return Some(p.to_string_lossy().to_string()) }
+    }
+    None
 }
 
 fn json_escape(s: &str) -> String {
@@ -369,6 +542,31 @@ fn handle(mut st: TcpStream) {
         respond(&mut st, "200 OK", "application/json", body.as_bytes());
         return;
     }
+    if path.starts_with("/api/deploy") {
+        let lvl: i32 = query(&path, "level").and_then(|v| v.parse().ok()).unwrap_or(3);
+        let cap: usize = query(&path, "cap").and_then(|v| v.parse().ok()).unwrap_or(8 << 20);
+        let n: usize = query(&path, "n").and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, 20);
+        let only = query(&path, "files").unwrap_or_default();
+        let want: Vec<String> = only.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect();
+        let files: Vec<PathBuf> = REGISTRY
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(nm, _, _, _, _)| want.is_empty() || want.iter().any(|w| w == nm))
+            .map(|(_, p, _, _, _)| p.clone())
+            .collect();
+        let body = if files.is_empty() {
+            "{\"ok\":false,\"error\":\"no files\"}".to_string()
+        } else {
+            match deploy(&files, lvl, cap, n) {
+                Ok(j) => j,
+                Err(e) => format!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(&e)),
+            }
+        };
+        respond(&mut st, "200 OK", "application/json", body.as_bytes());
+        return;
+    }
+
     if path.starts_with("/api/run") {
         let file = query(&path, "file").unwrap_or_default();
         let lvl: i32 = query(&path, "level").and_then(|v| v.parse().ok()).unwrap_or(1);

@@ -306,6 +306,14 @@ pub fn inspect_frames(src: &[u8]) -> Result<Vec<ListedFrame>, Error> {
         if n == 0 {
             return Err(Error::Corruption);
         }
+        // D23 REFUTED, recorded: `get(off..off+n).ok_or(Corruption)` here
+        // removed the pad but grew this function 166 -> 182 (**+16**). The
+        // `saturating_add` plus the `Option` cost more than the check.
+        //
+        // Third data point for the pad rule, and it is consistent: the win is
+        // real where the index is genuinely opaque and the site is hot
+        // (D17 -44, D21 -31, D22), and negative where the bound is already
+        // near-provable or the site is cold (D19 +3, D23 +16).
         let kind = crate::get_frame_header(&src[off..off + n])?;
         out.push(ListedFrame {
             kind,
@@ -362,6 +370,18 @@ pub fn frame_block_census(src: &[u8]) -> Result<BlockCensus, Error> {
 }
 
 #[cfg(feature = "alloc")]
+// D16 REFUTED, and the mistake that produced it is worth more than the attempt.
+//
+// I outlined this believing it had TWO call sites. It has ONE. The count came
+// from an ad-hoc `grep -c 'decode_zstd_frame('` -- which counts the DEFINITION
+// as a site. (The census script in `tools/premise_audit.py` subtracts one for
+// exactly this reason; the shell one-liner I typed instead did not.)
+//
+// With one caller, outlining cannot remove a copy -- it can only add a frame,
+// and it did: `decompress_into_history` 570 -> 143, `decode_zstd_frame` 464,
+// total 607 against 570. **+37.**
+//
+// CHECK THE SITE COUNT EXCLUDES THE DEFINITION before outlining anything.
 fn decode_zstd_frame(
     r: &mut Reader<'_>,
     header: FrameHeader,
@@ -486,6 +506,12 @@ fn decode_zstd_frame(
             }
             if let Some(h) = running.as_mut() {
                 // hash exactly the bytes this block produced, still cache-hot
+                // D26 REFUTED, recorded: `get(..).ok_or` on this slice and
+                // the two below drove this function's pads 2 -> 0 and measured
+                // **+4** (575 -> 579). Fourth data point, same rule: the pad
+                // transform pays on HOT sites with genuinely opaque indices
+                // (D17 -44, D21 -31, D25 -14) and loses on cold or
+                // near-provable ones (D19 +3, D23 +16, here +4).
                 h.update(&out[hashed_to..]);
                 hashed_to = out.len();
             }
@@ -516,6 +542,10 @@ fn decode_zstd_frame(
     }
 
     if let Some(n) = header.content_size {
+        // D30 REFUTED: D26's subtraction, isolated, still measured **+2**. So
+        // D26's +4 was not caused by its two `get` calls -- this whole frame-
+        // level site is simply one where the check is already cheap. Sixth and
+        // final refutation in the pad class; the rule holds without exception.
         let produced = (out.len() - start_len) as u64;
         if produced != n {
             return Err(Error::ContentSizeMismatch);

@@ -90,7 +90,13 @@ fn parse_trained(src: &[u8]) -> Result<Dictionary, Error> {
     if src.len() < 8 {
         return Err(Error::Corruption);
     }
-    let id = u32::from_le_bytes([src[4], src[5], src[6], src[7]]);
+    // C2: same treatment as `parse_seek_table`. Every `src[i]` here was its
+    // own bounds test and panic pad -- seventeen of them across this function
+    // -- because nothing in the source relates the indices to `src.len()`.
+    // Fixed-size arrays through `try_into` prove all four (or twelve) elements
+    // from ONE check, in safe Rust.
+    let idb: [u8; 4] = src[4..8].try_into().map_err(|_| Error::Corruption)?;
+    let id = u32::from_le_bytes(idb);
     let mut pos = 8usize;
     let (huff_d, hn) = huffman::read_table(None, &src[pos..])?;
     let (huff_c, _) = huffman::read_ctable(&src[pos..])?;
@@ -104,9 +110,12 @@ fn parse_trained(src: &[u8]) -> Result<Dictionary, Error> {
     if pos + 12 > src.len() {
         return Err(Error::Corruption);
     }
-    let r0 = u32::from_le_bytes([src[pos], src[pos + 1], src[pos + 2], src[pos + 3]]);
-    let r1 = u32::from_le_bytes([src[pos + 4], src[pos + 5], src[pos + 6], src[pos + 7]]);
-    let r2 = u32::from_le_bytes([src[pos + 8], src[pos + 9], src[pos + 10], src[pos + 11]]);
+    let rb: [u8; 12] = src[pos..pos + 12]
+        .try_into()
+        .map_err(|_| Error::Corruption)?;
+    let r0 = u32::from_le_bytes([rb[0], rb[1], rb[2], rb[3]]);
+    let r1 = u32::from_le_bytes([rb[4], rb[5], rb[6], rb[7]]);
+    let r2 = u32::from_le_bytes([rb[8], rb[9], rb[10], rb[11]]);
     pos += 12;
     let content = src[pos..].to_vec();
     let clen = content.len() as u32;
@@ -162,16 +171,33 @@ pub(crate) fn write_trained_parts(
     reps: [u32; 3],
     content: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&MAGIC_DICTIONARY.to_le_bytes());
-    out.extend_from_slice(&id.to_le_bytes());
+    // C7: ten `extend_from_slice` sites became seven, the `append_seek_table`
+    // treatment (C5). Each site inlines `Vec`'s capacity test and grow path,
+    // so the SITE COUNT is the code size -- the five variable-length slices
+    // must stay separate, but the magic+id pair and the three reps are fixed
+    // width and stage into arrays. One `reserve` up front removes the growth
+    // from the rest. Byte-for-byte identical dictionary.
+    let mut out = Vec::with_capacity(
+        8 + huff_tree.len()
+            + of_ncount.len()
+            + ml_ncount.len()
+            + ll_ncount.len()
+            + 12
+            + content.len(),
+    );
+    let mut hdr = [0u8; 8];
+    hdr[0..4].copy_from_slice(&MAGIC_DICTIONARY.to_le_bytes());
+    hdr[4..8].copy_from_slice(&id.to_le_bytes());
+    out.extend_from_slice(&hdr);
     out.extend_from_slice(huff_tree);
     out.extend_from_slice(of_ncount);
     out.extend_from_slice(ml_ncount);
     out.extend_from_slice(ll_ncount);
-    out.extend_from_slice(&reps[0].to_le_bytes());
-    out.extend_from_slice(&reps[1].to_le_bytes());
-    out.extend_from_slice(&reps[2].to_le_bytes());
+    let mut rb = [0u8; 12];
+    rb[0..4].copy_from_slice(&reps[0].to_le_bytes());
+    rb[4..8].copy_from_slice(&reps[1].to_le_bytes());
+    rb[8..12].copy_from_slice(&reps[2].to_le_bytes());
+    out.extend_from_slice(&rb);
     out.extend_from_slice(content);
     out
 }

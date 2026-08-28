@@ -35,6 +35,11 @@ profile = ["std"]
 # the decode loop, so it is NOT part of `profile`: it perturbs the very loop it
 # measures and must be built on purpose.
 dupladder = ["profile"]
+# `pfcensus` -- the D9 prefetch COVERAGE counters. Separate from `profile`
+# because they fire PER SEQUENCE: two atomics per sequence made a `profile`
+# build read D9 at +14.3% when the untaxed brick reads +0.2%. The tap must
+# not be in the build that measures the thing (codec-measurement 6).
+pfcensus = ["profile"]
 
 [lints]
 workspace = true

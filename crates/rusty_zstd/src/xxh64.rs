@@ -563,6 +563,49 @@ pub struct Xxh64 {
     buf_len: usize,
 }
 
+/// Copy `src` (0..=32 bytes) into `buf[at..at + src.len()]` without a `memcpy`
+/// CALL.
+///
+/// The third and last `unsafe` island in this file, and it exists for the same
+/// reason the first two do: a runtime-length `copy_from_slice` under 32 bytes
+/// lowers to `callq memcpy`, and `Xxh64::update` paid that call at all three
+/// of its buffering sites -- the small-stream append, the stripe top-up and
+/// the tail store. A width-laddered copy is branch-per-size-class instead of a
+/// call, and each rung moves a fixed width the compiler lowers to plain moves.
+/// The two overlapped moves per rung publish exactly `src.len()` bytes -- the
+/// same trick as C's `ZSTD_wildcopy` tails and this crate's `finish_words`.
+///
+/// Callers guarantee `at + src.len() <= 32`, re-checked here in debug.
+#[inline(always)]
+#[allow(unsafe_code)]
+fn copy_into_buf(buf: &mut [u8; 32], at: usize, src: &[u8]) {
+    let n = src.len();
+    debug_assert!(at + n <= 32);
+    let d = buf[at..at + n].as_mut_ptr();
+    let sp = src.as_ptr();
+    // SAFETY (all arms): `d` points at `n` writable bytes inside `buf` (the
+    // slice above just proved it), `sp` at `n` readable bytes. Each arm reads
+    // and writes only within those `n` bytes: the paired moves start at 0 and
+    // `n - W`, so both ranges are in-bounds and together cover [0, n) exactly.
+    unsafe {
+        if n >= 16 {
+            core::ptr::copy_nonoverlapping(sp, d, 16);
+            core::ptr::copy_nonoverlapping(sp.add(n - 16), d.add(n - 16), 16);
+        } else if n >= 8 {
+            core::ptr::copy_nonoverlapping(sp, d, 8);
+            core::ptr::copy_nonoverlapping(sp.add(n - 8), d.add(n - 8), 8);
+        } else if n >= 4 {
+            core::ptr::copy_nonoverlapping(sp, d, 4);
+            core::ptr::copy_nonoverlapping(sp.add(n - 4), d.add(n - 4), 4);
+        } else if n >= 2 {
+            core::ptr::copy_nonoverlapping(sp, d, 2);
+            core::ptr::copy_nonoverlapping(sp.add(n - 2), d.add(n - 2), 2);
+        } else if n == 1 {
+            *d = *sp;
+        }
+    }
+}
+
 impl Xxh64 {
     /// Seed 0 -- the only seed zstd uses for the content checksum.
     pub fn new() -> Self {
@@ -598,7 +641,7 @@ impl Xxh64 {
             // stop the copy going out to `memcpy` -- xxh64 total identical at
             // 722, still three `memcpy` calls in this function. Small-copy
             // inlining is a codegen decision the length bound does not reach.
-            self.buf[buf_len..buf_len + data.len()].copy_from_slice(data);
+            copy_into_buf(&mut self.buf, buf_len, data);
             self.buf_len = buf_len + data.len();
             return;
         }
@@ -629,7 +672,7 @@ impl Xxh64 {
             // pad; `split_at` proves the same bound once and yields both
             // halves. The guard above already established `data.len() >= take`.
             let (head, rest) = data.split_at(take);
-            self.buf[buf_len..].copy_from_slice(head);
+            copy_into_buf(&mut self.buf, buf_len, head);
             data = rest;
             // ...and no 32-byte COPY of the buffer. `let chunk = self.buf;`
             // moved all 32 bytes into a fresh local purely to end the borrow
@@ -663,7 +706,7 @@ impl Xxh64 {
             // check. The mask is a no-op the optimiser can read.
             debug_assert!(rest.len() < 32, "xxh64 remainder {} reached 32", rest.len());
             let n = rest.len() & 31;
-            self.buf[..n].copy_from_slice(&rest[..n]);
+            copy_into_buf(&mut self.buf, 0, &rest[..n]);
             self.buf_len = n;
         }
 

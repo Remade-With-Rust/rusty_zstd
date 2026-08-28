@@ -858,6 +858,30 @@ it becomes a call — which for a 256-element reduction is likely a net loss.
 
 ### E1 — the row-based match finder — **HIGHEST VALUE, HIGHEST COST**
 
+> **CEILING PROBE, 2026-08-24 -- E1 CANNOT HELP AT L3, AND THE PARAGRAPH BELOW
+> SAYS WHY BY ACCIDENT.** `examples/rowceiling.rs` counts `WALK_EXAM`, the serial
+> dependent chain-table loads a row scan would delete. Over 125.1 MiB of Silesia:
+>
+> | level | strategy | chain loads | loads/KiB |
+> |---|---|---:|---:|
+> | L1 | fast | **0** | 0.0 |
+> | L3 | dfast | **0** | 0.0 |
+> | L5 | greedy | 43,009,953 | 335.7 |
+> | L7 | lazy | 139,427,236 | 1088.1 |
+> | L9 | lazy2 | 220,979,813 | 1724.6 |
+> | L12 | lazy2 | 674,337,493 | 5262.8 |
+>
+> **L3 walks no chain at all.** `Strategy::DFast` uses two hash tables and never
+> enters `chain_find_best_inner`, so the row finder's ceiling at L3 is not small
+> -- it is EXACTLY ZERO. The text below cites `MatchFind` leading on 18/18
+> corpora **at L3** and then names `chain_find_best_inner` as its core; those are
+> two different finders, and every headline gap on the m7 board is measured at L3.
+>
+> This does not refute E1. It RELOCATES it: E1 is an **L5-L12 lever**, priced at
+> 336-5263 dependent loads per KiB, and it must be boarded there. Do not justify
+> it with an L3 profile again.
+
+
 This is the single largest SIMD opportunity in the codec, and it is not close.
 
 `MatchFind` is the encode leader on **18 of 18** corpora (57.4–82.6% at L3). Its core
@@ -1915,3 +1939,1698 @@ per-chunk `Vec` churn, a `BufWriter` that is not, and O(n²) accumulation.
 byte-identical, gate on the deterministic size table, and sit in the encode and
 decode leaders respectively. Landing them converts this document from 41 findings
 into 2 measured results, which is the only currency `codec-measurement` recognises.
+
+
+## 13. The "2x slower than zstd" diagnosis, corrected (2026-08-24)
+
+Two "missing functions" were named against the L3 board's 1.82x encode / 1.71x
+decode gap. **Both were measured before building, and both are refuted at L3.**
+
+### 13.1 `ZSTD_row_match_finder` -- ceiling EXACTLY ZERO at L3
+
+See the ceiling probe in E1. L1 and L3 walk no hash chain (`Fast`, `DFast`), so
+there are no dependent chain loads for a row scan to delete. The lever is real
+but lives at **L5-L12** (336-5263 loads/KiB). It was mis-sited, not mis-valued.
+
+### 13.2 `ZSTD_decompressSequencesLong` -- never selected at any level we board
+
+zstd picks its prefetching `_Long` sequence decoder on **window size**, not on
+level or corpus. `examples/mlceiling.rs` measured our windows:
+
+| level | L1 | L3 | L5 | L9 | L19 | L22 |
+|---|---|---|---|---|---|---|
+| window | 512 KiB | 2 MiB | 2 MiB | 4 MiB | 8 MiB | 64 MiB |
+
+Every level up to L19 sits **below** the threshold, and L3's 2 MiB fits in L3
+cache outright. zstd is running the same short decoder we are. A prefetch
+pipeline cannot explain a gap that exists where zstd does not prefetch either --
+and being byte-identical and work-identical, it would have **no deterministic
+counter**, leaving only a clock, against a null arm of 10.88-16.74%.
+
+### 13.3 What the gap actually is: FIXED COST PER SEQUENCE
+
+`examples/seqdensity.rs` counts executed match copies (one per sequence):
+
+| level | copies/MiB | bytes/copy | vs L3 |
+|---|---:|---:|---:|
+| L3 | 66,774 | 15.3 | 1.00x |
+| L5 | 72,506 | 14.8 | 1.09x |
+| L9 | 58,971 | 18.6 | 0.88x |
+| L19 | 49,519 | 24.0 | **0.74x** |
+
+Now price the two hypotheses against the boards. Our excess decode time is
+`(gap - 1) x C_time`: **0.71x** at L3 (gap 1.71) and **0.49x** at L19 (gap 1.49),
+so the excess falls by **0.69x** from L3 to L19 -- against a sequence count that
+falls by **0.74x**.
+
+**The excess tracks the sequence COUNT, not the byte count and not the window.**
+A per-byte or cache-latency cost would have grown with the window; it shrank, in
+proportion to sequences. The target is the fixed per-sequence cost in
+`decode_sequences_inner` and the copy dispatch around it.
+
+### 13.4 And the encode gap is L3-only
+
+The L19 board: **mean C/us comp 0.70** -- we compress **1.43x FASTER than zstd**
+at L19, winning 16 of 18 corpora. The 1.82x encode deficit is specific to L3's
+`DFast`. "We are 2x slower" is not a property of this codec; it is a property of
+one strategy. Board L5-L12 before spending another day on it.
+
+
+
+### 13.5 Where the per-sequence cost actually is (dsloop ladder, L3, 5 rounds, K=8)
+
+DecSeqLoop = **40.41 ns/sequence**. Cost of ONE execution of each op:
+
+| op | executions/seq | ns per execution | ns/seq | % of loop |
+|---|---:|---:|---:|---:|
+| `copy_match` | 1 | 23.29 | 23.29 | **57.6** |
+| `copy_literals` | 1 | 7.11 | 7.11 | **17.6** |
+| `FseTable::advance` x3 | 3 | 1.26 | 3.77 | 9.3 |
+| `BitRev::reload` x2 | 2 | 1.29 | 2.59 | 6.4 |
+| `BitRev::read_bits` x3 | 3 | 0.79 | 2.38 | 5.9 |
+| `resolve_offset` | 1 | 2.28 | 2.28 | 5.6 |
+| `FseTable::entry` x3 | 3 | 0.33 | 0.99 | 2.4 |
+| **total** | | | **42.41** | **105.0** |
+
+**The entropy machinery is 24% of the loop and the two copies are 75%.** Every
+brick in section 11 that shaved the FSE/bit-reader path was working inside a
+quarter of the loop. Stop optimising there.
+
+`copy_match` at **23.29 ns** for a mean length of 7.4 bytes (T4's census: 86.6%
+of match copies are `len <= 16`) is not copy cost -- a 16-byte `movups` pair is
+~1 ns. It is **memory latency**: the source is a random offset up to the 2 MiB
+window back into `out`, which does not fit L2. That is the fixed per-sequence
+cost 13.3 identified, now located.
+
+### 13.6 The brick this justifies: a DEPTH-1 decode-ahead pipeline
+
+This is the prefetch idea 13.2 refuted, rebuilt on the right evidence. It is NOT
+zstd's `_Long` decoder (window-gated, never selected here). It is the same
+principle at depth 1, and the match address is computable one sequence early:
+
+    src(N+1) = out.len_after_N + litlen(N+1) - offset(N+1)
+             = (out.len() + litlen_N + matchlen_N) + litlen(N+1) - offset(N+1)
+
+Every term is known once N+1's SYMBOLS are decoded, and symbol decode is the
+cheap 24%. So: decode N+1's symbols, compute and `prefetch` its match source,
+then execute N's copies. The miss for N+1 overlaps N's ~30 ns of copy work.
+
+Gate: `examples/bytegate.rs`, GOLD **BE0071FB0CB0CED9** -- the brick reorders
+DECODE relative to EXECUTE but publishes the same bytes in the same order, so it
+must be byte-identical. Note it is work-identical too, so per 13.2 it carries no
+deterministic counter of its own; the ladder's `copy_match` line is the
+instrument, and it must be re-run rather than a whole-decode clock trusted.
+
+
+
+### 13.7 D9 built, sized, and PARKED -- a noise verdict, stated as one
+
+The 13.6 brick was built in its cheapest form: prefetch the match source right
+after the symbols are decoded, so the miss overlaps `copy_literals` +
+`resolve_offset` (9.4 ns) instead of stalling `copy_match`. Only literal offsets
+are prefetched (`offset_value > 3`); rep codes need `state.reps`, resolved later.
+
+**Reachability confirmed:** `prefetcht0` appears **2x** in the emitted asm, so
+the kernel is not one of the five unreachable ones this workspace has shipped.
+
+**Deterministic size (`examples/d9cover.rs`):** 6,847,222 issued / 424,319
+rep-skipped / 4,497 oob-skipped = **94.1% coverage**, ceiling **21.9% of
+DecSeqLoop**. Not a coverage problem -- D9 reaches nearly every sequence.
+
+**The clock could not see it (`examples/d9probe.rs`, L3, 21 ABBA rounds,
+DecSeqLoop stage isolated):** OFF 34.31 -> ON 34.38 ns/seq = **+0.2%**,
+129/273 pairs, **z = -0.91**, against a **NULL ARM of 27.70%**.
+
+A 21.9% effect would have cleared even that floor. It read +0.2%. The mechanism
+is almost certainly that **9.4 ns is not far enough**: the out-of-order window
+already reaches past `copy_literals` to the `copy_match` load, so the software
+prefetch buys an instruction and no latency. That is the standard failure mode
+of short-distance software prefetch on a modern core, and it does NOT refute
+13.6 -- it constrains the DISTANCE, not the idea (codec-measurement 11: a prune
+constrains the approach it tested, not the idea it belonged to).
+
+**Disposition:** `set_prefetch_arm` kept, **defaulted OFF**. Point estimate leans
+mildly negative, so it does not ship unverified. This is a
+*revert-because-noise*, not a *revert-because-worse* -- and per section 15's
+corollary the floor moved for a NAMED reason: `faucet.exe` (86,147 CPU-s, up
+since 2026-08-19) plus eight `Code.exe` at 40-90k CPU-s each. The null arm went
+10.88% -> 16.74% -> 27.70% across one session on this box.
+
+**Next, and it needs a quiet box, not more code:** the depth-1 pipeline gives
+~40 ns of distance instead of 9.4. Decode sequence N+1's symbols before
+executing N's copies -- the address is `out.len_after_N + litlen(N+1) -
+offset(N+1)`, all known. Do NOT build it until `d9probe`'s null arm is under
+~3%, or the result will be exactly as unreadable as this one.
+
+
+
+## 14. E1 BUILT AND BOARDED -- the row match finder ships behind an arm
+
+`crates/rusty_zstd/src/rowfind.rs`, wired into the LAZY ladder via `ChainFn`.
+`set_row_arm(true)`. Defaults OFF: it is bitstream-changing and costs size, so
+it may not ship until a quiet box prices the speed it buys.
+
+**Reachability, first, because this workspace has shipped five unreachable
+kernels.** `ROW_LOADS` reads 30.6M/35.1M/34.6M at L7/L9/L12 -- the finder is on
+the shipping path, not just in the tests.
+
+**The board (`examples/rowboard.rs`, 12 Silesia corpora, 8 MiB each):**
+
+| level | chain loads | row loads | fewer dependent loads | size |
+|---|---:|---:|---:|---:|
+| L7 | 97,758,176 | 30,648,648 | **3.19x** | 1.0059x |
+| L9 | 153,594,793 | 35,147,365 | **4.37x** | 1.0054x |
+| L12 | 460,726,801 | 34,619,518 | **13.31x** | 1.0191x |
+
+Round-trip asserted on every cell of every level -- zero failures. At L7 the row
+finder is SMALLER than the chain on four corpora (nci 0.9602, ooffice 0.9806,
+osdb 0.9867, mozilla 0.9973).
+
+The reduction grows with level exactly as the mechanism predicts: deeper chains
+mean more dependent loads per position, while a row is always one load. The size
+cost grows for the same reason -- a row holds 16 candidates and a deep chain
+holds more, so the row finder trades candidates for loads. That trade is the
+whole design, and it is now priced instead of assumed.
+
+### 14.1 What is NOT yet known, and why
+
+**The speed.** Row loads are not free, and 3-13x fewer DEPENDENT loads is a
+claim about latency that only a clock can convert into a verdict. This box
+cannot: the decode null arm ran 10.88% -> 16.74% -> 27.70% -> 33.30% across one
+session, with `faucet.exe` at 86,147 CPU-s and eight `Code.exe` at 40-90k.
+
+So E1 is at the same gate D10 was, with the OPPOSITE deterministic evidence:
+D10 removed no work and added structure (correctly refuted at three distances),
+while E1 removes 3-13x of the dominant dependent-load class and adds a 16-lane
+SIMD compare. Do not ship it on that asymmetry -- ship it when the board can be
+run with a null arm under ~3%, on a corpus speed board paired with the size
+column above.
+
+### 14.2 Scope
+
+Only the LAZY ladder is wired. `find_greedy_impl` (L5) carries its own
+hand-copied walk instead of going through `ChainFn`, so it would need the same
+treatment separately -- worth 43M loads, against lazy's 139M/221M/674M.
+`Fast` (L1) and `DFast` (L3) walk no chain and are out of scope permanently.
+
+
+
+### 14.3 The speed verdict -- and a HARNESS DEFECT that nearly buried it
+
+14.1 said E1's speed "needs a quiet box." **That was wrong, and the error was in
+the instrument, not the box.**
+
+A null arm bounds the MAGNITUDE readable from one pair. It does not bound the
+SIGN: noise scatters pairs symmetrically, so a null arm wins ~50% of its own
+pairs however wide it is. D10 was decided on this same box at z = -14.59 for
+exactly that reason. E1 was decidable all along.
+
+Worse, `d9probe`/`d10probe` reported only the WORST null pair, which is the most
+pessimistic statistic there is. `examples/rowspeed.rs` reports both:
+
+    NULL ARM (chain vs chain): median 4.79%, worst 20.24%
+
+**The floor for a median delta is ~4.8%, not the 27-33% that got quoted.**
+Quoting the worst pair as if it were the floor overstated it ~7x and caused a
+real, resolvable result to be recorded as unmeasurable.
+
+**`examples/rowspeed.rs` @ L9, EncodeMatchFind stage, ABBA, 21 rounds:**
+
+| corpus | chain ns | row ns | delta | wins | z |
+|---|---:|---:|---:|---:|---:|
+| dickens | 971.0 | 508.9 | **-47.6%** | 21/21 | +4.58 |
+| reymont | 504.8 | 344.8 | -31.7% | 21/21 | +4.58 |
+| webster | 620.5 | 426.2 | -31.3% | 21/21 | +4.58 |
+| sao | 803.3 | 561.3 | -30.1% | 21/21 | +4.58 |
+| x-ray | 941.0 | 677.1 | -28.0% | 21/21 | +4.58 |
+| samba | 365.7 | 309.2 | -15.4% | 21/21 | +4.58 |
+| mr | 486.2 | 437.9 | -9.9% | 19/21 | +3.71 |
+| xml | 159.6 | 145.8 | -8.6% | 19/21 | +3.71 |
+| mozilla | 416.1 | 386.7 | -7.1% | 20/21 | +4.15 |
+| osdb | 406.7 | 401.2 | -1.4% | 9/21 | -0.65 (inconclusive) |
+| ooffice | 327.9 | 331.7 | +1.2% | 9/21 | -0.65 (inconclusive) |
+| **nci** | 163.4 | 180.7 | **+10.6%** | 3/21 | **-3.27 (regression)** |
+
+**BOARD: -23.6% | 205/252 pairs | z = +9.95 | size 1.0054x**
+
+Nine significant wins, ONE significant loss, two inconclusive.
+
+`nci` is the cell to understand before shipping: it is the only corpus that gets
+slower, and it is also where the row finder compresses BEST (675,624 vs 701,808
+= 0.963x). It finds different and better matches there and pays for them. That
+is a content-dependent split, which is what `codec-content-adaptive-dispatch`
+exists for -- not a reason to discard the lever.
+
+Plausibility check (codec-measurement 7): at L9 the row finder examines FEWER
+candidates than the chain (127.3M vs 153.6M) and takes 4.37x fewer dependent
+loads, so faster is the expected direction and -23.6% is not an impossible
+number. The genuine surprise is the 0.54% size cost -- capping at 16 candidates
+barely hurts, which says the 16 most-recent candidates carry the value.
+
+### 14.4 Disposition
+
+Still defaults OFF. It is bitstream-changing, costs 0.54% size, and regresses
+one corpus; flipping the default is a product call, not a measurement call. What
+has changed is that the trade is now PRICED on both axes instead of one:
+**-23.6% match-find time for +0.54% size, at z = +9.95.**
+
+Before shipping: board L5-L12 (only L9 is measured), decide the `nci` case, and
+wire `find_greedy_impl` (L5), which carries its own hand-copied walk outside the
+`ChainFn` seam and is therefore still on the chain.
+
+### 14.7 TEN CUTS ON THE ROW WALK -- 2026-08-26
+
+E1's finder had never been through a cuts pass. Ten landed, and the gate is
+sharper than byte-identity usually gets: **the row arm is bitstream-changing,
+so `rowboard` at L9 was run before and after and all TWELVE corpora returned
+IDENTICAL compressed sizes** -- proof that the candidate SET, its ORDER and the
+acceptance test are unchanged and only the cost of reaching them moved.
+
+| # | cut | what it removes, per position |
+|---|---|---|
+| 1 | `row_mask` cached in `RowTable` | `head.len()` Vec load off `row_of`'s dependency path |
+| 2 | **the bit-walk** -- rotate so newest is the high bit, consume set bits | the old loop stepped k=1..=16 testing one slot per step; now one iteration per CANDIDATE |
+| 3 | row base resolved once inside the walk | `r * ROW + s` per candidate |
+| 4 | `probe()` fuses tag-compare + collection | `r * ROW` derived once instead of twice; the tag slice never materialises |
+| 5 | `tag_row` -> `&[u8; ROW]`, kernel takes it | runtime slice length + the kernel's re-assert |
+| 6 | `low.max(1)` folds the sentinel into the window floor | the `m == 0` test |
+| 7 | fused reject `m.wrapping_sub(low) >= span` | 3 branches -> 1 |
+| 8 | `lz_insert_rowknown` | `row_of(h)` recomputed inside `row_insert` (the finder already held `r`), plus the `(Option, u8)` return that caller discards |
+| 9 | `src_len` hoisted | two slice-field re-reads |
+| 10 | `ip <= low` early return | the entire walk when no position can qualify |
+
+**THE STATIC SCREEN IS THE WRONG INSTRUMENT HERE, AND SAID SO.** Measured by
+reverse-patching this session's edits and rebuilding: `row_find_best`'s two
+monomorphs read **360 + 345 = 705 before and 363 + 341 = 704 after** -- flat.
+That is section 0b's screen-inversion in its purest form: cut 2 changes a
+loop's TRIP COUNT, and a trip count is invisible to a static count.
+
+**The admissible receipt is the walk census** (`take_row_walk`, `rowwalk.rs`,
+both new). It prices BOTH cost models from the SAME mask on every probe, so
+one run compares them with no A/B build and no clock:
+
+| corpus | probes | OLD slot visits | NEW | ratio |
+|---|---:|---:|---:|---:|
+| dickens | 2,874,645 | 34,219,143 | 19,877,919 | 1.72x |
+| mozilla | 4,750,092 | 15,463,311 | 7,703,484 | **2.01x** |
+| samba | 2,517,663 | 13,757,167 | 8,280,604 | 1.66x |
+| webster | 2,132,871 | 24,181,103 | 14,917,657 | 1.62x |
+| osdb | 2,881,425 | 19,348,903 | 12,682,537 | 1.53x |
+| reymont | 1,783,155 | 22,124,641 | 14,693,590 | 1.51x |
+| xml | 573,392 | 5,814,696 | 4,236,302 | 1.37x |
+| nci | 527,196 | 6,135,316 | 4,824,766 | 1.27x |
+| **total** | **18,040,439** | **141,044,280** | **87,216,859** | **1.62x** |
+
+**53.8 MILLION slot visits deleted** over 64 MiB at L9 -- 7.82 per probe down
+to 4.83. Gate: `rowboard` L9 identical on 12/12, `bytegate` GOLD
+`BE0071FB0CB0CED9` unmoved (the arm-off default path), rowfind's kernel-vs-
+oracle and ring-order tests green, 173 tests release + debug.
+
+**Recorded and NOT taken here:** the chain maintenance. Taken in 14.8.
+
+### 14.8 THE ROW FINDER WAS FEEDING A TABLE NOBODY READ -- 2026-08-26
+
+14.7 flagged it and declined to take it. This section takes it, with the board
+the flag asked for. **The result: 32 cells byte-identical with the entire
+chain path removed.**
+
+**The find.** `row_find_best` reads `rows` and nothing else. But every
+position it visited called `lz_insert`, which maintains FOUR other structures:
+the chain link (`chain_masked_set`), the chain tags (`ctags`), the hash head
+(`lz_head_put`) and the head tags (`tags`) -- plus the `lz_head_raw` load and
+the `old_tag` derivation that feed them. While the row arm is on, all of it is
+written and never read.
+
+**The proof is the board, not an argument.** Removing every one of those
+writes and re-boarding:
+
+| level | corpora | verdict |
+|---|---:|---|
+| L7 | 10 | **all identical** |
+| L9 | 12 | **all identical** |
+| L12 | 10 | **all identical** |
+
+32 cells, three levels, zero changed bytes. A table that is read cannot be
+stopped from being written without moving a single output byte.
+
+| # | win (this round) | what it removes |
+|---|---|---|
+| 1 | the `[u32; ROW]` candidate array | 64 bytes of stack per position, and its init |
+| 2 | per-candidate stores into it | ~4.83 per probe (measured popcount) |
+| 3 | per-candidate loads back out | ~4.83 per probe |
+| 4 | the `n` count and `take = n.min(attempts)` | a count, a min, a loop bound |
+| 5 | attempt budget as a COUNTDOWN on the walk | the bound computed against a count that no longer exists |
+| 6 | `probe_mask` returns `Copy` state | no out-parameter, no borrow plumbing at the call |
+| 7 | the chain link store | one random-access store into a table up to 64 MB |
+| 8 | the `ctags` store | one store |
+| 9 | the head-tag store | one store |
+| 10 | the hash-head store (`lz_head_put`) | one store |
+| 11 | the `lz_head_raw` load | one random-access load |
+| 12 | the `old_tag` derivation | a load or a shift, per position |
+| 13 | `lz_insert_rowknown`'s signature: 7 args -> 3 | four argument set-ups per call |
+| 14 | `cp`, `ca`, `chain_mask` dropped from the `ChainCtx` destructure | three struct loads per call |
+
+**Static receipt:** `row_find_best` went from **two monomorphs at 360 + 345 =
+705** instructions to a **single 301-instruction symbol** -- the bodies became
+identical enough to fold. Unlike 14.7 (where the static screen read flat
+because the win was a trip count), this round IS visible statically, because
+it deletes straight-line work.
+
+**The dynamic side is larger than the static side.** Six memory operations
+per position disappear, four of them random-access stores into the multi-MB
+chain and hash tables -- so this is cache pressure removed from the encoder's
+hottest stage, not just instructions. At L9's measured 18,040,439 probes over
+64 MiB, that is ~108M memory operations.
+
+**THE RESIDUAL RISK, STATED PLAINLY.** 32 identical cells is an empirical
+result about the paths these boards exercise, not a proof by construction. A
+future caller that reads the chain while rows are active would find a stale
+table. Two things bound it: the row arm is bitstream-changing and defaults
+OFF, and `rowboard` is its shipping gate -- any such caller appears there as a
+changed cell. The `lz_insert_rowknown` doc comment carries this warning at the
+site.
+
+### 14.9 THE 16-TO-1 BUCKET SHARING -- REFUTED as a cost. 2026-08-26
+
+`row_of(h) = (h >> 4) & mask` folds SIXTEEN hash buckets into one 16-slot row,
+so a tag match does not imply a bucket match. The hypothesis -- mine, written
+into 14.7's follow-up list -- was that most tag matches are collisions from
+the other fifteen buckets, each one costing an `mls_eq` (a RANDOM load into
+`src`) that for `mls >= 4` cannot possibly succeed. If true, that is a large
+byte-identical win: reject them from data already in the tag cache line.
+
+**It is not true.** `examples/rowbucket.rs` (new) recomputes each examined
+candidate's bucket and compares it to the probe's, L9, 8 corpora, 64 MiB:
+
+| | count | share |
+|---|---:|---:|
+| probes | 18,040,439 | |
+| candidates examined | 86,876,674 | 4.82/probe |
+| **same bucket** | **86,472,281** | **99.5%** |
+| cross bucket | 404,393 | **0.5%** |
+| passed `mls_eq` | 85,461,170 | 98.4% of examined |
+| `gtag == 0` probes | 117,318 | 0.7% |
+
+**The 8-bit tag is doing its job almost perfectly.** Cross-bucket collisions
+are 0.5% of examined candidates -- there is no meaningful wasted work to
+reclaim, and the ceiling on the entire idea is half a percent. Pruned on the
+arithmetic before anything was built (`codec-measurement` 11).
+
+**Two corrections this census forces:**
+
+1. **The sharing is not a defect; it is an implicit SPEED/RATIO trade, tuned
+   toward speed.** A bucket-private row would give a hot bucket up to 16 slots
+   instead of the 4.82 it averages today -- MORE candidates, better matches,
+   and MORE work per position. Undoing the sharing would COST instructions and
+   buy ratio. That is the opposite sign from the one this section set out to
+   find, and it re-frames E1's +0.54% size as a knob rather than a flaw.
+2. **The walk is near-optimal in candidate quality.** 98.4% of examined
+   candidates pass `mls_eq`, and the range reject (`low`/`ip`) eliminates
+   almost nothing (86.88M examined against 87.22M slot visits). There is no
+   filter to add that would pay.
+
+**The one win the census DID expose (W15).** `attempts = 1 << search_log` is
+32 at L9 and 64+ at L12, against a measured **4.82 candidates per probe** -- so
+the per-candidate countdown 14.7 introduced could never fire, yet cost a
+decrement, a compare and a branch on all 86.9M of them. The budget now applies
+to the MASK once per probe: the walk consumes set bits from the high end, so
+"the newest `attempts` candidates" is "clear the lowest set bits until
+popcount == attempts", and `w &= w - 1` clears exactly the lowest. The fixup
+loop runs only when a row over-delivers.
+
+Executed: roughly **-3 instructions x 4.82 candidates, +3 per probe** -- about
+**-200M instructions at L9's probe count**. Static: **301 -> 324** for the
+symbol, the usual inversion (0b) when a per-iteration cost is traded for a
+per-call one. Gate: `rowboard` L9 12/12 identical, GOLD unmoved, 173 tests
+release + debug.
+
+**A correction to my own first reading of this census.** I initially wrote
+that the vein was 0.5% deep and stopped at one win. That conflated two
+different claims: *the bucket-collision hypothesis is dead* (true, and
+permanently) with *the row path is exhausted* (false). The census does not
+just refute -- it MAPS the per-position work, and reading it that way found
+nine more. The refutation stands; the "nothing left here" did not.
+
+**The nine, all byte-identical, `rowboard` L9 12/12 after each batch.** The
+governing fact is one this section had to notice first: `row_find_best` is
+`#[inline(never)]` and reached through a `ChainFn` POINTER, so nothing hoists
+across positions -- every `ChainCtx` field it names is a real per-position
+load, and every constant it derives is derived again.
+
+| # | win | what it removes per position |
+|---|---|---|
+| W16 | `probe_view` merges `probe_mask` + `row_ref` | one of the two `r * ROW` derivations, and one call |
+| W17 | `insert_at` takes the probe's `at` | the THIRD derivation of the same row offset |
+| W18 | `insert_at` takes the probe's `head` | a reload of the byte the probe just read, on the dependency path of two stores |
+| W19 | advanced head computed from the register value | a second read-modify-write of `head[r]` |
+| W20 | `hash_shift32`/`hash_shift64` hoisted into `ChainCtx` | a `min` + a `saturating_sub`, on whichever of the three hash entries runs |
+| W21 | `lowest1 = lowest.max(1)` hoisted | a `max` (cmov) per position |
+| W22 | `hash_wide_link_tag_shift` | the third and last hash entry re-deriving the same block constant |
+| W23 | `hash_log` dropped from the destructure | one ctx field load -- W20/W22 made it unreachable |
+| W24 | `wchain` + `wide_hash` -> one `hash_mode` byte | one ctx field load, arm order preserved exactly (including a wide-hash block near the buffer end falling through to the wide-chain arm) |
+
+Static: **324 -> 330** for the symbol. The ctx grew by three fields, so the
+prologue that copies it grew; what shrank is the per-position work inside,
+which is the 0b inversion this document keeps re-learning and the reason the
+receipt is the operation list, not the symbol size.
+
+**A process failure worth recording, because the gate caught it and a lint
+did not.** W22-W24 removed `wchain`, `wide_hash` and `hash_log` from the
+destructure -- and the `profile`-only census block added earlier in this very
+section still referenced all three. `cargo check` passed because I ran it
+without the feature; the PROFILE build did not compile, so `rowboard` never
+ran, and the comparison printed an empty column that a careless `uniq` then
+rendered as "12 CHANGED". Two lessons, both already in this repo's rules:
+**check every cfg arm you have code under**, and **an empty result is not a
+result** -- read the raw numbers before believing a summary of them.
+
+`rowbucket.rs` stays in the tree so the next person with the bucket
+hypothesis can re-run it in a minute instead of building it.
+
+### 14.10 THE BACK-FILL WAS 2.3x THE FINDER, AND 14.8 HAD NOT TOUCHED IT
+
+Asked whether more was hiding, the answer was yes, and it was the largest
+single item in the whole E1 campaign -- found by asking where the row-mode
+inserts actually COME FROM.
+
+14.8 proved the chain link, chain tags, hash head and head tags are never
+read while the row arm is on, and removed them from `row_find_best`'s insert.
+**It stopped there.** `find_lazy_impl` also re-inserts every position a match
+covered, striding one byte, and that fill kept doing the full thing.
+`examples/lazyfill.rs` (new) prices the two against each other at L9:
+
+| | count |
+|---|---:|
+| finder probes (14.8's site) | 18,040,439 |
+| fill sites | 3,419,223 |
+| **fill inserts** | **41,742,765** |
+| **fill : probe ratio** | **2.31x** |
+
+Per corpus the ratio runs 0.75x (`mozilla`) to **10.80x** (`nci`) -- the
+content with the longest matches back-fills the most, which is exactly the
+content the row finder is otherwise best on.
+
+| # | win | what it removes |
+|---|---|---|
+| W25 | the fill's two hash shifts hoisted | a `min` + `saturating_sub` on **41.7M** inserts -- the fill strides ONE byte, so this was once per matched byte |
+| W26 | the fill's dead chain path, in row mode | chain link + ctags + head tags + hash head stores, plus the head load and tag derivation that feed them: **~6 memory ops x 41.7M ~= 250M**, four of them random-access stores into multi-MB tables |
+| W27 | the non-row arm takes `lz_insert_only` | W10 built that entry for callers that discard the result; this site still called full `lz_insert` and threw the `(Option<usize>, u8)` away with `let _ =`. **This one lands on the DEFAULT path**, so `bytegate` is its gate |
+
+**W26 is larger than everything 14.8 removed** -- 2.31x the volume, same six
+operations. The lesson is the one `rusty_curiosity` keeps charging for:
+14.8 found a dead table and fixed the site it was standing in, instead of
+asking who else wrote to it. **When a structure turns out to be dead, grep
+for every writer before closing the finding.**
+
+Gate: `bytegate` GOLD `BE0071FB0CB0CED9` unmoved (W27's path), `rowboard`
+identical at L7, L9 and L12 (W25/W26's path), 173 tests release + debug.
+
+### 14.11 THE FILL'S MARGINAL VALUE IS PRICED -- and half of it is nearly free to drop
+
+14.10 removed the fill's DEAD work. This asks the harder question: is the
+work that remains WORTH doing? The fill exists for defect B1 (positions inside
+a match are absent from the finder's table, so later searches see a thin table
+and find worse matches), and that defect was real -- but "necessary" is not
+"necessary at stride 1".
+
+**First, two hypotheses killed by counting:**
+
+- *Fill sites that insert nothing, paying setup for zero work.* **83 of
+  3,419,223 (0.0%).** Dead.
+- *The fill is a long tail on a few corpora.* No -- it is 12.21 inserts per
+  NON-EMPTY site everywhere, ranging 6.19 (`dickens`) to **37.56 (`nci`)**.
+  The content with the longest matches fills the most, which is the content
+  the row finder is otherwise best on.
+
+**The sweep (`examples/fillsweep.rs`, new; the stride knob already existed).**
+L9, row arm ON, 8 corpora, round-trip asserted on every cell:
+
+| stride | fill inserts | vs stride 1 | size | vs stride 1 |
+|---:|---:|---:|---:|---:|
+| **1** (shipping) | 41,742,765 | 1.00x | 17,906,078 | 1.0000x |
+| **2** | 21,749,282 | **0.52x** | 17,955,152 | **1.0027x** |
+| 3 | 15,024,082 | 0.36x | 18,011,261 | 1.0059x |
+| 4 | 11,713,837 | 0.28x | 18,079,418 | 1.0097x |
+| 8 | 6,740,929 | 0.16x | 18,204,714 | 1.0167x |
+
+**Stride 2 removes ~20 MILLION inserts -- 48% of the fill -- for 0.27% of
+size.** The curve is steeply diminishing: the second half of the fill buys a
+quarter of a percent, and the fourth stride buys another 0.4%.
+
+**Put that beside what this codec already trades.** E1 itself ships (when it
+ships) at +0.54% size for -23.6% match-find time. Stride 2 asks +0.27% for
+roughly half of a stage that is 2.31x the finder's own probe count. That is a
+comparable exchange rate on a knob that already exists and needs no new code.
+
+**NOT flipped here, deliberately.** It is bitstream-changing, the sweep is one
+level on eight corpora, and E1's own default is still off -- stacking a second
+un-boarded ratio decision underneath it would make both unattributable. What
+this section delivers is the PRICE, so the decision is a reading rather than a
+guess. Board it across levels and the full corpus set before touching the
+default.
+
+**W28, the one byte-identical win left in the fill path:** `row_insert`
+re-tested `!rows.head.is_empty()` on every call, but the fill only reaches it
+when `use_rows` -- which is exactly that predicate, decided once per block. A
+`Vec` length load and a branch, on 41.7M inserts.
+
+### 14.12 THE STRIDE LANDS, ROW-SCOPED -- and the mean was hiding the spread
+
+14.11 priced the fill and the call was made to take stride 4. Two things had
+to be established before landing it, and both changed the shape of the change.
+
+**1. The stride is SHARED, and the chain pays more for it.** `fill_stride`
+feeds `find_lazy_impl` whichever finder is running, so moving the default
+moves the SHIPPING path. Swept separately at L9 (the row column was measured
+with the arm genuinely off -- `ROW probes = 0` is the witness):
+
+| stride | fill inserts | ROW size | CHAIN size |
+|---:|---:|---:|---:|
+| 1 | 41.7M | 1.0000x | 1.0000x |
+| 2 | 21.7M (0.52x) | 1.0027x | 1.0034x |
+| **4** | **11.7M (0.28x)** | **1.0097x** | **1.0116x** |
+| 8 | 6.7M (0.16x) | 1.0167x | 1.0194x |
+
+So the stride is now **row-scoped**: `row_fill_stride()` defaults to 4, the
+chain keeps `lazy_fill_stride()` at 1, and `bytegate` GOLD
+`BE0071FB0CB0CED9` is UNMOVED. Two bitstream decisions, two boards, neither
+dragging the other.
+
+**Landed effect:** fill inserts **41,742,765 -> 11,713,837**, and the fill
+falls from **2.31x the finder's probe count to 0.65x** (12.21 inserts per
+non-empty site -> 3.45). Thirty million random writes into an 80 MB table,
+gone.
+
+**2. THE AGGREGATE UNDERSTATES THE COST, and this is `codec-campaign-laws`
+charging its usual fee.** "+0.97%" is a total over eight corpora, and totals
+are dominated by the big poorly-compressing files. Per corpus at L9:
+
+| corpus | s2 vs s1 | s4 vs s1 | s4 vs CHAIN |
+|---|---:|---:|---:|
+| dickens | +0.67% | **+1.94%** | **1.0517x** |
+| reymont | +0.67% | **+1.93%** | **1.0497x** |
+| webster | +0.49% | **+1.94%** | 1.0375x |
+| mr | +0.91% | +1.74% | 1.0169x |
+| x-ray | +1.48% | +1.54% | 1.0271x |
+| samba | +0.02% | +0.58% | 1.0137x |
+| sao | +0.21% | +0.35% | 1.0129x |
+| osdb | +0.16% | +0.30% | 0.9891x |
+| mozilla | +0.10% | +0.24% | 1.0022x |
+| ooffice | +0.34% | +0.80% | 0.9856x |
+| nci | **-0.06%** | +0.83% | 0.9707x |
+| xml | **-0.27%** | +0.46% | 1.0317x |
+
+**On TEXT the cost is double the mean** -- ~1.9% for stride 4 -- and stacked
+on E1's own it puts `dickens` and `reymont` at **+5% against the chain**,
+which is a large price for an encoder to pay for speed.
+
+**The marginal rate is where the argument is:**
+
+* 1 -> 2: **-20M inserts** for ~+0.5% on text, and `nci`/`xml` get SMALLER.
+* 2 -> 4: **-10M inserts** for another ~+1.2% on text.
+
+The second step buys half as much work for more than twice the size.
+
+**SHIPPED: stride 2.** The spread decided it. Landed effect at L9:
+
+| | stride 1 | **stride 2 (shipped)** |
+|---|---:|---:|
+| fill inserts | 41,742,765 | **21,749,282** |
+| fill : probe ratio | 2.31x | **1.21x** |
+| inserts per non-empty site | 12.21 | **6.42** |
+| worst text corpus | -- | **+0.67%** (`dickens`, `reymont`) |
+| best | -- | **`xml` -0.27%, `nci` -0.06% -- SMALLER** |
+
+**Twenty million inserts removed -- half the fill -- for 0.27% aggregate and
+at most 0.67% on any text corpus, with two corpora improving.** `x-ray` is
+the outlier at +1.48% and is the one cell to watch when this is boarded
+wider.
+
+The `set_row_fill_stride_arm` / `RZSTD_ROW_FILL_S` knob keeps every other
+stride one call away, and the sweep that priced them is `fillsweep.rs`.
+
+### 14.13 THE FILL LOOP ITSELF -- ten cuts on "inserts per non-empty site"
+
+14.12 halved HOW MANY inserts run. This works what each one COSTS. The loop
+had never been read as a hot loop: it re-asked two block constants and a
+bounds pair on every position, and the sibling fill in `find_greedy_impl`
+had drifted a full campaign behind.
+
+**The tell was in the numbers already on the page.** 6.42 inserts per
+non-empty site is a tight inner loop, and `find_greedy_impl`'s fill already
+carried a bounds fold (its W7) that this one never received -- two fills, one
+defect class, fixed in only one of them. That asymmetry is where the round
+started.
+
+| # | win | what it removes per inserted position |
+|---|---|---|
+| W29 | `stop = end.min(ilimit + 1)` | one of the two bounds compares -- the fold greedy's fill had and lazy's did not |
+| W30 | the hash MODE hoisted out of the loop | 1-2 branches; each arm now has ONE hash in its body |
+| W31 | the `use_rows` table choice hoisted out | one branch |
+| W32 | `p + 8 <= src_len` gone from the two non-wide arms | an add and a compare, on every position that is not using the 8-byte hash |
+| W33 | `row_mask` hoisted | a struct load per insert -> one per fill site |
+| W34 | `insert_h` folds `row_of` INTO the insert | one call boundary per position |
+| W35 | the `&mut rows` borrow taken once | lets LLVM hoist the `pos`/`tags`/`head` base pointers out of the loop entirely |
+| W36 | greedy's fill: both hash shifts hoisted | a `min` + `saturating_sub` **twice per matched byte** -- greedy strides 1 |
+| W37 | greedy's fill: hash mode hoisted | 1-2 branches per position, same shape as W30 |
+| W38 | greedy's fill keeps `lz_insert_only` | W10's entry, now reached from all three specialised arms |
+
+**Gate:** `bytegate` GOLD `BE0071FB0CB0CED9` unmoved -- which matters more
+here than usual, because W36-W38 land on `find_greedy_impl`, the SHIPPING
+finder at L5. `rowboard` L9 12/12 identical against the stride-2 baseline,
+`no_std` and `profile` clean, 173 tests release + debug.
+
+**The pattern worth keeping.** Three fills exist in this encoder and they
+drift apart: greedy's had the bounds fold but not the shift hoist, lazy's had
+neither until 14.11, and each fix has been applied to one site at a time.
+Section 14.10 already charged for this once ("when a structure turns out to
+be dead, grep for every writer"). The same rule applies to a LOOP SHAPE:
+**when a fill gets a cut, check the other fills the same day.**
+**Still to do before E1's own default flips:** board this at L7 and L12. L7
+is where E1 is already a wash, so it has the least headroom to spend, and a
+stride that is free at L9 is not automatically free there.
+
+### 14.6 The board COMPLETED -- L7 and L12 measured, 2026-08-24/26
+
+14.4 required boarding L5-L12 before any ship decision. L5 stays out of reach
+(greedy's hand-copied walk bypasses `ChainFn` -- 14.2). The other two:
+
+| level | chain -> row (total ms) | delta | pairs | z | size |
+|---|---|---:|---:|---:|---:|
+| L7 | 2892.5 -> 2854.8 | **-1.3%** | 121/252 | -0.63 | 1.0059x |
+| L9 (14.3) | -- | **-23.6%** | 205/252 | +9.95 | 1.0054x |
+| L12 | 15973.2 -> 5172.5 | **-67.6%** | **248/252** | **+15.37** | 1.0191x |
+
+**L12 is a 3.1x encode speedup, every corpus 21/21.** The profile is monotone
+with chain depth exactly as `rowceiling`'s load counts predicted (1088 ->
+1725 -> 5263 loads/KiB). L7 is a WASH overall with hard per-corpus
+sign-flips (webster -7.8% z +3.71 against nci +19.6% z -4.58, ooffice +18.3%
+z -3.71) -- `codec-content-adaptive-dispatch`'s trigger, not a ship-or-revert.
+
+**Ship shape this evidence supports:** row finder ON by default at L9+ (where
+it wins broadly), chain kept at L7 (or dispatched per-content later), greedy
+(L5) still needing its `ChainFn` wiring before it can even be measured. The
+default flip remains a product call; the measurement debt named in 14.4 is
+now PAID.
+
+### 14.5 Standing instrument fix
+
+`prof::scope` times with `Instant` -- WALL. On a loaded box every deschedule
+inside a scope is charged to that scope, which is a large part of what inflated
+the worst-pair null. codec-measurement 2 measured wall spread 0.78-1.50 against
+CPU-time 0.950-1.089 on identical work. Moving the stage clock to a THREAD CPU
+clock (`QueryThreadCycleTime` / `CLOCK_THREAD_CPUTIME_ID`) tightens every
+in-process measurement in this project at once. That is the highest-leverage
+measurement work outstanding.
+
+
+
+## 15. The stage clock: fixed, verified, and SMALLER than advertised
+
+14.5 called the wall-clock stage timer "the highest-leverage measurement work
+outstanding." It was worth doing and that billing was too high. Both halves are
+recorded here because a wrong instrument diagnosis is as expensive as a wrong
+codec one.
+
+### 15.1 What was fixed
+
+`crates/rusty_zstd/src/profclock.rs`. `prof::scope` timed with `Instant` --
+WALL -- so any moment the thread spent DESCHEDULED was charged to whichever
+scope was open. Now: `QueryThreadCycleTime` on Windows (thread CPU cycles),
+`clock_gettime(CLOCK_THREAD_CPUTIME_ID)` on Linux, `Instant` elsewhere so no
+platform loses the profiler. Profile-only; the shipping codec is untouched.
+
+Windows counts cycles and every consumer reports nanoseconds, so the ratio is
+calibrated once against `Instant` over short busy spins, keeping the HIGHEST
+cycles-per-wall-ns sample (descheduling inflates wall and leaves cycles alone,
+so the largest ratio is the least-interrupted trial).
+
+### 15.2 The calibration is SOUND -- and a wrong inference, corrected
+
+A cycles->ns error is invisible in ratios and fatal in absolutes, and every
+"ns/seq" in this document is an absolute. `examples/clockcheck.rs` settles it on
+one inequality: **thread CPU time cannot exceed wall time for the same region.**
+
+| corpus | stage ns | wall ns | ratio |
+|---|---:|---:|---:|
+| dickens | 33,368,771 | 34,821,900 | 0.958 |
+| webster | 27,952,205 | 28,473,100 | 0.982 |
+| samba | 20,334,526 | 20,916,800 | 0.972 |
+| nci | 13,926,490 | 14,271,300 | 0.976 |
+| xml | 8,683,929 | 9,456,100 | 0.918 |
+| mozilla | 14,823,140 | 15,216,100 | 0.974 |
+| **total** | **119,089,061** | **123,155,300** | **0.967** |
+
+Consistent everywhere, never above 1.0.
+
+It was briefly concluded from `d9probe`'s OFF arm reading 33.91 ns/seq on wall
+and 44.08 on CPU that the conversion was ~30% out. **That was wrong.** Those are
+different runs minutes apart on a variable-load box; the OFF arm ranged
+33.9-44.1 across this session on both clocks. Two numbers from un-interleaved
+runs are not a comparison -- the same rule that section 3 of codec-measurement
+states, applied to an instrument instead of a codec.
+
+### 15.3 Why it did not shrink the null arm, and what that PROVES
+
+| clock | median null | worst null |
+|---|---:|---:|
+| wall (`Instant`) | 3.79% | 18.87% |
+| thread CPU | 4.28% | 19.81% |
+
+Unchanged. The 0.967 ratio above says why, quantitatively: only **3.3% of wall
+sits outside the profiled scopes AT ALL**, descheduling included. Descheduling
+inside scopes therefore cannot account for a 4% median or a 19% worst pair --
+the ceiling on what this fix could ever have removed was ~3%.
+
+**So the residual noise is NOT scheduling. It is memory-system contention.**
+Eight `Code.exe` processes plus `faucet.exe` thrash L3 and memory bandwidth, and
+our thread pays that in REAL CYCLES. A CPU clock excludes time spent
+descheduled; it does not exclude cycles burnt on cache misses another process
+caused, and nothing does.
+
+The practical consequence: **~4% median is close to this box's true floor**, and
+no further instrument work will move it. Effects under ~4% need deterministic
+counters (codec-measurement 15) or the sign test. That is a more useful thing to
+know than the fix itself.
+
+### 15.4 Kept anyway
+
+It measures the right quantity, is verified consistent, costs nothing at runtime
+(profile-only), and on a scheduling-contended box it would matter. The
+diagnostic value is separate: `clockcheck.rs` now prices scope coverage against
+wall in one run, which is how 15.3 was settled at all.
+
+### 15.5 A second defect, found by the same run: the tap taxed its own brick
+
+`d9probe` on a plain `profile` build read D9 at **+14.3%, z = -10.26**, against
+**+0.2%, z = -0.91** before. Nothing about D9 changed. The difference was the
+`note_pf` COVERAGE census added for `d9cover.rs`: two atomics PER SEQUENCE, in
+the build used to TIME the brick they describe. codec-measurement 6, exactly.
+
+Fixed by a new `pfcensus` feature, separate from `profile`, so a timing build
+does not carry the counters. `d9cover` now requires it. Re-measured clean:
+**D9 = +0.4%, 60/117 pairs, z = +0.28** -- confirming the original reading and
+leaving D9 where it was, a genuine null.
+
+
+
+## 16. COMPLETENESS RE-VALIDATED -- 2026-08-24. The census diffed against the tree, and the residue adjudicated.
+
+The 1b census is this document's completeness argument, and it had never been
+checked by anyone who did not write it. It was re-run independently: every
+non-test `for`/`while`/`loop` in the crate, counted per file, attributed per
+function, and diffed against the 1b table.
+
+### 16.1 The census reproduces, and every delta has a named cause
+
+**Nine files match the 1b table EXACTLY** (fse 25, train 20, mt 7, decode 6,
+prof 5, seekable 4, stream 2, bit 1, params 1) -- so the 232-loop census was a
+real measurement whose method an independent count can reproduce. The files
+that moved, moved for reasons this document already records:
+
+| file | 1b | now | cause |
+| --- | ---: | ---: | --- |
+| `simd.rs` | 13 | 9 | shipped bricks DELETED loops (D7 tail, twin cleanup) |
+| `xxh64.rs` | 12 | 8 | `stripes_pre` factoring (D8b) collapsed hand-copied walks |
+| `ldm.rs` | 4 | 3 | E2 deleted the byte-compare loop |
+| `huffman.rs` | 64 | ~86 | the allocation campaign's `_into` writers, `pop_min` (N13), `covers_freq` (E11) -- i.e. the FIXES, plus kept reference twins |
+| `compressed.rs` | 14 | 14+ | the D9/D10 arms |
+| `encode.rs` | 52 | 54 | E1's `row_find_best` wiring |
+
+A shrinking census in the files where bricks shipped, growing only where fixes
+landed, is what a healthy campaign should read like.
+
+**One census-method correction, recorded so the next run does not re-flag it:**
+`compressed.rs`'s `pack_ll` / `pack_ml` / `build_code_lut` are **`const fn`** --
+`const LL_PACK: [u32; 36] = pack_ll();` runs at COMPILE TIME. Four of the
+file's counted loops execute zero times at runtime. A loop census counts
+source, not execution; these are the reminder to check which one a candidate is
+before ranking it.
+
+### 16.2 seekable.rs -- the one walked-but-silent file, now adjudicated
+
+The 1b table counted seekable.rs's 4 loops and no section of this document ever
+gave them a verdict. Read in full today:
+
+| loop | frequency | verdict |
+| --- | --- | --- |
+| `compress_seekable_adv` frame walk | once per **2 MiB** frame (default) | per-frame plumbing; the work is `encode_oneshot`, already the whole campaign's subject |
+| `append_seek_table` / `parse_seek_table` | once per FILE, over one 12-byte entry per 2 MiB of content | header I/O; no per-byte work exists here |
+| `decompress_frame_at` entry walk | O(entries) linear scan **per seek** | honest note: a binary search over prefix sums beats it -- at one entry per 2 MiB that matters from ~millions of frames, i.e. terabyte files. Not built; recorded with its threshold |
+
+**CLOSED.** No inline scalar byte work, nothing for this plan. The gap was in
+the paper trail, not the code.
+
+### 16.3 The small-parse residue -- named, read, closed
+
+Functions with loops that no D/E/V/N item ever named, each read today:
+
+| site | shape | verdict |
+| --- | --- | --- |
+| `huffman::write_tree_raw` | nibble-pack, <=64 iterations/table, pooled (ALLOC-15) | E12-class volume (11x SMALLER than E12's pruned 7M visits); below every floor |
+| `huffman::read_table` / `read_ctable` direct-weights arm | nibble-unpack, <=128 symbols/table | same class, decode side |
+| `fse::parse_ncount_into`, `weights_into_inner`, `decompress_weights_inner` | bit-serial FSE decode, <=256 symbols, W29-presized, WEIGHT_TBL-recycled | **serial recurrence** -- the E6/D6 argument verbatim; not vectorisable, already allocation-clean |
+| `compressed::build_code_lut`, `pack_ll`, `pack_ml` | `const fn` | compile-time; zero runtime loops (16.1). Runtime LUT use was adjudicated by brick 35 (`set_lut_arm`) |
+
+### 16.4 The census is a SNAPSHOT, not a standing gate
+
+Everything written after 2026-08-22 is outside the 1b census by construction.
+Audited today: **`rowfind.rs`** -- doctrine-compliant (scalar oracle dead by
+`cfg_attr` on x86/aarch64, shipping kernel baseline SSE2 so Law 1 does not
+apply, NEON movemask mirror, lane order pinned by test); **`profclock.rs`** --
+2 profile-only calibration loops; **`scratch.rs`** -- zero loops. The
+fn-pointer population (12.1's blind spot) was re-checked: **still exactly the
+four audited sites**, and E1 wires through the already-audited `ChainFn` seam.
+
+**The standing rule this earns:** the census, the 11.1 dead-code grep, and the
+12.1 fn-pointer check are point-in-time instruments. Re-run all three whenever
+a new source file or a new fn-pointer type lands -- the census by mechanical
+count with per-function attribution, exactly as here -- and append the diff to
+this section rather than trusting the 1b table, which is now a historical
+record. The 11.1 recommendation ("make this a recurring audit") is hereby its
+own precedent: this section IS that audit's first recurrence, and it found the
+tree clean.
+
+
+## 17. TEN CUTS ON THE DECODER'S SEQUENCE LOOP -- 2026-08-24
+
+The m7 anatomy says Loop is 97.2-98.9% of DecSeq at every level; the 13.5
+ladder prices its ops. The finders all had their ten-cuts pass; this is the
+sequence loop's. **Every receipt is a count; the gate is byte-identity.**
+
+| | before | after | delta |
+|---|---:|---:|---:|
+| `decode_sequences` (baseline twin) | 2,755 | **1,608** | **-41.6%** |
+| `decode_sequences_avx2` | 2,708 | **1,570** | **-42.0%** |
+| crate total | 238,749 | 236,934 | -1,815 net |
+
+Gate: `bytegate` GOLD **BE0071FB0CB0CED9** unmoved; 173 tests green in release
+AND debug (debug carries the hostile-input `copy_literals` case and every new
+`debug_assert`); both cfg arms (`profile` on/off) compile clean.
+
+The cuts, each with its mechanism:
+
+1. **Pattern-A `pipeline_on()`** -- the parked D10 block, including TWO macro
+   expansions of the full symbol-decode body, folded out of both twins in
+   non-`profile` builds. The single biggest static cut. Probes keep the arm
+   under `--features profile`.
+2. **Pattern-A `prefetch_on()`** -- the parked D9 `prefetch_hist` body and its
+   per-sequence branch, same fold.
+3. **Pattern-A `seqcheck_hoisted()`** -- shipping builds fold to `true` (the
+   brick-45 default); the per-sequence `!seqcheck && (range tests)` vanishes.
+4. **`offset_value` branch deleted by algebra** -- `read_bits(0) == 0` and
+   `1 << 0 == 1`, so `(1 << of_code) + offset_add` IS the special case. One
+   branch per sequence, in both loop bodies.
+5. **`resolve_offset` single dispatch** -- the old body re-tested
+   `offset_value > 3` and re-matched the rep index a second time to apply the
+   update the first match had determined. Each RFC repcode case now fuses its
+   update; every condition tested once. The 5-instruction outlined residual
+   symbol is gone entirely.
+6. **Pattern-A `litcopy_on()` / `matchcopy_on()`** -- const `true` in shipping;
+   the per-sequence `arm` tests in every copy tier become tautologies.
+7. **`reps` register promotion** -- the rep history moves from behind the
+   `&mut BlockState` pointer into a local `[u32; 3]`, written back once per
+   block.
+8. **`copy_literals` overflow branch** -- `checked_add` per sequence replaced
+   by a remaining-length compare that cannot overflow on any width; the sum is
+   computed only after it is proven to fit.
+9. **Dict-path arm outlined cold** -- `copy_match` (inline(always)) was
+   stamped into both twins as the `else` of `if nodict`; it now sits once
+   behind `copy_match_dict_cold` (203 instructions, its own symbol) per the
+   round-five duplication rule.
+10. **`copy_match_nodict` guard fold** -- `off == 0` and `off > produced`
+    share one compare via `off.wrapping_sub(1) >= produced`; both rejected the
+    same inputs to the same error.
+
+Cuts 3-8 and 10 are EXECUTED-path reductions (fewer instructions per sequence
+retired); 1, 2 and 9 are static-size cuts that shrink the loop bodies the
+front-end streams. No timing number is quoted -- this box's floor is ~4%
+median (15.3) and the deterministic receipts above are the admissible record.
+
+
+## 18. TEN MORE -- the second decode sweep, 2026-08-24
+
+Section 17 worked the sequence loop; this round follows the same laws one
+level out: the per-SYMBOL Huffman loops, the streaming plumbing, and the
+checks that re-prove build-time invariants per element. Gate: `bytegate` GOLD
+**BE0071FB0CB0CED9** unmoved, 173 tests green in release AND debug (debug
+carries every new invariant as a `debug_assert`), all five configs clean.
+
+| # | cut | deterministic reduction |
+|---|---|---|
+| 1 | **decode_into_x1/x2 get their ISA back.** Round five's outlining left the per-symbol loops as ONE baseline symbol called from all three `decode_4x` twins -- the 12.4 shim trap, live. `#[target_feature]` twins, statically selected by `const ISA` from the enclosing twin (and by one per-SECTION CPUID pick on the 1-stream path). | x1: 14 `shl %cl` -> **14 `shrx/shlx`**; x2: 17 -> **17** -- every variable shift in the per-symbol loop goes 3 uops -> 1 on the hardware that runs it. +1,132 static for 4 twin symbols, the deliberate inverse of the trap. |
+| 2 | **`decode_one` infallible.** Its `nbits == 0` reject re-proved Kraft-completeness per SYMBOL; `read_table` already rejects any non-exactly-complete tree (`rest` a power of two, derived last weight, `rank[1]` parity). | One test-and-branch per LITERAL deleted from every unrolled copy: `decode_4x` 2,875 -> **2,712**, `_bmi2` 2,610 -> **2,388**, `_avx2` 2,435 -> **2,275**; `decode_into_x1` 273 -> **241**. |
+| 3 | **`FseView::entry_u32` unmasked.** `init_state < 2^log` and `baseline + (2^nb - 1) <= len - 1` hold for every entry `from_norm_buf` can emit (it rejects `ns == 0`, `hb > log`), and `rle` pins state 0. | 3 AND instructions per sequence deleted; `decode_sequences_avx2` 1,570 -> **1,546**. |
+| 4 | **Streaming decoder: the per-block payload copy.** `try_block` did `input[a..b].to_vec()` -- a heap alloc + full copy of EVERY payload -- purely to end a borrow the cursor makes unnecessary. | `streamcost` (10.2 MB, 256 blocks, 64 KiB chunks): **278 -> 23 allocator calls (1.09 -> 0.09/block), 17,423,464 -> 7,452,088 bytes requested (-57%)**; the remainder is the decoded buffer itself. |
+| 5 | **Streaming decoder: input cursor.** Five sites drained `input` per parsed unit -- an O(remaining) memmove per BLOCK. `in_off` + reclaim only on fully-consumed (a `clear`) or a 64 KiB dead prefix. | **258 O(remaining) memmoves per streamcost run -> amortised compactions**; total bytes moved now bounded by bytes fed, not units x remaining. |
+| 6 | **`lut_on()` -> pattern A.** The brick-35 LL/ML code LUT has been the shipping default since it landed. | The linear-scan alternative folds out of the three `write_sequences` twins in non-`profile` builds; the per-block atomic read goes with it. |
+| 7 | **Compressor stream hygiene.** `out_acc.drain(..n)` ran per CALL on the unread remainder, and `compact_in` drained on every call. | Per-call O(remaining) memmoves -> `out_off`/threshold reclaim, same shape as cut 5, encode side. |
+| 8 | **`Reader` N6, finally closed.** `u16_le`/`u32_le`/`u64_le`/`u24_le` assembled element-wise through `take(n)`'s unknown-length slice. | 2/4/8/3 per-byte bounds checks -> ONE structural length proof each (`try_into`), the form `peek_u32_le` has carried since T4. |
+| 9 | **`copy_from_decoded` hot entry.** `copy_match_nodict`'s fused guard already proves `src < out.len()`, RFC `matchlen >= 3` proves `len > 0`, and `offset == 0` was unreachable behind the first check. | **3 per-sequence entry tests bypassed** on the no-dict path; the checked wrapper remains for the dictionary path and tests. |
+| 10 | **The `offset == 1` splat demoted.** Band 0 of the census is 0.01% of match copies, and offset 1 can never satisfy any tier's `offset >= width`. | Its test moves off the 86.6% tier-1 path into `copy_from_decoded_cold`; dispatch outcomes provably unchanged. |
+
+Crate total: 236,934 -> 237,713 -- **+779 net**, the +1,132 ISA-twin cost less
+~350 of cuts, and that trade is the point: rounds one and two together hold
+the sequence loops at **-42%** while this round returns the per-symbol loops
+to the ISA the twin campaign bought them. `examples/streamcost.rs` is the new
+standing instrument for the streaming plumbing.
+
+
+## 19. THE STREAMING DECODER'S HIDDEN QUADRATIC -- 2026-08-24
+
+Section 18's cut 4 removed the per-block payload copy and left a residue the
+census could still smell. Dug into with a new instrument (`take_dec_compact`,
+`profile`-gated: compaction count + bytes memmoved), it turned out to be the
+biggest single overhead in the whole streaming path -- and invisible to every
+whole-frame gate, because only `Decompressor::stream` reaches it.
+
+**What the counter found (webster, 32 MiB decoded, 10.2 MB frame):**
+
+| feed pattern | compactions | bytes MEMMOVED | vs decoded bytes |
+|---|---:|---:|---:|
+| 64 KiB chunks | 147 | 306,315,264 | **9.1x** |
+| whole frame, one call | 255 | **4,278,190,080** | **133x** |
+
+`compact()` drained `decoded` on EVERY `stream()` call, memmoving the retained
+2 MiB window each time; and the progress loop's only early exit was
+`output.is_empty()`, so a one-shot feed decoded ALL 32 MB into `decoded`
+before returning a byte -- 121 MB of allocator traffic -- and then paid the
+classic O(n^2) front-drain reading it back out. N3 rehomed the drain pattern
+to 12.2; the allocation campaign fixed the ENCODER and never came back for
+this.
+
+**Three bricks:**
+
+- **A -- decode no further than the caller can drink.** The loop now stops
+  once pending output can fill the caller's buffer, bounding `decoded` at
+  ~output + window + block regardless of how much input is fed at once.
+- **B -- amortise the reclaim.** Compact only once a full WINDOW of dead
+  prefix has accumulated, so each compaction reclaims at least what it moves
+  and total traffic is bounded by ~1x decoded bytes, for one extra window of
+  memory held.
+- **C -- size `decoded` from the header.** Reserve
+  `min(content_size + block, 2*window + 2*block, 8 MiB)` at header accept;
+  the caps keep a hostile header from allocating past 8 MiB unverified.
+
+**After (same instrument, same corpus):**
+
+| feed pattern | compactions | bytes memmoved | allocator calls | bytes requested |
+|---|---:|---:|---:|---:|
+| 64 KiB chunks | **16** | **31,588,352 (0.9x)** | 24 -> **10** | 7.45 MB -> **4.96 MB** |
+| one-shot | **16** | **31,588,352 (0.9x, was 133x)** | 25 -> **7** | 121.4 MB -> **14.7 MB** |
+
+The one-shot column now READS THE SAME as the chunked one -- feed pattern no
+longer changes the cost, which is the property a streaming API is supposed to
+have. Behavioural note: a caller that fed everything in one call now gets
+`done` after draining rather than in the first call; `StreamStatus::done` has
+always been the loop condition the API documents.
+
+Gate: `bytegate` GOLD unmoved, 173 tests release + debug, `no_std + alloc`
+and wasm32 clean. `streamcost.rs` prints both feed patterns and the counter,
+so the next regression here has an instrument waiting for it.
+
+
+## 20. THE ENCODER'S MIRROR -- half a billion inserts of slide overhead, 2026-08-24
+
+Asked what else was hiding around section 19, the symmetric question answered
+itself: `Compressor::emit_block` slides `hist` past the window at
+`hist > window`, which at steady state is EVERY BLOCK -- and each slide
+memmoves the retained window, zeroes six match tables (`tables.reset()`), and
+re-primes the ENTIRE window at stride 1. One-shot encode never runs this path,
+so no board, gate or census had ever priced it. `take_enc_slide` (new,
+`profile`-gated) plus the pre-existing `take_prime_iters` did:
+
+**Before (webster 32 MB, L3, 256 KiB chunks):**
+
+| | count |
+|---|---:|
+| window slides | **240** (one per block) |
+| hist bytes memmoved | **503,316,480 -- 15.0x the source** |
+| prime inserts | **503,314,800 -- half a BILLION** |
+| table resets (x6 fills each) | 240 |
+
+For scale: E1's whole L9 chain walk is 221M dependent loads over 96 MiB; the
+streaming encoder was doing 2.3x that many table inserts on a THIRD of the
+data, as pure bookkeeping.
+
+**The fix is section 19 brick B, mirrored:** slide at `hist >= 2 * window`,
+retaining one window -- each slide then reclaims at least what it moves and
+all three costs amortise to ~1x the stream, for one extra window of memory.
+Safe for the reason one-shot already proves daily: the finders clamp offsets
+to `window` internally regardless of how much history the buffer holds.
+
+**After:** **15 slides, 31,457,280 bytes memmoved (0.9x), 31,457,175 prime
+inserts** -- a **16x reduction** on all three axes.
+
+**The honest size trade, anchored to one-shot.** This is bitstream-changing
+on the STREAMING path (one-shot is untouched; `bytegate` GOLD unmoved):
+
+| | bytes | vs one-shot |
+|---|---:|---:|
+| one-shot `compress_with` | 10,234,302 | -- |
+| streamed, per-block slide (old) | 10,150,089 | **-0.82%** |
+| streamed, hysteresis (new) | 10,221,196 | **-0.13%** |
+
+The old code was spending 15x the work to BEAT one-shot by 0.8% -- per-block
+stride-1 re-priming builds denser tables than natural finder operation. The
+new point is ~one-shot parity on ratio AND work, which is the principled place
+for a streaming API to sit. If the denser tables are ever wanted back, the
+knob is the hysteresis factor, and `take_enc_slide` prices it.
+
+Gate: round-trip asserted in `streamcost`; the streamed frame decodes
+**byte-exact through C zstd v1.5.7** (the external gate); `bytegate` GOLD
+unmoved (one-shot untouched); 173 tests release + debug; `no_std + alloc` and
+wasm32 clean. Before flipping any default that depends on streamed SIZE,
+board the streaming ratio across the 18 corpora, not this one file.
+
+
+## 21. SEQUENCE-DENSITY PARITY -- C's frames have MORE sequences, and C still wins. 2026-08-24
+
+The demo's decode arms each decode their own encoder's bitstream, so "C
+decodes 1.71x faster" confounds decoder speed with bitstream shape. 13.3
+counted OUR density only; `examples/cseqdensity.rs` (new) decodes C-produced
+L3 frames through the same counters:
+
+| | copies/MiB | total c-size (8 corpora, 16 MiB caps) |
+|---|---:|---:|
+| our L3 frames | 66,774 | 28,578,403 |
+| C v1.5.7 L3 frames | **69,755 (+4.5%)** | **27,263,908 (-4.6%)** |
+
+**Two findings, one per axis:**
+
+1. **The decode gap is ALL per-sequence decoder cost.** C's decoder handles
+   4.5% MORE sequences 1.71x faster -- ~18 ns/seq against our ~33. Nothing
+   about our bitstream excuses the gap; the fixed per-sequence cost 13.5
+   located (`copy_match`'s ~23 ns history-load stall, 57.6% of the loop) is
+   the whole story. The existence proof for hiding it is C's own SHORT
+   decoder: `ZSTD_decompressSequences_body` decodes sequence N+1's symbols
+   BEFORE executing N's copies -- a depth-1 interleave with no queue. D10
+   refuted the QUEUE (PIPE=4/8, three arrays, cost grew with depth); its own
+   comment says the prune constrains the approach, not the idea. Depth-1
+   without structure -- 13.6's original shape -- has never been built.
+
+2. **L3 has a ~4.6% RATIO gap too, and it points the other way.** C finds
+   more (and evidently better) matches at DFast: more sequences AND smaller
+   output. That is an encoder search-quality gap at L3, separate from speed,
+   and per `codec-rate-allocation-vs-efficiency` it needs its own diagnosis
+   before anyone tunes toward it.
+
+Both numbers are deterministic counts; `cseqdensity` takes the level and a
+directory of C frames, per the 11.7 provenance rule.
+
+### 21.1 THE TAG FILTER IS NOT THE RATIO GAP -- and the counter that said it was, lied
+
+The leading hypothesis for 21's gap was structural: our DFast runs a TAG
+FILTER on both hash tables that C's `ZSTD_compressBlock_doubleFast` does not
+have at all. A tag is a lossy hash; when it mismatches we skip the candidate
+without loading it. That is free when the candidate would have failed anyway
+and a LOST MATCH when it would not -- which would explain "C finds 4.5% more
+sequences" exactly.
+
+`examples/dfasttag.rs` (new) reads the audit counters that already existed.
+The first read was alarming:
+
+| | rejections | "FALSE" | share |
+|---|---:|---:|---:|
+| short table | 6,193,286 | 3,658,617 | **59.07%** |
+| long table | 4,255,691 | 0 | 0.000% |
+
+**59% would have been the whole gap. It was an instrument defect.** The LONG
+audit verifies its claim -- on a rejection it reloads the candidate and runs
+`match_ok` + `count_match` before counting a FALSE. The SHORT audit, despite
+`TAG_FALSE_REJECT`'s name and its "rejections that `fast_probe` would have
+ACCEPTED" doc, only tested `m.is_none()`: it counted EVERY rejection of a
+non-empty slot and called it false. Given the same verification as its
+sibling:
+
+| | rejections | FALSE (verified) |
+|---|---:|---:|
+| short table | 6,193,286 | **0** |
+| long table | 4,255,691 | **0** |
+
+**Zero on both tables, over 64 MiB at L3.** The tag filter loses nothing; it
+is a pure work reduction, and the ratio gap is elsewhere. Hypothesis refuted
+on measurement, and the counter now checks what its name claims.
+
+*The lesson is `rusty_curiosity`'s, in its most expensive form: a beautifully
+clean number that turns out to measure something else. Two audits sat ten
+lines apart in the same function, one verifying and one not, and the
+non-verifying one was the alarming one. When two instruments of the same kind
+disagree by 59 points, suspect the instruments before the codec.*
+
+**Where the gap is NOT:** not the tag filter (here), not the decoder (13.1),
+not the window (13.2), and the "next long" capability C has at `ip + 1` we
+also have (`nl_on`, added for exactly that reason). What remains untested is
+the step/acceleration schedule and the repcode handling -- and those want
+their own section, not this one.
+
+### 21.2 ELEVEN CUTS ON THE SHIFT FAMILY -- the same defect, eight more sites
+
+Hunting the ratio gap read every hash entry in the encoder, and found the
+defect 14.9/14.11/14.13 had already cut four times sitting in eight more
+places. Every hash in this crate derives its shift as
+`N - hash_log.min(32)`, both terms per-BLOCK constants; the sites below were
+re-deriving it per POSITION, per CANDIDATE or per MATCH.
+
+| # | site | frequency |
+|---|---|---|
+| W40 | `dfast_hash_pair`'s long hash | **per position at L3**, twice when the speculation arm is on |
+| W41 | `fill_hash_long_after_match`'s two `hash8` | twice per match on the DFast ladder |
+| W42 | the `next long` probe at `ip + 1` | per match on the nl path |
+| W43 | the GATE-12 stride fill | per filled position -- a loop that had already hoisted its four table BASES |
+| W44 | `find_greedy_impl`'s MAIN loop hash | per searched position at L5 (its FILL was fixed in 14.13; the loop was not) |
+| W45 | `chain_find_best_inner`'s head hash | per searched position at L7-L12 -- `ChainCtx` had carried both shifts resolved since W20, and the row finder was the only consumer |
+| W46 | the RUNTIME Bt entry (+ `hash4_shift`) | per searched position whenever the (hash_log, chain_log) pair is off the spec list |
+| W47 | the RUNTIME Bt entry's `src.len()` | same line as W46 |
+| W48 | `find_greedy_impl`'s walk-entry guard | `src_len` was hoisted at block scope; this guard re-read the field anyway |
+| W49 | `chain_find_best_inner`'s two `src.len()` | per searched position |
+| W50 | the SPEC Bt entry's `src.len()` | its shifts already fold (`HLOG` is a const generic); the field read was the last per-position cost on that line |
+
+**Correctly NOT taken:** the four `src.len()` reads at the DFast candidate
+level sit inside `#[cfg(feature = "profile")]` census blocks, and
+`prime_tables`' four `hash8` calls are on a path E4 measured at **zero
+iterations at every level L1-L22**. Cold is cold.
+
+Gate: `bytegate` GOLD `BE0071FB0CB0CED9` unmoved -- and it covers all four
+shipping finders these touch (DFast L3, Greedy L5, chain Lazy L7-L12, Bt
+L13+). `rowboard` L9 identical, tag audit unchanged, `no_std` clean.
+
+**The standing rule this earns, third time of asking:** 14.10 said grep every
+WRITER when a structure turns out dead; 14.13 said check the other FILLS the
+same day. This says the same thing about a computation: **when a block
+constant is found being re-derived in a loop, grep the whole crate for that
+expression before closing the finding.** Four sites were fixed today one at a
+time before anyone ran the grep, and it returned eight more.
+
+
+## 22. D11 BUILT AND REFUTED -- the third distance closes decode-ahead. 2026-08-24
+
+Section 21 pointed at the depth-1 interleave as the decode gap's biggest
+lever, so it was built: ONE pending sequence in registers, the next
+sequence's symbols decoded and its history load prefetched before the pending
+copies run -- 13.6's original shape, none of D10's queue, bit order identical
+to the classic loop by construction (round-trip asserted on every one of the
+probe's ~2,000 armed decodes).
+
+**`d11probe` @ L3, 21 ABBA rounds, DecSeqLoop isolated, null median 2.16%:
+OFF 30.27 -> ON 30.56 ns/seq = +0.9%, 110/273 pairs, z = -3.21.** Worst
+corpora xml (z -3.71) and mozilla (-2.84); best ooffice (+1.96,
+insignificant).
+
+That is the THIRD distance, and together they refute the DIRECTION, not an
+implementation (codec-measurement 11's three-probe rule, satisfied for real
+this time):
+
+| probe | distance | structure | verdict |
+|---|---|---|---|
+| D9 | 9.4 ns | none | +0.2%, z -0.91 -- null |
+| **D11** | **~30 ns (one sequence)** | **registers only** | **+0.9%, z -3.21 -- worse** |
+| D10 | ~120-240 ns | queue | +15.8/18.4%, z -13/-14 -- much worse |
+
+**What this proves about the loop:** the out-of-order window already overlaps
+adjacent sequences' history misses on its own -- hardware memory-level
+parallelism is doing the decode-ahead, for free, and every software shape
+that "helps" only adds retired instructions. The DecSeq loop is
+instruction-THROUGHPUT bound, not latency bound. Section 21's C gap
+(~18 ns/seq vs our ~30) is therefore FEWER INSTRUCTIONS PER SEQUENCE on C's
+side -- exactly the axis sections 17-18 were already cutting -- and the
+campaign's decode direction is: keep removing instructions from the loop, and
+stop trying to hide a latency the hardware already hides.
+
+Disposition: `set_pipe1_arm` kept, default OFF, reader folded to const
+`false` in non-`profile` builds like its D9/D10 siblings -- shipping builds
+carry zero cost and a future microarchitecture can re-adjudicate all three
+with one call each. A negative at z = -3.21 with the idea CLOSED is worth
+more than the +0.9% it cost to learn.
+
+
+## 23. TEN CUTS ON COPY_MATCH -- the 60.8% row, 2026-08-26
+
+Section 22 redirected the decode campaign to instruction reduction and the
+dsloop ladder crowned `copy_match` king (60.8% of the loop). This round works
+the copy chain: `copy_match_nodict` -> `copy_from_decoded_hot` -> tier 1,
+plus the literal copy that shares its bookkeeping. Gate: `bytegate` GOLD
+**BE0071FB0CB0CED9** unmoved, 173 tests release + debug -- the debug run
+matters doubly here because cuts 3/4 replace runtime tests with invariants
+the `debug_assert`s now carry, and the suite's external C-encoded frames
+prove cut 2's budget rejects no conformant stream.
+
+**The architecture: one reserve + one budget make capacity a BLOCK INVARIANT.**
+Nothing reserved `out` before this round -- the per-sequence capacity tests in
+the copy tiers were the only guard, and the only bound on a hostile block's
+output was the frame-end content check (a real amplification hole: one block
+could legally emit gigabytes before anything objected).
+
+| # | cut | deterministic reduction |
+|---|---|---|
+| 1 | `out.reserve(block_max + 64)` once per block | the enabler; at most one allocation per frame in practice |
+| 2 | running output BUDGET, one subtract-and-branch per sequence | enforces the RFC 128 KB block bound for the first time; rejects over-long hostile blocks at the first overrunning sequence |
+| 3 | match tier-1 capacity test DELETED | -1 branch, -2 Vec field reads per sequence (invariant, asserted in debug) |
+| 4 | literal tier-1 capacity test DELETED (`copy_literals_hot`) | -1 branch, -2 Vec field reads per sequence |
+| 5 | `off == 0` / `off > produced` / `off > window` fused: `off-1 >= min(dst_at, win_lim)` | window reject's branch folds into cut 10's compare: -1 branch per sequence |
+| 6 | per-sequence `len > block_max` DELETED (subsumed by cut 2's tighter bound) | -1 branch per sequence |
+| 7 | `dst_at` threaded through the match chain | no `out.len()` re-read after the literal `set_len`, no `offset`/`src` re-derivation -- the whole chain runs on caller registers |
+| 8 | `dst_at` threaded through the literal copy | same, literal side |
+| 9 | trailing-literals budget check | one compare per BLOCK completes the invariant chain cuts 3/4 stand on |
+| 10 | 8-byte sub-tier PRUNED by census (`bandcensus.rs`, new) | post-cuts band shares: tier-1 80.4% of calls, `off < 16` bands 2.03% -- a rung's whole ceiling is 2% of calls on the already-cold path. Recorded, not built |
+
+**The per-sequence executed ledger (the admissible receipt):** branches
+-4 +1 = **net -3 per sequence** (~160K sequences/MiB at L3), Vec field loads
+-5 (two capacity pairs and one length re-read), one offset re-derivation
+gone. Static size ~flat (crate 237,713 -> 237,798; the sequence-loop twins
+moved +7/+25 while the reserve/budget prologue landed per block).
+
+**Instrument caveat, stated so nobody misreads the ladder:** a dsloop re-run
+two days after section 17's baseline shows every row -- including `advance`
+and `read_bits`, which this round never touched -- inflated 15-30%. That is
+15.2's lesson (un-interleaved runs on different days are not a comparison),
+and it is why this round's receipts are counts. Within the new run the
+shares hold their shape: `copy_match` 54.6%, the copies together 71.1%.
+
+**What the census leaves as copy_match's remaining structure:** tier-1 takes
+80.4% of calls but only 49.4% of BYTES -- the 64-byte tier carries 16.0% of
+bytes at 4.6% of calls and `extend_from_within` 12.9% at 1.8%. The next
+lever, if one is wanted, is byte-weighted: widen what the cold rungs move,
+not how the hot rung tests.
+
+
+## 24. TEN MORE ON COPY_MATCH -- the cold rungs, byte-weighted. 2026-08-26
+
+Section 23 took the entry chain and tier 1; this round takes the rungs by the
+census's byte weights, on section 23's invariant. Gate: `bytegate` GOLD
+**BE0071FB0CB0CED9** unmoved, 173 tests release + debug, and the strongest
+routing receipt available: **`bandcensus` before and after are IDENTICAL to
+the call** (6,215,835 copies, every band unchanged) -- the cuts moved zero
+copies between paths, exactly as claimed.
+
+| # | cut | deterministic reduction |
+|---|---|---|
+| 1 | splat test repositioned by CALL weight | its compare moved from ahead of 19.6% of copies (cold entry) to ~2.0% (after the fixed tiers); band 0 is 0.01% |
+| 2 | 32-tier capacity test folded under `G` | -1 branch, -2 Vec loads on 13.0% of copies |
+| 3 | 64-tier capacity test folded under `G` | -1 branch, -2 Vec loads on 4.6% of copies |
+| 4 | dead band-5 sub-census branch DELETED | census receipt: 0 calls since the 16-first reorder (tier 1 provably owns `len<=16, off>=32`); orphaned brick-82 comment removed with it |
+| 5 | band-3 strided wildcopy under `G` (`off >= 32`) | **12.9% of all match BYTES** stop paying `extend_from_within`'s call + internal range checks; inline 32-byte strides, overshoot absorbed by the invariant's pad |
+| 6 | band-3's hidden `reserve` eliminated | via cut 5; the invariant already owns the space |
+| 7 | overlap loop: `avail` as a register RECURRENCE | per-iteration `out.len() - src` load+subtract gone (3.3 iters/call measured by D3), dead `avail == 0` reject deleted (`off >= 2` proven: splat took 1, entry proves >= 1) |
+| 8 | splat under `G`: `resize` -> `write_bytes` | element-wise extend becomes one memset; source read unchecked under the entry invariant |
+| 9 | `const G: bool` monomorph split | the MECHANISM: one source, two cold symbols (226 + 219 instrs) -- the budgeted path gets cuts 2/3/5/8, the dictionary path and oracle tests keep every runtime check, drift impossible |
+| 10 | cold signature slimmed to `(out, dst_at, off, len, wide)` | `src` derived once inside; the hot callsite passes registers it already owns |
+
+**Attribution note, because the tree is CO-AUTHORED this session:** a
+concurrent workstream landed `decode_seq_header` (the header/table parse
+outlined from the sequence-loop twins -- 933-instruction symbol, twins
+1,611/1,571 -> **827/771**) and encoder-side cuts; crate total moved 237,798
+-> **213,723 (-10.1%)** with MOST of that theirs. This section claims only
+the copy-chain ledger above; the combined tree passes every gate. Same-file
+concurrent editing is how clobbers happen (`editor-clobber-protection`) --
+flagged to the user, not silently absorbed.
+
+
+## 25. ROUND THREE ON COPY_MATCH -- the loop goes RAW-CURSOR. 2026-08-26
+
+Rounds one and two took the checks; what remained was HOW the loop talks to
+memory. The emitted body (not the source) named every target: `out` behind
+two levels of indirection with `ptr`/`len` reloaded twice and `set_len`
+stored twice per sequence, tier conditions as branch PAIRS, `budget`/`rem`/
+`nodict` in stack slots, the literal cursor re-derived per sequence, and the
+cold fallback re-inlining the very tier test that had just failed.
+
+**The campaign's hardest-won lesson this round: register-allocation wins are
+NOT wins.** `budget` moved into `%r15` on one build and back to a stack slot
+on the next; a `&`-fused setcc branch pair held on one build and re-split on
+the next. Every claim below is STRUCTURAL -- a load, store, instruction or
+branch that no allocator decision can reintroduce -- verified by reading the
+emitted body after each build.
+
+| # | win | receipt (from the emitted body) |
+|---|---|---|
+| 1 | the loop runs on RAW CURSORS (`base`, `dst`); `set_len` publishes only at cold boundaries, taps and exit | BOTH per-sequence `set_len` stores gone, BOTH `len` field reloads gone, the double indirection gone; tier copies address `(%rcx,%r13)` directly |
+| 2 | budget + literal-bound rejects: the SUBTRACTION is the test | both `cmp` instructions deleted -- `subq`+`jb` pairs, results reused as the updates |
+| 3 | per-sequence `nodict` test DELETED from the always-path | dict blocks get `win_eff = 0`, so cut 5's guard routes them through its reject arm, where the real test lives; plain frames pay zero |
+| 4 | literal tier: ONE branch, arithmetically forced | `orq` + `js` (the setcc form re-split on a later build; the wrapping-difference OR cannot) |
+| 5 | match tier: ONE branch, same form | second `js`; was `cmp/ja` + `cmp/jbe` |
+| 6 | literal source as (pointer, remaining) recurrences | the copy is DIRECT-addressed `movups (%rdx)` -- the per-sequence index arithmetic is gone; the slots the allocator spills them to are its own affair |
+| 7 | `lits_len` hoisted, one derivation per block | feeds wins 2/4/6 |
+| 8 | match-cold: `wide` as `const W`, argument deleted | the outlined symbols test nothing the caller already folded |
+| 9 | literal-cold: `arm` as `const A`, argument deleted | single live 96-instruction monomorph in shipping |
+| 10 | the literal fallback goes STRAIGHT to cold | the re-inlined tier double-test is gone: symbol `movups` count 6 -> 4 |
+
+Static size: twins 827/771 -> 906/813 -- the growth is publish/refetch sync
+at the RARE cold boundaries while the 80%-path sheds memory traffic, the
+exact 0b screen-inversion this document first recorded for D1/D2: the
+receipt is the loop body, and it was read after every build. Gate: GOLD
+unmoved, band census identical, 173 tests release + debug, `no_std` clean.
+Still stack-resident and honestly not claimed: `rem`'s countdown and
+whatever the allocator spills next -- registers on x86-64 are a budget this
+loop now spends to the last byte.
+
+**CORRECTION (2026-08-26, found while building section 26):** section 25's
+win 2 as WRITTEN never landed -- the patch's anchor mismatched and Python's
+`replace` no-ops silently, so the source kept the two separate reject `if`s.
+The emitted `subq`+`jb` receipt quoted above was LLVM's own flag reuse, not
+the source change. The intended form landed for real in section 26 (its win
+8), and the lesson is recorded: **assert every patch anchor, and never let a
+receipt's story outrun the source diff.**
+
+
+## 26. THE JOINT-SEQUENCE MEGAFUSE -- twenty wins, one branch. 2026-08-26
+
+`jointrate.rs` (new) priced it first: the literal tier fires on **99.22%** of
+sequences and the match tier on **80.40%**, so the joint fast path is
+**[79.62%, 80.40%]** of every sequence decoded. This round collapses that
+path to ONE predicate branch and then hunts the small tweaks hiding around
+it. Receipts are the emitted body after every build; gates: GOLD unmoved,
+band census identical to the call, `jointrate` unchanged, 173 tests release
++ debug, `no_std` clean.
+
+**The fused fast path, in full:** seven borrow-free differences OR'd into one
+sign test, then nine instructions -- two `movups` pairs, three cursor
+updates -- and back around. Zero Vec-field operations, zero `set_len`, zero
+variable shifts, zero cmovs, one branch.
+
+| # | win | receipt |
+|---|---|---|
+| 1 | the MEGAFUSE: budget reject + lit tier + match guard + match tier = **5 branches -> 1** on ~80% of sequences | single `js` in the body |
+| 2 | input-bound term DROPPED on the fast path | `n <= 16 <= lit_rem` makes it redundant; slow arm keeps it |
+| 3 | `off >= 1` wrap-guard DROPPED on the fast path | implied by the `off >= 16` term |
+| 4 | the guard's `min`/cmov DECOMPOSED into two OR terms | no cmov in the fast trace |
+| 5 | `b_ok` dual-use: predicate term IS the budget update | one `sub`, stored once |
+| 6 | `dst - off` dual-use: predicate term becomes the match SOURCE | `subq %r15` off the copy address, no fresh derivation |
+| 7 | ONE cursor advance for both copies (`op += need`) | `addq %r9, %r12`; two adds before |
+| 8 | slow-arm rejects fused 2 -> 1 branch | section 25's win-2 intent, now actually in source |
+| 9 | `OF_PACK` LUT for `1 << of_code` | variable `shll %cl` (3 uops + 2 setup movs) -> one load; **zero `%cl` shifts remain in the symbol** |
+| 10 | the cursor is `op` -- C's form -- stores address it DIRECTLY | `movups (%r13)` / `(%r12,%r8)`: the per-copy `base + dst` adds are gone |
+| 11 | `fast_arms` conjunction hoisted per block | profile builds drop an AND per sequence; shipping folds it |
+| 12 | `lit_rem` DELETED as a loop variable | its per-sequence subtract + spill store gone; tier test compares against hoisted `lit_guard` |
+| 13 | lit-fallback reuses the predicate's `lit_off` | no `lits_len - lit_rem` recomputation at the cold boundary |
+| 14 | tail + anatomy-tap `lit_pos` derivations are one pointer subtract | per block |
+| 15 | fast path touches ZERO Vec fields end-to-end | body: only loop-invariant spill slots and the two buffers |
+| 16 | `need` dual-use: one `lea` feeds `b_ok` AND the advance | `leaq (%r8,%rbx)` used twice |
+| 17 | `off`/`mlen` computed once ABOVE the fuse, shared by both arms | the slow arm's re-lets deleted |
+| 18 | `lit_guard` hoist: the literal bound is load+sub, not lea+cmp chains | `-40(%rbp)` term in the predicate |
+| 19 | census fidelity under restructure: the fused path feeds BOTH tier counters and band 2 | `bandcensus`/`jointrate` byte-identical across the change |
+| 20 | the section-25 silent no-op FOUND and corrected | the hunt's meta-win: source and receipt now agree everywhere |
+
+The aliasing proof the fused copies rest on, stated once: the match write is
+`[op+n, op+n+16)`, its read `[op+n-off, op+n-off+16)`; `off >= 16` puts the
+read wholly at or before `op+n` -- disjoint from the write -- and reads of
+bytes the literal half just wrote are CORRECT (matches may reference the
+literals of their own sequence) and well-defined in program order. This is
+the same argument the split tiers relied on; the fuse only states it in one
+place.
+
+Twins: 906/813 -> **898/844** -- baseline SHRANK while carrying the fuse;
+avx2's growth is its slow-arm scaffolding. The fast trace is the receipt.
+
+
+## 27. THE RAW COLD PROTOCOL -- the byte-weighted middle rungs. 2026-08-26
+
+The cold bands move HALF the match bytes (t32 20.9%, t64 16.0%, within
+12.9%, overlap 0.9% -- against tier 1's 49.4%), and every cold call paid the
+full Vec boundary: publish (`set_len`), a `&mut Vec` argument, callee derefs,
+refetch. Under the block invariant the fixed-width rungs CANNOT grow `out` --
+so the boundary was pure freight. `match_cold_raw` / `lit_cold_raw` (164 and
+32 instructions) take `op` in and hand a new `op` back: no Vec anywhere.
+`None` marks the genuinely Vec-needing leftovers -- the overlap band at
+0.24% of copies and the `off < 32` within-cases -- which keep the old
+byte-exact boundary.
+
+| # | win | receipt |
+|---|---|---|
+| 1-2 | publish AND refetch deleted per raw cold call | ~5 memory ops off every t32/t64/within/splat call -- **~18% of ALL copies** |
+| 3 | `&mut Vec` arg -> three scalars | callee has zero derefs |
+| 4 | return-`op` protocol | no `out.len()` reload after cold; one register move |
+| 5 | every `(G \|\| capacity)` test GONE inside raw | the invariant is baked in; zero capacity code |
+| 6-7 | t32 / t64 rungs: ONE or-sign branch each | was two compares + a capacity test |
+| 8 | within rungs carry NO length test | `len > 32` / `len > 64` implied by rung order |
+| 9 | within strides 64 bytes when `off >= 64` | iterations HALVED on the 12.9%-of-bytes band (old path strode 32 always) |
+| 10 | splat: `*op.sub(1)` + `write_bytes` | no indexed Vec read, no `resize` machinery |
+| 11 | rungs call-ordered by census | t32 (12.99%) tested first |
+| 12 | `wide` gating folds at the callsite | shipping calls raw unconditionally |
+| 13 | `None`-isolation | only the truly-growing 0.24% keeps the boundary; fallback byte-exact |
+| 14-15 | literal t32/t64: boundary deleted | same protocol, lit side |
+| 16 | lit rungs: one or-sign branch each | was arm + two bounds + capacity |
+| 17 | `rem` passed in a register | callee re-derives nothing; no `&mut lit_pos` |
+| 18 | return-(lit_p, op) pair | both cursors advance from returned registers |
+| 19 | the strided rung GENERALISES to overlapping copies | the stride proof (each read ends at or before the write cursor) needs `off >= W`, not `off >= len` -- so 225 former OVERLAP-band calls (off in [32, len)) now stride instead of paying ~3.3 doubling `extend_from_within` calls each. The census records the migration: band 4 14,987 -> 14,762, band 3 +225, totals identical, GOLD unmoved |
+| 20 | the attribute-hijack caught mid-patch | inserting between an item's attributes and its `fn` re-parents them; the lint caught it, the fix is recorded |
+
+Gate: GOLD unmoved; band census totals identical with exactly the win-19
+migration (225 calls, 0.004%) and every counter preserved; streaming
+round-trip clean; 173 tests release + debug; `no_std` clean. Twins 898/844
+-> 954/862: the raw call plumbing lands in the slow arm (static, rare) while
+every raw cold call sheds ~10 boundary operations (executed, ~19% of
+copies).
+
+
+
+## 28. THE ISA-TWIN AUDIT -- a portability bug, two hijacks, and the lever's floor. 2026-08-27
+
+Nine suspected problem points, worked structurally. Four were real defects, one
+of those a live portability bug; three were correctly-retired twins whose
+arithmetic I re-derived and confirmed; one hypothesis died on its own census.
+Every number here is a count from the emitted asm or from a census, never a clock.
+
+### 28.1 The portability bug: an attribute hijack put AVX2 behind a BMI2 guard
+
+Retiring the `decode_4x` AVX2 arm deleted its `fn` line and body but left its
+attribute block sitting above the next doc comment. The attributes re-parented
+onto `decode_4x_bmi2`:
+
+    #[target_feature(enable = "avx2,bmi2,lzcnt")]   <- orphan, from the dead arm
+    #[allow(unsafe_code)]
+                                                   <- blank line
+    /// The BMI2-compiled twin of `decode_4x_inner`.
+    #[target_feature(enable = "bmi2,lzcnt")]
+    unsafe fn decode_4x_bmi2(...)
+
+The shipping BMI2 twin was therefore compiled with AVX2 ENABLED while dispatched
+on `has_bmi2()` alone -- VEX permitted on a Skylake Pentium/Celeron, which ships
+BMI2 with AVX2 fused off. That is verbatim the hazard the retirement note two
+screens above says "goes with" the removed arm. It did not go; it moved.
+
+Nothing could see it. The suite cannot: a twin is byte-identical to its sibling
+on any host that runs it. The census read `vex=0`, but that is LLVM declining
+the opportunity, not lacking it. `decode_sequences_avx2` had already been
+converted to BMI2-only for exactly this reason, with a comment naming the same
+parts -- so the hazard was understood here and reintroduced anyway.
+
+    decode_4x_bmi2   702 instr -> 681 instr   (-21, from dropping the dead feature)
+
+### 28.2 The weights twin sat on the cold path; the hot path had none
+
+`decompress_weights` carried a BMI2 twin whose note claimed "per new-table block
+on the literal decode path". W39 had moved the decode path off it. Its two
+remaining callers are `read_ctable` (once per dictionary) and a test. And the
+twin was not working regardless: `decompress_weights_inner` is
+`#[inline(never)]`, so the twin compiled to a single `jmp` into a baseline
+symbol -- the fourth thunk twin found in this crate.
+
+Meanwhile `decompress_weights_into` -> `weights_into_inner`, which IS the
+per-block path (`huffman::read_table`), had no twin at all. Retired the thunk;
+built a real twin on the live path using the body/arm split:
+
+    weights_into_inner (baseline)   444 instr   12 cl    0 bmi2
+    weights_into_bmi2  (twin)       431 instr    0 cl   13 bmi2
+
+### 28.3 The second hijack, and why the compiler only half-sees this class
+
+`encode::lz_insert_rowknown` had `row_insert_live` inserted between its doc
+block and its `fn` line. The doc block re-parented (documenting a function that
+has its own doc), the `#[inline(always)]` became a duplicate on the wrong
+function, and `lz_insert_rowknown` -- the row finder's per-position insert --
+lost its inline hint.
+
+HONEST OUTCOME: no performance change. LLVM inlined it anyway on size and no
+symbol appears in the asm. The mis-attribution was real, the cost was zero, and
+claiming a win here would be inventing one.
+
+A hijack lands in one of two shapes and NEITHER GATE SEES BOTH:
+
+  (a) the stolen attribute is one the victim did not carry (28.1) -- rustc is
+      silent; only a source scan finds it
+  (b) it duplicates one the victim already has (this section) -- rustc reports
+      `unused_attributes`, and it names the innocent line
+
+Both gates are now wired: `#![deny(unused_attributes)]` in `lib.rs` for (b), and
+`scripts/twinguard.py` for (a), in CI. The scanner is verified in BOTH
+directions against reconstructed copies of both real defects, and it runs on
+COMMENT-STRIPPED source -- this crate writes `#[inline(always)]` and
+`#[target_feature]` in prose constantly, and matching raw lines gave about 25
+false positives against 2 real findings. A check nobody can read the output of
+is a check nobody runs.
+
+### 28.4 The guard now tests what the twins actually enable
+
+Eight twins enabled `bmi2,lzcnt` while `has_bmi2()` tested only `bmi2` -- the
+same shape as 28.1, reached by omission rather than by a stray attribute. It
+held only by an argument about hardware history (every part with BMI2 has
+LZCNT), and `twinguard` needed a hand-written exemption to stay quiet about it.
+
+`has_bmi2()` now tests both: one extra CPUID bit, once per process, rejecting no
+part that exists. The exemption table is empty, so the invariant is checked
+instead of asserted. `twinguard` reads each `has_*()` predicate's feature set out
+of the DETECTION SOURCE, so deleting the `lzcnt` test re-trips every dependent
+twin immediately -- verified by doing it.
+
+`encode_stream_unrolled_bmi2_into` -- the only twin still enabling `bmi2` alone,
+and the one that ships -- was brought in line. HONEST OUTCOME: zero instruction
+change (1830 -> 1830). Correct as a consistency fix; not a win.
+
+### 28.5 The encoder win: a dispatcher carrying its own dead arm
+
+`encode_stream_into` is the route `write_literals` takes, four times per
+4-stream block. It measured 457 instructions -- for a function whose job is to
+pick an arm. `encode_stream_scalar_into`, the `RZSTD_HUFF_FAST=0`
+re-adjudication arm, carried no inline attribute, so LLVM stamped its whole body
+into the dispatcher. `huff_fast_enabled()` defaults TRUE, so on every shipping
+run that body is not executed once.
+
+    encode_stream_into        457 instr -> 134 instr   (-323, -71%)
+    encode_stream_scalar_into  (inlined) -> 337 instr, outlined, #[cold]
+
+Same finding as `decode_4x_x2_slow`, whose census read 0 of 509 sections: a
+fallback that stays correct and reachable does not have to stay resident.
+
+### 28.6 THE LEVER HAS A FLOOR, and the encoder is already sitting on it
+
+The screen is instructions-of-duplicated-body per converted shift op. Below
+about 40 a twin tends to pay; above it the duplicated body costs more I-cache
+than the shifts are worth. Measured across every remaining baseline `%cl`
+carrier in the crate:
+
+    parse_ncount_into      747 / 56 =  13.3   best ratio in the crate
+    decode_into_x2         351 / 17 =  20.6
+    decode_4x_x1           532 / 20 =  26.6   <- TWINNED, see 28.6a
+    decode_4x_x2_slow      577 / 20 =  28.9
+    prime_tables          1115 / 17 =  65.6
+    find_dfast            1409 / 20 =  70.5   <- D6 retired it, measuring 72
+    encode_block          4223 / 47 =  89.9   <- retired, measuring 1 shrx / 1291
+    find_lazy             1616 / 14 = 115.4
+    find_greedy           1386 / 12 = 115.5
+    ncount_or_default      868 /  6 = 144.7
+    select_seq_table      2208 / 12 = 184.0
+
+D6 and the `encode_block` retirement are CONFIRMED by independent
+re-derivation (70.5 against their 72). Their arithmetic was right.
+
+One correction to the record: D6's stated REASON -- "`shr %cl` and `shrx` are
+both one uop on any CPU that HAS BMI2" -- is wrong, and contradicts this crate's
+own fast-trans section 3. A CL-count shift is 3 uops on Intel (the flags-merge
+quirk); `shrx` is 1. The retirement stands on its I-cache arithmetic, not on
+that claim, and the claim must not be reused as precedent.
+
+RATIO IS NOT SUFFICIENT -- frequency gates it as well, and three candidates with
+good ratios were declined on exactly that:
+
+  * `parse_ncount_into` has the best ratio in the crate and was DECLINED: it
+    runs at most three times per block (ll/of/ml).
+  * `decode_into_x2` was DECLINED: its own comment establishes that it decodes
+    only the TAIL. `fast_4x2` handles the bulk and is already
+    `#[inline(always)]` into the twins, so the bulk ALREADY runs under BMI2.
+  * `decode_4x_x2_slow` was DECLINED: `#[cold]`, census 0 of 509 sections.
+
+`decode_4x_x1` was the one that PASSED both screens -- see 28.6a, which is also
+where a stale census turned up.
+
+CONCLUSION, STATED PLAINLY: every un-twinned shift carrier on the ENCODE side is
+at 65 instructions per converted op or worse. The ISA-twin lever is exhausted on
+the encoder. Further encoder gains have to come from search cost or from
+structure of the 28.5 kind -- not from another twin.
+
+### 28.6a `decode_4x_x1`: a stale census, and an instrument that could not be read
+
+`decode_4x_x1` runs at BASELINE ISA beneath `decode_4x_bmi2`, which calls it --
+a `#[target_feature]` function cannot be inlined into a baseline caller, and the
+converse is what bites here: an outlined baseline helper stays baseline no
+matter who calls it. 532 instructions to convert 20 shifts is 26.6 per op,
+which clears the screen. The question was frequency, and the answer was already
+written down: "509 of 517 sections (98.45%) to the X2 arm and 8 (1.55%) here",
+which is why the arm had been outlined out of the twins.
+
+THAT NUMBER IS STALE BY ~16x. Re-measured with `x1arm.rs` over twelve Silesia
+corpora at L1/L3/L9/L19 -- deliberately the same corpus family the original
+used, because comparing against a different population is not a measurement:
+
+    cap  1 MiB    x1=110   x2=292   x1_share 27.36%
+    cap 16 MiB    x1=1004  x2=3044  x1_share 24.80%
+
+One section in FOUR, not one in sixty-five. Stable across a 16x change in input
+size, and rising steeply with level (6.97% at L1 to 38.72% at L19). The six
+SYNTHETIC corpora contribute 0.00% -- so this is not a stress-corpus artefact;
+it is what real data does.
+
+AND THE INSTRUMENT COULD NOT HAVE SAID OTHERWISE. That share was read as
+`X4_X1_CALLS / X2_STATS[1]`, and `X2_STATS[1]` is incremented at TWO sites: the
+4-stream arm in `decode_4x_inner` AND the 1-stream path in `decode_stream`. Its
+denominator therefore contains sections its numerator can never count, so the
+ratio understates the X1 share by however many 1-stream X2 sections a run
+happens to contain. A shared counter cannot express a two-way split, in either
+direction. `X4_X2_CALLS` now counts the sibling arm at exactly one site, and
+`take_x4_arms()` returns the pair -- so the ratio is readable rather than
+merely printable.
+
+The outlining stays (that trade was about I-cache and is unaffected); what
+changes is that the arm no longer runs at baseline ISA beneath a BMI2 caller.
+`decode_4x_inner` gained a `const BMI2: bool` so the arm selection folds at
+compile time -- Law 1 means the only way into an outlined helper is a different
+SYMBOL, and the choice has to be made where the ISA is already known.
+
+    decode_4x_x1      (baseline)   532 instr   20 cl    0 bmi2
+    decode_4x_x1_bmi2 (twin)       482 instr    0 cl   24 bmi2
+
+-50 instructions and all 20 variable shifts converted, on ~25% of 4-stream
+literal sections. RESIDUAL, STATED: `decode_into_x1` (105 instr, 3 cl) is still
+outlined at baseline beneath both arms. Three shifts did not justify a third
+copy; it is recorded so the next reader does not have to re-derive it.
+
+### 28.7 Refuted: the literal double-encode
+
+`write_literals_inner` builds two candidate sections and fully Huffman-ENCODES
+each before comparing, while `body_bytes_exact` already computes each
+candidate's exact body size WITHOUT encoding it. That looked like a free halving
+of literal emit cost. `littry.rs` (new) says otherwise:
+
+    L     blocks    encodes   prev_ENC   new_ENC   skipped   WASTED
+    1        123        137         14       123        53       14 (10.2%)
+    3        115        127         12       115        42       12 ( 9.4%)
+    9        112        127         15       112        47       16 (12.6%)
+   19        120        145         25       120        45       23 (15.9%)
+
+1.11 encodes per block at L1, against a floor of 1.00. The `futile` predicate --
+which already calls `body_bytes_exact` for both tables -- skips 53 of them.
+There is no halving available; the path sits at 0.11 wasted encodes per block
+and the hypothesis is dead.
+
+### 28.8 Dead, and left dead deliberately
+
+`row_insert_live` has zero call sites: the fill loop calls `rows.insert_h`,
+which is strictly better (hoisted mask, no `row_of` re-derivation, no emptiness
+test). W28 was SUPERSEDED, not reverted -- worth stating, because a dead
+optimisation helper looks identical to a reverted one. `block_avx2_on` is dead
+from the same AVX2 retirement that caused 28.1. Both are dead CODE, not dead
+paths: LLVM drops them and they cost nothing at runtime.
+
+### 28.9 Tooling repaired along the way
+
+`scripts/isaudit.sh` demangled by stripping ALL digits to remove Rust's length
+prefixes -- which also ate `4x`, `x1`, `bmi2` and `avx2`, rendering
+`decode_4x_x1` and `decode_4x_x2_slow` indistinguishable and making a filter for
+them match NOTHING. It now parses length prefixes properly, and handles both
+legacy `_ZN` and v0 `_R` mangling, because this tree emits both depending on how
+the build was invoked and an audit that silently returns zero rows for the wrong
+one reads exactly like "clean".
+
+### 28.10 Gates
+
+    bytegate  BE0071FB0CB0CED9   unchanged (59,760,356 bytes, 18 corpora x 9 levels)
+    xxhgold   10751459475B6849   unchanged
+    tests     173 passed, 0 failed
+    twinguard 37 files clean, verified against both reconstructed defects
+    cfg arms  default / profile / no-default+alloc -- all clean under the new deny
+    clippy    clean, --all-targets
+    harness   `cargo check -p rusty_zstd-bench --all-targets --features profile`
+              was FAILING before this section: `d9cover` reads `take_pf_census`,
+              which is gated on `pfcensus`, not `profile`. Given a
+              `required-features` declaration so the harness job stops building
+              it under the wrong feature set.

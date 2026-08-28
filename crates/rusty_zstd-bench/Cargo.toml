@@ -42,9 +42,20 @@ name = "dsloop"
 path = "examples/dsloop.rs"
 required-features = ["dupladder"]
 
+# `d9cover` reads `take_pf_census`, which is gated on `pfcensus` and NOT on
+# `profile` -- deliberately, since those counters fire per sequence and a build
+# carrying them cannot honestly time the brick they describe. Without this
+# declaration the example is built by `--all-targets --features profile`, which
+# is exactly what CI's harness job runs, and it fails to resolve the symbol.
+[[example]]
+name = "d9cover"
+path = "examples/d9cover.rs"
+required-features = ["pfcensus"]
+
 [features]
 profile = ["rusty_zstd/profile"]
 dupladder = ["profile", "rusty_zstd/dupladder"]
+pfcensus = ["profile", "rusty_zstd/pfcensus"]
 
 [lints]
 workspace = true

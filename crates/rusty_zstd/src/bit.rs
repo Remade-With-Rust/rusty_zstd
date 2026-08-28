@@ -14,6 +14,27 @@ pub(crate) struct BitRev<'a> {
     bits_consumed: u32,
 }
 
+/// Executed `BitRev::reload` calls. See the note inside `reload`.
+#[cfg(feature = "profile")]
+pub static RELOAD_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Executed refills -- reloads that reached the container load rather than
+/// taking one of the four early-outs. See the note inside `reload`.
+#[cfg(feature = "profile")]
+pub static RELOAD_REFILLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear the refill counter.
+#[cfg(feature = "profile")]
+pub fn take_reload_refills() -> u64 {
+    RELOAD_REFILLS.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Read and clear the reload counter.
+#[cfg(feature = "profile")]
+pub fn take_reload_calls() -> u64 {
+    RELOAD_CALLS.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
 impl<'a> BitRev<'a> {
     /// DecSeq loop anatomy (profile only): snapshot/restore the reader so an op
     /// can be executed a SECOND time and undone, leaving output byte-identical.
@@ -155,6 +176,12 @@ impl<'a> BitRev<'a> {
 
     #[inline(always)]
     pub(crate) fn reload(&mut self) -> Result<(), Error> {
+        // D9/D12 ADJUDICATION INSTRUMENT (profile only): count EXECUTED
+        // reloads. The question "was deleting the X1 unrolls a mistake" is a
+        // work-count question, not a clock question -- the unroll called this
+        // once per N positions and the tail loop calls it once per position.
+        #[cfg(feature = "profile")]
+        RELOAD_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if self.bits_consumed > 64 {
             return Err(Error::Corruption);
         }
@@ -166,6 +193,8 @@ impl<'a> BitRev<'a> {
             return Ok(());
         }
         if self.ptr >= bytes {
+            #[cfg(feature = "profile")]
+            RELOAD_REFILLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             self.ptr -= bytes;
             self.bits_consumed &= 7;
             if self.ptr + 8 <= self.src.len() {
@@ -202,10 +231,24 @@ impl<'a> BitRev<'a> {
     /// STREAM.
     #[cold]
     #[inline(never)]
+    /// D21: three checks become one. `self.src.len() - self.ptr` could
+    /// underflow, `buf[..n]` could exceed 8, and `&self.src[self.ptr..]` could
+    /// be out of range -- each its own test and panic pad, in a function the
+    /// bit reader calls on every short reload.
+    ///
+    /// Taking the tail ONCE through `get` proves the offset, and clamping `n`
+    /// to `min(8)` makes both remaining slices provably in range: `n <=
+    /// buf.len()` and `n <= tail.len()`, so LLVM drops the tests entirely.
+    ///
+    /// The clamp never fires: the sole caller reaches here only when
+    /// `ptr + 8 > src.len()`, i.e. `n < 8`. It exists to make the bound STATIC
+    /// rather than to change behaviour -- the C1/C2 lesson, applied to a hot
+    /// path instead of a header parser.
     fn tail_word(&self) -> u64 {
         let mut buf = [0u8; 8];
-        let n = self.src.len() - self.ptr;
-        buf[..n].copy_from_slice(&self.src[self.ptr..]);
+        let tail = self.src.get(self.ptr..).unwrap_or(&[]);
+        let n = tail.len().min(8);
+        buf[..n].copy_from_slice(&tail[..n]);
         u64::from_le_bytes(buf)
     }
 

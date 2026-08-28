@@ -139,9 +139,9 @@ pub struct EncodeCounts {
 #[cfg(feature = "profile")]
 mod on {
     use super::{BlockTap, EncodeCounts, Stage, NAMES, N_STAGES};
+    use crate::profclock as cpuclock;
     use core::cell::RefCell;
     use core::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Instant;
 
     thread_local! {
         static BLOCK_TAPS: RefCell<alloc::vec::Vec<BlockTap>> = const { RefCell::new(alloc::vec::Vec::new()) };
@@ -191,13 +191,14 @@ mod on {
 
     pub struct Guard {
         stage: Stage,
-        start: Instant,
+        /// Thread-CPU ticks, not wall. See `profclock`.
+        start: u64,
     }
 
     impl Drop for Guard {
         fn drop(&mut self) {
             let i = self.stage as usize;
-            let ns = self.start.elapsed().as_nanos() as u64;
+            let ns = cpuclock::to_ns(cpuclock::now().saturating_sub(self.start));
             NS[i].fetch_add(ns, Ordering::Relaxed);
             CALLS[i].fetch_add(1, Ordering::Relaxed);
         }
@@ -206,11 +207,13 @@ mod on {
     pub fn scope(stage: Stage) -> Guard {
         Guard {
             stage,
-            start: Instant::now(),
+            start: cpuclock::now(),
         }
     }
 
     pub fn reset() {
+        // Calibrate out of band -- never inside a measured scope.
+        cpuclock::warm();
         for i in 0..N_STAGES {
             NS[i].store(0, Ordering::Relaxed);
             CALLS[i].store(0, Ordering::Relaxed);

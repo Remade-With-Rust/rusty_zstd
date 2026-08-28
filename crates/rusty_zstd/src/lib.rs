@@ -5,6 +5,17 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]
+// ATTRIBUTE HIJACK GUARD. Deleting a function's `fn` line while leaving its
+// attribute block, or inserting a new function between an existing block and
+// its `fn`, silently re-parents those attributes onto the next item. This has
+// happened twice here. Once it re-parented `#[target_feature(enable = "avx2")]`
+// onto a twin dispatched on `has_bmi2()` alone -- a latent illegal-instruction
+// bug on parts that ship BMI2 with AVX2 fused off, which no test on any host
+// that runs the suite can observe. Once it stole `#[inline(always)]` from
+// `encode::lz_insert_rowknown`. The duplicate-attribute case is the half the
+// compiler can see, so it is denied rather than warned; `scripts/twinguard.py`
+// covers the half it cannot (see that script's header).
+#![deny(unused_attributes)]
 // Under `no_std` the runtime ISA dispatch and every env knob compile out -- both
 // need `std` -- which strands the caches, `*_on()` predicates and SIMD entry
 // points they are the only callers of. They are live in every `std`
@@ -71,7 +82,10 @@ mod mt;
 mod params;
 #[cfg(feature = "alloc")]
 mod prof;
+#[cfg(feature = "profile")]
+mod profclock;
 mod reader;
+mod rowfind;
 #[cfg(feature = "alloc")]
 mod scratch;
 #[cfg(feature = "alloc")]
@@ -110,6 +124,8 @@ pub use decode::{
 pub use dict::{
     public_dict_id, Dictionary, DICT_ID_PUBLIC_MAX, DICT_ID_PUBLIC_MIN, MAGIC_DICTIONARY,
 };
+#[cfg(feature = "profile")]
+pub use encode::take_row_bucket;
 #[cfg(feature = "alloc")]
 pub use encode::{
     compress, compress_using_dict, compress_using_dict_with, compress_using_prefix, compress_with,
@@ -130,6 +146,8 @@ pub use mt::{
 };
 #[cfg(feature = "alloc")]
 pub use params::{compression_params, CompressionParameters, Strategy};
+#[cfg(feature = "profile")]
+pub use rowfind::take_row_walk;
 #[cfg(feature = "alloc")]
 pub use seekable::{
     compress_seekable, compress_seekable_adv, decompress_frame_at, parse_seek_table, SeekEntry,
@@ -140,6 +158,8 @@ pub use stream::{
     compress_stream_in_size, compress_stream_out_size, decompress_stream_in_size,
     decompress_stream_out_size, Compressor, Decompressor, Flush, StreamStatus,
 };
+#[cfg(feature = "profile")]
+pub use stream::{take_dec_compact, take_enc_slide};
 #[cfg(all(feature = "alloc", feature = "std"))]
 pub use train::{train, TrainAlgo, TrainOptions, DEFAULT_MAX_DICT};
 
@@ -179,13 +199,19 @@ pub fn compress_bound(src_len: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 #[doc(hidden)]
-pub use compressed::set_block_avx2_arm;
+#[cfg(feature = "profile")]
+#[doc(hidden)]
+pub use bit::take_reload_calls;
+#[cfg(feature = "profile")]
+#[doc(hidden)]
+pub use bit::take_reload_refills;
 #[doc(hidden)]
 #[cfg(feature = "dupladder")]
 pub use compressed::{set_dup_arm, set_dup_k};
 #[doc(hidden)]
 pub use compressed::{
-    set_litcopy_arm, set_lut_arm, set_matchcopy_arm, set_seqcheck_arm, set_seqloop_avx2_arm,
+    set_litcopy_arm, set_lut_arm, set_matchcopy_arm, set_pipe1_arm, set_pipeline_arm,
+    set_prefetch_arm, set_seqcheck_arm, set_seqloop_avx2_arm,
 };
 #[doc(hidden)]
 #[cfg(feature = "profile")]
@@ -204,18 +230,26 @@ pub use encode::{set_enc_avx2_arm, set_fast_hash_arm, set_fast_pack_arm};
 #[cfg(feature = "profile")]
 pub use encode::{
     take_bext, take_envhits, take_ff_arms, take_ff_waste, take_link_tag, take_long_tag,
-    take_long_tag_residual, take_raw_exits, take_raw_margin, take_short_tag_residual,
-    take_step_forfeit, take_tag_reads, take_walk_census, take_walk_classes, take_walk_signals,
-    FF_LATCH, FF_LAZY_FIRES,
+    take_long_tag_residual, take_raw_exits, take_raw_margin, take_row_census,
+    take_short_tag_residual, take_step_forfeit, take_tag_reads, take_walk_census,
+    take_walk_classes, take_walk_signals, FF_LATCH, FF_LAZY_FIRES,
 };
 #[doc(hidden)]
 pub use encode::{take_ent_save, take_n9_basic};
 #[doc(hidden)]
 #[cfg(feature = "profile")]
 pub use fse::take_d6_spread;
+
 #[doc(hidden)]
+pub use encode::set_dfast_bext_arm;
+#[cfg(feature = "profile")]
+pub use encode::take_dfast_bext;
+#[cfg(feature = "profile")]
+pub use encode::take_walk_exit;
 #[cfg(feature = "profile")]
 pub use huffman::{take_e11_walked, take_e12_scan, take_n13_stats, take_x2_stats};
+#[cfg(feature = "profile")]
+pub use huffman::{take_f4x2_arm, take_x4_arms, take_x4_x1_calls};
 #[doc(hidden)]
 #[cfg(feature = "alloc")]
 pub use params::set_cparam_clamp_arm;
@@ -238,6 +272,9 @@ pub fn xxh64_pub(d: &[u8]) -> u64 {
 }
 
 #[doc(hidden)]
+#[cfg(feature = "profile")]
+pub use encode::take_ltag_audit;
+#[doc(hidden)]
 #[cfg(feature = "alloc")]
 pub use encode::{
     reset_env_arms, set_accel_shift_arm, set_bt_spec_arm, set_chain_tag_arm,
@@ -254,16 +291,16 @@ pub use encode::{
     set_pipe_arm, set_pipe_rep1_arm, set_prefix_bound_arm, set_prefix_window_arm, set_prime_bt_arm,
     set_prime_bt_depth_arm, set_prime_bt_extent_arm, set_prime_bt_tree_arm, set_prime_stride_arm,
     set_raw_probe_arm, set_raw_run_min_arm, set_raw_skip_arm, set_rep1_mode, set_rep_reprobe_arm,
-    set_replen_pipe_arm, set_search_log_delta, set_step0_arm, set_step_forfeit_arm,
-    set_step_probe_arm, set_step_seq_arm, set_tag_alloc_arm, set_tag_arm, set_walk_cont_arm,
-    set_walk_first_max_arm, set_walk_rep_max_arm, set_wide_chain_arm, set_wide_first_max_arm,
-    set_wide_spb_min_arm, take_bt_calls, take_bt_iters, take_bt_probe_stats, take_content_signals,
-    take_dfast_calls, take_dfast_endfill, take_dfast_fill, take_dfast_match_stats,
-    take_dfast_rep_blocks, take_dfast_spec, take_ff_pipe, take_finder_calls, take_g5,
-    take_g5_inputs, take_lazy_fill, take_lp_guard, take_lp_stats, take_mm, take_next_long,
-    take_nl_band, take_nl_off, take_opt_bt, take_opt_fill_ins, take_opt_rep, take_opt_skips,
-    take_pair_split, take_pair_stats, take_prime_iters, take_rep_rate, take_route_hist,
-    take_tag_rejects,
+    set_replen_pipe_arm, set_row_arm, set_row_fill_stride_arm, set_search_log_delta, set_step0_arm,
+    set_step_forfeit_arm, set_step_probe_arm, set_step_seq_arm, set_tag_alloc_arm, set_tag_arm,
+    set_walk_cont_arm, set_walk_first_max_arm, set_walk_rep_max_arm, set_wide_chain_arm,
+    set_wide_first_max_arm, set_wide_spb_min_arm, take_bt_calls, take_bt_iters,
+    take_bt_probe_stats, take_content_signals, take_dfast_calls, take_dfast_endfill,
+    take_dfast_fill, take_dfast_match_stats, take_dfast_rep_blocks, take_dfast_spec, take_ff_pipe,
+    take_finder_calls, take_g5, take_g5_inputs, take_lazy_fill, take_lp_guard, take_lp_stats,
+    take_mm, take_next_long, take_nl_band, take_nl_off, take_opt_bt, take_opt_fill_ins,
+    take_opt_rep, take_opt_skips, take_pair_split, take_pair_stats, take_prime_iters,
+    take_rep_rate, take_route_hist, take_tag_rejects,
 };
 #[doc(hidden)]
 pub use encode::{
@@ -311,3 +348,9 @@ mod tests {
         assert!(compress_bound(1_000_000) > 1_000_000);
     }
 }
+
+/// D9 prefetch coverage counters. Behind `pfcensus`, NOT `profile`: they fire
+/// per sequence, and a build carrying them cannot honestly time the brick
+/// they describe (codec-measurement 6).
+#[cfg(feature = "pfcensus")]
+pub use compressed::take_pf_census;

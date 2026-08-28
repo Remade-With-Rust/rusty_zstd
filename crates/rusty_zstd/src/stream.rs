@@ -13,6 +13,42 @@ use crate::reader::Reader;
 use crate::xxh64::Xxh64;
 use crate::DecompressOptions;
 
+/// Streaming-decoder compaction census: `[compactions, bytes memmoved]`.
+/// The memmove per `decoded.drain(..drop)` is `len - drop` -- the retained
+/// window -- and section 18's dig found it running once per `stream()` CALL.
+#[cfg(feature = "profile")]
+pub static DEC_COMPACT: [core::sync::atomic::AtomicU64; 2] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+/// Read and clear the decoder-compaction census.
+#[cfg(feature = "profile")]
+pub fn take_dec_compact() -> [u64; 2] {
+    use core::sync::atomic::Ordering;
+    [
+        DEC_COMPACT[0].swap(0, Ordering::Relaxed),
+        DEC_COMPACT[1].swap(0, Ordering::Relaxed),
+    ]
+}
+
+/// Encoder window-slide census: `[slides, hist bytes memmoved, table resets]`.
+/// Each slide memmoves the retained window, zeroes six match tables and
+/// re-primes the whole window -- section 19's decoder finding, mirrored.
+#[cfg(feature = "profile")]
+pub static ENC_SLIDE: [core::sync::atomic::AtomicU64; 2] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+/// Read and clear the encoder window-slide census.
+#[cfg(feature = "profile")]
+pub fn take_enc_slide() -> [u64; 2] {
+    use core::sync::atomic::Ordering;
+    [
+        ENC_SLIDE[0].swap(0, Ordering::Relaxed),
+        ENC_SLIDE[1].swap(0, Ordering::Relaxed),
+    ]
+}
+
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
@@ -74,6 +110,10 @@ pub struct Compressor {
     /// Consumed prefix of `in_acc`; compacted once per `stream` call.
     in_off: usize,
     out_acc: Vec<u8>,
+    /// DECSEQ-II CUT 7 -- read cursor into `out_acc`, same shape as the
+    /// decoder's `in_off` (CUT 5): the per-call `out_acc.drain(..n)` was an
+    /// O(remaining) memmove of everything the caller had not read yet.
+    out_off: usize,
     produced_in: u64,
     last_block_written: bool,
     dict_id: Option<u32>,
@@ -114,6 +154,7 @@ impl Compressor {
             in_acc: Vec::new(),
             in_off: 0,
             out_acc: Vec::new(),
+            out_off: 0,
             produced_in: 0,
             last_block_written: false,
             dict_id: None,
@@ -191,13 +232,11 @@ impl Compressor {
         flush: Flush,
     ) -> Result<StreamStatus, Error> {
         if self.ended {
-            let n = self.out_acc.len().min(output.len());
-            output[..n].copy_from_slice(&self.out_acc[..n]);
-            self.out_acc.drain(..n);
+            let n = self.take_output(output);
             return Ok(StreamStatus {
                 input_consumed: 0,
                 output_produced: n,
-                done: self.out_acc.is_empty(),
+                done: self.out_pending() == 0,
             });
         }
         self.in_acc.extend_from_slice(input);
@@ -244,26 +283,56 @@ impl Compressor {
             self.ended = true;
         }
 
-        let n = self.out_acc.len().min(output.len());
-        output[..n].copy_from_slice(&self.out_acc[..n]);
-        self.out_acc.drain(..n);
+        let n = self.take_output(output);
         Ok(StreamStatus {
             input_consumed: input.len(),
             output_produced: n,
-            done: self.ended && self.out_acc.is_empty(),
+            done: self.ended && self.out_pending() == 0,
         })
+    }
+
+    /// Unread output bytes.
+    #[inline(always)]
+    fn out_pending(&self) -> usize {
+        self.out_acc.len() - self.out_off
+    }
+
+    /// CUT 7: hand the caller its bytes and advance the cursor; reclaim the
+    /// dead prefix only when everything is read (a `clear`) or it exceeds
+    /// 64 KiB -- never a per-call memmove of the unread remainder.
+    fn take_output(&mut self, output: &mut [u8]) -> usize {
+        let n = self.out_pending().min(output.len());
+        output[..n].copy_from_slice(&self.out_acc[self.out_off..self.out_off + n]);
+        self.out_off += n;
+        if self.out_off == self.out_acc.len() {
+            self.out_acc.clear();
+            self.out_off = 0;
+        } else if self.out_off >= 64 * 1024 {
+            self.out_acc.drain(..self.out_off);
+            self.out_off = 0;
+        }
+        n
     }
 
     fn pending(&self) -> usize {
         self.in_acc.len().saturating_sub(self.in_off)
     }
 
+    /// CUT 7's input half: this drained on EVERY `stream` call, memmoving the
+    /// unconsumed remainder each time. Reclaim is now free when everything is
+    /// consumed and amortised (64 KiB threshold) otherwise; `pending()` and
+    /// `emit_block` are already offset-aware.
     fn compact_in(&mut self) {
         if self.in_off == 0 {
             return;
         }
-        self.in_acc.drain(..self.in_off);
-        self.in_off = 0;
+        if self.in_off == self.in_acc.len() {
+            self.in_acc.clear();
+            self.in_off = 0;
+        } else if self.in_off >= 64 * 1024 {
+            self.in_acc.drain(..self.in_off);
+            self.in_off = 0;
+        }
     }
 
     fn emit_empty_last_if_needed(&mut self) -> Result<(), Error> {
@@ -295,8 +364,34 @@ impl Compressor {
             &mut self.entropy,
             last,
         )?;
-        if self.hist.len() > window {
+        // SECTION 20 -- the ENCODER's mirror of section 19. Sliding at
+        // `hist > window` fired on EVERY block at steady state, and each slide
+        // memmoves the retained window, zeroes six match tables and re-primes
+        // the WHOLE window. Measured (webster 32 MB, L3, 256 KiB chunks):
+        // **240 slides, 503,316,480 hist bytes memmoved (15.0x the source),
+        // 503,314,800 prime inserts** -- half a billion table inserts as pure
+        // slide overhead. Waiting for a full EXTRA window amortises all three
+        // costs to ~1x the stream, for one window of extra memory -- the same
+        // trade section 19 brick B made, and safe for the same reason one-shot
+        // encode is: the finders clamp offsets to `window` internally however
+        // much history the buffer holds (`bytegate` proves that daily at 32 MB
+        // inputs over a 2 MB window).
+        //
+        // NOTE: this changes WHICH table state each streamed block is found
+        // under, so streamed bytes differ from the previous build's (both are
+        // valid frames; the round-trip, the external decoder and the size are
+        // the gate). One-shot output is untouched -- `emit_block` is
+        // streaming-only.
+        if self.hist.len() >= 2 * window {
             let drop = self.hist.len() - window;
+            #[cfg(feature = "profile")]
+            {
+                ENC_SLIDE[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                ENC_SLIDE[1].fetch_add(
+                    (self.hist.len() - drop) as u64,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
             self.hist.drain(..drop);
             self.tables.reset();
             crate::encode::prime_tables(
@@ -324,6 +419,11 @@ impl Compressor {
 pub struct Decompressor {
     opts: DecompressOptions,
     input: Vec<u8>,
+    /// DECSEQ-II CUT 5 -- read cursor into `input`. Every parsed unit used to
+    /// `input.drain(..k)` -- an O(remaining) memmove per BLOCK (the
+    /// codec-memory-copies opening pattern, N3). The cursor advances for free
+    /// and `compact_input` amortises the reclaim.
+    in_off: usize,
     decoded: Vec<u8>,
     decoded_off: usize,
     header: Option<FrameHeader>,
@@ -349,6 +449,7 @@ impl Decompressor {
         Self {
             opts,
             input: Vec::new(),
+            in_off: 0,
             decoded: Vec::new(),
             decoded_off: 0,
             header: None,
@@ -384,24 +485,34 @@ impl Decompressor {
         end: bool,
     ) -> Result<StreamStatus, Error> {
         self.input.extend_from_slice(input);
+        // SECTION 19 BRICK A -- decode no further than the caller can drink.
+        // The old exit only fired when `output` was EMPTY, so a caller feeding
+        // a whole frame in one call had ALL of it decoded into `decoded`
+        // before the first byte came back: 121 MB of allocator traffic to
+        // stream a 32 MB frame, and a buffer the size of the content. Stopping
+        // once the pending bytes can fill `output` bounds `decoded` at
+        // ~output + window + one block, and later calls resume from `input`
+        // exactly where this one stopped.
         loop {
+            let have = self.decoded.len() - self.decoded_off;
+            if have > 0 && have >= output.len() {
+                break;
+            }
             if !self.progress()? {
                 break;
             }
-            if self.decoded.len() > self.decoded_off && output.is_empty() {
-                break;
-            }
         }
+        self.compact_input();
         let avail = self.decoded.len() - self.decoded_off;
         let n = avail.min(output.len());
         output[..n].copy_from_slice(&self.decoded[self.decoded_off..self.decoded_off + n]);
         self.decoded_off += n;
         self.compact();
-        if end && !self.input.is_empty() && self.header.is_none() && n == 0 && avail == 0 {
+        if end && self.in_avail() != 0 && self.header.is_none() && n == 0 && avail == 0 {
             return Err(Error::UnexpectedEof);
         }
         let done = end
-            && self.input.is_empty()
+            && self.in_avail() == 0
             && self.header.is_none()
             && self.decoded_off == self.decoded.len();
         if done && !self.saw_zstd {
@@ -414,14 +525,43 @@ impl Decompressor {
         })
     }
 
+    /// Unconsumed input.
+    #[inline(always)]
+    fn in_avail(&self) -> usize {
+        self.input.len() - self.in_off
+    }
+
+    /// The unconsumed input, as a slice.
+    #[inline(always)]
+    fn in_bytes(&self) -> &[u8] {
+        &self.input[self.in_off..]
+    }
+
+    /// CUT 5's amortiser: reclaim consumed input only when it is all consumed
+    /// (a `clear`, no memmove) or the dead prefix has grown past 64 KiB -- so
+    /// the per-unit O(remaining) drains become O(1) cursor bumps and the total
+    /// moved is bounded by the bytes fed, not units x remaining.
+    fn compact_input(&mut self) {
+        if self.in_off == 0 {
+            return;
+        }
+        if self.in_off == self.input.len() {
+            self.input.clear();
+            self.in_off = 0;
+        } else if self.in_off >= 64 * 1024 {
+            self.input.drain(..self.in_off);
+            self.in_off = 0;
+        }
+    }
+
     fn progress(&mut self) -> Result<bool, Error> {
         if self.in_checksum {
-            if self.input.len() < 4 {
+            if self.in_avail() < 4 {
                 return Ok(false);
             }
-            let got =
-                u32::from_le_bytes([self.input[0], self.input[1], self.input[2], self.input[3]]);
-            self.input.drain(..4);
+            let b = self.in_bytes();
+            let got = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            self.in_off += 4;
             if checksum_u32(&self.xxh) != got {
                 return Err(Error::ChecksumMismatch);
             }
@@ -440,21 +580,21 @@ impl Decompressor {
     }
 
     fn try_header(&mut self) -> Result<bool, Error> {
-        if self.input.len() < 4 {
+        if self.in_avail() < 4 {
             return Ok(false);
         }
-        let magic =
-            u32::from_le_bytes([self.input[0], self.input[1], self.input[2], self.input[3]]);
+        let b = self.in_bytes();
+        let magic = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
         if is_skippable_magic(magic) {
-            if self.input.len() < 8 {
+            if self.in_avail() < 8 {
                 return Ok(false);
             }
-            let n = u32::from_le_bytes([self.input[4], self.input[5], self.input[6], self.input[7]])
-                as usize;
-            if self.input.len() < 8 + n {
+            let b = self.in_bytes();
+            let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
+            if self.in_avail() < 8 + n {
                 return Ok(false);
             }
-            self.input.drain(..8 + n);
+            self.in_off += 8 + n;
             return Ok(true);
         }
         if magic != MAGIC {
@@ -464,7 +604,7 @@ impl Decompressor {
                 Error::BadMagic
             });
         }
-        let mut r = Reader::new(&self.input);
+        let mut r = Reader::new(self.in_bytes());
         match parse_kind(&mut r) {
             Err(Error::UnexpectedEof) => Ok(false),
             Err(e) => Err(e),
@@ -473,7 +613,7 @@ impl Decompressor {
                 if r.remaining() < n {
                     return Ok(false);
                 }
-                self.input.drain(..r.pos() + n);
+                self.in_off += r.pos() + n;
                 Ok(true)
             }
             Ok(FrameKind::Zstd(h)) => {
@@ -493,7 +633,23 @@ impl Decompressor {
                     }
                 }
                 let pos = r.pos();
-                self.input.drain(..pos);
+                self.in_off += pos;
+                // SECTION 19 BRICK C -- size `decoded` once, from the header.
+                // Bricks A and B pin its steady state near
+                // `2*window + output + block`; growing there by doubling cost
+                // ~7.5 MB of allocator traffic per 32 MB frame. The reserve is
+                // clamped by the declared content size when the header carries
+                // one and by a flat 8 MiB either way, so a hostile header
+                // cannot make this allocate past the cap unverified.
+                {
+                    let keep = 2 * h.window_size + 2 * u64::from(h.block_size_max());
+                    let want = h
+                        .content_size
+                        .map(|cs| cs.saturating_add(u64::from(h.block_size_max())).min(keep))
+                        .unwrap_or(keep)
+                        .min(8 << 20) as usize;
+                    self.decoded.reserve(want);
+                }
                 self.header = Some(h);
                 self.block_state = BlockState::from_dict(self.dict.as_ref());
                 self.xxh = Xxh64::new();
@@ -508,10 +664,10 @@ impl Decompressor {
 
     fn try_block(&mut self) -> Result<bool, Error> {
         let header = self.header.ok_or(Error::Corruption)?;
-        if self.input.len() < 3 {
+        if self.in_avail() < 3 {
             return Ok(false);
         }
-        let mut r = Reader::new(&self.input);
+        let mut r = Reader::new(self.in_bytes());
         let bh = match parse_block_header(&mut r) {
             Err(Error::UnexpectedEof) => return Ok(false),
             Err(e) => return Err(e),
@@ -522,8 +678,15 @@ impl Decompressor {
             return Ok(false);
         }
         let hdr_len = r.pos();
-        let payload = self.input[hdr_len..hdr_len + payload_n].to_vec();
-        self.input.drain(..hdr_len + payload_n);
+        // DECSEQ-II CUT 4: this was `self.input[a..b].to_vec()` -- a heap
+        // allocation plus a full copy of EVERY block payload, per block,
+        // purely to end `input`'s borrow before the drain. The cursor (CUT 5)
+        // removes the drain, so the payload is now borrowed straight from
+        // `input`: `input`, `decoded`, `block_state` and `prefix` are disjoint
+        // fields, which is all the block decoder needs.
+        let a = self.in_off + hdr_len;
+        let b = a + payload_n;
+        self.in_off = b;
         let block_max = header.block_size_max();
         let start = self.decoded.len();
         match bh.ty {
@@ -531,22 +694,26 @@ impl Decompressor {
                 if bh.size > block_max {
                     return Err(Error::BlockTooLarge);
                 }
-                self.decoded.extend_from_slice(&payload);
+                self.decoded.extend_from_slice(&self.input[a..b]);
             }
             BlockType::Rle => {
                 if bh.size > block_max {
                     return Err(Error::BlockTooLarge);
                 }
-                let b = *payload.first().ok_or(Error::Corruption)?;
+                let b0 = *self
+                    .input
+                    .get(a)
+                    .filter(|_| b > a)
+                    .ok_or(Error::Corruption)?;
                 let n = bh.size as usize;
-                self.decoded.resize(self.decoded.len() + n, b);
+                self.decoded.resize(self.decoded.len() + n, b0);
             }
             BlockType::Compressed => {
                 if bh.size > block_max {
                     return Err(Error::BlockTooLarge);
                 }
                 decode_compressed_block(
-                    &payload,
+                    &self.input[a..b],
                     &mut self.decoded,
                     header.window_size,
                     block_max,
@@ -588,7 +755,23 @@ impl Decompressor {
             .unwrap_or(BLOCKSIZE_MAX as usize);
         let keep_from = self.decoded.len().saturating_sub(window);
         let drop = self.decoded_off.min(keep_from);
-        if drop > 0 {
+        // SECTION 19 BRICK B -- amortise the reclaim. This drained on EVERY
+        // `stream()` call, and each drain memmoves the retained WINDOW
+        // (`len - drop`): measured 306 MB moved for 32 MB decoded (9.1x) on a
+        // 64 KiB-chunk feed, and 4.28 GB (133x) on a one-shot feed. Waiting
+        // until a full window of dead prefix has accumulated makes each
+        // compaction reclaim at least as much as it moves, so total traffic is
+        // bounded by ~1x the decoded bytes, for at most one extra window of
+        // memory held.
+        if drop >= window.max(64 * 1024) {
+            #[cfg(feature = "profile")]
+            {
+                DEC_COMPACT[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                DEC_COMPACT[1].fetch_add(
+                    (self.decoded.len() - drop) as u64,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
             self.decoded.drain(..drop);
             self.decoded_off -= drop;
             if drop <= self.frame_start {

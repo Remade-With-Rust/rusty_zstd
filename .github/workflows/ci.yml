@@ -74,6 +74,13 @@ jobs:
       - run: cargo clippy -p rusty_zstd -p rusty_zstd-cli -p rzstd-alloc --all-targets -- -D warnings
       - name: ASCII sources
         run: bash scripts/check-ascii-rs.sh crates
+      # An ISA twin is byte-identical to its baseline sibling by construction,
+      # so the whole correctness suite is blind to every way a twin can be
+      # wrong. This catches the two source-level ways -- see the script header.
+      # It has already found a live one: `decode_4x_bmi2` compiled with AVX2
+      # enabled while dispatched on `has_bmi2()` alone.
+      - name: ISA twin guard
+        run: python3 scripts/twinguard.py
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
 

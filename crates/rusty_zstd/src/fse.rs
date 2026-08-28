@@ -70,13 +70,28 @@ impl FseView<'_> {
     /// bytes, and the emitted asm reads it as THREE loads (movzwl +0, movzbl +2,
     /// movzbl +3) -- 3 per table, 9 per sequence. Reading the whole entry as one
     /// `u32` and extracting in registers makes it one load.
+    /// DECSEQ-II CUT 3 -- no mask. Three AND instructions per sequence (LL, ML,
+    /// OF) re-proved a CONSTRUCTION invariant:
+    ///
+    /// * `init_state` reads `accuracy_log` bits, so `state < 2^log == len`.
+    /// * `advance_w` produces `baseline + add` where `from_norm_buf` sets
+    ///   `baseline = (ns << nb) - len` with `nb = log - highbit(ns)` and
+    ///   `ns >= 1`, `highbit(ns) <= log` ENFORCED on every entry (it rejects
+    ///   `next_state == 0` and `hb > log` outright, hostile tables included).
+    ///   With `ns in [2^hb, 2^(hb+1))`: `ns << nb <= 2*len - 2^nb`, so
+    ///   `baseline + (2^nb - 1) <= len - 1`. Every reachable state is in range.
+    /// * `rle` builds `accuracy_log == 0`, len 1: the state is 0 forever.
+    ///
+    /// The mask stays in the struct (and in `entry`, the oracle) and the
+    /// invariant is asserted here in debug builds.
     #[inline(always)]
     #[allow(unsafe_code)]
     pub(crate) fn entry_u32(self, state: u16) -> u32 {
-        // SAFETY: same invariant as `entry`; `FseEntry` is repr(C), 4 bytes,
-        // align 2, and a u32 read of 4 initialised bytes is a valid bit-cast.
+        debug_assert!((state as usize) <= self.mask, "FSE state out of table");
+        // SAFETY: `state <= mask == len - 1` by the construction invariant
+        // proven above, so the pointer is inside the live table allocation.
         unsafe {
-            let p = self.ptr.add((state as usize) & self.mask);
+            let p = self.ptr.add(state as usize);
             // SAFETY: `FseEntry` is repr(C, align(4)) and 4 bytes, so `p` is a
             // validly-aligned u32 address holding 4 initialised bytes.
             *p.cast::<u32>()
@@ -408,15 +423,26 @@ pub(crate) fn read_ncount_ctable(
     Ok((dt, ct, consumed))
 }
 
-// inline(always) so callers compiled with BMI2 (the decode twin) get this
-// bit-reading loop in their own ISA context -- the shim-trap rule.
-#[inline(always)]
+// PREMISE EXPIRED -- this carried `#[inline(always)]` "so callers compiled
+// with BMI2 (the decode twin) get this bit-reading loop in their own ISA
+// context -- the shim-trap rule". There is no such caller any more: the chain
+// is `decode_seq_header` -> `seq_table` -> `read_ncount_into` -> here, and
+// `decode_seq_header` is now `#[inline(never)]` and ISA-neutral, so this was
+// inlining three times into a BASELINE function. The other caller is
+// `dict.rs`'s dictionary load, also baseline. See the outlining note below.
 /// W28 -- `norm` filled into a caller-owned STACK buffer.
 ///
 /// `parse_ncount` allocated `vec![0i16; max_symbol + 1]` per table build and
 /// returned it by value. `max_symbol` is at most 52 (ML) on the sequence path
 /// and 255 for Huffman weights, so a 256-entry array covers every case and the
 /// heap allocation disappears. Returns the filled LENGTH; the caller slices.
+///
+/// Outlined: LLVM inlined this into ALL THREE `read_ncount*` entries above (no
+/// symbol of its own in the emitted asm), and it is the bulk of each -- an RFC
+/// 8878 normalized-count parser stamped three times for a parse that runs at
+/// most three times per block (ll/of/ml) and once per dictionary table. A call
+/// is free at that rate.
+#[inline(never)]
 fn parse_ncount_into(
     norm: &mut [i16; 256],
     src: &[u8],
@@ -650,7 +676,16 @@ impl Drop for FseCTable {
 
 #[cfg(feature = "alloc")]
 impl FseCTable {
-    #[inline(always)]
+    /// OUTLINED. A 140-line table build that was `#[inline(always)]` at EIGHT
+    /// call sites -- `select_seq_table`, `read_ncount_ctable`, the three
+    /// `default_*_ctable` builders, the dictionary load and the cached probe.
+    /// It runs at most a few times per BLOCK (and most of those sites run once
+    /// per frame or once ever), so the call is free at that rate.
+    ///
+    /// Note the sibling directly above: `FseTable::from_norm_buf`, the DECODE
+    /// side of the same build, is already `#[inline(never)]` for exactly this
+    /// reason. This is the encode side of that parity.
+    #[inline(never)]
     pub(crate) fn from_norm(norm: &[i16], table_log: u8) -> Result<Self, Error> {
         // T4: `max_sv` is `norm.len().saturating_sub(1)`, which SILENTLY yields
         // 0 for an empty `norm` and then indexes `norm[0]`. Rejecting it here
@@ -1298,22 +1333,17 @@ impl FseCTable {
 }
 
 /// FSE-decompress Huffman weights (two interleaved states).
+///
+/// TWIN RETIRED, and the note it carried was wrong about its own frequency.
+/// It read "per new-table block on the literal decode path" -- but the decode
+/// path stopped calling this at W39. Its two remaining callers are
+/// `huffman::read_ctable` (dictionary load, once per dictionary) and a test.
+/// A twin cannot pay for itself at once-per-dictionary, and this one was not
+/// even trying: `decompress_weights_inner` is `#[inline(never)]`, so the twin
+/// compiled to a single `jmp` to a baseline symbol and every shift in the body
+/// stayed `%cl`. The real per-block path is `decompress_weights_into` below,
+/// which had no twin at all -- it has one now.
 pub(crate) fn decompress_weights(src: &[u8], max_out: usize) -> Result<(Vec<u8>, usize), Error> {
-    // Own BMI2 twin: the Huffman weights FSE decode (per new-table block on
-    // the literal decode path) sits outside every other twin.
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    if crate::simd::has_bmi2() {
-        // SAFETY: runtime CPUID guard; identical body.
-        #[allow(unsafe_code)]
-        return unsafe { decompress_weights_bmi2(src, max_out) };
-    }
-    decompress_weights_inner(src, max_out)
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-#[target_feature(enable = "bmi2,lzcnt")]
-#[allow(unsafe_code)]
-unsafe fn decompress_weights_bmi2(src: &[u8], max_out: usize) -> Result<(Vec<u8>, usize), Error> {
     decompress_weights_inner(src, max_out)
 }
 
@@ -1342,12 +1372,48 @@ pub(crate) fn decompress_weights_into(
     max_out: usize,
 ) -> Result<(usize, usize), Error> {
     let cap = max_out.min(dst.len());
+    // The twin the retired one above should have been. This IS the per-block
+    // literal decode path (`huffman::read_table`), and the body is a two-state
+    // FSE loop -- one `table.update` plus one `br.reload()` per weight symbol,
+    // both variable-shift bit reads. That is what BMI2 `shrx`/`bzhi` exist for.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    if crate::simd::has_bmi2() {
+        // SAFETY: runtime CPUID guard; identical body via `weights_into_body`.
+        #[allow(unsafe_code)]
+        return unsafe { weights_into_bmi2(dst, src, cap) };
+    }
     weights_into_inner(dst, src, cap)
+}
+
+/// The BMI2-compiled arm. Calls the `#[inline(always)]` BODY, never the
+/// `#[inline(never)]` baseline arm -- a twin that calls its sibling is a `jmp`
+/// thunk and does nothing at all. See the retired twin above for the shape
+/// this is deliberately not.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "bmi2,lzcnt")]
+#[allow(unsafe_code)]
+unsafe fn weights_into_bmi2(
+    dst: &mut [u8],
+    src: &[u8],
+    max_out: usize,
+) -> Result<(usize, usize), Error> {
+    weights_into_body(dst, src, max_out)
+}
+
+/// The BASELINE arm. Outlined so the body is generated once for non-BMI2
+/// hosts rather than inlined into every caller.
+#[inline(never)]
+fn weights_into_inner(dst: &mut [u8], src: &[u8], max_out: usize) -> Result<(usize, usize), Error> {
+    weights_into_body(dst, src, max_out)
 }
 
 /// The weight decode, writing symbols straight into `dst`. Mirrors
 /// `decompress_weights_inner` exactly; `n_out` replaces `out.len()`.
-fn weights_into_inner(dst: &mut [u8], src: &[u8], max_out: usize) -> Result<(usize, usize), Error> {
+///
+/// `#[inline(always)]` is LOAD-BEARING: it is what lets each ISA arm above
+/// re-generate this body under its own feature set.
+#[inline(always)]
+fn weights_into_body(dst: &mut [u8], src: &[u8], max_out: usize) -> Result<(usize, usize), Error> {
     #[cfg(feature = "std")]
     let recycled = WEIGHT_TBL.with(|c| c.borrow_mut().take());
     #[cfg(not(feature = "std"))]

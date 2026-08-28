@@ -51,6 +51,61 @@ pub fn take_n13_stats() -> [u64; 3] {
 /// build; the same discipline the 64-byte copy tier followed, where the
 /// histogram chose the width and the mean would have chosen wrong.
 #[cfg(feature = "profile")]
+/// `fast_4x2` outcomes: [bailed, succeeded].
+#[cfg(feature = "profile")]
+pub static F4X2_ARM: [core::sync::atomic::AtomicU64; 2] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Read and clear the `fast_4x2` outcome census.
+#[cfg(feature = "profile")]
+pub fn take_f4x2_arm() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        F4X2_ARM[0].swap(0, Ordering::Relaxed),
+        F4X2_ARM[1].swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Sections that took `decode_4x`'s X1 arm.
+#[cfg(feature = "profile")]
+pub static X4_X1_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Sections that took `decode_4x`'s X2 arm.
+///
+/// A SEPARATE COUNTER because the doc line here used to read "the x2 arm is
+/// `X2_STATS[1]`" and that was not true: `X2_STATS[1]` is incremented by BOTH
+/// `decode_stream` (the ONE-stream path) and `decode_4x_inner` (the FOUR-stream
+/// path). The two sites are different decisions, so the ratio
+/// `X4_X1_CALLS / X2_STATS[1]` has a denominator containing sections the
+/// numerator can never count -- it understates the 4-stream X1 share by
+/// however many 1-stream X2 sections the run happened to contain.
+///
+/// This matters because that ratio is the evidence `decode_4x_x1`'s
+/// "OUTLINED, on a census" note rests on, and a conflated counter cannot
+/// support it in either direction.
+#[cfg(feature = "profile")]
+pub static X4_X2_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear the X1-arm count.
+#[cfg(feature = "profile")]
+pub fn take_x4_x1_calls() -> u64 {
+    X4_X1_CALLS.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Read and clear the 4-stream arm split: `(x1, x2)`. Both counters are
+/// incremented at exactly one site each, so this ratio is readable.
+#[cfg(feature = "profile")]
+pub fn take_x4_arms() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        X4_X1_CALLS.swap(0, Ordering::Relaxed),
+        X4_X2_CALLS.swap(0, Ordering::Relaxed),
+    )
+}
+
+#[cfg(feature = "profile")]
 pub static X2_STATS: [core::sync::atomic::AtomicU64; 2] = [
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
@@ -154,6 +209,7 @@ impl HuffmanTable {
         let mut i = 0usize;
         // The loop guard is `i + 5 <= n`, so `i + 4 <= n - 1`: all five writes
         // are in range by the condition that admitted the iteration.
+        // D12 REVERTED -- same reason as D9.
         while i + 5 <= n {
             let _ = br.reload();
             debug_assert!(i + 4 < n);
@@ -261,53 +317,46 @@ impl HuffmanTable {
         d2: &mut [u8],
         d3: &mut [u8],
     ) -> Result<(), Error> {
-        // The seq-loop precedent (621a140): `avx2` does not imply BMI2, and
-        // this loop is made of variable shifts. The twin compiles the SAME
-        // body with shrx/shlx/bzhi available; byte-identity by construction.
-        // SIMD-4: AVX2 arm first. Chosen by a 17-twin instruction-count sweep --
-        // enabling avx2 on EVERY bmi2-only twin ADDS 38,051 instructions overall
-        // and only two shrink. This is the meaningful one: 6,436 -> 6,311
-        // (**-125**). It is also at the right frequency: `decode_4x` is the
-        // 4-stream Huffman literal decode, i.e. per LITERAL BYTE
-        // (168k-362k/MiB), not per block.
+        // SIMD-4 AVX2 ARM RETIRED. It was chosen by a 17-twin sweep as the one
+        // meaningful avx2 win (6,436 -> 6,311, **-125**) and at the right
+        // frequency -- per literal byte, not per block. Both halves of that
+        // have since stopped being true, and the emitted asm says so:
         //
-        // The guard MUST test avx2 too -- a twin compiled with avx2 but
-        // dispatched on bmi2 alone would execute VEX on the Skylake
-        // Pentium/Celeron parts that ship BMI2 with AVX2 fused off. The
-        // bmi2-only arm below stays for exactly those.
-        #[cfg(all(target_arch = "x86_64", feature = "std"))]
-        if crate::simd::has_avx2() && crate::simd::has_bmi2() {
-            // SAFETY: runtime CPUID guard for BOTH features; identical body.
-            #[allow(unsafe_code)]
-            return unsafe { self.decode_4x_avx2(s0, s1, s2, s3, d0, d1, d2, d3) };
-        }
+        //   decode_4x_bmi2   702 instrs   36 BMI2 ops   0 ymm   0 VEX
+        //   decode_4x_avx2   702 instrs   36 BMI2 ops   0 ymm   0 VEX
+        //
+        // Identical -- the avx2 arm emits **zero** VEX instructions now. Its
+        // 83 VEX ops lived in `decode_4x_x1` and the post-`fast_4x2` ladder,
+        // both of which are now outlined shared symbols on their own censuses
+        // (1.55% and 0.00% of sections). The vectorisable code left the body,
+        // so the twin that was compiled to vectorise it has nothing to do.
+        //
+        // The BMI2 arm below STAYS: 36 real ISA ops in 702 instructions, on
+        // the per-literal-byte path. That one earns its place.
+        //
+        // The retired guard tested `has_avx2() && has_bmi2()` deliberately --
+        // a twin compiled with avx2 but dispatched on bmi2 alone would execute
+        // VEX on Skylake Pentium/Celeron parts that ship BMI2 with AVX2 fused
+        // off. With the arm gone that hazard goes with it.
         #[cfg(all(target_arch = "x86_64", feature = "std"))]
         if crate::simd::has_bmi2() {
             // SAFETY: guarded by runtime CPUID; the body is identical.
             #[allow(unsafe_code)]
             return unsafe { self.decode_4x_bmi2(s0, s1, s2, s3, d0, d1, d2, d3) };
         }
-        self.decode_4x_inner(s0, s1, s2, s3, d0, d1, d2, d3)
+        self.decode_4x_inner::<false>(s0, s1, s2, s3, d0, d1, d2, d3)
     }
 
-    /// SIMD-4: the AVX2 + BMI2 twin. Byte-identical by construction.
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    #[target_feature(enable = "avx2,bmi2,lzcnt")]
-    #[allow(clippy::too_many_arguments)]
-    #[allow(unsafe_code)]
-    unsafe fn decode_4x_avx2(
-        &self,
-        s0: &[u8],
-        s1: &[u8],
-        s2: &[u8],
-        s3: &[u8],
-        d0: &mut [u8],
-        d1: &mut [u8],
-        d2: &mut [u8],
-        d3: &mut [u8],
-    ) -> Result<(), Error> {
-        self.decode_4x_inner(s0, s1, s2, s3, d0, d1, d2, d3)
-    }
+    // ATTRIBUTE HIJACK, repaired. Retiring the AVX2 arm deleted its `fn` line
+    // and body but left its attribute block above the doc comment below, so
+    // `#[target_feature(enable = "avx2,...")]` re-parented onto the BMI2 twin:
+    // a function compiled with AVX2 enabled, dispatched on `has_bmi2()` alone.
+    // That is verbatim the hazard the retirement note two screens up says went
+    // away with the arm -- VEX on a Skylake Pentium/Celeron that ships BMI2
+    // with AVX2 fused off. It did not go away; it moved. No test can see this
+    // (the twin is byte-identical to its sibling on any host that runs the
+    // suite) and the census reads vex=0 only because LLVM declined the
+    // opportunity, not because it lacked it.
 
     /// The BMI2-compiled twin of `decode_4x_inner`.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
@@ -325,12 +374,18 @@ impl HuffmanTable {
         d2: &mut [u8],
         d3: &mut [u8],
     ) -> Result<(), Error> {
-        self.decode_4x_inner(s0, s1, s2, s3, d0, d1, d2, d3)
+        self.decode_4x_inner::<true>(s0, s1, s2, s3, d0, d1, d2, d3)
     }
 
+    /// `BMI2` is a CONST, not a runtime flag: the arm selection below folds at
+    /// compile time, so each of the two monomorphisations contains only its own
+    /// call. It exists because a `#[target_feature]` function cannot be inlined
+    /// into a baseline caller (Law 1), so the ONLY way to get BMI2 into an
+    /// outlined helper is to call a different symbol -- and the choice of which
+    /// has to be made where the ISA is already known.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    fn decode_4x_inner(
+    fn decode_4x_inner<const BMI2: bool>(
         &self,
         s0: &[u8],
         s1: &[u8],
@@ -347,31 +402,128 @@ impl HuffmanTable {
         let dst_size = d0.len() + d1.len() + d2.len() + d3.len();
         let src_size = s0.len() + s1.len() + s2.len() + s3.len();
         if !self.use_x2(dst_size, src_size) {
+            // PATH CENSUS: `X2_STATS[1]` counts the x2 arm below; nothing
+            // counted this one, so the x1/x2 split -- which decides whether
+            // `decode_4x_x1`'s share of three ISA twins is code anyone runs --
+            // was unmeasurable. `X4_X1_CALLS` closes that.
+            #[cfg(feature = "profile")]
+            X4_X1_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            #[cfg(all(target_arch = "x86_64", feature = "std"))]
+            if BMI2 {
+                // SAFETY: `BMI2 == true` is reached only from `decode_4x_bmi2`,
+                // which is itself entered under the `has_bmi2()` CPUID guard and
+                // carries the same `#[target_feature]` set.
+                #[allow(unsafe_code)]
+                return unsafe { self.decode_4x_x1_bmi2(s0, s1, s2, s3, d0, d1, d2, d3) };
+            }
             return self.decode_4x_x1(s0, s1, s2, s3, d0, d1, d2, d3);
         }
         // N2: the 4-stream X2 use. Instrumenting only the 1-stream site read
         // zero and would have "confirmed" N1 for the wrong reason.
+        //
+        // `X4_X2_CALLS` is the ARM counter; `X2_STATS[1]` stays because other
+        // readers use it, but it is shared with `decode_stream`'s 1-stream site
+        // and therefore cannot express this arm's share on its own.
+        #[cfg(feature = "profile")]
+        X4_X2_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "profile")]
         X2_STATS[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if let Some(st) = self.fast_4x2(s0, s1, s2, s3, d0, d1, d2, d3)? {
+        let fast = self.fast_4x2(s0, s1, s2, s3, d0, d1, d2, d3)?;
+        #[cfg(feature = "profile")]
+        F4X2_ARM[usize::from(fast.is_some())].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if let Some(st) = fast {
             let mut b0 = BitRev::from_window(s0, st.ip0, st.c0)?;
             let mut b1 = BitRev::from_window(s1, st.ip1, st.c1)?;
             let mut b2 = BitRev::from_window(s2, st.ip2, st.c2)?;
             let mut b3 = BitRev::from_window(s3, st.ip3, st.c3)?;
-            self.decode_into_x2(&mut b0, &mut d0[st.op0..])?;
-            self.decode_into_x2(&mut b1, &mut d1[st.op1..])?;
-            self.decode_into_x2(&mut b2, &mut d2[st.op2..])?;
-            self.decode_into_x2(&mut b3, &mut d3[st.op3..])?;
+            // D17: four bounds checks and their panic pads, on the HOT path --
+            // `fast_4x2` succeeds on 100% of x2 sections, so every 4-stream
+            // literals section lands here. `st.opN <= dN.len()` holds by
+            // construction (`fast_4x2` advances `opN` only under a
+            // `.min(dN.len().saturating_sub(opN) / 10)` guard) but the value
+            // reaches this scope through the `Fast4x2` struct, where LLVM
+            // cannot follow it.
+            //
+            // `get_mut` states the bound as a branch instead of a panic -- and
+            // makes the decoder RETURN on a violation rather than unwind, which
+            // is the better contract for parsing untrusted input regardless of
+            // the instruction count.
+            let (t0, t1, t2, t3) = match (
+                d0.get_mut(st.op0..),
+                d1.get_mut(st.op1..),
+                d2.get_mut(st.op2..),
+                d3.get_mut(st.op3..),
+            ) {
+                (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+                _ => return Err(Error::Corruption),
+            };
+            self.decode_into_x2(&mut b0, t0)?;
+            self.decode_into_x2(&mut b1, t1)?;
+            self.decode_into_x2(&mut b2, t2)?;
+            self.decode_into_x2(&mut b3, t3)?;
             return Ok(());
         }
+        // COLD FALLBACK, on a census: `fast_4x2` returned `Some` on **509 of
+        // 509** x2 sections over five Silesia corpora at L1/L3/L9/L19 -- it
+        // did not bail once. Everything below it (four `BitRev::new`, the
+        // dtable setup and the 20-way unrolled `write_x2` ladder) was
+        // `#[inline(always)]` into all THREE ISA twins for a path that never
+        // ran on the board. It stays correct and reachable -- an adversarial
+        // stream can still land here -- it just no longer costs three copies.
+        self.decode_4x_x2_slow(s0, s1, s2, s3, d0, d1, d2, d3)
+    }
+
+    /// The non-pipelined X2 ladder: `decode_4x_inner`'s fallback when
+    /// `fast_4x2` declines. See the census at the call site.
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn decode_4x_x2_slow(
+        &self,
+        s0: &[u8],
+        s1: &[u8],
+        s2: &[u8],
+        s3: &[u8],
+        d0: &mut [u8],
+        d1: &mut [u8],
+        d2: &mut [u8],
+        d3: &mut [u8],
+    ) -> Result<(), Error> {
+        // E1-E3 REFUTED, recorded: routing this arm's `BitRev::new` (x4),
+        // `reload` (x4) and `write_x2` (x4) through single `#[cold]`
+        // `#[inline(never)]` wrappers -- four expansions of each becoming one
+        // -- measured **+32** crate-wide.
+        //
+        // The arm did shrink, 587 -> 502. The three wrappers cost 117
+        // (bitrev 50, reload 41, write_x2 26), and 117 > 85. Each wrapper
+        // carries its own prologue, epilogue and argument shuffling, and at
+        // four sites that overhead exceeds three saved expansions of bodies
+        // this small.
+        //
+        // The rule this adds to the outlining law: **(copies - 1) x body must
+        // beat the wrapper's own frame.** For a 200-instruction body at 48
+        // copies (`fast_finder_epilogue`) that is trivially true; for a
+        // 40-line helper at four copies it is not. Outlining has a floor.
         let mut b0 = BitRev::new(s0)?;
         let mut b1 = BitRev::new(s1)?;
         let mut b2 = BitRev::new(s2)?;
         let mut b3 = BitRev::new(s3)?;
+        // D10 REFUTED, and the corpus gate is why this note exists.
+        //
+        // I deleted the interleaved ladder here, arguing the four
+        // `decode_into_x2` calls below were "the general per-stream decoder,
+        // correct from index 0" and that per-stream decoding must be
+        // byte-identical because the four streams are independent. The 173
+        // unit tests PASSED. `simdparity` came back **DIFFERS** on the
+        // 144-pair corpus.
+        //
+        // The argument was wrong somewhere real -- the ladder and
+        // `decode_into_x2` do not consume the bitstream identically -- and no
+        // amount of reasoning about stream independence substitutes for the
+        // gate. Restored verbatim. Do not retry without first proving the
+        // equivalence against the corpus, not against the unit suite.
         let max = u32::from(self.max_bits);
         let dt = self.table_x2.as_slice();
-        // Required by `decode_one`/`write_x2`: `saturating_sub` would turn an
-        // empty table into `mask == 0` and then index it. Checked once per call.
         if dt.is_empty() {
             return Err(Error::Corruption);
         }
@@ -389,31 +541,31 @@ impl HuffmanTable {
             let _ = b1.reload();
             let _ = b2.reload();
             let _ = b3.reload();
-            i0 += Self::write_x2(&mut b0, dt, mask, max, d0, i0);
-            i1 += Self::write_x2(&mut b1, dt, mask, max, d1, i1);
-            i2 += Self::write_x2(&mut b2, dt, mask, max, d2, i2);
-            i3 += Self::write_x2(&mut b3, dt, mask, max, d3, i3);
-            i0 += Self::write_x2(&mut b0, dt, mask, max, d0, i0);
-            i1 += Self::write_x2(&mut b1, dt, mask, max, d1, i1);
-            i2 += Self::write_x2(&mut b2, dt, mask, max, d2, i2);
-            i3 += Self::write_x2(&mut b3, dt, mask, max, d3, i3);
-            i0 += Self::write_x2(&mut b0, dt, mask, max, d0, i0);
-            i1 += Self::write_x2(&mut b1, dt, mask, max, d1, i1);
-            i2 += Self::write_x2(&mut b2, dt, mask, max, d2, i2);
-            i3 += Self::write_x2(&mut b3, dt, mask, max, d3, i3);
-            i0 += Self::write_x2(&mut b0, dt, mask, max, d0, i0);
-            i1 += Self::write_x2(&mut b1, dt, mask, max, d1, i1);
-            i2 += Self::write_x2(&mut b2, dt, mask, max, d2, i2);
-            i3 += Self::write_x2(&mut b3, dt, mask, max, d3, i3);
-            i0 += Self::write_x2(&mut b0, dt, mask, max, d0, i0);
-            i1 += Self::write_x2(&mut b1, dt, mask, max, d1, i1);
-            i2 += Self::write_x2(&mut b2, dt, mask, max, d2, i2);
-            i3 += Self::write_x2(&mut b3, dt, mask, max, d3, i3);
+            for _ in 0..5 {
+                i0 += Self::write_x2(&mut b0, dt, mask, max, d0, i0);
+                i1 += Self::write_x2(&mut b1, dt, mask, max, d1, i1);
+                i2 += Self::write_x2(&mut b2, dt, mask, max, d2, i2);
+                i3 += Self::write_x2(&mut b3, dt, mask, max, d3, i3);
+            }
         }
-        self.decode_into_x2(&mut b0, &mut d0[i0..])?;
-        self.decode_into_x2(&mut b1, &mut d1[i1..])?;
-        self.decode_into_x2(&mut b2, &mut d2[i2..])?;
-        self.decode_into_x2(&mut b3, &mut d3[i3..])?;
+        // D18: same as D17 one screen up -- `iN <= dN.len()` holds by the loop
+        // guard (`iN + 10 <= dN.len()` to enter, advancing by at most 10), but
+        // the four `&mut dN[iN..]` slices each carried a bounds test and a
+        // panic pad. `get_mut` states the bound as a branch and returns
+        // `Corruption` instead of unwinding.
+        let (t0, t1, t2, t3) = match (
+            d0.get_mut(i0..),
+            d1.get_mut(i1..),
+            d2.get_mut(i2..),
+            d3.get_mut(i3..),
+        ) {
+            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+            _ => return Err(Error::Corruption),
+        };
+        self.decode_into_x2(&mut b0, t0)?;
+        self.decode_into_x2(&mut b1, t1)?;
+        self.decode_into_x2(&mut b2, t2)?;
+        self.decode_into_x2(&mut b3, t3)?;
         Ok(())
     }
 
@@ -510,8 +662,93 @@ impl HuffmanTable {
         }))
     }
 
-    #[inline(always)]
+    /// OUTLINED, on a census. `decode_4x`'s two arms are not equal: over five
+    /// Silesia corpora at L1/L3/L9/L19, `use_x2` sent **509 of 517 literals
+    /// sections (98.45%) to the X2 arm and 8 (1.55%) here**. This body was
+    /// `#[inline(always)]` and therefore stamped into all THREE ISA twins
+    /// (`decode_4x`, `_bmi2`, `_avx2`) for a path that runs on one section in
+    /// sixty-five.
+    ///
+    /// The trade is stated rather than assumed: as one shared symbol this arm
+    /// loses `shrx`/`lzcnt` on its bit reader. It keeps them for 1.55% of
+    /// sections at a cost of two full copies of the body -- the same shape as
+    /// `copy_literals_cold` and `count_match_sub8` elsewhere in this campaign.
+    /// The X2 arm, which serves the other 98.45%, is untouched and still
+    /// compiled into every twin.
+    ///
+    /// NEUTRAL, recorded: adding `#[cold]` here measured **+3** and was
+    /// reverted. The body's cost is the explicit `for k in 0..4`, which LLVM
+    /// fully unrolls on its own regardless of the hint. Contrast
+    /// `decode_4x_x2_slow`, where rolling the hand-written 5x4 ladder back up
+    /// gave -399 -- the win was removing the SOURCE unroll, not the hint.
+    ///
+    /// CENSUS CORRECTED, 2026-08-27. The "1.55% / one section in sixty-five"
+    /// figure above is STALE, and it is the entire basis of the trade this
+    /// doc-block describes. Re-measured with `x1arm.rs` over twelve Silesia
+    /// corpora at L1/L3/L9/L19:
+    ///
+    /// ```text
+    /// cap  1 MiB    x1=110  x2=292   x1_share 27.36%
+    /// cap 16 MiB    x1=1004 x2=3044  x1_share 24.80%
+    /// ```
+    ///
+    /// One section in FOUR, not one in sixty-five -- stable across a 16x change
+    /// in input size, and rising with level (6.97% at L1 to 38.72% at L19).
+    ///
+    /// The old number could not have been read correctly even in principle: it
+    /// was taken as `X4_X1_CALLS / X2_STATS[1]`, and `X2_STATS[1]` is
+    /// incremented by BOTH this function's caller and `decode_stream`'s
+    /// one-stream path, so its denominator contains sections the numerator can
+    /// never count. `X4_X2_CALLS` now counts this arm's sibling at exactly one
+    /// site, which is what makes the ratio above readable.
+    ///
+    /// So the arm stays OUTLINED (that trade was about I-cache and is
+    /// unaffected) but it no longer runs at baseline ISA beneath a BMI2 caller:
+    /// 532 instructions of duplicated body converting 20 variable shifts is
+    /// 26.6 per op, which clears the ~40 screen comfortably, and it now earns
+    /// that on a quarter of sections rather than one in sixty-five.
+    #[inline(never)]
     fn decode_4x_x1(
+        &self,
+        s0: &[u8],
+        s1: &[u8],
+        s2: &[u8],
+        s3: &[u8],
+        d0: &mut [u8],
+        d1: &mut [u8],
+        d2: &mut [u8],
+        d3: &mut [u8],
+    ) -> Result<(), Error> {
+        self.decode_4x_x1_body(s0, s1, s2, s3, d0, d1, d2, d3)
+    }
+
+    /// The BMI2-compiled arm of `decode_4x_x1`. Calls the `#[inline(always)]`
+    /// BODY, never the baseline sibling -- a twin that calls its sibling is a
+    /// `jmp` thunk and does nothing at all.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[target_feature(enable = "bmi2,lzcnt")]
+    #[allow(clippy::too_many_arguments)]
+    #[allow(unsafe_code)]
+    #[inline(never)]
+    unsafe fn decode_4x_x1_bmi2(
+        &self,
+        s0: &[u8],
+        s1: &[u8],
+        s2: &[u8],
+        s3: &[u8],
+        d0: &mut [u8],
+        d1: &mut [u8],
+        d2: &mut [u8],
+        d3: &mut [u8],
+    ) -> Result<(), Error> {
+        self.decode_4x_x1_body(s0, s1, s2, s3, d0, d1, d2, d3)
+    }
+
+    /// `#[inline(always)]` is LOAD-BEARING: it is what lets each ISA arm above
+    /// re-generate this body under its own feature set.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn decode_4x_x1_body(
         &self,
         s0: &[u8],
         s1: &[u8],
@@ -536,6 +773,8 @@ impl HuffmanTable {
         let mask = dt.len() - 1;
         let n = d0.len().min(d1.len()).min(d2.len()).min(d3.len());
         let mut i = 0usize;
+        // D9 REVERTED -- see the ledger. The census that justified deleting
+        // this loop was wrong by 16x.
         while i + 4 <= n {
             let _ = b0.reload();
             let _ = b1.reload();
@@ -581,8 +820,17 @@ impl HuffmanTable {
 }
 
 /// Parse Huffman_Tree_Description at the start of `src`. Returns (table, bytes used).
-#[inline(always)]
+///
 /// W36: `recycle` is the previous block's table, donated for its buffers.
+///
+/// OUTLINED. This was `#[inline(always)]` across shipping call sites in three
+/// different frequency classes -- `decode_literals` (per BLOCK),
+/// `Dictionary::from_bytes` and `seed_from_dict` (once per dictionary) -- so
+/// the tree parser was stamped into the cold dictionary paths as well as the
+/// hot one. At most once per block, a call is free; the note below the
+/// attribute was also sitting BELOW it, which is why the two doc blocks had
+/// drifted apart.
+#[inline(never)]
 pub(crate) fn read_table(
     recycle: Option<HuffmanTable>,
     src: &[u8],
@@ -627,7 +875,12 @@ pub(crate) fn read_table(
     Ok((table, used))
 }
 
-#[inline(always)]
+// STACKED-ATTRIBUTE HAZARD, third sighting: an `#[inline(always)]` sat here,
+// ABOVE the doc block, while the outlining note and `#[inline(never)]` were
+// added below it. Both applied to the same item, rustc warned "unused
+// attribute" rather than erroring, and only the asm said which had won.
+// Removed: its doc block justifies buffer reuse and a dead_code allowance,
+// never an ISA context, so nothing here depended on inlining.
 /// W36: `recycle` donates the previous table's two buffers so the X1 and X2
 /// tables (up to 4 KiB and 8 KiB) are rebuilt in place instead of reallocated.
 /// W42: the weights arrive in the caller's 256-byte stack buffer with `n_wo`
@@ -646,6 +899,13 @@ pub(crate) fn read_table(
 /// encode. The encoder's two call sites now pass `cfg!(test)`, so the oracle
 /// still exists in test builds (where `ct.table.decode_stream` is asserted
 /// against) and costs nothing in release.
+///
+/// OUTLINED. A 195-line Huffman DTable builder that LLVM was inlining at all
+/// three of its call sites -- `read_table` (per BLOCK on the decode path) and
+/// two dictionary-load paths -- with no symbol of its own. It runs at most
+/// once per block and once per dictionary, so a call is free at that rate,
+/// and the two cold stamps were not.
+#[inline(never)]
 fn table_from_weights(
     recycle: Option<HuffmanTable>,
     wbuf: &mut [u8; 256],
@@ -1256,21 +1516,31 @@ impl HuffCTable {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     #[target_feature(enable = "bmi2,lzcnt")]
     #[allow(unsafe_code)]
+    #[inline(never)]
     unsafe fn encode_stream_unrolled_bmi2(&self, src: &[u8]) -> Result<Vec<u8>, Error> {
-        self.encode_stream_unrolled(src)
+        self.encode_stream_unrolled_body(src, Vec::new())
     }
 
     /// ALLOC-2: the BMI2 twin's recycled-buffer form. Kept a separate
     /// `#[target_feature]` function for the same reason the twin exists at all.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    #[target_feature(enable = "bmi2")]
+    // `lzcnt` ADDED. This is the arm that SHIPS (`encode_stream_into` is the
+    // route `write_literals` takes; the allocating sibling above is
+    // `#[allow(dead_code)]`), and it was the only BMI2 twin in the crate
+    // enabling `bmi2` alone -- its own non-shipping twin already had both.
+    // Without `lzcnt`, `leading_zeros` in the bit-width chain lowers to `bsr`
+    // plus its zero-input fixup instead of one instruction.
+    #[target_feature(enable = "bmi2,lzcnt")]
     #[allow(unsafe_code)]
+    #[inline(never)]
     unsafe fn encode_stream_unrolled_bmi2_into(
         &self,
         src: &[u8],
         buf: Vec<u8>,
     ) -> Result<Vec<u8>, Error> {
-        self.encode_stream_unrolled_into(src, buf)
+        // Calls the BODY, not the baseline wrapper: calling the wrapper is
+        // what made this a `jmp` thunk. See `encode_stream_unrolled_body`.
+        self.encode_stream_unrolled_body(src, buf)
     }
 
     /// True iff every byte in `src` has a code. Treeless reuse of `prev` must
@@ -1330,6 +1600,17 @@ impl HuffCTable {
     /// bitstream. The two Huffman literal-stream sites called `with_capacity`
     /// and allocated fresh, four times per 4-stream block. The right helper
     /// existed and nothing here called it; the same shape as N9 and V1.
+    ///
+    /// `#[cold] #[inline(never)]`: this is the `RZSTD_HUFF_FAST=0`
+    /// re-adjudication arm, and `huff_fast_enabled()` defaults TRUE -- so on
+    /// every shipping run this body is not executed even once. Inlined, it made
+    /// the DISPATCHER `encode_stream_into` 457 instructions, of which ~430 were
+    /// this arm sitting in the I-cache line the hot path walks through on its
+    /// way to the twin. Same finding as `decode_4x_x2_slow`, whose census read
+    /// 0 of 509 sections: a fallback that stays correct and reachable does not
+    /// have to stay resident.
+    #[cold]
+    #[inline(never)]
     fn encode_stream_scalar_into(&self, src: &[u8], buf: Vec<u8>) -> Result<Vec<u8>, Error> {
         if src.is_empty() {
             return Err(Error::Corruption);
@@ -1350,17 +1631,45 @@ impl HuffCTable {
     /// `K` from `max_nbits` so `K*max + 7 leftover < 64` (16/8/6/5 analog of 4×4/8×8/16×16).
     #[inline(always)]
     fn encode_stream_unrolled(&self, src: &[u8]) -> Result<Vec<u8>, Error> {
-        self.encode_stream_unrolled_into(src, Vec::new())
+        // The BODY, not the baseline wrapper -- this fn is `inline(always)`,
+        // so routing it through an `inline(never)` wrapper would re-create the
+        // thunk for its own BMI2 twin below.
+        self.encode_stream_unrolled_body(src, Vec::new())
     }
 
-    /// ALLOC-2, unrolled twin. See `encode_stream_scalar_into`.
-    fn encode_stream_unrolled_into(&self, src: &[u8], buf: Vec<u8>) -> Result<Vec<u8>, Error> {
+    /// The literal emit body. **`#[inline(always)]` is LOAD-BEARING** -- see
+    /// `m7-anatomy.md` 3(h).
+    ///
+    /// This body used to BE `encode_stream_unrolled_into`, a plain function
+    /// with no inline hint and ~1,983 instructions. Its `#[target_feature]`
+    /// twins therefore could not inline it, and a function without
+    /// `target_feature` is generated at the crate's BASELINE ISA no matter who
+    /// calls it -- so the twins collapsed to `jmp` thunks and the emitted body
+    /// carried **118 variable `%cl` shifts and zero BMI2 ops**. The runtime
+    /// `has_bmi2()` dispatch fired and bought nothing.
+    ///
+    /// As an `#[inline(always)]` body with one thin `#[inline(never)]` wrapper
+    /// per ISA, each twin instantiates its own copy and gets its own
+    /// `shrx`/`shlx`. That is exactly the shape `decode_4x_inner` uses in this
+    /// same file -- and why `decode_4x_bmi2` reads 40 BMI2 ops and 0 CL.
+    ///
+    /// The duplicated body is the deliberate price (section 10.5's build-cost
+    /// budget): one extra copy per ISA, against a per-LITERAL-BYTE loop in a
+    /// stage that is 86.7% of encode at L1 on `x-ray`.
+    #[inline(always)]
+    fn encode_stream_unrolled_body(&self, src: &[u8], buf: Vec<u8>) -> Result<Vec<u8>, Error> {
         if src.is_empty() {
             return Err(Error::Corruption);
         }
         let mut bits = crate::bit::BitCStream::from_vec(buf, src.len() + 8);
         self.encode_rev_into(&mut bits, src);
         Ok(bits.close())
+    }
+
+    /// ALLOC-2, unrolled twin -- the BASELINE arm. See `encode_stream_scalar_into`.
+    #[inline(never)]
+    fn encode_stream_unrolled_into(&self, src: &[u8], buf: Vec<u8>) -> Result<Vec<u8>, Error> {
+        self.encode_stream_unrolled_body(src, buf)
     }
 
     #[inline(always)]
@@ -2160,34 +2469,45 @@ fn write_lit_huff_header_into(
     csize: u32,
     outbuf: Vec<u8>,
 ) -> Result<Vec<u8>, Error> {
+    // C11: TWELVE `Vec::push` sites became ONE `extend_from_slice`. The header
+    // is at most five bytes, but each `push` inlined a capacity test and a
+    // grow path, so the site count was the code size. Staging into a fixed
+    // `[u8; 5]` and publishing once emits one grow path for all four arms.
+    //
+    // Identical bytes and identical errors: the arms are tested in the same
+    // order (`n_streams == 1` first, then the three size classes), each writes
+    // the same fields, and both `Corruption` exits are unchanged.
     let mut h = outbuf;
     h.clear();
-    if n_streams == 1 {
+    let mut b = [0u8; 5];
+    let n: usize = if n_streams == 1 {
         if regen > 0x3FF || csize > 0x3FF {
             return Err(Error::Corruption);
         }
-        h.push(lit_type | ((regen & 0xF) << 4) as u8);
-        h.push((((regen >> 4) & 0x3F) as u8) | (((csize & 3) as u8) << 6));
-        h.push((csize >> 2) as u8);
-        return Ok(h);
-    }
-    if regen <= 0x3FF && csize <= 0x3FF {
-        h.push(lit_type | (1 << 2) | ((regen & 0xF) << 4) as u8);
-        h.push((((regen >> 4) & 0x3F) as u8) | (((csize & 3) as u8) << 6));
-        h.push((csize >> 2) as u8);
+        b[0] = lit_type | ((regen & 0xF) << 4) as u8;
+        b[1] = (((regen >> 4) & 0x3F) as u8) | (((csize & 3) as u8) << 6);
+        b[2] = (csize >> 2) as u8;
+        3
+    } else if regen <= 0x3FF && csize <= 0x3FF {
+        b[0] = lit_type | (1 << 2) | ((regen & 0xF) << 4) as u8;
+        b[1] = (((regen >> 4) & 0x3F) as u8) | (((csize & 3) as u8) << 6);
+        b[2] = (csize >> 2) as u8;
+        3
     } else if regen <= 0x3FFF && csize <= 0x3FFF {
-        h.push(lit_type | (2 << 2) | ((regen & 0xF) << 4) as u8);
-        h.push((regen >> 4) as u8);
-        h.push((((regen >> 12) & 3) as u8) | (((csize & 0x3F) as u8) << 2));
-        h.push((csize >> 6) as u8);
+        b[0] = lit_type | (2 << 2) | ((regen & 0xF) << 4) as u8;
+        b[1] = (regen >> 4) as u8;
+        b[2] = (((regen >> 12) & 3) as u8) | (((csize & 0x3F) as u8) << 2);
+        b[3] = (csize >> 6) as u8;
+        4
     } else if regen <= 0x3FFFF && csize <= 0x3FFFF {
-        // libzstd 5-byte header: 2+2+18+18, `cLitSize<<22` then `cLitSize>>10`.
         let lhc = u32::from(lit_type) | (3 << 2) | (regen << 4) | (csize << 22);
-        h.extend_from_slice(&lhc.to_le_bytes());
-        h.push((csize >> 10) as u8);
+        b[0..4].copy_from_slice(&lhc.to_le_bytes());
+        b[4] = (csize >> 10) as u8;
+        5
     } else {
         return Err(Error::Corruption);
-    }
+    };
+    h.extend_from_slice(&b[..n]);
     Ok(h)
 }
 
@@ -2884,30 +3204,40 @@ fn raw_section_len(n: u32) -> usize {
 }
 
 fn write_raw_or_rle(lits: &[u8], rle: bool) -> Vec<u8> {
+    // C12: eight `Vec` plumbing sites became two. The header is at most three
+    // bytes across three size classes, and each `push` inlined its own
+    // capacity test and grow path -- the same shape as C5, C7 and C11. Staging
+    // the header into a fixed `[u8; 3]` publishes all three classes through
+    // one `extend_from_slice`, and the payload through a second.
+    //
+    // This is the RAW/RLE literals fallback, taken only when Huffman does not
+    // pay -- so the code it emits is cold, and its size is all it costs.
+    // Identical bytes: same fields, same order, same size-class boundaries.
     let n = lits.len() as u32;
     let ty: u8 = if rle { 1 } else { 0 };
-    let mut dst = Vec::new();
-    if n < 32 {
-        dst.push((n << 3) as u8 | ty);
+    let mut hdr = [0u8; 3];
+    let hn: usize = if n < 32 {
+        hdr[0] = (n << 3) as u8 | ty;
+        1
     } else if n < 4096 {
-        dst.push((1 << 2) | ty | ((n & 0xF) << 4) as u8);
-        dst.push((n >> 4) as u8);
+        hdr[0] = (1 << 2) | ty | ((n & 0xF) << 4) as u8;
+        hdr[1] = (n >> 4) as u8;
+        2
     } else {
-        dst.push((3 << 2) | ty | ((n & 0xF) << 4) as u8);
-        dst.push((n >> 4) as u8);
-        dst.push((n >> 12) as u8);
-    }
-    if rle {
-        // `rle` promising a non-empty `lits` is a CALLER contract with no local
-        // witness, so this must not become `unsafe`. `first()` keeps it safe and
-        // still drops the panic path.
+        hdr[0] = (3 << 2) | ty | ((n & 0xF) << 4) as u8;
+        hdr[1] = (n >> 4) as u8;
+        hdr[2] = (n >> 12) as u8;
+        3
+    };
+    let body: &[u8] = if rle {
         debug_assert!(!lits.is_empty());
-        if let Some(&b) = lits.first() {
-            dst.push(b);
-        }
+        &lits[..lits.len().min(1)]
     } else {
-        dst.extend_from_slice(lits);
-    }
+        lits
+    };
+    let mut dst = Vec::with_capacity(hn + body.len());
+    dst.extend_from_slice(&hdr[..hn]);
+    dst.extend_from_slice(body);
     dst
 }
 

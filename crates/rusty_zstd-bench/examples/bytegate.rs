@@ -7,6 +7,19 @@
 //! It also round-trips each frame, so it is a correctness gate as well.
 //!
 //! A count, not a clock -- same number on any machine at any load.
+//!
+//! GOLD HISTORY. This number is the campaign's identity anchor and only moves
+//! when a bitstream-changing arm is deliberately flipped:
+//!
+//! ```text
+//!   BE0071FB0CB0CED9   59,760,356 bytes   until 2026-08-27
+//!   CAE84167220B70DA   59,841,188 bytes   DFAST_FILL_N_ARM -> start-only
+//! ```
+//!
+//! The 2026-08-27 move is +0.135% of total bytes and buys HALF the per-match
+//! table fills at L1 and L3/L4 (`fillcut.rs`, and section 9 of
+//! docs/plans/m7-anatomy.md). L5 and above are unaffected -- they do not fill
+//! through this path.
 const IDS: &[&str] = &[
     "zeros-32m","text-32m","incomp-32m","jsonlog-16m","smallmsg-8m","versions-16m",
     "mr","ooffice","osdb","reymont","sao","webster","dickens","mozilla","nci","samba","xml","x-ray",

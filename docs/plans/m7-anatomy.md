@@ -8,6 +8,41 @@ computations removed). Earlier passes: the BMI2 twin campaign (`08d14e3`..`bfd0c
 the 08-20 gate/dispatch session (`30e6863`..`0fbc57b`), and the per-finder campaign
 (`..d012c6c`). Older boards are in git history.
 
+> **PROVENANCE SPLIT, 2026-08-26 -- READ THIS BEFORE ANY CELL ON THIS PAGE.** The
+> page no longer has one date, and pretending it does would be the exact instrument
+> error `m7-benchmark-repair.md` exists to prevent.
+>
+> | what | when | status |
+> |---|---|---|
+> | **Speed boards** (sections 1, 2, 6) -- ms/MiB, MB/s, C/us ratios | 2026-08-22 | **NOT re-boarded.** Four decode campaigns have landed since (`inline-execution.md` 17-18, 23-27) and the host has carried a concurrent workstream all session. These cells are HISTORICAL. |
+> | **Size / `us/c size` cells** | 2026-08-22 | **STILL EXACT.** `bytegate` GOLD `BE0071FB0CB0CED9` is re-verified after every brick and has not moved through any of it. |
+> | **Section 3(c) function census, 3(d) loop counts, 3(e) op ladder** | **2026-08-26** | Re-taken on the current tree. |
+>
+> The rule this page has always run on applies to itself: **a speed cell and a count
+> cell from different builds are not a comparison.** The counts below are current; the
+> clocks above them are not, and no claim on this page pairs them.
+>
+> **Why the speed boards were NOT re-taken on 2026-08-26, with the receipt.** The
+> `simserver` demo was launched on the current build and driven over the L3 corpora.
+> Three consecutive runs of the IDENTICAL measurement (`dickens`, L3, 4 MiB,
+> best-of-7) returned **577.4, 395.2 and 617.0 MB/s decompress** -- a 56% spread, with
+> 106 busy processes on the host and the demo's own same-arm spread reading 13.22%,
+> 5.93% and 2.85% across those same three runs. The first sweep's `dickens` cell
+> (370 MB/s, "3.35x C") was a draw from the bottom of that distribution and means
+> nothing; 577 and 617 bracket the 603 measured this morning, so **no regression is
+> indicated and none is claimed.** A cell that moves 56% between identical runs cannot
+> be put on a board, and the correct response is to publish the deterministic columns
+> and leave the clocks alone.
+>
+> **What the demo session DID establish, deterministically:** `bytegate` GOLD
+> `BE0071FB0CB0CED9` (59,760,356 bytes) unmoved on the current tree, and the L3 size
+> ratios against C v1.5.7 -- `mozilla` **1.0036**, `webster` 1.0513, `dickens` 1.0528,
+> `nci` **1.0982**. Compressed sizes are deterministic and carry no noise caveat.
+> These confirm `inline-execution.md` section 21's finding (a ~5% L3 ratio gap that is
+> an ENCODER search-quality question, not a decode one) and localise it: `nci` is the
+> worst cell at 9.8% and `mozilla` is at parity, so whatever it is, it is
+> content-dependent rather than uniform.
+
 > **THE DETERMINISTIC RESULT, FIRST.** All **36** `us/c size` cells on this page --
 > 18 at L1, 18 at L3 -- are unchanged for the **THIRD CONSECUTIVE BOARD**. The twelve
 > identity totals agree: L1 43,313,087 | L2 52,103,625 | L3 40,681,863 | L4 40,242,889 |
@@ -216,19 +251,7 @@ decompress, which missed by one hundredth at 1.12 on the first pass, now PASSES 
 
 ## 3. Stage anatomy — where OUR time goes
 
-**Re-measured 2026-08-22 (seventh pass, post MatchFind monomorphisation campaign),
-L3, 8 MiB board.** Shares, so machine state does not reach them: every cell is a
-fraction of its own run. The ENCODE half is stable to within a point on every corpus
-(`smallmsg-8m` 82.5 -> 82.6, `jsonlog-16m` 79.4 -> 79.4, `nci` 67.1 -> 66.2), which is
-the expected reading for a campaign that deleted duplicated code rather than moving
-work between stages.
-
-**The DECODE half moved, and in one direction: `DecLits` fell and `DecSeq` absorbed
-it.** `smallmsg-8m` 11.8 -> 7.4, `jsonlog-16m` 10.8 -> 7.4, `mozilla` 14.9 -> 14.2,
-`sao` 32.8 -> 31.6 -- with `DecSeq` rising by almost exactly the same amount
-(`smallmsg-8m` 83.5 -> 89.5). Literal decoding got cheaper, so its share shrank. That
-is the concurrent Huffman/FSE work landing, and it is visible here as a share shift
-even though shares cannot show absolute gains.
+L3 is the shipping default
 
 | corpus       | MatchFind |     Huff | FseSeq | SeqCode |  DecLits |   DecSeq |    DecCk |
 | ------------ | --------: | -------: | -----: | ------: | -------: | -------: | -------: |
@@ -532,58 +555,86 @@ decoder question at all -- it is the encoder's `(litlen, matchlen, offset)`
 distribution, which is what gate #3-#6 below already hinted at and this now
 quantifies.
 
-**(c) The functions -- footprint and ISA state** (asm census of the SHIPPING build,
-`RUSTFLAGS="--emit asm"`, 886,353 lines parsed per symbol).
+**(c) The functions -- footprint and ISA state.** Asm census of the SHIPPING build
+(`RUSTFLAGS="--emit asm"`), **re-taken 2026-08-26** after the copy_match campaign
+(`inline-execution.md` sections 17-18 and 23-27) and the concurrent
+`decode_seq_header` extraction. The 2026-08-21 table it replaces is kept below the
+fold because its central finding has been RESOLVED, and a resolved trap is worth more
+on the record than a deleted one.
 
-| function | copies | live-copy instrs | ISA receipt | unit of execution |
-| --- | ---: | ---: | --- | --- |
-| `decode_sequences` | 1 | 4,167 | 0 BMI2, 56 SSE, **240 CL-shift** | per block, plain arm |
-| `decode_sequences_avx2` | 1 | 4,055 | **175 BMI2, 28 AVX2**, 0 SSE, 68 CL | per block, twin |
-| `decode_compressed_block` | 1 | 2,942 | 0 BMI2, 40 SSE, 187 CL | per block, plain arm |
-| `decode_compressed_block_bmi2` | 1 | 2,792 | **78 BMI2**, 38 SSE, 112 CL | per block, twin |
-| `decompress_into_history` | 1 | 542 | 2 SSE, 8 CL | per frame |
-| `copy_match` | 1, **CALLED per sequence** | 141 | **0 ymm, 0 SSE** | per sequence, OUTSIDE the twin |
-| `copy_from_decoded` | 1, **CALLED per sequence** | 230 | **0 ymm, 13 SSE** | per sequence, OUTSIDE the twin |
-| `ll_code` / `ml_code` | 1 / 1, not called from the loop | 198 / 284 | 3 / 6 CL | test-only |
-| `seq_table`, `init_state`, `copy_literals`, `resolve_offset`, `of_code`, `FseTable::entry`, `FseTable::advance`, `BitRev::read_bits`, `BitRev::reload`, `code_from_base` | -- | fully inlined | -- | per sequence |
+| function | instrs | BMI2 | ymm | xmm | CL-shift | callq | unit of execution |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `decode_sequences` | **954** | 0 | 0 | 8 | **22** | 25 | per block, plain arm |
+| `decode_sequences_avx2` | **862** | **22** | 0 | 8 | **0** | 23 | per block, twin |
+| `decode_seq_header` | 933 | 0 | 0 | 12 | 0 | 29 | **per block, outlined (new)** |
+| `decode_compressed_block` | 223 | 0 | 0 | 2 | 0 | 8 | per block, plain arm |
+| `decode_compressed_block_bmi2` / `_avx2` | 147 / 147 | 0 | 0 | 2 | 0 | 4 | per block, twins |
+| `decompress_into_history` | 570 | 0 | 0 | 9 | 0 | 17 | per frame |
+| `match_cold_raw` | 164 | 0 | 0 | **70** | 0 | **1** | per COLD copy (~19% of copies) |
+| `lit_cold_raw` | 32 | 0 | 0 | 10 | 0 | **0** | per cold literal copy |
+| `copy_from_decoded_cold` x3 monomorphs | 226 / 217 / 182 | 0 | 0 | 30 / 10 / 0 | 0 | 10-12 | Vec-needing leftovers (0.24%) |
+| `copy_match_dict_cold` | 179 | 0 | 0 | 4 | 0 | 8 | dictionary path only |
+| `copy_literals_cold` | 96 | 0 | 0 | 10 | 0 | 3 | literal tail |
+| `copy_match`, `copy_from_decoded`, `copy_literals`, `seq_table`, `init_state`, `resolve_offset`, `FseTable::entry`/`advance`, `BitRev::read_bits`/`reload` | -- | -- | -- | -- | -- | -- | **fully inlined into the twins** |
 
-> **CORRECTION 2026-08-21, and it inverts the paragraph that stood here.** This
-> section previously claimed "DecSeq IS TWO SYMBOLS -- the sequence loop calls nothing
-> of its own", and listed `copy_match` / `copy_from_decoded` as DEAD COPIES reachable
-> only from tests. **Both claims were wrong.** They came from a call-target dump that
-> printed only the top 40 targets by count, and ~28 of those slots were consumed by
-> `.LBB` local labels -- the `copy_match` edge, appearing **once** as a call site,
-> fell off the end of the list. A whole-binary scan for callers finds three edges:
-> `decode_sequences -> copy_match`, `decode_sequences_avx2 -> copy_match`, and
-> `copy_match -> copy_from_decoded`. **Never read "absent" off a truncated list.**
+**THE 2026-08-21 SHIM TRAP IS CLOSED.** That census found `copy_match` and
+`copy_from_decoded` as two nested CALLS per sequence, outside the twin, carrying
+0 ymm -- "the exact shim trap the twin campaign was built to avoid, still open on the
+single largest object in the decoder." Neither symbol exists today: both are inlined
+into all three block twins, and the per-sequence execute path reaches its copies with
+no call at all. What replaced them:
 
-**THE STRUCTURAL FINDING, CORRECTED: THE MATCH COPY RUNS OUTSIDE THE TWIN.** The
-entropy half of the loop is genuinely inlined -- `FseTable::entry`/`advance`,
-`read_bits`, `reload`, `resolve_offset` and `copy_literals` all survive as straight-line
-code inside `decode_sequences_avx2`. The MATCH COPY does not:
+| then (2026-08-21) | now (2026-08-26) |
+| --- | --- |
+| `copy_match` -> `copy_from_decoded`, 2 calls/sequence | inlined; the ~80% joint fast path is **one branch + two `movups` pairs**, zero calls |
+| cold rungs behind a `&mut Vec` boundary | `match_cold_raw` / `lit_cold_raw`: `op` in, `op` out, **1 and 0 `callq`** |
+| `decode_sequences` 4,167 instrs | **954** (-77%); `_avx2` 4,055 -> **862** (-79%) |
+| `decode_compressed_block` 2,942 | **223**, with the header/table parse outlined to `decode_seq_header` |
 
-| what | where it executes | ISA it gets |
-| --- | --- | --- |
-| `copy_literals` (~13.7% of the loop) | INLINED into the AVX2 twin | 256-bit `vmovups [ymm]` |
-| `copy_match` -> `copy_from_decoded` (**~42% of the loop**) | **two nested CALLS per sequence, outside the twin** | **0 ymm; 13 SSE, baseline x86-64** |
+**The twin receipt is still real, and it is now clean.** The plain arm carries **22
+CL-shifts and 0 BMI2**; the AVX2 twin carries **0 CL and 22 BMI2** -- a complete
+swap, where the 2026-08-21 build still left 68 CL inside the twin. Every variable
+shift in the sequence loop is now either a BMI2 `shrx`/`shlx` on the twin or an
+`OF_PACK` table load on both (section 26, win 9).
 
-All 26 `vmovups [ymm]` in the twin belong to `copy_literals`. `copy_match` carries
-none, because a function with no `#[target_feature]` is compiled to the crate's
-baseline ISA no matter which twin calls it -- the exact "shim trap" the twin campaign
-was built to avoid, still open on the single largest object in the decoder.
+> **RE-TAKEN 2026-08-27, and the page moved under it.** Crate total
+> **146,955 -> 79,883 instructions (-46%)** in one day, almost all of it a
+> CONCURRENT workstream's outlining, and the decode structure changed shape:
+> `decode_sequences` no longer exists as its own symbol (folded into
+> `decode_compressed_block`, now 1,031), and `decode_4x_x2_slow` has been
+> split out. Current decode-path census:
+>
+> | symbol | instrs | BMI2 | ymm | xmm | CL |
+> |---|---:|---:|---:|---:|---:|
+> | `decode_compressed_block` | 1,031 | 0 | 0 | 10 | 22 |
+> | `decode_sequences_avx2` | 875 | **22** | 0 | 8 | **0** |
+> | `decode_4x` | 790 | 0 | 0 | 0 | 32 |
+> | `decode_4x_bmi2` | 702 | **40** | 0 | 0 | **0** |
+> | `decompress_into_history` | 570 | 0 | 0 | 9 | 0 |
+> | `decode_seq_header` | 324 | 0 | 0 | 12 | 0 |
+> | `row_find_best` | 330 | 0 | 0 | 7 | 3 |
+> | `match_cold_raw` | 164 | 0 | 0 | **70** | 0 |
+> | `lit_cold_raw` | 32 | 0 | 0 | 10 | 0 |
+>
+> **The two decode twins are healthy** -- each swaps its CL-shifts for BMI2
+> cleanly (22/0 and 40/0). Hold that shape in mind for the ENCODE-side twin
+> audited in section 3(h), which does not have it.
+>
+> **A file being edited by another session cannot be boarded.** `huffman.rs`
+> was written at 05:36 while this census ran. Every number above is a
+> deterministic count from one build; treat them as a snapshot of a moving
+> tree, not a standing board.
 
-Three consequences:
-
-1. **There IS call overhead in DecSeq, two levels of it, on every sequence** --
-   53,509 sequences per MiB at L3, each paying a call into `copy_match` and another
-   into `copy_from_decoded`.
-2. **The widest copy the match path can currently emit is 128-bit**, in a function the
-   AVX2 twin cannot inline. Bringing the match copy inside the twin is the outstanding
-   SIMD item in this stage, and it is worth more than everything section (f) ruled
-   out, because it lands on ~42% of the loop rather than on ~5%.
-3. **The twin receipt is real and lopsided.** The plain arm carries 240 CL-shifts and
-   0 BMI2; the twin carries 68 CL and 175 BMI2, plus AVX2 where the baseline needs
-   SSE. `decode_compressed_block` twins the same way (187 CL / 0 BMI2 -> 112 / 78).
+**What the census says is NOT there, and why that is correct.** No symbol on the
+decode path carries a single `ymm`. That is not a regression and not an oversight:
+the fast-path copies are 16-byte `movups` by measurement (`bandcensus`: 80.40% of
+match copies and 99.22% of literal copies are `len <= 16`, mean 7.4 bytes), and the
+wide rungs live in `match_cold_raw`, which is `#[cold] #[inline(never)]` and therefore
+compiles at baseline ISA by construction -- the deliberate trade recorded in
+`inline-execution.md` section 27. T4's AVX2 audit already measured a
+`#[target_feature]` copy helper here as a NET LOSS (call overhead vs 4 inline SSE
+instructions). The 70 `xmm` in `match_cold_raw` are the strided wildcopy rungs doing
+their work.
 
 **(d) The loop interior, by COUNT.** Exact, not sampled -- the loop's shape is fixed by
 the RFC.
@@ -605,6 +656,17 @@ ones** -- 24 `seq_table` calls per MiB against 160,527 `FseTable::entry`. That i
 count-side statement of the 1% Tables share, and it is why no table-build brick can
 pay. **Eleven primitive calls happen per sequence**, and the three FSE `entry` +
 three `advance` + three `read_bits` dominate that count nine to three over the copies.
+
+> **STILL EXACT 2026-08-26, and the reason is worth stating.** These counts are fixed
+> by RFC 8878 -- one literal copy, one match copy, three symbol decodes and three
+> state advances per sequence, whatever the implementation does -- so the campaign
+> that rewrote this loop five times could not move a single cell of this table, and
+> `bandcensus` re-reads 6,215,835 match copies before and after every round to prove
+> exactly that. **What changed is the unit, not the count:** every row except
+> `seq_table` is now an INLINED operation rather than a `callq`, and the ~80% joint
+> fast path executes its `copy_literals` + `copy_match` pair with no call, no
+> capacity test and one branch (section 26). Read this table as the loop's SHAPE; read
+> (c) for what each row costs to reach.
 
 **(e) Breaking the LOOP open -- where the 98.8% goes.** `dsloop.rs`, `--features
 dupladder`, L3, 13 sequence-bearing corpora, 6.5M sequences.
@@ -661,6 +723,40 @@ only.** Every number below is a share for that reason.
 | **the three execution ops together**                             |          **~59%** |
 | ALL FOUR entropy primitives -- **eleven calls per sequence**     |         **~4-6%** |
 | unattributed (loop branch/counter/bounds + warm-cache shortfall) |              ~36% |
+
+**RE-RUN 2026-08-26, after the five copy_match rounds** (`inline-execution.md`
+17-18, 23-27). Same instrument, same 13 corpora, `--features dupladder`:
+
+| op | ns/exec | ns/seq | **% of loop** | share then (K=8) |
+| --- | ---: | ---: | ---: | ---: |
+| `copy_match` | 35.73 | 35.73 | **52.5** | 42.9 |
+| `copy_literals` | 9.96 | 9.96 | **14.6** | 13.9 |
+| `FseTable::advance` x3 | 2.65 | 7.95 | 11.7 | 0.7 |
+| `BitRev::reload` x2 | 2.39 | 4.78 | 7.0 | 1.3 |
+| `BitRev::read_bits` x3 | 1.44 | 4.33 | 6.4 | 0.7 |
+| `resolve_offset` | 2.02 | 2.02 | 3.0 | 2.9 |
+| `FseTable::entry` x3 | 0.52 | 1.57 | 2.3 | 1.6 |
+| **ladder total** | | **66.33** | **97.4** | 64.0 |
+
+**The two copies are now 67.1% of the loop and coverage rose 64.0% -> 97.4%** -- the
+"unattributed ~36%" this section recorded (loop branch, counter, bounds, cursor
+arithmetic) is largely GONE, which is precisely what the five rounds deleted: the
+per-sequence capacity tests, the Vec-field traffic, the double `set_len`, and four of
+the five fast-path branches. An instrument that once could not account for a third of
+the loop now accounts for all but 2.6% of it.
+
+> **DO NOT read the ns column against the older one, and do not trust the small
+> shares to two digits.** The board baseline reads **68.08 ns/seq** here against
+> 35.42 on 08-24 and 45.83 earlier on 08-26 -- the SAME source, three numbers, on a
+> host carrying a concurrent workstream all session. That is section 15.2's law
+> (un-interleaved runs on different days are not a comparison) applying to this
+> instrument, and it is why the entropy rows appear to have grown 10x in share when
+> the campaign never touched them: under load every op inflates, and the ladder's
+> `dup` arms inflate unevenly. **What survives is the ORDER and the coverage jump**,
+> both of which are structural and both of which agree with the deterministic counts
+> in (c). The 08-24 run put `copy_match` at 60.8%, this one at 52.5%; the honest
+> reading is "roughly half to three-fifths of the loop, still the single largest
+> object by a factor of three." A quiet box is required before any finer claim.
 
 That is the opposite of what the stage's name suggests. The FSE and bit-reader
 machinery -- eleven primitive calls per sequence, 321,054 calls per MiB at L3, the
@@ -735,11 +831,15 @@ the live decode path. The headline is a REFUTATION:
    against an immediate shift they are not faster. Same in the block twin: 110
    immediate, 2 variable. **The twin campaign already converted everything
    convertible** -- "replace the remaining shifts with BMI2" is a dead lever.
-2. **The LITERAL copy is already 256-bit; the MATCH copy is not.** All 26
-   `vmovups [ymm]` in the sequence twin belong to `copy_literals`. `copy_match` and
-   `copy_from_decoded` are outlined, baseline-compiled, and carry **0 ymm / 13 SSE** --
-   see the correction in (c). The match path is the one place left where widening is
-   both possible and worth it.
+2. ~~**The LITERAL copy is already 256-bit; the MATCH copy is not.**~~ **SUPERSEDED
+   2026-08-26 -- the gap closed, and the answer was not widening.** `copy_match` and
+   `copy_from_decoded` are no longer outlined at all: both inline into every twin, and
+   the ~80% joint fast path emits two 16-byte `movups` pairs under ONE branch (see (c)
+   and `inline-execution.md` sections 23-27). The width question resolved AGAINST ymm
+   on measurement -- `bandcensus` puts 80.40% of match copies and 99.22% of literal
+   copies at `len <= 16` (mean 7.4 bytes), so a 32-byte move would publish 7.4 bytes
+   at double the cost, which is exactly the T4 ordering law this document already
+   records. The wide rungs live in `match_cold_raw`, cold and baseline by construction.
 3. **The 394 byte-ops are mostly `movzbl` (190)** -- single-byte FSE symbol and
    length-code table reads. One-element table lookups are the gather case; vectorising
    them costs more than it saves.
@@ -901,10 +1001,115 @@ lever is not a nuance, it is one of only two levers that exist.
 
 ---
 
+### 3(h) THE HUFFMAN LITERAL ENCODER'S BMI2 TWIN IS A `jmp`. 2026-08-27.
+
+Found while re-taking 3(c). The census puts two numbers side by side that
+cannot both be right:
+
+| symbol | instrs | BMI2 ops | CL-shifts |
+|---|---:|---:|---:|
+| `HuffCTable::encode_stream_unrolled_into` | **1,983** | 0 | **118** |
+| `HuffCTable::encode_stream_unrolled_bmi2_into` | **1** | 0 | 0 |
+| -- for contrast, a WORKING twin -- | | | |
+| `fse::compress_using_ctable` | 1,100 | 0 | 43 |
+| `fse::compress_using_ctable_bmi2` | 1,084 | **42** | 1 |
+
+The twin's entire body:
+
+```
+encode_stream_unrolled_bmi2_into:
+        jmp     encode_stream_unrolled_into
+```
+
+**The BMI2 dispatch for Huffman literal encoding has never done anything.**
+The runtime `has_bmi2()` check fires, calls the twin, and the twin tail-calls
+the baseline -- which runs its 118 variable `%cl` shifts (3 uops each on
+Intel) exactly as if the dispatch were absent.
+
+**The mechanism, and it is the shim trap in its purest form.** The twin is
+`#[target_feature(enable = "bmi2")]` and its body is one call:
+
+```rust
+#[target_feature(enable = "bmi2")]
+unsafe fn encode_stream_unrolled_bmi2_into(&self, src, buf) -> ... {
+    self.encode_stream_unrolled_into(src, buf)   // plain fn, ~1,983 instrs
+}
+```
+
+`encode_stream_unrolled_into` carries no `#[inline(always)]` and is far past
+LLVM's inlining threshold, so it is NOT inlined into the twin. A function
+without `target_feature` is generated at the crate's BASELINE ISA no matter
+who calls it -- so the body exists once, at baseline, and the twin collapses
+to a jump. The per-symbol loop it wraps (`encode_rev_into`) IS
+`#[inline(always)]`, which is why all 118 shifts land in that one body.
+
+**The fix is the one section 18's W1 already used** on `decode_into_x1/x2`,
+and the working pattern is in this same file: `decode_4x_bmi2` calls
+`decode_4x_inner`, which IS `#[inline(always)]` -- and that twin reads 702
+instructions with **40 BMI2 ops and 0 CL-shifts**. The encode side needs the
+same shape: an `#[inline(always)]` body with one thin `#[inline(never)]`
+wrapper per ISA, so each twin instantiates its own copy.
+
+**Why it is worth doing.** `Huff` is **86.7% of encode at L1 on `x-ray`** and
+16-21% on `ooffice`/`sao`/`osdb`/`mr`, and this is its per-literal-byte emit
+loop. 118 variable shifts is exactly the workload BMI2's `shrx`/`shlx` exist
+to serve -- the same trade `decode_4x` and `compress_using_ctable` already
+bank.
+
+**FIXED 2026-08-27**, once `huffman.rs` had been quiet for ten minutes and
+compiled clean. (It was deliberately left alone at first: editing a file
+another agent is mid-write in is how the truncated `fn` earlier that day left
+the crate unbuildable.)
+
+The body became `encode_stream_unrolled_body`, `#[inline(always)]`, with one
+thin `#[inline(never)]` wrapper per ISA calling it. **Both** twin pairs
+needed it -- the no-buffer `encode_stream_unrolled` is itself
+`inline(always)` and routed through the baseline `_into` wrapper, so it
+re-created the same thunk for its own twin one level down.
+
+| symbol | before | after |
+|---|---|---|
+| baseline `encode_stream_unrolled_into` | 1,983 instrs, **CL=118**, BMI2=0 | 1,897 instrs, CL=118, BMI2=0 |
+| `encode_stream_unrolled_bmi2_into` | **1 instruction (`jmp`)** | **1,744 instrs, BMI2=118, CL=0** |
+
+**A clean swap: all 118 variable shifts became 118 `shrx`/`shlx`** -- the
+exact shape `decode_4x_bmi2` (40 BMI2 / 0 CL) and
+`compress_using_ctable_bmi2` (42 BMI2 / 1 CL) already had. The twin is
+SMALLER than the baseline it replaces (1,744 vs 1,897), because `shrx` takes
+its count from any register and needs none of the `%cl` setup moves.
+
+Crate total 79,883 -> 82,063 (+2,180): one duplicated body, the price section
+10.5 budgets for an ISA twin, paid on a per-literal-byte loop.
+
+Gate: `bytegate` GOLD `BE0071FB0CB0CED9` unmoved -- byte-identical by
+construction, since both arms run the same body and differ only in ISA.
+
+**The class, now three-for-three in this crate.** V1 (xxh64's AVX2 kernel
+reachable only from a test), section 18 W1 (`decode_into_x1/x2` outlined at
+baseline beneath three twins), and this. All three had correct code, a
+correct runtime dispatch, and no effect -- and all three were invisible to
+every correctness gate, because a thunk is byte-identical to what it wraps.
+**The standing check is one line of asm per twin: if a `_bmi2`/`_avx2` symbol
+is not carrying the ISA ops its baseline sibling carries in `%cl`, the twin
+is not doing anything.**
+
 ### Cross-cutting: dispatches that are DEAD in the shipping build
 
 Found while auditing, per the `rusty_curiosity` law that an unused thing is invisible
 to every profiler:
+
+> **ADDENDUM 2026-08-26 -- a THIRD category, and it is the one to check first now.**
+> Beyond "dead" (nothing calls it) and "live" (runtime CPUID), the decode loop now
+> carries arms that are **FOLDED**: their readers are `#[cfg(feature = "profile")]`
+> twins whose shipping half returns a constant, so the arm survives for the A/B
+> harness and costs the shipping build nothing -- not an atomic load, not a branch,
+> not the body it guards. Seven decode arms are in this state (`seqcheck`, `litcopy`,
+> `matchcopy`, `lut`, `prefetch`/D9, `pipeline`/D10, `pipe1`/D11), and the last three
+> fold to `false`, which deletes two parked decode-ahead implementations from the
+> shipping twins entirely. This is `inline-execution.md` section 10.1's pattern A
+> applied at per-sequence frequency. **An arm census that greps for `set_*_arm` will
+> now over-count what the shipping build actually executes by seven** -- read the
+> `#[cfg]` on the READER, not the presence of the setter.
 
 > **CORRECTION 2026-08-21:** the two bullets below were true when written and are now
 > INVERTED by the BMI2 twin campaign (`08d14e3`..`bfd0cf0`). `has_bmi2()` is the
@@ -1028,14 +1233,20 @@ Rewritten 2026-08-17, after the literals-gate and chain-fill work.
    `x-ray` L1 decompress 6488 -> 1034 MB/s, `sao` 5681 -> 562. **A gate that trades
    decode speed for size should know it is doing that.**
 
-5. **xxh64 remains the best-evidenced decode lever.** #2 overall, leads outright on
-   3 of 18 at 33-53% of decode. **Memory-bound, not compute-bound** (17.9/18.0/18.0
-   GB/s at 32 KiB/256 KiB/4 MiB vs **12.5 GB/s over 32 MiB** -- `xxh64::locality_probe`).
-   Two dead ends paid for: the algorithm is fixed by RFC 8878 (XXH64's 64x64 multiply
-   has no SSE2/AVX2 equivalent -- why XXH3 exists), and fusing the hash into the block
-   loop measured **~12% WORSE** (brick 85, reverted). Per section 3 it is also the only
-   stage with NO dispatch of any kind. **What is left is overlapping it with decode on
-   a second thread.**
+5. **xxh64 -- the dispatch gap named here was REAL and is now CLOSED (D8a, shipped
+   2026-08-22).** This item said xxh64 "is the only stage with NO dispatch of any
+   kind." The reason turned out to be worse than missing dispatch: the AVX2 kernel
+   EXISTED, tested and A/B-armed, and nothing on the shipping path called it --
+   `Xxh64::update` ran the scalar stripe loop while the vector kernel sat two functions
+   away, reachable only from `xxh64_seed` (a test and a bench). Wiring it moved kernel
+   reach **50.00% -> 100.00% of checksummed bytes, and the DECODE side 0% -> 100%**
+   (`d8acensus`, re-verified 2026-08-26: 516,624,384 hybrid bytes against 640 scalar,
+   the sub-tile tails). `inline-execution.md` V1 carries the full trace; the standing
+   lesson is that **a beautiful kernel benchmark proves nothing until a caller trace
+   proves reachability.** Still true and unchanged: memory-bound not compute-bound
+   (17.9/18.0/18.0 GB/s at 32 KiB/256 KiB/4 MiB vs **12.5 GB/s over 32 MiB**), the
+   algorithm is RFC-fixed, and fusing the hash into the block loop measured ~12% WORSE
+   (brick 85). **What is left is overlapping it with decode on a second thread.**
 
 6. **`SeqCode` is 20-26% of encode on five corpora with exactly ONE decision** (section
    3). Larger than `FseSeq` on every file, and the decision is RFC-forced. That makes it
@@ -1136,3 +1347,471 @@ and per section 3 that stage is near its structural limit.
 
 ---
 
+
+## 7. L1 AND L3: WHERE THE ENCODE TIME ACTUALLY GOES. 2026-08-27
+
+`hotspot.rs` says MatchFind is **73.1%** of encode at L1 and **76.3%** at L3.
+That number has been read for a long time as "match finding is the cost". It is
+not, and the stage's own counters refute it.
+
+### 7.1 The stage name is wrong about what it measures
+
+`Stage::EncodeMatchFind` wraps the whole `find_sequences` call, which returns
+`(Vec<Seq>, Vec<u8>)`. So the 73/76% covers probing, match extension, the
+literal COPY into a Vec, and the SEQUENCE VECTOR build. It is the entire
+sequence-production pipeline, not the search. Anything reasoning from "match
+finding is 75% of encode" to "make probing cheaper" has skipped that step.
+
+### 7.2 The search is not big enough to be the cost
+
+`l13anat.rs` (new), all columns per INPUT byte, 12 corpora, 8 MiB:
+
+```text
+        probes/B  fills/B  seqs/B  matchB  litB   pos/B   mean mlen
+  L1      0.333    0.072   0.0394   0.562  0.438  0.405     12.1
+  L3      0.067    0.251   0.0666   0.728  0.272  0.318     11.6
+```
+
+CORRECTED 2026-08-27, and the first figures published here were WRONG.
+`fill_hash_long_after_match` reported to `DF_ENDFILL` but never called
+`note_hash_fill`, so `EncodeCounts::hash_fills` omitted DFast's ENTIRE
+long-table fill -- DFast writes TWO tables per match and only the short one was
+counted. L3's `fills/B` was published as 0.125 and is 0.251; `pos/B` was
+published as 0.192 and is 0.318. Fixed at the source, so the counter is now
+complete rather than compensated for here. Fourth instrument defect this
+session, and the same shape as the others: a counter whose name claims more
+than its code counts.
+
+THE CORRECTION CHANGES THE READING. At L3 fills are **3.7x** probes, and DFast
+writes **3.77 table slots per sequence** against roughly one probe. L1 is the
+mirror image -- 4.6 probes per fill. So the two levels are not "few probes vs
+many probes"; they are PROBE-bound and FILL-bound respectively:
+
+```text
+  L1   probe-heavy   0.333 probes/B,  0.072 fills/B
+  L3   fill-heavy    0.067 probes/B,  0.251 fills/B
+```
+
+The per-EVENT conclusion below is unaffected -- the correlations that establish
+it are unchanged, and `matchB` still correlates +0.06 / -0.56 -- but "L3 touches
+half the positions L1 does" was an artefact of the undercount. It touches
+0.318 against 0.405, and its dominant per-position term is the FILL.
+
+`pos/B` is table positions TOUCHED per input byte -- every probe plus every
+fill. At L3 that is **0.318** (see the correction above; it was first published
+as 0.192). For
+0.067 probes/byte to carry 76% of encode, a probe would have to cost ~250
+cycles. A hash lookup does not. **L3 touches HALF the positions L1 does
+(0.192 vs 0.405) and is still no cheaper per byte.**
+
+Two identities worth knowing before modelling any of this, because both are
+exact and both break a regression that includes them:
+`matchB + litB == 1.0` always, and `fills == 2 x seqs` by construction
+(`fill_fast_after_match` inserts exactly two positions per match).
+
+### 7.3 The cost is per EVENT, not per BYTE -- shown without a model
+
+Correlation of MatchFind ns/byte against each work term, 12 corpora per level:
+
+```text
+              probes/B   fills/B   matchB/B   litB/B   seqs/B
+  L1            +0.93     +0.60      +0.06     -0.06    +0.57
+  L3            +0.78     +0.70      -0.56     +0.56    +0.70
+```
+
+**`matchB` -- the bytes covered by matches, i.e. the match-extension work --
+correlates +0.06 with the time at L1 and MINUS 0.56 at L3.** Extension is not
+the cost. At L3 the sign is negative because more matched bytes means fewer,
+LONGER matches, and the cost tracks the number of events rather than the bytes
+they span. Everything that correlates positively (probes, fills, seqs) is a
+per-EVENT counter; the two per-BYTE counters are the two that do not.
+
+### 7.4 The attribution, and where it is and is not identifiable
+
+Least squares on MatchFind ns/byte. `fills` and `matchB` are dropped as the
+exact identities of 7.2 -- keeping them produced coefficients like -20.7
+ns/sequence and -38.5 ns/fill, and a negative cost per unit of work is the
+tell that a fit is unidentified rather than merely noisy.
+
+The probe:sequence ratio decides whether the remaining two separate:
+
+```text
+  L1   1.86 .. 1632    separable -- most probes MISS, so the two vary apart
+  L3   0.73 .. 1.27    collinear -- one probe per match; they are ONE event
+```
+
+```text
+  L1  (R^2 0.980)   hash probes   16.2 ns x 0.3326/B = 5.39 ns/B   67%
+                    sequences     88.2 ns x 0.0394/B = 3.48 ns/B   43%
+                    literal bytes  1.09 ns x 0.4384/B = 0.48 ns/B    6%
+
+  L3  (R^2 0.963)   match events  94.0 ns x 0.0670/B = 6.29 ns/B   77%
+                    literal bytes  9.77 ns x 0.2715/B = 2.65 ns/B   33%
+```
+
+ABSOLUTE ns are inflated -- this is a `profile` build and the instrumentation
+is in the measurement. Only the comparisons are read. The one that matters:
+**at L1 a sequence costs ~5x what a probe costs** (88.2 vs 16.2), and L1 emits
+one sequence per 25 bytes while probing every 3rd byte.
+
+### 7.5 What this says
+
+L1 and L3 cost almost exactly the same per input byte in this build --
+MatchFind 8.04 vs 8.15 ns/B, encode total 10.13 vs 10.57 -- and they arrive
+there by opposite routes:
+
+```text
+  L1   many cheap probes      0.333 probes/B,  0.0394 seqs/B
+  L3   few expensive events   0.067 probes/B,  0.0666 seqs/B
+```
+
+**L3 emits 1.7x more sequences per byte than L1 while probing 5x less.** Since
+the cost is per-event, that is where L3's time is. And it explains why the
+row-finder and probe-cheapening work found no ceiling at L3 (section 6, and
+[[l3-is-dfast-not-chain]]): L3 was never probe-bound. Probing less is not the
+lever; it has already been pushed 5x past L1 with nothing to show.
+
+THE LEVER IS THE COST OF EMITTING ONE SEQUENCE. That is `emit_fast_seq` and
+its dfast twin -- the 12-byte `Seq` push, the literal copy, the repcode
+bookkeeping and the back-extension. At L1 it is 88 ns against a probe's 16.
+Note also that `back_ext_bytes` is 0.0069/B at L1 and **exactly 0.0000 at L3**:
+the dfast path does no backward extension at all, so whatever L1 spends there
+is not a shared cost and the two emitters are not the same code.
+
+NOT YET MEASURED, and the honest next step: this section localises the cost to
+the emit event but does not decompose it. The four candidates inside one
+sequence -- `Seq` push, literal `extend_from_slice`, repcode update,
+back-extension -- are not separated here, and the per-sequence scope needed to
+separate them by clock would cost more than the body it measures. It wants an
+ablation or an instruction-count decomposition, the way the DecSeq loop was
+resolved.
+
+## 8. DFAST HAS NO BACK-EXTENSION -- and that is 1% of L3. 2026-08-27
+
+Section 7 localised the encode cost to the emit EVENT and left its decomposition
+open. Opening it found something better than a speed win: a missing capability.
+
+### 8.1 The gap
+
+`emit_fast_seq_body` back-extends every Fast (L1) match -- a backward walk from
+the match start converting literal bytes into match bytes. Its own comment calls
+that walk "the seventh instance of a capability present in one path and absent
+in its neighbour", and names greedy, lazy and bt_lazy as the paths it had to be
+re-added to.
+
+DFast -- the finder the DEFAULT level runs -- was never on that list. A search
+of the entire `find_dfast_impl_inner` body for `back_eq`, `ip -= 1` or
+`back_ext` returned NOTHING. Both of its commit sites push a sequence directly.
+C's `ZSTD_compressBlock_doubleFast` does back-extend.
+
+Section 7's table already showed this as a flat zero and nobody had read it as
+one: `back_ext_bytes` is 0.0069 per input byte at L1 and **exactly 0.0000** at
+L3.
+
+### 8.2 The prize, measured before building
+
+`dfastbext.rs` (new) probes the walk at DFast's commit point WITHOUT applying it
+-- same guards, same `back_eq`, so the count is what applying it would recover:
+
+```text
+  corpus     matches   can_extend   share      bytes   vs literals emitted
+  dickens     926306      144893    15.6%     169379          21.00%
+  webster     718425       94507    13.2%     111533          16.13%
+  nci         187560       15141     8.1%      16233           6.51%
+  mr          796307       58618     7.4%      61377           5.86%
+  osdb        446696       52772    11.8%      57252           3.10%
+  TOTAL      6124550      588530     9.6%     681749           2.65%
+```
+
+The distribution is the tell: dickens and webster, the two corpora with the most
+recoverable literals, are also the two worst natural-text ratio cells against C
+at L3 (+5.16% and +5.00%).
+
+### 8.3 The board
+
+Implemented behind `DFAST_BEXT_ARM`, DEFAULTING OFF, because this CHANGES THE
+BITSTREAM. With the arm off, bytegate is unchanged -- `BE0071FB0CB0CED9` -- so
+the default path is byte-identical and the identity gate still means something.
+The verdict comes from a SIZE board (`bextboard.rs`), which also round-trips
+every frame:
+
+```text
+  L3   50,818,930 -> 50,308,336   -510,594   -1.0047%   smaller 15, larger 0, unchanged 3
+  L4                                          -0.7772%   smaller 15, larger 0, unchanged 3
+  L2                                           0.0000%   (Fast -- not this finder)
+  L5                                           0.0000%   (lazy -- not this finder)
+```
+
+Per corpus at L3: dickens **-3.327%**, webster **-3.214%**, reymont -1.740%,
+xml -1.634%, samba -1.616%, nci -1.607%, sao -1.204%, osdb -1.181%,
+ooffice -1.130%, mr -1.103%. **Zero regressions on any corpus at any level.**
+
+The scope is exactly right: L3 and L4 move, L2 and L5 do not, which is what
+"this touches `find_dfast_impl_inner` and nothing else" should look like.
+
+### 8.4 The cost
+
+`find_dfast` 1409 -> **1459 instructions (+50)**. The loop body runs on the 9.6%
+of matches that can extend, mean 1.16 iterations; every other match pays one
+guard evaluation. Section 7 established the cost here is per-EVENT, and this
+adds a small constant to an event that already costs ~94 units -- so the size
+win is bought cheaply, but it is NOT free and the arm exists so that is
+adjudicable.
+
+TWO DETAILS THAT ARE EASY TO GET WRONG, both taken from L1's proven emitter:
+
+  * the hash FILLS use the PRE-extension position (`found_ip`), exactly as
+    `emit_fast_seq_body` passes `found_ip` to `fill_fast_after_match` rather
+    than the walked-back `ip`. Filling from the extended position changes which
+    slots the table holds -- a different change with a different verdict.
+  * `best_ip` and `best_m` fall together, so the OFFSET is unchanged and
+    `best_ip + best_ml` is unchanged. Only the literal/match split moves.
+
+The REP path is deliberately not back-extended, matching C: a rep match starts
+at `ip+1` by construction.
+
+### 8.5 A hijack, self-inflicted, and what it says about the guard
+
+Inserting the counters landed a new line BETWEEN `#[cfg(feature = "profile")]`
+and the `pub static ROW_LOADS` it belonged to -- and again in `lib.rs` between a
+`#[cfg]` and its `pub use`. The arm was gated out of shipping builds and
+`ROW_LOADS` was gated INTO them; six compile errors said so immediately.
+
+`scripts/twinguard.py` did not catch it, correctly: it scopes to attributes
+that can ONLY apply to a function (`target_feature`, `inline`, `cold`,
+`no_mangle`, `track_caller`), and `#[cfg]` applies to almost anything, so
+including it would drown the check in false positives. The compiler catches the
+`#[cfg]` variant on its own, which is why the scope is drawn there. Recorded so
+the next person does not "fix" the guard by widening it.
+
+### 8.6 What is still open in MatchFind
+
+  * THE DEFAULT IS STILL OFF. Flipping it is a deliberate act: it moves
+    bytegate's GOLD, which anchors every other identity claim in this campaign.
+  * The emit event's SPEED decomposition -- `Seq` push, literal copy, repcode
+    update, back-extension -- is still not separated. Section 7's caveat stands.
+  * A capability matrix across the six finders shows `rep2` matched by NONE of
+    them, while every one of them tracks three repcodes. Whether that is a real
+    gap or an artefact of how the search is written is unmeasured, and it is the
+    obvious next thing to probe the way 8.2 probed this one: measure the prize
+    before building anything.
+
+## 9. BREAKING OPEN THE FILL -- one win, four refutations, and where the lever is. 2026-08-27
+
+Section 7 (as corrected) made DFast's fill the dominant per-position work at the
+DEFAULT level: 0.251 fills per input byte against 0.067 probes, i.e. **3.77
+table writes per sequence** across two tables at two positions. This opens it.
+
+THE HEADLINE IS NOT AN INSTRUCTION WIN. Three separate micro-optimisations of
+the fill's instruction count measured ZERO, because LLVM had already taken
+them. The available lever is the fill COUNT, and it is large.
+
+### 9.1 The one instruction win: fuse the pair, share position `b`
+
+DFast called two helpers per match. Both recomputed `match_end - 2`, its
+`<= ilimit` bound, the `!= a` test, `pack_tags`, and two `is_empty()` reads
+through `&mut MatchTables`. More usefully, both called `hash4_tag_mls` at
+position `b` -- which BOTH tables index identically, always. The short store
+wants `(hash, tag)`; the long store wants only the tag and was recomputing the
+pair to get it.
+
+`fill_dfast_after_match` does one walk and computes that hash once:
+
+```text
+  find_dfast   1459 -> 1449 instructions   (-10),  cl 20 -> 19
+  bytegate     BE0071FB0CB0CED9            UNCHANGED
+```
+
+### 9.2 Four refutations, each recorded so it is not retried
+
+  * **Sharing position `a`'s tag across the two anchors: +31 instructions.**
+    The anchors differ only when the next-long probe wins, so an `la == sa`
+    test would share the hash in the common case -- but the branch costs more
+    than the hash it saves on a path LLVM had as straight-line code. This is
+    the same shape as the REFUTED table-surgery note in `find_dfast_impl_inner`:
+    restructuring a fill that LLVM already has flat makes it worse.
+  * **Block-hoisting `pack_tags` / `tags.is_empty()` / `ltags.is_empty()`
+    out of the per-match path: ZERO.** They are loop-invariant and LLVM had
+    already hoisted them. The explicit parameters were kept -- they cost
+    nothing and they document the invariant -- but they bought nothing.
+  * **Sharing the `load_u64le` between `hash4_tag_mls` and `hash8_shift`:
+    ZERO.** Both begin with the same load at the same position, so this looked
+    free. LLVM had already CSE'd it. `hash4_tag_from` / `hash8_from` (the
+    mixing halves, split from the load) are kept because they make the sharing
+    explicit, but the win was already banked.
+  * **C's fill-anchor shape: +0.115% SIZE.** GATE 12's note says C fills both
+    tables at the same two positions while we anchor the long table on the
+    pre-probe `ip`. Boarding `dfast_fill_anchor_c` ON: 39,744,039 bytes against
+    39,698,213 OFF. Our shape is BETTER than C's here, which is why that arm
+    ships off. Worth stating plainly: this is a place where matching C would
+    cost us.
+
+### 9.3 The lever: half the fill work buys 0.371%
+
+`fillcut.rs` (new) boards each setting of `dfast_fill_ends` -- the fills
+actually performed against the size they buy. Both columns are deterministic:
+one is a census, the other is the bitstream.
+
+```text
+  fill arm                    fills     vs base         bytes     size
+  both ends (DEFAULT)      24497126       1.00x      39698213    0.000%
+  start only  (a)          12289245       0.50x      39845447   +0.371%
+  end only    (b)          12204440       0.50x      40199517   +1.263%
+  neither     (none)              0       0.00x      40460080   +1.919%
+```
+
+THE MARGINAL READING. All of the fill work buys 1.919% of ratio. The START
+half (`match_ip + 2`) buys 1.548% of that; the END half (`match_end - 2`) buys
+only **0.371%** while costing exactly half the writes. The two halves are not
+worth the same and the board says so 3.4x over.
+
+So `start only` is 0.50x the fills for +0.371% size. For comparison, the row
+finder's accepted trade was 0.28x fills for +0.97% -- this is a better rate per
+fill removed. FLIPPED 2026-08-27. Boarded first across levels, because this arm is read by
+`find_fast` TOO -- it is not DFast-only:
+
+```text
+  L1      1,872,359 -> 937,927 fills (0.50x)    size +0.150%
+  L3      6,448,402 -> 3,230,205 fills (0.50x)  size +0.482%  (2 MiB cap)
+  L9/L19  unaffected -- different finders, zero fills through this path
+```
+
+L1's cost is a third of L3's, which the single-level board would have missed.
+Whole-board effect: **59,760,356 -> 59,841,188 bytes, +0.135%**, for HALF the
+per-match table writes at every level that fills through here.
+
+bytegate GOLD moved DELIBERATELY, `BE0071FB0CB0CED9` -> `CAE84167220B70DA`,
+and the history is recorded in `bytegate.rs`'s header so the anchor's moves stay
+auditable. xxhgold unchanged; 173 tests pass; clippy clean on all arms.
+
+### 9.4 Two instrument defects found while doing this
+
+  * `fill_hash_long_after_match` reported to `DF_ENDFILL` but never called
+    `note_hash_fill`, so `EncodeCounts::hash_fills` omitted DFast's ENTIRE
+    long-table fill. Section 7's L3 `fills/B` was published as 0.125 and is
+    0.251; `pos/B` was 0.192 and is 0.318. Fixed at the source and corrected
+    in place there.
+  * `set_dfast_fill_n_arm(n)` STORES `n + 1`, while `dfast_fill_ends` matches
+    the STORED value. So the argument is one less than the arm, and `2` lands
+    on the `_` (both-ends) arm rather than a disabled one. The first run of
+    this board passed the raw arm values, mislabelled every row, and reported
+    the default as "0 fills". The numbers looked absurd -- more fills for
+    "neither" than for "both" -- which is the only reason it was caught.
+
+### 9.5 What is left
+
+The fill's instruction count is now tight: three independent attempts to
+shave it measured zero because LLVM had them already. Further gain from the
+fill has to come from doing FEWER of them, and 9.3 prices that exactly.
+`fill_hash_after_match` and `fill_hash_long_after_match` are now unreferenced
+at the DFast commit point (LLVM drops them); they remain in source as the
+reference shape.
+
+## 10. THE EMPTY BUCKET: a lead, a wrong baseline, and two refutations. 2026-08-27
+
+`walkexit.rs` (new) censuses the chain walk's EXIT REASON -- which of the seven
+ways it can end actually fires. It was built to test one claim and it refuted
+it; then the follow-up refuted a second. Nothing here is a win, and that is the
+result.
+
+### 10.1 The claim it was built to test, refuted
+
+`l9cache.rs` showed L9's probe count collapsing 1.845 -> 0.553 per byte as the
+tables shrink. I explained that as "smaller tables collide more, so the walk's
+`next >= m` guard breaks sooner" and did not check it. The census:
+
+```text
+  tables      probes/B   walks     empty   LINK GUARD   depth spent
+  8M+4M          1.845   9.44M     28.8%        12.4%         58.9%
+  1M+512K        1.370   9.86M      7.9%        29.5%         62.6%
+  256K+128K      0.832  10.85M      2.6%        26.3%         71.1%
+  64K+32K        0.553  11.82M      0.6%        19.3%         80.1%
+```
+
+LINK GUARD is NOT monotone (12.4 -> 29.5 -> 26.3 -> 19.3). The explanation was
+wrong. What actually moves is `empty bucket`, 28.8% -> 0.6%, while walks RISE
+(9.44M -> 11.82M) and full-depth walks rise (58.9% -> 80.1%). The walk does
+roughly 1.7x MORE iterations at small tables, not fewer.
+
+So why does `probes/byte` fall? Because **`probes` only counts candidates that
+survive the TAG FILTER** -- `probes += 1` sits in the `else` of the tag-reject
+branch (`encode.rs`, the walk's per-candidate block). More collisions means more
+tag mismatches, so a larger share of iterations are rejected before being
+counted. `probes/byte` is not a work counter here; it is a
+"candidates past the tag filter" counter, and shrinking the tables SHIFTS work
+from full compares into cheap tag rejects rather than removing it.
+
+This also corrects section 9's reading of `l9cache`: "the speedup is mostly less
+work" is not supportable. Iterations went UP 1.7x while time went DOWN 2.9x.
+
+### 10.2 The empty bucket is warm-up, not a hash defect -- and the baseline is
+### the whole story
+
+28.8% of L9 chain searches find an EMPTY bucket. That number means nothing
+without a baseline, and the obvious one is wrong.
+
+`e^(-n/s)` is the STEADY-STATE empty fraction for `n` positions in `s` slots.
+But the table fills PROGRESSIVELY: the search at position `i` sees about `i`
+entries, not `n`. Averaged over the pass the correct baseline is
+`(s/n) * (1 - e^(-n/s))`, which is far higher:
+
+```text
+  load n/s   steady e^-L   fill-averaged   measured   vs fill-avg
+      0.50         60.7%           78.7%      40.7%         0.52x
+      1.00         36.8%           63.2%      36.6%         0.58x
+      2.00         13.5%           43.2%      28.8%         0.67x
+      4.00          1.8%           24.5%      22.8%         0.93x
+```
+
+Against `steady`, the bottom row reads **12.5x excess** -- severe clustering, a
+hash defect, a lead worth days. Against `fill-avg` it reads **0.93x**: our hash
+is doing BETTER than uniform. There is no clustering. `bucketfill.rs` prints
+both columns so the wrong comparison cannot be made by accident.
+
+### 10.3 The dead work on that path is real, and not worth removing
+
+On an empty bucket both `lz_insert` and `lz_insert_only` still do two array
+accesses describing a predecessor that does not exist: a LOAD (`tags[h]`, to
+build `old_tag`) and a STORE (`ctags[ip & mask] = old_tag`). The load's result
+is discarded by the caller on the `None` path; the store describes a link of 0,
+which the walk never tag-filters, since position 0 is sentinel-ambiguous and
+skips the filter via `m != 0`. Both are genuinely dead.
+
+Removing them costs more than they do:
+
+```text
+  guard the LOAD and the STORE   find_lazy +75   find_greedy +45
+  guard the LOAD only            find_lazy +51   find_greedy -29
+```
+
+**The branch that avoids the dead work is more expensive than the dead work.**
+Reverted; `find_lazy` and `find_greedy` are back at 1568 / 1494 and bytegate is
+unmoved. Recorded so the "obvious" cleanup is not attempted a third time.
+
+### 10.4 The neighbours, and why they are closed
+
+  * THREE of the seven exits fire at **0.0%**: window bound, `block_end`, and
+    the entry guard. They are correctness bounds on adversarial input, and the
+    walk's three validity tests were already folded to one (`low`). Nothing to
+    take.
+  * **58.9% of walks run their full depth** (`attempts = 16` at L9) and roughly
+    half of those iterations are tag rejects rather than probes. That is the
+    cost centre, and it is a DEPENDENT-LOAD problem: `m = chain[m & mask]`,
+    where each address is the previous load's result.
+  * Folding `cp`/`ca` to const generics would remove two register compares per
+    iteration at the cost of duplicating the whole walk. The D4 note at the
+    `cfb` selection already prices that shape: "457 instructions of duplicated
+    walk converting THREE BMI2 ops, 152 per op, the worst ratio in the crate."
+    Refuted by precedent, not attempted.
+
+### 10.5 What this leaves
+
+The chain walk's instruction count is not the lever at L9; its memory access
+pattern is. The one structural answer -- C's row match finder, which turns N
+dependent loads into ~N/16 independent ones -- exists here and measures 6.5
+loads per candidate (`l9row.rs`), which is backwards. That ratio, not any
+instruction count, is the open defect.
+
+Still unmeasured and boardable: `attempts = 16` may be deeper than the chain
+quality justifies, given 58.9% of walks spend it in full. Depth against ratio is
+a two-column deterministic board of exactly the `fillcut.rs` shape.
