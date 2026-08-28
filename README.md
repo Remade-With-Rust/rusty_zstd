@@ -29,7 +29,7 @@ the rest of the stack.
 
 A pure-Rust Zstandard codec that is **interoperable in both directions with the C
 reference**, ships the whole product surface rather than a decoder, and lands
-**within ~1-3% of C on compressed size at default settings**:
+**within ~2-4% of C on compressed size across the level range**:
 
 - **Format: all of RFC 8878.** Raw / RLE / Compressed blocks, Huffman literals
   (1-stream and 4-stream, treeless), FSE sequences in all four modes, repeat
@@ -71,19 +71,37 @@ other's output; the cross-check passed on every run below.
 
 | level | encode vs C | decode vs C | size vs C |
 |---|---:|---:|---:|
-| **L1** | 0.56–0.61× | **2.58–2.82×** | **+1.00%** |
-| **L3** (default) | 0.73–0.75× | **2.20–3.12×** | **+2.56%** |
-| **L9** | 0.34–0.38× | **2.32–2.85×** | **+1.65%** |
-| **L19** | **1.22–1.40×** | **2.64–2.76×** | **+3.05%** |
+| **L1** | 0.56–0.61× | **2.58–2.82×** | **+2.00%** |
+| **L3** (default) | 0.73–0.75× | **2.20–3.12×** | **+2.11%** |
+| **L9** | 0.34–0.38× | **2.32–2.85×** | **+2.45%** |
+| **L19** | **1.22–1.40×** | **2.64–2.76×** | **+3.82%** |
+
+<sub>**The two columns come from different runs, and mixing them would be
+sloppy, so here is exactly which is which.** The **size** column was
+re-measured for 0.3.0 over the **full 19-file corpus, 355,593,492 bytes**,
+both CLIs at their defaults: at L1 we emit 116,548,162 bytes against C's
+114,259,341. It is deterministic and reproduces bit-for-bit. The **speed**
+ranges are carried over from the 0.2.0 measurement, which ran the same 19
+files in a *capped* staging totalling 143.9 MB, and were **not** re-measured
+here — this host has been under sustained load all campaign, and a speed
+number taken today would be a worse estimate than the one it replaced, not a
+better one.</sub>
 
 <sub>**Speed cells are ranges, not point estimates, and that is deliberate.**
 Min–max over independent samples at N=10 per arm per phase, on a host that was
 not quiescent. The same measurement at N=3 read L1 decode as 2.66× on one
 sample and 1.57× on the next, and even at N=10 the L3 encode cell moved 0.63×
 to 0.93× *between batches*. Anything quoted here as a single number would be
-one draw from that spread. The **size** column carries no such caveat: it is
-deterministic and reproduced bit-for-bit on every run — 143,865,706 bytes in,
-54,111,978 out at L1 against C's 53,631,039.</sub>
+one draw from that spread.</sub>
+
+<sub>**0.3.0 moved the size column on purpose, in both directions.** DFast
+back-extension took **L3 −1.28%** and L4 −1.15% — a pure win on the default
+level's ladder, no corpus regressing. Tightening the chain walk's first-find
+bar traded **+0.35% to +1.39% size for +5.2% to +38.1% encode throughput** at
+L5–L12; it is the one deliberate size-for-speed trade in this encoder, and
+`RZSTD_WALK_FIRST_MAX=0.70` restores the previous bitstream exactly at L7/L9.
+The L1 and L19 rows are bit-identical to 0.2.2 — neither change touches those
+ladders, so their movement above is corpus, not code.</sub>
 
 <sub>**READ THIS BEFORE OPTIMISING FROM IT — the decode figure is not a codec
 claim.** These are whole-program numbers: read + codec + write. On this host

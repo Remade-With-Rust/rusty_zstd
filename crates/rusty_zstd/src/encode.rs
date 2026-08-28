@@ -13873,10 +13873,30 @@ pub fn set_walk_first_max_arm(v: f32) {
     WALK_FIRST_ARM.store(v.to_bits(), core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Latch for the env escape hatch below: 0 = not yet looked up, 1 = looked up.
+/// `walk_first_max` is read once per BLOCK, so the parse must not repeat.
+static WALK_FIRST_ENV: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 fn walk_first_max(attempts: usize) -> f32 {
-    let c = WALK_FIRST_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    use core::sync::atomic::Ordering::Relaxed;
+    let c = WALK_FIRST_ARM.load(Relaxed);
     if c != u32::MAX {
         return f32::from_bits(c);
+    }
+    // ESCAPE HATCH. The ladder below is a deliberate size-for-speed trade, and
+    // a caller who wants the old ratio back must be able to get it without
+    // rebuilding: `RZSTD_WALK_FIRST_MAX=0.70` restores the pre-trade bitstream
+    // at L7/L9. Setting it pins ONE bar for every level, exactly as
+    // `set_walk_first_max_arm` does -- the `attempts` scaling is what the
+    // unset path provides.
+    if WALK_FIRST_ENV.swap(1, Relaxed) == 0 {
+        if let Some(v) = crate::env_knob("RZSTD_WALK_FIRST_MAX")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            WALK_FIRST_ARM.store(v.to_bits(), Relaxed);
+            return v;
+        }
     }
     // The first-find share of BOTH classes falls as the walk deepens, so the
     // bar scales with `attempts` (swept: L5 wants 0.80 -- greedy is
@@ -13884,12 +13904,39 @@ fn walk_first_max(attempts: usize) -> f32 {
     // static bar leaks jsonlog at one level or over-shuts dickens at
     // another).
     // Actual ladder attempts (clevels.h search_log): L5=8, L7/L9=16, L12=64.
+    //
+    // TIGHTENED BY 0.15 FROM THAT LADDER. This is a deliberate SIZE-FOR-SPEED
+    // trade, the only one in this encoder, and it is the largest speed lever
+    // the campaign found:
+    //
+    //     level   size      speed     probes
+    //     L5     +0.351%    +5.2%      -2.8%
+    //     L7     +1.213%   +11.1%     -11.6%
+    //     L9     +1.297%   +13.5%     -13.0%
+    //     L12    +1.388%   +38.1%     -15.1%
+    //
+    // L12 gains far more time than it drops probes because the walks this cuts
+    // are the DEEP, cache-cold ones, not average ones -- the bar removes the
+    // most expensive probes first. That is also why the size cost stays near
+    // 1% while the time falls by a third.
+    //
+    // MEASUREMENT. The speed column is an INTERLEAVED A/B (`firstbar.rs`) --
+    // arms alternating inside one process with a per-arm best. Run as separate
+    // passes on a loaded host the arms drift apart and this same delta swung
+    // from -3.9% to +24.8% on identical config. Do not re-adjudicate this with
+    // two `cargo run`s and a stopwatch.
+    //
+    // The cost is NOT uniform across corpora: the worst single corpus is
+    // reymont at +6.94% (L12) and xml at +5.19% (L7). A caller who picks a
+    // level for ratio alone, on text-like input, is the one who pays. That is
+    // what `RZSTD_WALK_FIRST_MAX` / `set_walk_first_max_arm` are for -- setting
+    // the bar back to 0.80/0.70/0.55 restores the old bitstream exactly.
     if attempts <= 8 {
-        0.80
+        0.65
     } else if attempts <= 16 {
-        0.70
-    } else {
         0.55
+    } else {
+        0.40
     }
 }
 
@@ -14036,8 +14083,17 @@ pub fn take_row_bucket() -> [u64; 5] {
     o
 }
 
-/// DFast back-extension arm. 0 = undecided, 1 = off, 2 = on. Defaults OFF:
-/// this CHANGES THE BITSTREAM, so it is boarded on size before it can ship.
+/// DFast back-extension arm. 0 = undecided, 1 = off, 2 = on.
+///
+/// SHIPS ON. It changes the bitstream, so it was boarded on size first, and the
+/// board is one-sided: **-1.276% at L3 and -1.146% at L4** over 12 corpora at
+/// 8 MiB, with ZERO corpora regressing at either level and the probe count flat
+/// (-0.0% / -0.2%). It is not a ratio trade -- the backward walk recovers bytes
+/// that were already matched and simply not credited, so there is no size to
+/// give back.
+///
+/// L3 is the DEFAULT level, so this is the one flip on this ladder that every
+/// caller of `compress(src, 3)` gets without asking.
 static DFAST_BEXT_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Bench hook: turn DFast's backward match extension on or off in-process.
@@ -14054,7 +14110,7 @@ pub(crate) fn dfast_bext_enabled() -> bool {
         _ => {
             let on = crate::env_knob("RZSTD_DFAST_BEXT")
                 .map(|v| v != "0")
-                .unwrap_or(false);
+                .unwrap_or(true);
             DFAST_BEXT_ARM.store(if on { 2 } else { 1 }, Relaxed);
             on
         }
@@ -16044,19 +16100,50 @@ mod tests {
     /// at L7). B3: greedy/lazy/btlazy2 never back-extended a match, a capability
     /// `emit_fast_seq` (fast/dfast) has always had and C's lazy has as its
     /// "catch up" loop.
+    /// L3->L5 EXCEPTION, added when DFast back-extension shipped. `bext` is a
+    /// pure size win on the DFast ladder (-1.276% at L3), and on some corpora it
+    /// makes L3 beat L5 outright -- osdb by 0.012%, dickens by 1.020%. That is
+    /// an inversion caused by the CHEAPER level GAINING a capability, which is
+    /// the opposite event from the one this gate exists to catch, and suppressing
+    /// a real improvement to preserve the ladder would be backwards.
+    ///
+    /// On the FULL osdb this test reads, the margin is +0.074% (3,517,111 at L3
+    /// against 3,519,696 at L5); the 0.012% figure above is the 8 MiB prefix the
+    /// boards use. The tolerance below is set from the full-file number.
+    ///
+    /// The exception is deliberately narrow: this pair only, and a ceiling on L5
+    /// itself so the gate keeps its teeth. If Greedy ever loses a capability its
+    /// size grows, `L5_CEILING` fires, and the exception cannot hide it -- which
+    /// is exactly how B2 and B3 would still be caught today.
+    const L5_CEILING: usize = 3_530_000;
+
     #[test]
     fn higher_level_never_larger_osdb() {
         let Ok(src) = std::fs::read("../../corpora/data/silesia/osdb") else {
             return; // corpus absent
         };
         let mut prev = usize::MAX;
+        let mut prev_lvl = 0;
         for lvl in [1, 3, 5, 7, 9, 13, 16, 19] {
             let n = crate::compress(&src, lvl).unwrap().len();
+            // The one adjudicated inversion: L3 -> L5, and only as a near-tie.
+            // The bar is 0.1%: the measured tie is +0.074%, and the historical
+            // DEFECT inversions on this pair were +1.25% and +0.33% -- both far
+            // above it, so the gate still catches every defect it ever caught.
+            let tie = prev_lvl == 3 && lvl == 5 && n <= prev + prev / 1000;
             assert!(
-                n <= prev,
+                n <= prev || tie,
                 "level {lvl} emitted {n} bytes, more than the previous level's {prev}"
             );
+            if lvl == 5 {
+                assert!(
+                    n <= L5_CEILING,
+                    "L5 emitted {n} bytes, above the {L5_CEILING} ceiling -- Greedy has \
+                     lost a capability; the L3->L5 tie exception must not mask that"
+                );
+            }
             prev = n;
+            prev_lvl = lvl;
         }
     }
 

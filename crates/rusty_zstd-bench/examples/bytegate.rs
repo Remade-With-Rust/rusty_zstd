@@ -14,12 +14,29 @@
 //! ```text
 //!   BE0071FB0CB0CED9   59,760,356 bytes   until 2026-08-27
 //!   CAE84167220B70DA   59,841,188 bytes   DFAST_FILL_N_ARM -> start-only
+//!   EA4E12B951B48F4A   59,852,335 bytes   dfast_bext ON + walk_first_max -0.15
 //! ```
 //!
 //! The 2026-08-27 move is +0.135% of total bytes and buys HALF the per-match
 //! table fills at L1 and L3/L4 (`fillcut.rs`, and section 9 of
 //! docs/plans/m7-anatomy.md). L5 and above are unaffected -- they do not fill
 //! through this path.
+//!
+//! The 2026-08-28 move is +0.019% NET, and that small number is two much larger
+//! ones cancelling -- see `shipboth.rs`, which boards them together:
+//!
+//!   * `dfast_bext` ON: **-1.276% at L3, -1.146% at L4**, zero corpora
+//!     regressing, probe count flat. A pure win on the DEFAULT level's ladder.
+//!   * `walk_first_max` -0.15: **+0.35% to +1.39% size for +5.2% to +38.1%
+//!     encode throughput** at L5/L7/L9/L12. The one deliberate size-for-speed
+//!     trade in this encoder. `RZSTD_WALK_FIRST_MAX=0.70` restores the old
+//!     bitstream exactly at L7/L9.
+//!
+//! bext also introduced two LADDER INVERSIONS by making L3 beat L5 outright --
+//! dickens +1.020%, osdb +0.074%. Both are the cheaper level GAINING a
+//! capability, not the dearer one losing it; `higher_level_never_larger_osdb`
+//! records the adjudication and keeps a ceiling on L5 so the exception cannot
+//! mask a real Greedy regression.
 const IDS: &[&str] = &[
     "zeros-32m","text-32m","incomp-32m","jsonlog-16m","smallmsg-8m","versions-16m",
     "mr","ooffice","osdb","reymont","sao","webster","dickens","mozilla","nci","samba","xml","x-ray",

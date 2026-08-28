@@ -132,15 +132,22 @@ removed in any release.
 ## Performance
 
 Both CLIs at their real defaults — `zstd -<lvl> <files>` against
-`rzstd -<lvl> <files>`, no flags beyond the level. 19 files, 143.9 MB, each arm
-decoding the other's output (cross-checked every run).
+`rzstd -<lvl> <files>`, no flags beyond the level, each arm decoding the
+other's output (cross-checked every run).
 
 | level | encode vs C | decode vs C | size vs C |
 |---|---:|---:|---:|
-| L1 | 0.56–0.61× | **2.58–2.82×** | +1.00% |
-| L3 (default) | 0.73–0.75× | **2.20–3.12×** | +2.56% |
-| L9 | 0.34–0.38× | **2.32–2.85×** | +1.65% |
-| L19 | **1.22–1.40×** | **2.64–2.76×** | +3.05% |
+| L1 | 0.56–0.61× | **2.58–2.82×** | +2.00% |
+| L3 (default) | 0.73–0.75× | **2.20–3.12×** | +2.11% |
+| L9 | 0.34–0.38× | **2.32–2.85×** | +2.45% |
+| L19 | **1.22–1.40×** | **2.64–2.76×** | +3.82% |
+
+The two columns come from different runs. **Size** was re-measured for 0.3.0
+over the full 19-file corpus, 355,593,492 bytes — deterministic, reproduces
+bit-for-bit. **Speed** is carried over from the 0.2.0 run, which used the same
+files in a capped 143.9 MB staging, and was not re-measured: this host has been
+under sustained load, and a fresh number would be a worse estimate than the one
+it replaced.
 
 **Read the decode column carefully — it is not a codec claim.** These are
 whole-program numbers (read + codec + write), and decode is dominated by each
@@ -154,6 +161,13 @@ Speed cells are min–max over independent samples (N=10 per arm per phase) on a
 non-quiescent host, so they are ranges rather than point estimates. The size
 column is deterministic and exact. Encode trails C at L1–L9 and leads at L19;
 closing the mid-level gap is the open work.
+
+**0.3.0 moved the size column deliberately, in both directions.** DFast back
+extension took L3 −1.28% and L4 −1.15%, a pure win on the default level with no
+corpus regressing. Tightening the chain walk's first-find bar traded +0.35% to
++1.39% size for +5.2% to +38.1% encode throughput at L5–L12 — the one
+deliberate size-for-speed trade in this encoder. Setting
+`RZSTD_WALK_FIRST_MAX=0.70` restores the previous bitstream exactly at L7/L9.
 
 ## Correctness
 
