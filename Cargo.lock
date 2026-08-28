@@ -104,9 +104,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_alloc-api"
-version = "1.1.0"
+version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a9e613f57add3e842219c0ca6a85ee4cc5754128e7a08a09545cd0c00d495d5"
+checksum = "02301ad2df6159237fe4087334310d48543aa626ae9b89410b38a9d5b77e04e0"
 dependencies = [
  "rusty_alloc",
 ]
