@@ -9,15 +9,6 @@ homepage.workspace = true
 rust-version.workspace = true
 description = "rusty_alloc seam for rusty_zstd deliverables — never depend on rusty_alloc-api from feature code"
 publish = false
-# Cargo permits at most one package per `links` value in a dependency graph, so
-# two allocator seams reaching the same build become a RESOLVE-TIME error that
-# names both packages -- instead of the multiple-definition link error you get
-# today at the end of a long build, which does not say where either came from.
-#
-# For this to catch anything the other house seams must claim the same value:
-# rusty_alloc_default, deputy-alloc, atlas-alloc, faceless-alloc, mata-alloc.
-# Until they do, this is correct but inert.
-links = "rusty_alloc_global"
 
 [dependencies]
 rusty_alloc-api = { version = "=1.1.4" }
