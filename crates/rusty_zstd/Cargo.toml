@@ -44,9 +44,10 @@ profile = ["std"]
 # It also cannot be made automatic. Cargo unifies features across a build, so one
 # consumer enabling this imposes it on every other consumer in the same graph; the
 # feature is a property of the build, not of one dependent. There is no
-# `cfg(has_global_allocator)` to test either -- `#[global_allocator]` is resolved at
-# link time, which is why the collision is caught by `links` (see rzstd-alloc)
-# rather than by detection.
+# `cfg(has_global_allocator)` to test either -- but nothing is silent about it:
+# a build that ends up with two installers fails to compile with
+# `the #[global_allocator] in this crate conflicts with global allocator in:
+# rusty_alloc_default`, which names the culprit.
 rusty-alloc = ["dep:rusty_alloc_default"]
 # DecSeq loop anatomy ladder (`dsloop.rs`). Adds a per-sequence arm dispatch to
 # the decode loop, so it is NOT part of `profile`: it perturbs the very loop it
