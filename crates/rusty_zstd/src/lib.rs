@@ -28,6 +28,14 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+// Linking `rusty_alloc_default` is what INSTALLS the allocator: that crate holds
+// the `#[global_allocator]`, and Cargo links an rlib only when something in the
+// build actually references it. Turning the feature on without this line
+// compiles the dependency and links nothing -- the process quietly keeps the
+// platform allocator, and the feature reads as working while doing nothing.
+#[cfg(feature = "rusty-alloc")]
+extern crate rusty_alloc_default;
+
 // The supported floor is `no_std + alloc` (docs/plans/rusty-zstd-mission.md
 // §3.6: "Core decode + one-shot encode: no_std + alloc"). Core-only is NOT a
 // configuration this crate has ever built in -- every entry point returns or
