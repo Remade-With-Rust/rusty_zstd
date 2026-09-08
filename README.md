@@ -31,7 +31,7 @@ the rest of the stack.
 
 ---
 
-## ⚡ The headline
+## The headline
 
 A pure-Rust Zstandard codec that is **interoperable in both directions with the C
 reference**, ships the whole product surface rather than a decoder, and lands
