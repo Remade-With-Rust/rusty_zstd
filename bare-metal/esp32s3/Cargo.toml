@@ -1,0 +1,23 @@
+[package]
+name = "s3zstd"
+version = "0.1.0"
+edition = "2021"
+
+# On-board proof for rusty_zstd's bare-metal support: an ESP32-S3 (Xtensa LX7,
+# 32-bit, NO 64-bit atomics) compressing and decompressing in `no_std + alloc`.
+# Deliberately outside the codec repo: it needs the `esp` toolchain, which CI
+# does not have, so it is a hand-run instrument, not a gate.
+
+[dependencies]
+esp-hal = { version = "1.2.1", features = ["esp32s3", "unstable"] }
+esp-alloc = { version = "0.11.0", features = ["esp32s3"] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3"] }
+esp-println = { version = "0.18.0", default-features = false, features = ["esp32s3", "jtag-serial"] }
+esp-backtrace = { version = "0.20.0", features = ["esp32s3", "println", "panic-handler"] }
+rusty_zstd = { path = "../../crates/rusty_zstd", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = 2

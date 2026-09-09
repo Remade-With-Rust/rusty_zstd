@@ -6,6 +6,33 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Added -- the bare-metal claim, run on silicon (ESP32-S3)
+
+CI proves rusty_zstd COMPILES for Cortex-M4F and RV32. That is a different
+claim from running, so this one was run: `bare-metal/esp32s3` is a `no_std +
+alloc` firmware that compresses and decompresses on the part and compares the
+result byte for byte against the source.
+
+```
+census64::CENSUS_LIVE = false  (false is expected here: no 64-bit atomics)
+source            8260 bytes
+L1  8260 ->  468 bytes  (17.65x)  round trip OK
+L3  8260 ->  426 bytes  (19.39x)  round trip OK
+L5  8260 ->  263 bytes  (31.41x)  round trip OK
+RESULT: PASS -- compressed and decompressed on the board
+```
+
+Three levels because they are three different match finders: Fast, DFast and
+Greedy. Xtensa LX7 is 32-bit, so every census counter on that part is the
+`census64` stub -- which makes the board the exact configuration the fix
+created, and the `PASS` the evidence that stubbing the instrument left the
+codec alone.
+
+It is excluded from the workspace and hand-run: it needs Espressif's Rust fork,
+which CI does not have. It claims no timing and no heap floor; 192 KiB was
+enough for 8 KiB of source at levels 1 to 5, and the crate sizes its tables
+from the source length. See `bare-metal/esp32s3/README.md`.
+
 ### Fixed -- the census counters cost the crate BARE METAL; they no longer do
 
 `cargo check -p rusty_zstd --no-default-features --features alloc` failed with

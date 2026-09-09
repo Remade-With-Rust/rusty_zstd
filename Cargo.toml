@@ -7,6 +7,11 @@ members = [
     "crates/rzstd-alloc",
 ]
 
+# The on-board proof (bare-metal/esp32s3) is a firmware crate for Xtensa: it
+# needs Espressif's Rust fork and its own linker script, so it must not be a
+# workspace member. Excluded, a plain `cargo build` at the root never sees it.
+exclude = ["bare-metal/esp32s3"]
+
 [workspace.package]
 version = "0.2.5"
 edition = "2021"
