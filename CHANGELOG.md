@@ -42,11 +42,15 @@ which took a single brick (99, a per-call prologue trim), and they read flat to
 1.07. A campaign that claimed a uniform win across all levels would be measuring
 the box, not the code.
 
-Compressed sizes are IDENTICAL at every level except 3, where the DFast
-back-extension trades: samba **-1.14%** (smaller) and dickens +0.04%. Decode is
+Compressed sizes are IDENTICAL at every level except 3, which is DFast and is
+the one ladder carrying a deliberate bitstream change in this release: the
+next-long OFFSET-TRADE dispatch now defaults ON (see its section below). It
+reads samba **-1.14%** (smaller) and dickens +0.04% here -- the same trade that
+section measured at -0.36% across an 18-corpus L3 board, and the reason the L3
+decode row moves too. Decode is
 inside the floor everywhere the bitstream is unchanged; the one row that reads
-+12.5% (samba L3) is NOT a decode win but the -1.14% smaller frame giving the
-decoder less to do, so it is not work-parity comparable and is not claimed.
++12.5% (samba L3) is NOT a decode win but that smaller frame giving the decoder
+less to do, so it is not work-parity comparable and is not claimed.
 
 ### Changed -- rusty_alloc 2.0.0 -> 2.0.5 in the deliverable seam
 
