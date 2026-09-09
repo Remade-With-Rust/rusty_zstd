@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.2.3...rusty_zstd-v0.2.4) - 2026-09-09
+
+### Added
+
+- *(encode)* 1.08-1.27x faster matchfind at L3-L12, byte-identical
+
+### Fixed
+
+- *(bench,test)* two defects CI found the moment the files became visible
+
+### Other
+
+- Merge pull request #12 from Remade-With-Rust/perf/matchfind-campaign
+
 ## [0.2.3](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.2.2...rusty_zstd-v0.2.3) - 2026-08-28
 
 ### Added
