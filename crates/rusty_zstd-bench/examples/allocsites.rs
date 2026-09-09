@@ -23,7 +23,7 @@ unsafe impl GlobalAlloc for C {
             let n = N.fetch_add(1, Ordering::Relaxed);
             // sample: backtrace capture allocates, so guard against reentry
             let big = l.size() >= MIN.load(Ordering::Relaxed);
-            if big || n % 37 == 0 {
+            if big || true {
                 REENTRY.with(|r| {
                     if !r.get() {
                         r.set(true);
@@ -65,7 +65,7 @@ fn main() {
     let lvl: i32 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(3);
     if let Ok(m) = std::env::var("ALLOC_MIN") { if let Ok(v) = m.parse() { MIN.store(v, Ordering::Relaxed); } }
     let full = std::fs::read("corpora/data/silesia/dickens").expect("corpus");
-    let src = &full[..full.len().min(8 << 20)];
+    let src = &full[..full.len().min(1 << 20)];
     ON.store(1, Ordering::Relaxed);
     let _ = rusty_zstd::compress(src, lvl).unwrap();
     ON.store(0, Ordering::Relaxed);

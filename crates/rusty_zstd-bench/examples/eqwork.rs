@@ -13,7 +13,7 @@ fn main() {
                 let _ = rusty_zstd::compress_with(s, rusty_zstd::CompressOptions { level: lvl, checksum: false }).unwrap();
             }
             let (calls, _we, h) = rusty_zstd::take_eqlen_stats();
-            println!("L{lvl}: calls {calls}, len-hist [<8:{} 8-31:{} 32-63:{} 64-255:{} 256+:{}]", h[0],h[1],h[2],h[3],h[4]);
+            println!("L{lvl}: calls {calls}, len-hist [<3:{} 3-7:{} 8-31:{} 32-63:{} 64-255:{} 256+:{}]", h[0],h[1],h[2],h[3],h[4],h[5]);
         }
     }
 }

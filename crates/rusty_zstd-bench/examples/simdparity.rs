@@ -15,6 +15,10 @@
 
 use sha2::{Digest, Sha256};
 
+/// One level per strategy family. Asserted against the resolved strategies
+/// in `main`, so the claim cannot drift away from the list again.
+const LEVELS: &[i32] = &[1, 3, 5, 7, 9, 13, 16, 18, 19];
+
 fn main() {
     let ids = [
         ("generated", "jsonlog-16m"),
@@ -39,8 +43,41 @@ fn main() {
     // One level per strategy family, so every finder that calls
     // `count_eq_len_ge8` is exercised: fast, dfast, greedy, lazy, lazy2,
     // btlazy2, btopt, btultra.
+    //
+    // FIXED: the list said `12` where it meant BtLazy2, but L12 resolves to
+    // **Lazy2** -- BtLazy2 starts at L13. So this gate's own doc claimed a
+    // strategy it did not exercise, and `find_bt_lazy` -- which calls
+    // `count_match` like every other finder -- was never parity-checked. L9
+    // already covers Lazy2, so 12 is replaced rather than added.
+    //
+    // The assertion below makes the doc comment enforceable: if a future
+    // level-table edit moves a boundary, this fails loudly instead of
+    // silently dropping a finder out of the gate.
     let mut files = 0usize;
-    for lvl in [1i32, 3, 5, 7, 9, 12, 16, 19] {
+    {
+        let mut seen: Vec<String> = LEVELS
+            .iter()
+            .filter_map(|&l| rusty_zstd::compression_params(l, None).ok())
+            .map(|p| format!("{:?}", p.strategy))
+            .collect();
+        seen.sort();
+        seen.dedup();
+        const WANT: &[&str] = &["Fast", "DFast", "Greedy", "Lazy", "Lazy2",
+                                "BtLazy2", "BtOpt", "BtUltra", "BtUltra2"];
+        let missing: Vec<&str> = WANT
+            .iter()
+            .copied()
+            .filter(|w| !seen.iter().any(|x| x == w))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "simdparity LEVELS no longer cover every finder: missing {missing:?} \
+             (covered: {seen:?}). A simd defect in a missing finder would not \
+             move this gate's output."
+        );
+        eprintln!("simdparity strategies covered: {}", seen.join(", "));
+    }
+    for &lvl in LEVELS {
         for (dir, id) in ids {
             let path = format!("corpora/data/{dir}/{id}");
             let Ok(f) = std::fs::read(&path) else {

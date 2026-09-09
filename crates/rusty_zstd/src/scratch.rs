@@ -234,16 +234,85 @@ pub(crate) use scratch_slot;
 pub(crate) fn pool_take<T: 'static>(
     slot: &'static std::thread::LocalKey<core::cell::RefCell<Vec<Vec<T>>>>,
 ) -> Vec<T> {
-    let mut v = slot
+    let got = slot
         .try_with(|c| c.try_borrow_mut().ok().and_then(|mut p| p.pop()))
         .ok()
-        .flatten()
-        .unwrap_or_default();
+        .flatten();
+    // A pool that MISSES allocates, so its hit rate is the whole question:
+    // a `pool_take` that returns `None` is indistinguishable at the call site
+    // from never having pooled at all.
+    #[cfg(feature = "profile")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        if got.is_some() {
+            POOL_HIT.fetch_add(1, Relaxed);
+        } else {
+            POOL_MISS.fetch_add(1, Relaxed);
+        }
+    }
+    let mut v = got.unwrap_or_default();
     v.clear();
     v
 }
 
-/// Return a buffer to a bounded thread-local free list (cap 6).
+/// Record a take on a pool that keeps its OWN free list (`fse::ct_pool`),
+/// so one census covers every pool in the crate rather than just this one.
+#[cfg(feature = "profile")]
+#[inline]
+pub(crate) fn note_pool(hit: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if hit {
+        POOL_HIT.fetch_add(1, Relaxed);
+    } else {
+        POOL_MISS.fetch_add(1, Relaxed);
+    }
+}
+
+/// Pool hit/miss census. A miss is an allocation.
+#[cfg(feature = "profile")]
+pub static POOL_HIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Pool misses -- each one is a fresh allocation.
+#[cfg(feature = "profile")]
+pub static POOL_MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Buffers handed back with real capacity.
+#[cfg(feature = "profile")]
+pub static POOL_GIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Buffers handed back with ZERO capacity -- never pooled, so the matching
+/// take must allocate. A take/give imbalance shows up here first.
+#[cfg(feature = "profile")]
+pub static POOL_GIVE_EMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Buffers DROPPED because the free list was full.
+#[cfg(feature = "profile")]
+pub static POOL_DROP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear the pool census: `(hits, misses, drops, gives, give_empty)`.
+#[cfg(feature = "profile")]
+pub fn take_pool_census() -> (u64, u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        POOL_HIT.swap(0, Relaxed),
+        POOL_MISS.swap(0, Relaxed),
+        POOL_DROP.swap(0, Relaxed),
+        POOL_GIVE.swap(0, Relaxed),
+        POOL_GIVE_EMPTY.swap(0, Relaxed),
+    )
+}
+
+/// How many buffers one slot's free list holds.
+///
+/// This was a bare `6` and it was STARVING the pool: a block hands back three
+/// ncount headers plus their losing candidates, and anything past the cap is
+/// dropped -- freed, so the next `pool_take` that wants it allocates. Measured
+/// at 6: **78.2% hit rate, 1,437 misses and 708 drops** over four corpora.
+///
+/// REFUTED TWICE, recorded. Raising it to 32 changed hits and misses NOT AT
+/// ALL -- first at a 78.2% hit rate (5,167 / 1,437 both ways), and again after
+/// two `SC_NORM` leaks were fixed and the rate rose to 89.1% (5,885 / 719 at
+/// caps 6, 12 and 32 alike). Only drops move. The misses are first-use per
+/// slot and genuine concurrent liveness, not capacity.
+pub(crate) const POOL_CAP: usize = 6;
+
+/// Return a buffer to a bounded thread-local free list.
 #[cfg(all(feature = "std", feature = "alloc"))]
 #[inline]
 pub(crate) fn pool_give<T: 'static>(
@@ -251,12 +320,23 @@ pub(crate) fn pool_give<T: 'static>(
     v: Vec<T>,
 ) {
     if v.capacity() == 0 {
+        // A zero-capacity vec is not a buffer -- returning it would put an
+        // empty shell in the pool that the next take has to grow anyway.
+        #[cfg(feature = "profile")]
+        POOL_GIVE_EMPTY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return;
     }
+    #[cfg(feature = "profile")]
+    POOL_GIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let _ = slot.try_with(|c| {
         if let Ok(mut p) = c.try_borrow_mut() {
-            if p.len() < 6 {
+            if p.len() < POOL_CAP {
                 p.push(v);
+            } else {
+                // Dropped: the free list is full, so this buffer is freed and
+                // the next `pool_take` that wants it will allocate.
+                #[cfg(feature = "profile")]
+                POOL_DROP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
     });

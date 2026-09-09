@@ -95,9 +95,16 @@ pub(crate) fn prime_ldm(
     let mls = p.min_match as usize;
     let from = payload_off.saturating_sub(window);
     let mut pos = from + (step - from % step) % step;
+    debug_assert!(tables.hash.len() == 1usize << p.hash_log.min(20));
     while pos + mls <= payload_off && pos + 8 <= src.len() {
         let h = ldm_hash(src, pos, p.hash_log);
-        tables.hash[h] = pos as u32;
+        // BRICK 31: `ldm_hash` masks to `hash_log` bits and the table is
+        // exactly that size (`LdmTables::new`), as in `collect_ldm`.
+        debug_assert!(h < tables.hash.len());
+        #[allow(unsafe_code)]
+        {
+            *unsafe { tables.hash.get_unchecked_mut(h) } = pos as u32;
+        }
         pos += step;
     }
 }
@@ -122,16 +129,45 @@ pub(crate) fn collect_ldm(
     let mut ip = block_start;
     let align = (step - (ip % step)) % step;
     ip = ip.saturating_add(align);
+    // BRICK 18: the head test's byte mask -- the first `min(mls, 8)` bytes.
+    let smask: u64 = if mls >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (8 * mls)) - 1
+    };
+    debug_assert!(tables.hash.len() == 1usize << p.hash_log.min(20));
     while ip <= ilimit && ip + 8 <= src.len() {
         let h = ldm_hash(src, ip, p.hash_log);
-        let m = tables.hash[h] as usize;
-        tables.hash[h] = ip as u32;
+        // `ldm_hash` masks to `hash_log` bits and the table is exactly that
+        // size (see `LdmTables::new`), so the index is proven; the checked
+        // form cost a guard on each of the two accesses per position.
+        debug_assert!(h < tables.hash.len());
+        #[allow(unsafe_code)]
+        let m = *unsafe { tables.hash.get_unchecked(h) } as usize;
+        #[allow(unsafe_code)]
+        {
+            *unsafe { tables.hash.get_unchecked_mut(h) } = ip as u32;
+        }
+        // The candidate check used to be `src[m..m + mls] == src[ip..ip + mls]`
+        // -- a libc `memcmp` of `mls` (64 by default) bytes on EVERY candidate
+        // that passed the window tests, followed by `count_eq`, which reads
+        // the same bytes again and decides the same thing (`ml >= mls` holds
+        // exactly when the first `mls` bytes are equal; `ip + mls <= block_end`
+        // by `ilimit`, so the count's limit covers them). One masked 8-byte
+        // xor rejects the hash collisions, and the count settles the rest.
+        // `m < ip` and `ip + 8 <= src.len()` put both words in bounds.
+        #[cfg(feature = "profile")]
+        if m < ip && m >= frame_start && ip - m <= window && m + mls <= src.len() {
+            LDM_CANDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         if m < ip
             && m >= frame_start
             && ip - m <= window
             && m + mls <= src.len()
-            && src[m..m + mls] == src[ip..ip + mls]
+            && (crate::simd::load_u64_le(src, m) ^ crate::simd::load_u64_le(src, ip)) & smask == 0
         {
+            #[cfg(feature = "profile")]
+            LDM_COUNTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let ml = count_eq(src, m, ip, block_end);
             if ml >= mls {
                 let offset = (ip - m) as u32;
@@ -217,6 +253,21 @@ fn ldm_hash(src: &[u8], ip: usize, hash_log: u32) -> usize {
 /// is here because it is free, and because the oversight CLASS -- a hand-rolled
 /// loop beside a better kernel nobody wired in -- is the same one that left the
 /// xxh64 vector kernel unreachable (V1/D8a).
+/// BRICK 18 verdict counters: candidates that passed the window tests (the
+/// population the old `memcmp` ran on) and those the 8-byte head let through
+/// to `count_eq`.
+#[cfg(feature = "profile")]
+pub static LDM_CANDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "profile")]
+pub static LDM_COUNTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `(candidates, counted)` since the last call.
+#[cfg(feature = "profile")]
+pub fn take_ldm_stats() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (LDM_CANDS.swap(0, Relaxed), LDM_COUNTS.swap(0, Relaxed))
+}
+
 #[inline]
 fn count_eq(src: &[u8], m: usize, ip: usize, limit: usize) -> usize {
     crate::encode::count_match(src, m, ip, limit.min(src.len()))

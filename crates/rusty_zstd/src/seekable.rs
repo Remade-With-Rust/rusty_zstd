@@ -85,8 +85,13 @@ pub fn compress_seekable_adv(
     adv: AdvancedOptions,
 ) -> Result<Vec<u8>, Error> {
     let max_frame = max_frame_size.max(1);
+    // Both of these grew by doubling. The FRAME COUNT is known here, so
+    // `entries` can be exact; `out` cannot be, because the frames have not been
+    // compressed yet -- so it is reserved from the FIRST frame's measured size
+    // in the loop below rather than from a guessed ratio.
+    let nframes = src.len().div_ceil(max_frame).max(1);
     let mut out = Vec::new();
-    let mut entries: Vec<SeekEntry> = Vec::new();
+    let mut entries: Vec<SeekEntry> = Vec::with_capacity(nframes);
     // C6: THE EMPTY-INPUT SPECIAL CASE IS DELETED. It was a full copy of the
     // loop body below -- `encode_oneshot`, an entry push, an `extend_from_slice`
     // and its own `append_seek_table` + return -- for a case that IS exactly
@@ -122,6 +127,16 @@ pub fn compress_seekable_adv(
                 None
             },
         });
+        if out.is_empty() {
+            // Extrapolate the whole output from what the first frame actually
+            // compressed to. `saturating_mul` because `nframes` is derived
+            // from a caller-supplied frame size.
+            crate::copies::add(
+                crate::copies::C_MT_REGROW,
+                zst.len().saturating_mul(nframes),
+            );
+            out.reserve(zst.len().saturating_mul(nframes));
+        }
         out.extend_from_slice(&zst);
         off = end;
         if off >= src.len() {

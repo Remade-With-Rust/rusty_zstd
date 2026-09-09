@@ -63,7 +63,7 @@ pfcensus = ["profile"]
 # Optional, and off unless `rusty-alloc` is enabled: with the feature off this
 # crate still resolves to zero dependencies, which is the property the crate
 # description claims.
-rusty_alloc_default = { version = "0.1.1", optional = true }
+rusty_alloc_default = { version = "0.1.2", optional = true }
 
 [lints]
 workspace = true

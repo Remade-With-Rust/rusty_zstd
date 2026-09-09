@@ -61,11 +61,41 @@ use rusty_zstd::{AdvancedOptions, CompressOptions, DecompressOptions};
 use std::io::Write;
 
 const IDS: &[&str] = &[
-    "zeros-32m", "text-32m", "incomp-32m", "jsonlog-16m", "smallmsg-8m", "versions-16m", "mr",
-    "ooffice", "osdb", "reymont", "sao", "webster", "dickens", "mozilla", "nci", "samba", "xml",
+    "zeros-32m",
+    "text-32m",
+    "incomp-32m",
+    "jsonlog-16m",
+    "smallmsg-8m",
+    "versions-16m",
+    "mr",
+    "ooffice",
+    "osdb",
+    "reymont",
+    "sao",
+    "webster",
+    "dickens",
+    "mozilla",
+    "nci",
+    "samba",
+    "xml",
     "x-ray",
 ];
-const LEVELS: &[i32] = &[1, 3, 19, 22];
+// STRATEGY COVERAGE, not level coverage. This list was [1, 3, 19, 22], which
+// resolves to Fast, DFast, BtUltra2, BtUltra2 -- THREE of the seven
+// strategies, and none of Greedy (L5), Lazy (L7), Lazy2 (L9), BtLazy2 (L13)
+// or BtOpt (L16). Every gate whose only call sites live in an untested
+// finder was therefore reported SZ-DEAD for a reason that has nothing to do
+// with the gate -- the exact failure this tool exists to prevent.
+//
+// MEASURED INSTANCE that found it: `lazy_fill` is read only in
+// `find_lazy_impl` and `find_bt_lazy`, so no tested level reached it and it
+// read SZ-DEAD at every prefix. Toggled at L9 on a 40 MiB board it moves
+// 266,695 compressed bytes (1.53%) and 4,133,134 probes. A campaign trusting
+// the old table would have deleted a live ratio gate.
+//
+// The `strategy_coverage` check below fails LOUDLY if this list ever stops
+// covering all seven, so the hole cannot silently reopen.
+const LEVELS: &[i32] = &[1, 3, 5, 7, 9, 13, 16, 18, 19, 22];
 
 fn load(cap: usize) -> Vec<(&'static str, Vec<u8>)> {
     IDS.iter()
@@ -136,39 +166,206 @@ fn b(f: impl Fn() + 'static) -> Box<dyn Fn()> {
 fn encode_arms() -> Vec<Arm> {
     use rusty_zstd::*;
     vec![
-        Arm { name: "fast_lazy",       vals: vec![("on", b(|| set_fast_lazy_arm(true))), ("off", b(|| set_fast_lazy_arm(false)))] },
-        Arm { name: "lazy_fill",       vals: vec![("on", b(|| set_lazy_fill_arm(true))), ("off", b(|| set_lazy_fill_arm(false)))] },
-        Arm { name: "rep1_mode",       vals: vec![("dispatch", b(|| set_rep1_mode(None))), ("on", b(|| set_rep1_mode(Some(true)))), ("off", b(|| set_rep1_mode(Some(false))))] },
-        Arm { name: "step0",           vals: vec![("2", b(|| set_step0_arm(2))), ("1", b(|| set_step0_arm(1))), ("3", b(|| set_step0_arm(3)))] },
-        Arm { name: "pipe_rep1",       vals: vec![("on", b(|| set_pipe_rep1_arm(true))), ("off", b(|| set_pipe_rep1_arm(false)))] },
-        Arm { name: "pipe",            vals: vec![("on", b(|| set_pipe_arm(true))), ("off", b(|| set_pipe_arm(false)))] },
-        Arm { name: "huff_fast",       vals: vec![("on", b(|| set_huff_fast_arm(true))), ("off", b(|| set_huff_fast_arm(false)))] },
-        Arm { name: "payload_reserve", vals: vec![("on", b(|| set_payload_arm(true))), ("off", b(|| set_payload_arm(false)))] },
-        Arm { name: "litpush_hoist",   vals: vec![("on", b(|| set_litpush_hoist_arm(true))), ("off", b(|| set_litpush_hoist_arm(false)))] },
-        Arm { name: "litpush",         vals: vec![("on", b(|| set_litpush_arm(true))), ("off", b(|| set_litpush_arm(false)))] },
-        Arm { name: "dfast_step",      vals: vec![("dispatch", b(|| set_dfast_step_arm(0))), ("1", b(|| set_dfast_step_arm(1))), ("2", b(|| set_dfast_step_arm(2)))] },
-        Arm { name: "dfast_spec_min",  vals: vec![("0.70", b(|| set_dfast_spec_min_arm(0.70))), ("0.0", b(|| set_dfast_spec_min_arm(0.0))), ("2.0", b(|| set_dfast_spec_min_arm(2.0)))] },
-        Arm { name: "dfast_pipe",      vals: vec![("on", b(|| set_dfast_pipe_arm(true))), ("off", b(|| set_dfast_pipe_arm(false)))] },
-        Arm { name: "search_log_d",    vals: vec![("0", b(|| set_search_log_delta(0))), ("-1", b(|| set_search_log_delta(-1))), ("+1", b(|| set_search_log_delta(1)))] },
-        Arm { name: "opt_lit",         vals: vec![("auto", b(|| set_opt_lit_arm(u32::MAX))), ("6", b(|| set_opt_lit_arm(6))), ("9", b(|| set_opt_lit_arm(9)))] },
-        Arm { name: "opt_rep",         vals: vec![("on", b(|| set_opt_rep_arm(true))), ("off", b(|| set_opt_rep_arm(false)))] },
-        Arm { name: "dfast_spec",      vals: vec![("on", b(|| set_dfast_spec_arm(true))), ("off", b(|| set_dfast_spec_arm(false)))] },
-        Arm { name: "fast_spec",       vals: vec![("on", b(|| set_fast_spec_arm(true))), ("off", b(|| set_fast_spec_arm(false)))] },
-        Arm { name: "bt_spec",         vals: vec![("on", b(|| set_bt_spec_arm(true))), ("off", b(|| set_bt_spec_arm(false)))] },
-        Arm { name: "next_long",       vals: vec![("on", b(|| set_next_long_arm(true))), ("off", b(|| set_next_long_arm(false)))] },
-        Arm { name: "pair_on",         vals: vec![("on", b(|| set_pair_on_arm(true))), ("off", b(|| set_pair_on_arm(false)))] },
-        Arm { name: "tag",             vals: vec![("on", b(|| set_tag_arm(true))), ("off", b(|| set_tag_arm(false)))] },
-        Arm { name: "tag_alloc",       vals: vec![("on", b(|| set_tag_alloc_arm(true))), ("off", b(|| set_tag_alloc_arm(false)))] },
-        Arm { name: "pair_hi",         vals: vec![("1.0", b(|| set_pair_hi_arm(1.0))), ("0.0", b(|| set_pair_hi_arm(0.0))), ("9.0", b(|| set_pair_hi_arm(9.0)))] },
-        Arm { name: "pair_gain",       vals: vec![("0.20", b(|| set_pair_gain_arm(0.20))), ("0.0", b(|| set_pair_gain_arm(0.0))), ("1.0", b(|| set_pair_gain_arm(1.0)))] },
-        Arm { name: "incomp_skip",     vals: vec![("level", b(|| set_incomp_skip_arm(None))), ("on", b(|| set_incomp_skip_arm(Some(true)))), ("off", b(|| set_incomp_skip_arm(Some(false))))] },
-        Arm { name: "strategy",        vals: vec![("level", b(|| set_strategy_arm(None))), ("Greedy", b(|| set_strategy_arm(Some(Strategy::Greedy))))] },
+        Arm {
+            name: "fast_lazy",
+            vals: vec![
+                ("on", b(|| set_fast_lazy_arm(true))),
+                ("off", b(|| set_fast_lazy_arm(false))),
+            ],
+        },
+        Arm {
+            name: "lazy_fill",
+            vals: vec![
+                ("on", b(|| set_lazy_fill_arm(true))),
+                ("off", b(|| set_lazy_fill_arm(false))),
+            ],
+        },
+        Arm {
+            name: "rep1_mode",
+            vals: vec![
+                ("dispatch", b(|| set_rep1_mode(None))),
+                ("on", b(|| set_rep1_mode(Some(true)))),
+                ("off", b(|| set_rep1_mode(Some(false)))),
+            ],
+        },
+        Arm {
+            name: "step0",
+            vals: vec![
+                ("2", b(|| set_step0_arm(2))),
+                ("1", b(|| set_step0_arm(1))),
+                ("3", b(|| set_step0_arm(3))),
+            ],
+        },
+        Arm {
+            name: "pipe_rep1",
+            vals: vec![
+                ("on", b(|| set_pipe_rep1_arm(true))),
+                ("off", b(|| set_pipe_rep1_arm(false))),
+            ],
+        },
+        Arm {
+            name: "pipe",
+            vals: vec![
+                ("on", b(|| set_pipe_arm(true))),
+                ("off", b(|| set_pipe_arm(false))),
+            ],
+        },
+        Arm {
+            name: "huff_fast",
+            vals: vec![
+                ("on", b(|| set_huff_fast_arm(true))),
+                ("off", b(|| set_huff_fast_arm(false))),
+            ],
+        },
+        Arm {
+            name: "payload_reserve",
+            vals: vec![
+                ("on", b(|| set_payload_arm(true))),
+                ("off", b(|| set_payload_arm(false))),
+            ],
+        },
+        Arm {
+            name: "litpush_hoist",
+            vals: vec![
+                ("on", b(|| set_litpush_hoist_arm(true))),
+                ("off", b(|| set_litpush_hoist_arm(false))),
+            ],
+        },
+        Arm {
+            name: "litpush",
+            vals: vec![
+                ("on", b(|| set_litpush_arm(true))),
+                ("off", b(|| set_litpush_arm(false))),
+            ],
+        },
+        Arm {
+            name: "dfast_step",
+            vals: vec![
+                ("dispatch", b(|| set_dfast_step_arm(0))),
+                ("1", b(|| set_dfast_step_arm(1))),
+                ("2", b(|| set_dfast_step_arm(2))),
+            ],
+        },
+        Arm {
+            name: "dfast_spec_min",
+            vals: vec![
+                ("0.70", b(|| set_dfast_spec_min_arm(0.70))),
+                ("0.0", b(|| set_dfast_spec_min_arm(0.0))),
+                ("2.0", b(|| set_dfast_spec_min_arm(2.0))),
+            ],
+        },
+        Arm {
+            name: "dfast_pipe",
+            vals: vec![
+                ("on", b(|| set_dfast_pipe_arm(true))),
+                ("off", b(|| set_dfast_pipe_arm(false))),
+            ],
+        },
+        Arm {
+            name: "search_log_d",
+            vals: vec![
+                ("0", b(|| set_search_log_delta(0))),
+                ("-1", b(|| set_search_log_delta(-1))),
+                ("+1", b(|| set_search_log_delta(1))),
+            ],
+        },
+        Arm {
+            name: "opt_lit",
+            vals: vec![
+                ("auto", b(|| set_opt_lit_arm(u32::MAX))),
+                ("6", b(|| set_opt_lit_arm(6))),
+                ("9", b(|| set_opt_lit_arm(9))),
+            ],
+        },
+        Arm {
+            name: "opt_rep",
+            vals: vec![
+                ("on", b(|| set_opt_rep_arm(true))),
+                ("off", b(|| set_opt_rep_arm(false))),
+            ],
+        },
+        Arm {
+            name: "dfast_spec",
+            vals: vec![
+                ("on", b(|| set_dfast_spec_arm(true))),
+                ("off", b(|| set_dfast_spec_arm(false))),
+            ],
+        },
+        Arm {
+            name: "fast_spec",
+            vals: vec![
+                ("on", b(|| set_fast_spec_arm(true))),
+                ("off", b(|| set_fast_spec_arm(false))),
+            ],
+        },
+        Arm {
+            name: "next_long",
+            vals: vec![
+                ("on", b(|| set_next_long_arm(true))),
+                ("off", b(|| set_next_long_arm(false))),
+            ],
+        },
+        Arm {
+            name: "pair_on",
+            vals: vec![
+                ("on", b(|| set_pair_on_arm(true))),
+                ("off", b(|| set_pair_on_arm(false))),
+            ],
+        },
+        Arm {
+            name: "tag",
+            vals: vec![
+                ("on", b(|| set_tag_arm(true))),
+                ("off", b(|| set_tag_arm(false))),
+            ],
+        },
+        Arm {
+            name: "tag_alloc",
+            vals: vec![
+                ("on", b(|| set_tag_alloc_arm(true))),
+                ("off", b(|| set_tag_alloc_arm(false))),
+            ],
+        },
+        Arm {
+            name: "pair_hi",
+            vals: vec![
+                ("1.0", b(|| set_pair_hi_arm(1.0))),
+                ("0.0", b(|| set_pair_hi_arm(0.0))),
+                ("9.0", b(|| set_pair_hi_arm(9.0))),
+            ],
+        },
+        Arm {
+            name: "pair_gain",
+            vals: vec![
+                ("0.20", b(|| set_pair_gain_arm(0.20))),
+                ("0.0", b(|| set_pair_gain_arm(0.0))),
+                ("1.0", b(|| set_pair_gain_arm(1.0))),
+            ],
+        },
+        Arm {
+            name: "incomp_skip",
+            vals: vec![
+                ("level", b(|| set_incomp_skip_arm(None))),
+                ("on", b(|| set_incomp_skip_arm(Some(true)))),
+                ("off", b(|| set_incomp_skip_arm(Some(false)))),
+            ],
+        },
+        Arm {
+            name: "strategy",
+            vals: vec![
+                ("level", b(|| set_strategy_arm(None))),
+                ("Greedy", b(|| set_strategy_arm(Some(Strategy::Greedy)))),
+            ],
+        },
     ]
 }
 
 fn arm_sweep(srcs: &[(&'static str, Vec<u8>)], hi_cap: usize) -> (usize, usize, usize, usize) {
     println!("\n================ 1. ARM SWEEP — every encode arm, all 4 levels ================");
-    println!("{:<16} {:<8} {:<28} {}", "arm", "verdict", "deployed / values", "moved cells");
+    println!(
+        "{:<16} {:<8} {:<28} {}",
+        "arm", "verdict", "deployed / values", "moved cells"
+    );
     println!("{}", "-".repeat(112));
     let mut base = fingerprint(srcs, hi_cap);
     let (mut live, mut dead, mut drift, mut stuck) = (0, 0, 0, 0);
@@ -243,10 +440,34 @@ fn decode_sweep(srcs: &[(&'static str, Vec<u8>)]) {
     use rusty_zstd::*;
     println!("\n================ 2. DECODE ARM SWEEP — output must NEVER move ================");
     let arms: Vec<(&str, Vec<(&str, Box<dyn Fn()>)>)> = vec![
-        ("seqcheck",  vec![("on", b(|| set_seqcheck_arm(true))),  ("off", b(|| set_seqcheck_arm(false)))]),
-        ("lut",       vec![("on", b(|| set_lut_arm(true))),       ("off", b(|| set_lut_arm(false)))]),
-        ("litcopy",   vec![("on", b(|| set_litcopy_arm(true))),   ("off", b(|| set_litcopy_arm(false)))]),
-        ("matchcopy", vec![("on", b(|| set_matchcopy_arm(true))), ("off", b(|| set_matchcopy_arm(false)))]),
+        (
+            "seqcheck",
+            vec![
+                ("on", b(|| set_seqcheck_arm(true))),
+                ("off", b(|| set_seqcheck_arm(false))),
+            ],
+        ),
+        (
+            "lut",
+            vec![
+                ("on", b(|| set_lut_arm(true))),
+                ("off", b(|| set_lut_arm(false))),
+            ],
+        ),
+        (
+            "litcopy",
+            vec![
+                ("on", b(|| set_litcopy_arm(true))),
+                ("off", b(|| set_litcopy_arm(false))),
+            ],
+        ),
+        (
+            "matchcopy",
+            vec![
+                ("on", b(|| set_matchcopy_arm(true))),
+                ("off", b(|| set_matchcopy_arm(false))),
+            ],
+        ),
     ];
     // one frame per corpus per level, encoded once
     let mut frames = Vec::new();
@@ -308,22 +529,58 @@ fn caller_sweep(srcs: &[(&'static str, Vec<u8>)]) {
     };
 
     // Gate 4 — checksum
-    let ck_on = rusty_zstd::compress_with(src, CompressOptions { level: lvl, checksum: true }).unwrap();
+    let ck_on = rusty_zstd::compress_with(
+        src,
+        CompressOptions {
+            level: lvl,
+            checksum: true,
+        },
+    )
+    .unwrap();
     row(
         "4 checksum",
         ck_on.len() != base.len(),
-        format!("{} vs {} bytes (Δ{})", ck_on.len(), base.len(), ck_on.len() as i64 - base.len() as i64),
+        format!(
+            "{} vs {} bytes (Δ{})",
+            ck_on.len(),
+            base.len(),
+            ck_on.len() as i64 - base.len() as i64
+        ),
     );
 
     // Gate 1 — nb_workers (MT). Must round-trip and must not corrupt.
     // `job_size = 0` means `4 * window`, which at L3 is 8 MiB -- larger than this
     // source, so MT would run ONE job and emit byte-identical output. That is a
     // null A/B dressed as a verdict; pin the job size so >1 job actually exists.
-    let adv_mt = AdvancedOptions { nb_workers: 2, job_size: 128 * 1024, ..Default::default() };
-    match rusty_zstd::compress_with_advanced(src, rusty_zstd::compression_params(lvl, Some(src.len() as u64)).unwrap(), false, None, &[], true, adv_mt) {
+    let adv_mt = AdvancedOptions {
+        nb_workers: 2,
+        job_size: 128 * 1024,
+        ..Default::default()
+    };
+    match rusty_zstd::compress_with_advanced(
+        src,
+        rusty_zstd::compression_params(lvl, Some(src.len() as u64)).unwrap(),
+        false,
+        None,
+        &[],
+        true,
+        adv_mt,
+    ) {
         Ok(z) => {
-            let ok = rusty_zstd::decompress(&z).map(|d| d == src).unwrap_or(false);
-            row("1 nb_workers=2", z != base, format!("{} vs {} bytes ({} jobs of 128 KiB), round-trip {}", z.len(), base.len(), src.len().div_ceil(128 << 10), if ok { "OK" } else { "FAILED" }));
+            let ok = rusty_zstd::decompress(&z)
+                .map(|d| d == src)
+                .unwrap_or(false);
+            row(
+                "1 nb_workers=2",
+                z != base,
+                format!(
+                    "{} vs {} bytes ({} jobs of 128 KiB), round-trip {}",
+                    z.len(),
+                    base.len(),
+                    src.len().div_ceil(128 << 10),
+                    if ok { "OK" } else { "FAILED" }
+                ),
+            );
         }
         Err(e) => row("1 nb_workers=2", false, format!("ERROR {e:?}")),
     }
@@ -333,8 +590,19 @@ fn caller_sweep(srcs: &[(&'static str, Vec<u8>)]) {
     let p_base = enc(tail, lvl);
     match rusty_zstd::compress_using_prefix(tail, pre, lvl) {
         Ok(z) => {
-            let ok = rusty_zstd::decompress_using_prefix(&z, pre).map(|d| d == tail).unwrap_or(false);
-            row("2/10 prefix", z.len() != p_base.len(), format!("{} vs {} bytes, round-trip {}", z.len(), p_base.len(), if ok { "OK" } else { "FAILED" }));
+            let ok = rusty_zstd::decompress_using_prefix(&z, pre)
+                .map(|d| d == tail)
+                .unwrap_or(false);
+            row(
+                "2/10 prefix",
+                z.len() != p_base.len(),
+                format!(
+                    "{} vs {} bytes, round-trip {}",
+                    z.len(),
+                    p_base.len(),
+                    if ok { "OK" } else { "FAILED" }
+                ),
+            );
         }
         Err(e) => row("2/10 prefix", false, format!("ERROR {e:?}")),
     }
@@ -347,49 +615,134 @@ fn caller_sweep(srcs: &[(&'static str, Vec<u8>)]) {
     row(
         "5 BLOCK_KB=32",
         z32.len() != base.len(),
-        format!("{} vs {} bytes ({:+.3}%), restored {}", z32.len(), base.len(), (z32.len() as f64 / base.len() as f64 - 1.0) * 100.0, if z_re == base { "OK" } else { "FAILED" }),
+        format!(
+            "{} vs {} bytes ({:+.3}%), restored {}",
+            z32.len(),
+            base.len(),
+            (z32.len() as f64 / base.len() as f64 - 1.0) * 100.0,
+            if z_re == base { "OK" } else { "FAILED" }
+        ),
     );
 
     // Gate 14 — target_cblock_size
-    let adv_t = AdvancedOptions { target_cblock_size: 16384, ..Default::default() };
+    let adv_t = AdvancedOptions {
+        target_cblock_size: 16384,
+        ..Default::default()
+    };
     let params = rusty_zstd::compression_params(lvl, Some(src.len() as u64)).unwrap();
     match rusty_zstd::compress_with_advanced(src, params, false, None, &[], true, adv_t) {
-        Ok(z) => row("14 target_cblock", z.len() != base.len(), format!("{} vs {} bytes ({:+.3}%)", z.len(), base.len(), (z.len() as f64 / base.len() as f64 - 1.0) * 100.0)),
+        Ok(z) => row(
+            "14 target_cblock",
+            z.len() != base.len(),
+            format!(
+                "{} vs {} bytes ({:+.3}%)",
+                z.len(),
+                base.len(),
+                (z.len() as f64 / base.len() as f64 - 1.0) * 100.0
+            ),
+        ),
         Err(e) => row("14 target_cblock", false, format!("ERROR {e:?}")),
     }
 
     // Gate 15 — rsyncable
-    let adv_r = AdvancedOptions { rsyncable: true, ..Default::default() };
+    let adv_r = AdvancedOptions {
+        rsyncable: true,
+        ..Default::default()
+    };
     match rusty_zstd::compress_with_advanced(src, params, false, None, &[], true, adv_r) {
         Ok(z) => {
-            let ok = rusty_zstd::decompress(&z).map(|d| d == src).unwrap_or(false);
-            row("15 rsyncable", z.len() != base.len(), format!("{} vs {} bytes ({:+.3}%), round-trip {}", z.len(), base.len(), (z.len() as f64 / base.len() as f64 - 1.0) * 100.0, if ok { "OK" } else { "FAILED" }));
+            let ok = rusty_zstd::decompress(&z)
+                .map(|d| d == src)
+                .unwrap_or(false);
+            row(
+                "15 rsyncable",
+                z.len() != base.len(),
+                format!(
+                    "{} vs {} bytes ({:+.3}%), round-trip {}",
+                    z.len(),
+                    base.len(),
+                    (z.len() as f64 / base.len() as f64 - 1.0) * 100.0,
+                    if ok { "OK" } else { "FAILED" }
+                ),
+            );
         }
         Err(e) => row("15 rsyncable", false, format!("ERROR {e:?}")),
     }
 
     // Gate 16 — LDM
-    let adv_l = AdvancedOptions { ldm: rusty_zstd::LdmParams::enabled(), ..Default::default() };
+    let adv_l = AdvancedOptions {
+        ldm: rusty_zstd::LdmParams::enabled(),
+        ..Default::default()
+    };
     match rusty_zstd::compress_with_advanced(src, params, false, None, &[], true, adv_l) {
         Ok(z) => {
-            let ok = rusty_zstd::decompress(&z).map(|d| d == src).unwrap_or(false);
-            row("16 ldm", z.len() != base.len(), format!("{} vs {} bytes ({:+.3}%), round-trip {}", z.len(), base.len(), (z.len() as f64 / base.len() as f64 - 1.0) * 100.0, if ok { "OK" } else { "FAILED" }));
+            let ok = rusty_zstd::decompress(&z)
+                .map(|d| d == src)
+                .unwrap_or(false);
+            row(
+                "16 ldm",
+                z.len() != base.len(),
+                format!(
+                    "{} vs {} bytes ({:+.3}%), round-trip {}",
+                    z.len(),
+                    base.len(),
+                    (z.len() as f64 / base.len() as f64 - 1.0) * 100.0,
+                    if ok { "OK" } else { "FAILED" }
+                ),
+            );
         }
         Err(e) => row("16 ldm", false, format!("ERROR {e:?}")),
     }
 
     // Gate 9 — decoder window_max rejection
-    let tiny = DecompressOptions { window_max: 1024, ..Default::default() };
+    let tiny = DecompressOptions {
+        window_max: 1024,
+        ..Default::default()
+    };
     let rejected = rusty_zstd::decompress_with(&base, tiny).is_err();
-    row("9 window_max=1KiB", rejected, format!("over-large-window frame {}", if rejected { "REJECTED (correct)" } else { "ACCEPTED — the cap does not bind" }));
+    row(
+        "9 window_max=1KiB",
+        rejected,
+        format!(
+            "over-large-window frame {}",
+            if rejected {
+                "REJECTED (correct)"
+            } else {
+                "ACCEPTED — the cap does not bind"
+            }
+        ),
+    );
 
     // Gate 20 — force_ignore_checksum: must CONSUME the 4 bytes, not verify them
     let mut corrupt = ck_on.clone();
     let n = corrupt.len();
     corrupt[n - 1] ^= 0xFF;
     let strict = rusty_zstd::decompress(&corrupt).is_err();
-    let lax = rusty_zstd::decompress_with(&corrupt, DecompressOptions { force_ignore_checksum: true, ..Default::default() }).is_ok();
-    row("20 force_ignore_ck", strict && lax, format!("corrupt trailer: strict {}, lax {}", if strict { "rejects" } else { "ACCEPTS — verification is not running" }, if lax { "accepts" } else { "REJECTS — the flag is not honoured" }));
+    let lax = rusty_zstd::decompress_with(
+        &corrupt,
+        DecompressOptions {
+            force_ignore_checksum: true,
+            ..Default::default()
+        },
+    )
+    .is_ok();
+    row(
+        "20 force_ignore_ck",
+        strict && lax,
+        format!(
+            "corrupt trailer: strict {}, lax {}",
+            if strict {
+                "rejects"
+            } else {
+                "ACCEPTS — verification is not running"
+            },
+            if lax {
+                "accepts"
+            } else {
+                "REJECTS — the flag is not honoured"
+            }
+        ),
+    );
 
     // Gate 11 — frame magic: a skippable frame must be consumed and ignored
     let mut skip = Vec::new();
@@ -397,13 +750,36 @@ fn caller_sweep(srcs: &[(&'static str, Vec<u8>)]) {
     skip.extend_from_slice(&8u32.to_le_bytes());
     skip.extend_from_slice(&[0u8; 8]);
     skip.extend_from_slice(&base);
-    let ok = rusty_zstd::decompress(&skip).map(|d| d == src).unwrap_or(false);
-    row("11 frame magic", ok, format!("skippable+zstd concatenation {}", if ok { "decodes to the payload (correct)" } else { "FAILED" }));
+    let ok = rusty_zstd::decompress(&skip)
+        .map(|d| d == src)
+        .unwrap_or(false);
+    row(
+        "11 frame magic",
+        ok,
+        format!(
+            "skippable+zstd concatenation {}",
+            if ok {
+                "decodes to the payload (correct)"
+            } else {
+                "FAILED"
+            }
+        ),
+    );
 
     // Gate 12 — empty frame
     let ez = enc(&[], lvl);
-    let ok = rusty_zstd::decompress(&ez).map(|d| d.is_empty()).unwrap_or(false);
-    row("12 empty frame", ok, format!("{} bytes, round-trips to empty {}", ez.len(), if ok { "OK" } else { "FAILED" }));
+    let ok = rusty_zstd::decompress(&ez)
+        .map(|d| d.is_empty())
+        .unwrap_or(false);
+    row(
+        "12 empty frame",
+        ok,
+        format!(
+            "{} bytes, round-trips to empty {}",
+            ez.len(),
+            if ok { "OK" } else { "FAILED" }
+        ),
+    );
 
     println!("\n  *UNWIRED means setting the option changed nothing observable. For a");
     println!("   CALLER gate that is a DEFECT, not a verdict — a corpus board would then");
@@ -413,7 +789,9 @@ fn caller_sweep(srcs: &[(&'static str, Vec<u8>)]) {
 // ---------------------------------------------------------------------------
 
 fn knob_census() {
-    println!("\n================ 4. KNOB CENSUS — counted from source, never quoted ================");
+    println!(
+        "\n================ 4. KNOB CENSUS — counted from source, never quoted ================"
+    );
     let files = [
         "crates/rusty_zstd/src/encode.rs",
         "crates/rusty_zstd/src/compressed.rs",
@@ -451,9 +829,7 @@ fn knob_census() {
         for blk in s.split("\nfn ").skip(1) {
             let name = blk.split('(').next().unwrap_or("").trim().to_string();
             let body = blk.split("\n}").next().unwrap_or("");
-            if body.contains("env::var")
-                && !body.contains("OnceLock")
-                && !body.contains(".store(")
+            if body.contains("env::var") && !body.contains("OnceLock") && !body.contains(".store(")
             {
                 for seg in body.split("env::var(\"").skip(1) {
                     if let Some(k) = seg.split('"').next() {
@@ -484,6 +860,33 @@ fn main() {
     let hi_cap = (cap / 4).max(65536);
     let srcs = load(cap);
     println!("ALL GATES — {} corpora, levels {LEVELS:?}", srcs.len());
+    {
+        // SELF-CHECK: which strategies does this level list actually exercise?
+        let mut seen: Vec<String> = LEVELS
+            .iter()
+            .filter_map(|&l| rusty_zstd::compression_params(l, None).ok())
+            .map(|p| format!("{:?}", p.strategy))
+            .collect();
+        seen.sort();
+        seen.dedup();
+        const ALL: &[&str] = &[
+            "Fast", "DFast", "Greedy", "Lazy", "Lazy2", "BtLazy2", "BtOpt", "BtUltra", "BtUltra2",
+        ];
+        let missing: Vec<&str> = ALL
+            .iter()
+            .copied()
+            .filter(|s| !seen.iter().any(|x| x == s))
+            .collect();
+        println!("  strategies covered: {}", seen.join(", "));
+        if !missing.is_empty() {
+            println!(
+                "  !! STRATEGY HOLE: {} never exercised. Every gate whose only",
+                missing.join(", ")
+            );
+            println!("     call sites are in those finders will read SZ-DEAD for a reason");
+            println!("     that has nothing to do with the gate. Add a level for each.");
+        }
+    }
     println!(
         "  prefix {} KiB = {} blocks (L1/L3), {} KiB = {} blocks (L19/L22); encode checksum OFF",
         cap >> 10,
@@ -492,8 +895,12 @@ fn main() {
         hi_cap.div_ceil(128 << 10)
     );
     if cap.div_ceil(128 << 10) < 16 {
-        println!("  !! WARNING: under 16 blocks. Gates keyed on a RUN of blocks (fast_lazy needs 4,");
-        println!("     raw_probe re-probes every 16) are structurally inert — their DEAD is UNPROVEN.");
+        println!(
+            "  !! WARNING: under 16 blocks. Gates keyed on a RUN of blocks (fast_lazy needs 4,"
+        );
+        println!(
+            "     raw_probe re-probes every 16) are structurally inert — their DEAD is UNPROVEN."
+        );
     }
     println!("  every verdict below is DETERMINISTIC (compressed sizes) — valid on a busy box");
     let t0 = std::time::Instant::now();

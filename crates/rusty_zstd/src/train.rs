@@ -143,15 +143,31 @@ fn k_candidates(k: u32, d: usize, steps: u32, max_dict: usize) -> Vec<usize> {
 }
 
 fn fallback_content(samples: &[&[u8]], max_dict: usize) -> Vec<u8> {
-    let mut cat = Vec::new();
+    // Two copies became one. `Vec::new()` grew to the whole sample set by
+    // doubling (~1x the samples in realloc traffic), and the tail slice was
+    // then copied into a SECOND allocation. The total is known from the slice
+    // lengths, and only the last `max_dict` bytes are ever kept -- so reserve
+    // exactly what is needed and drop the head in place.
+    let total: usize = samples.iter().map(|s| s.len()).sum();
+    let mut cat = Vec::with_capacity(
+        total
+            .min(max_dict.saturating_mul(2))
+            .max(total.min(1 << 20)),
+    );
     for s in samples {
         cat.extend_from_slice(s);
+        // Keeping only the tail bounds the buffer at ~2x `max_dict` instead of
+        // the whole sample set, which is the real memory win here.
+        if cat.len() > max_dict.saturating_mul(2) {
+            let drop = cat.len() - max_dict;
+            cat.drain(..drop);
+        }
     }
     if cat.len() > max_dict {
-        cat[cat.len() - max_dict..].to_vec()
-    } else {
-        cat
+        let drop = cat.len() - max_dict;
+        cat.drain(..drop);
     }
+    cat
 }
 
 fn hash_dmer(src: &[u8], pos: usize, d: usize, f: u32) -> usize {
@@ -171,15 +187,24 @@ fn hash_dmer(src: &[u8], pos: usize, d: usize, f: u32) -> usize {
     // runtime-length subslice does not, by either spelling.** The array turns a
     // dynamic bound into a static one. A subslice just moves the dynamic bound.
     // Every remaining pad in this crate is the second shape.
+    // WIN: walk the tail as an ITERATOR instead of indexing `src[pos + i]`.
+    // The note above records that a runtime-length SUBSLICE does not retire
+    // these pads -- it only moves the dynamic bound -- and that is still true.
+    // An iterator is a different construction: it carries no index to prove, so
+    // the bounds checks and their panic pads have nothing to guard. `take` and
+    // `skip` reproduce the old loop ranges exactly:
+    //   `take(d.min(8))`  == `0..d.min(8).min(tail.len())`
+    //   `take(d).skip(8)` == `8..d.min(tail.len())`
+    // and `tail.len() == src.len().saturating_sub(pos)` for every `pos`.
+    let tail = src.get(pos..).unwrap_or(&[]);
     let mut v = 0u64;
-    let n = d.min(8).min(src.len().saturating_sub(pos));
-    for i in 0..n {
-        v |= u64::from(src[pos + i]) << (8 * i);
+    for (i, &b) in tail.iter().take(d.min(8)).enumerate() {
+        v |= u64::from(b) << (8 * i);
     }
     if d > 8 {
         let mut acc = 0u64;
-        for i in 8..d.min(src.len().saturating_sub(pos)) {
-            acc = acc.wrapping_mul(131).wrapping_add(u64::from(src[pos + i]));
+        for &b in tail.iter().take(d).skip(8) {
+            acc = acc.wrapping_mul(131).wrapping_add(u64::from(b));
         }
         v ^= acc;
     }
@@ -188,15 +213,24 @@ fn hash_dmer(src: &[u8], pos: usize, d: usize, f: u32) -> usize {
 }
 
 fn packed_dmer(src: &[u8], pos: usize, d: usize) -> u64 {
+    // WIN: walk the tail as an ITERATOR instead of indexing `src[pos + i]`.
+    // The note above records that a runtime-length SUBSLICE does not retire
+    // these pads -- it only moves the dynamic bound -- and that is still true.
+    // An iterator is a different construction: it carries no index to prove, so
+    // the bounds checks and their panic pads have nothing to guard. `take` and
+    // `skip` reproduce the old loop ranges exactly:
+    //   `take(d.min(8))`  == `0..d.min(8).min(tail.len())`
+    //   `take(d).skip(8)` == `8..d.min(tail.len())`
+    // and `tail.len() == src.len().saturating_sub(pos)` for every `pos`.
+    let tail = src.get(pos..).unwrap_or(&[]);
     let mut v = 0u64;
-    let n = d.min(8).min(src.len().saturating_sub(pos));
-    for i in 0..n {
-        v |= u64::from(src[pos + i]) << (8 * i);
+    for (i, &b) in tail.iter().take(d.min(8)).enumerate() {
+        v |= u64::from(b) << (8 * i);
     }
     if d > 8 {
         let mut acc = 0u64;
-        for i in 8..d.min(src.len().saturating_sub(pos)) {
-            acc = acc.wrapping_mul(131).wrapping_add(u64::from(src[pos + i]));
+        for &b in tail.iter().take(d).skip(8) {
+            acc = acc.wrapping_mul(131).wrapping_add(u64::from(b));
         }
         v ^= acc;
     }
@@ -340,15 +374,18 @@ where
             break;
         }
     }
-    let mut content = Vec::new();
+    // Same shape as `fallback_content`: an unreserved concat followed by a
+    // second full copy of the tail. The segment lengths are already known.
+    let total: usize = segments.iter().map(alloc::vec::Vec::len).sum();
+    let mut content = Vec::with_capacity(total.min(max_dict).max(total.min(1 << 20)));
     for seg in segments.iter().rev() {
         content.extend_from_slice(seg);
     }
     if content.len() > max_dict {
-        content[content.len() - max_dict..].to_vec()
-    } else {
-        content
+        let drop = content.len() - max_dict;
+        content.drain(..drop);
     }
+    content
 }
 
 fn finalize_dictionary(
@@ -373,7 +410,11 @@ fn finalize_dictionary(
     }
     let cap = max_dict - header_len;
     if content.len() > cap {
-        content = content[content.len() - cap..].to_vec();
+        // Was `content[content.len() - cap..].to_vec()` -- a fresh allocation
+        // and a full copy to discard a prefix. `drain` moves the tail down in
+        // place and keeps the allocation.
+        let drop = content.len() - cap;
+        content.drain(..drop);
     }
     let clen = content.len() as u32;
     let mut reps = harvested.reps;

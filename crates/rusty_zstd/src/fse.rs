@@ -621,21 +621,25 @@ mod ct_pool {
         static DELTA: RefCell<Vec<Vec<FseCDelta>>> = const { RefCell::new(Vec::new()) };
     }
     pub(super) fn take_state(n: usize) -> Vec<u16> {
-        let mut v = STATE
+        let got = STATE
             .try_with(|c| c.try_borrow_mut().ok().and_then(|mut p| p.pop()))
             .ok()
-            .flatten()
-            .unwrap_or_default();
+            .flatten();
+        #[cfg(feature = "profile")]
+        crate::scratch::note_pool(got.is_some());
+        let mut v = got.unwrap_or_default();
         v.clear();
         v.resize(n, 0u16);
         v
     }
     pub(super) fn take_delta(n: usize) -> Vec<FseCDelta> {
-        let mut v = DELTA
+        let got = DELTA
             .try_with(|c| c.try_borrow_mut().ok().and_then(|mut p| p.pop()))
             .ok()
-            .flatten()
-            .unwrap_or_default();
+            .flatten();
+        #[cfg(feature = "profile")]
+        crate::scratch::note_pool(got.is_some());
+        let mut v = got.unwrap_or_default();
         v.clear();
         v.resize(n, FseCDelta { nb: 0, find: 0 });
         v
@@ -1010,17 +1014,17 @@ pub(crate) fn normalize_count(
     let low_threshold = total >> table_log;
     let mut largest = 0usize;
     let mut largest_p: i16 = 0;
-    for s in 0..=max_sv {
-        // SAFETY: `max_sv == count.len() - 1` with `count` non-empty (checked at
-        // entry), and `norm` is built `max_sv + 1` long just above.
-        debug_assert!(s < count.len() && s < norm.len());
-        #[allow(unsafe_code)]
-        let c = *unsafe { count.get_unchecked(s) };
+    // `norm` was just resized to `count.len()`, so zipping the two makes the
+    // iteration bounded by construction: LLVM proves both accesses in range
+    // from one length, which retires the bounds checks on `norm[s]` and lets
+    // the `get_unchecked` that used to be needed for `count[s]` go with them.
+    // Strictly safer than what it replaces, and one fewer `unsafe` island.
+    for (s, (&c, n)) in count.iter().zip(norm.iter_mut()).enumerate() {
         if c == 0 {
             continue;
         }
         if c <= low_threshold {
-            norm[s] = low_prob;
+            *n = low_prob;
             still -= 1;
             continue;
         }
@@ -1039,7 +1043,7 @@ pub(crate) fn normalize_count(
             largest_p = proba;
             largest = s;
         }
-        norm[s] = proba;
+        *n = proba;
         still -= i32::from(proba);
     }
     // SAFETY for the `largest` accesses here and below: `largest` starts at 0
@@ -1054,12 +1058,14 @@ pub(crate) fn normalize_count(
         let mut n2 = crate::scratch::pool_take(&SC_NORM);
         n2.resize(max_sv + 1, 0i16);
         let mut dist = 0i32;
-        for s in 0..=max_sv {
-            if count[s] == 0 {
+        // Same bounded-by-construction zip as the main loop above: `n2` is
+        // resized to `count.len()`, so neither index needs a runtime check.
+        for (&c, w_out) in count.iter().zip(n2.iter_mut()) {
+            if c == 0 {
                 continue;
             }
-            let w = ((u64::from(count[s]) << table_log) / u64::from(total)).max(1) as i16;
-            n2[s] = w;
+            let w = ((u64::from(c) << table_log) / u64::from(total)).max(1) as i16;
+            *w_out = w;
             dist += i32::from(w);
         }
         let leftover = (1i32 << table_log) - dist;
@@ -1072,6 +1078,10 @@ pub(crate) fn normalize_count(
                 *v = 1;
             }
         }
+        // `norm` was taken from the pool at the top and this branch returns
+        // `n2` instead, so without this the buffer is DROPPED and the pool
+        // drains -- which is what held the hit rate at 78%.
+        crate::scratch::pool_give(&SC_NORM, norm);
         return Ok(n2);
     }
     #[allow(unsafe_code)]
@@ -1090,6 +1100,24 @@ pub(crate) fn normalize_count(
 #[cfg(feature = "alloc")]
 pub(crate) fn give_ncount_buf(v: alloc::vec::Vec<u8>) {
     crate::scratch::pool_give(&SC_NCOUNT, v);
+}
+
+/// Take an ncount-sized buffer from the pool.
+///
+/// Exposed so callers that build a one-byte RLE header by hand get a POOLED
+/// buffer instead of a fresh `vec![sym]`. The caller already returns these
+/// through `give_ncount_buf`, so the loop closes without any new plumbing.
+pub(crate) fn take_ncount_buf() -> alloc::vec::Vec<u8> {
+    crate::scratch::pool_take(&SC_NCOUNT)
+}
+
+/// Hand a `normalize_count` result back to the pool.
+///
+/// `ncount_and_ctable` already does this at its own death site; a caller that
+/// uses `normalize_count` DIRECTLY owns the buffer and must close the loop
+/// itself, or the pool drains and every later take allocates.
+pub(crate) fn give_norm_buf(v: alloc::vec::Vec<i16>) {
+    crate::scratch::pool_give(&SC_NORM, v);
 }
 
 pub(crate) fn write_ncount(norm: &[i16], table_log: u8) -> Result<Vec<u8>, Error> {
@@ -1193,10 +1221,12 @@ pub(crate) fn compress_using_ctable(src: &[u8], table: &FseCTable) -> Result<Vec
     // header's FSE bitstream, a variable-shift loop outside every other twin.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     if crate::simd::has_bmi2() {
+        crate::kreach::hit(crate::kreach::K_FSE_CTABLE);
         // SAFETY: runtime CPUID guard; identical body.
         #[allow(unsafe_code)]
         return unsafe { compress_using_ctable_bmi2(src, table) };
     }
+    crate::kreach::miss(crate::kreach::K_FSE_CTABLE);
     compress_using_ctable_inner(src, table)
 }
 
@@ -1378,10 +1408,12 @@ pub(crate) fn decompress_weights_into(
     // both variable-shift bit reads. That is what BMI2 `shrx`/`bzhi` exist for.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     if crate::simd::has_bmi2() {
+        crate::kreach::hit(crate::kreach::K_FSE_WEIGHTS);
         // SAFETY: runtime CPUID guard; identical body via `weights_into_body`.
         #[allow(unsafe_code)]
         return unsafe { weights_into_bmi2(dst, src, cap) };
     }
+    crate::kreach::miss(crate::kreach::K_FSE_WEIGHTS);
     weights_into_inner(dst, src, cap)
 }
 
@@ -1414,6 +1446,14 @@ fn weights_into_inner(dst: &mut [u8], src: &[u8], max_out: usize) -> Result<(usi
 /// re-generate this body under its own feature set.
 #[inline(always)]
 fn weights_into_body(dst: &mut [u8], src: &[u8], max_out: usize) -> Result<(usize, usize), Error> {
+    // Narrow to the caller's cap ONCE, up front. Every write below is then
+    // bounded by ONE length the compiler can see, so the explicit
+    // `n_out >= max_out` guards and the implicit `dst[n_out]` bounds checks
+    // become the same test and merge -- four guard branches instead of eight.
+    // It also turns a would-be PANIC into a clean `Corruption` if a caller ever
+    // passes a buffer shorter than the cap it asked for; both existing callers
+    // pass 255 with a 255-byte buffer, so this is unreachable today.
+    let dst = dst.get_mut(..max_out).ok_or(Error::Corruption)?;
     #[cfg(feature = "std")]
     let recycled = WEIGHT_TBL.with(|c| c.borrow_mut().take());
     #[cfg(not(feature = "std"))]
@@ -1428,7 +1468,7 @@ fn weights_into_body(dst: &mut [u8], src: &[u8], max_out: usize) -> Result<(usiz
     let mut s2 = table.init_state(&mut br);
     let mut n_out = 0usize;
     loop {
-        if n_out >= max_out {
+        if n_out >= dst.len() {
             return Err(Error::Corruption);
         }
         dst[n_out] = table.entry(s1).symbol;
@@ -1436,13 +1476,13 @@ fn weights_into_body(dst: &mut [u8], src: &[u8], max_out: usize) -> Result<(usiz
         s1 = table.update(s1, &mut br)?;
         let _ = br.reload();
         if br.overflowed() {
-            if n_out < max_out {
+            if n_out < dst.len() {
                 dst[n_out] = table.entry(s2).symbol;
                 n_out += 1;
             }
             break;
         }
-        if n_out >= max_out {
+        if n_out >= dst.len() {
             return Err(Error::Corruption);
         }
         dst[n_out] = table.entry(s2).symbol;
@@ -1450,7 +1490,7 @@ fn weights_into_body(dst: &mut [u8], src: &[u8], max_out: usize) -> Result<(usiz
         s2 = table.update(s2, &mut br)?;
         let _ = br.reload();
         if br.overflowed() {
-            if n_out < max_out {
+            if n_out < dst.len() {
                 dst[n_out] = table.entry(s1).symbol;
                 n_out += 1;
             }

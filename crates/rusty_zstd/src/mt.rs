@@ -124,7 +124,15 @@ pub fn compress_mt(
         },
         &mut parts,
     )?;
-    let mut out = Vec::new();
+    // RESERVE the exact total before concatenating. This was `Vec::new()`, so
+    // the buffer grew to the whole compressed stream by doubling -- and a Vec
+    // grown to N by doubling copies ~N bytes in reallocs, meaning an
+    // unreserved concat pays for the compressed output roughly TWICE. The
+    // total is known: the jobs have already finished and their lengths are
+    // right here.
+    let total: usize = parts.iter().map(alloc::vec::Vec::len).sum();
+    crate::copies::add(crate::copies::C_MT_CONCAT, total);
+    let mut out = Vec::with_capacity(total);
     for p in parts {
         out.extend_from_slice(&p);
     }
@@ -179,10 +187,16 @@ where
                     let mut done = Vec::new();
                     loop {
                         let idx = next.fetch_add(1, Ordering::Relaxed);
-                        if idx >= n {
+                        // WIN: `.get` is the SAME test as `idx >= n` -- `n` is a
+                        // copy of `ranges.len()` -- but it also discharges the
+                        // bounds check that followed it. The copy travels into
+                        // this thread closure, and LLVM loses the relation
+                        // between it and the slice's own length across that
+                        // boundary, so the index was tested twice per work item.
+                        let Some(&range) = ranges.get(idx) else {
                             break;
-                        }
-                        done.push((idx, f(idx, ranges[idx])?));
+                        };
+                        done.push((idx, f(idx, range)?));
                     }
                     Ok(done)
                 }));

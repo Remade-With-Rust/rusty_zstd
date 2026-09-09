@@ -411,6 +411,15 @@ fn decode_zstd_frame(
         out.try_reserve(extra)
             .map_err(|_| Error::ContentSizeTooLarge)?;
     }
+    // A frame with NO declared content size got no reserve at all, so `out`
+    // grew to the whole decompressed stream by doubling -- ~1x the output in
+    // realloc copies. Our own streaming compressor omits the size unless the
+    // caller pledges one, so this is the common case for streamed frames, not
+    // a corner. There is nothing to reserve EXACTLY here (the size is what the
+    // header failed to say), so it is extrapolated from the first block's
+    // measured ratio inside the loop below rather than from a guessed
+    // constant. `reserve_from_first_block` is that hook.
+    let mut sized_from_first_block = header.content_size.is_some();
 
     let block_max = header.block_size_max();
     let start_len = out.len();
@@ -471,6 +480,28 @@ fn decode_zstd_frame(
         let _b = crate::prof::scope(crate::prof::Stage::DecodeBlocks);
         loop {
             let bh = parse_block_header(r)?;
+            if !sized_from_first_block {
+                // One block has landed (or is about to); extrapolate the whole
+                // output from what the compressed stream and this block say,
+                // then stop asking. `saturating_*` throughout: these are
+                // attacker-controlled header fields.
+                // Only mark it done once a block has actually landed --
+                // setting the flag on the first iteration (when nothing has
+                // been produced yet) makes the whole thing a permanent no-op.
+                let produced = out.len().saturating_sub(start_len);
+                if produced > 0 {
+                    sized_from_first_block = true;
+                    let ratio = produced.max(1);
+                    let want = ratio
+                        .saturating_mul(r.remaining().saturating_add(1))
+                        .saturating_div(bh.payload_len().max(1) as usize);
+                    let cap = want.min(64 << 20);
+                    if cap > out.capacity().saturating_sub(out.len()) {
+                        crate::copies::add(crate::copies::C_DEC_RESERVE, cap);
+                        let _ = out.try_reserve(cap);
+                    }
+                }
+            }
             match bh.ty {
                 BlockType::Raw => {
                     if bh.size > block_max {

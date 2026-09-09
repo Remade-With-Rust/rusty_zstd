@@ -261,6 +261,13 @@ where
     {
         census::HYBRID_BYTES.fetch_add(n as u64, core::sync::atomic::Ordering::Relaxed);
         census::HYBRID_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // Only a call that actually consumed a tile reached the kernel. A
+        // sub-tile input declines here and is served by the scalar remainder
+        // walk BY DESIGN -- scoring that as a kernel hit would inflate the
+        // share with zero-byte calls.
+        if n > 0 {
+            crate::kreach::hit(crate::kreach::K_XXH_STRIPE);
+        }
     }
     n
 }
@@ -303,6 +310,12 @@ fn stripes_hybrid(input: &[u8], v: &mut [u64; 4]) -> usize {
                 }
             });
         }
+    }
+    // Reached only when NO vector arm exists for this build/CPU (or the bench
+    // knob forced it off). That is a genuine routing miss, unlike the sub-tile
+    // decline above -- but only when there was a whole tile's work to do.
+    if input.len() >= PRE_TILE {
+        crate::kreach::miss(crate::kreach::K_XXH_STRIPE);
     }
     let _ = (input, v);
     0

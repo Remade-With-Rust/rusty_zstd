@@ -604,6 +604,7 @@ pub(crate) fn decode_sequences(
     // D15: gate matches payload -- see the twin. It was `has_avx2() &&
     // has_bmi2()` for a body with zero ymm.
     if seqloop_avx2_on() && crate::simd::has_bmi2() {
+        crate::kreach::hit(crate::kreach::K_DEC_SEQ);
         // SAFETY: guarded by a runtime AVX2 check; the body is identical.
         #[allow(unsafe_code)]
         return unsafe {
@@ -620,6 +621,7 @@ pub(crate) fn decode_sequences(
             )
         };
     }
+    crate::kreach::miss(crate::kreach::K_DEC_SEQ);
     decode_sequences_inner(
         src,
         literals,
@@ -2438,16 +2440,22 @@ fn prefetch_hist(out: &[u8], litlen: u32, offset_value: u32) {
 /// ~36 iterations for LL and ~53 for ML on a typical sequence. This stays as
 /// the correctness reference and as the path for values above the LUT.
 pub(crate) fn code_from_base(val: u32, base: &[u32], bits: &[u8]) -> (u8, u32, u8) {
-    let mut i = base.len() - 1;
-    loop {
-        if val >= base[i] {
-            return (i as u8, val - base[i], bits[i]);
+    // NOT a speed change -- MEASURED at zero, and recorded so nobody re-runs
+    // it expecting one. The hypothesis was that `bits[i]` needed a bounds check
+    // the decrementing index could not discharge (nothing states
+    // `bits.len() >= base.len()`); the emitted asm says LLVM had already proven
+    // it, and the zip form measures **0 instructions and 0 guard branches**
+    // either way.
+    //
+    // Kept purely because it is safer and shorter: the old `base.len() - 1`
+    // underflowed to `usize::MAX` on an empty `base`, and this cannot. Same
+    // top-down scan order, same first-match-wins, same `(0, val, 0)` fall-off.
+    for (i, (&b, &nb)) in base.iter().zip(bits).enumerate().rev() {
+        if val >= b {
+            return (i as u8, val - b, nb);
         }
-        if i == 0 {
-            return (0, val, 0);
-        }
-        i -= 1;
     }
+    (0, val, 0)
 }
 
 /// Direct value-to-code lookup covering the common range (C keeps `LL_Code[64]`

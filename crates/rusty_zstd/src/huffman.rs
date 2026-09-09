@@ -340,10 +340,12 @@ impl HuffmanTable {
         // off. With the arm gone that hazard goes with it.
         #[cfg(all(target_arch = "x86_64", feature = "std"))]
         if crate::simd::has_bmi2() {
+            crate::kreach::hit(crate::kreach::K_HUF_DEC4X);
             // SAFETY: guarded by runtime CPUID; the body is identical.
             #[allow(unsafe_code)]
             return unsafe { self.decode_4x_bmi2(s0, s1, s2, s3, d0, d1, d2, d3) };
         }
+        crate::kreach::miss(crate::kreach::K_HUF_DEC4X);
         self.decode_4x_inner::<false>(s0, s1, s2, s3, d0, d1, d2, d3)
     }
 
@@ -410,12 +412,14 @@ impl HuffmanTable {
             X4_X1_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             #[cfg(all(target_arch = "x86_64", feature = "std"))]
             if BMI2 {
+                crate::kreach::hit(crate::kreach::K_HUF_DEC4X1);
                 // SAFETY: `BMI2 == true` is reached only from `decode_4x_bmi2`,
                 // which is itself entered under the `has_bmi2()` CPUID guard and
                 // carries the same `#[target_feature]` set.
                 #[allow(unsafe_code)]
                 return unsafe { self.decode_4x_x1_bmi2(s0, s1, s2, s3, d0, d1, d2, d3) };
             }
+            crate::kreach::miss(crate::kreach::K_HUF_DEC4X1);
             return self.decode_4x_x1(s0, s1, s2, s3, d0, d1, d2, d3);
         }
         // N2: the 4-stream X2 use. Instrumenting only the 1-stream site read
@@ -1474,12 +1478,15 @@ impl HuffCTable {
         if crate::encode::huff_fast_enabled() {
             #[cfg(all(target_arch = "x86_64", feature = "std"))]
             if crate::simd::has_bmi2() {
+                crate::kreach::hit(crate::kreach::K_HUF_ENC);
                 // SAFETY: guarded by runtime CPUID; the body is identical.
                 #[allow(unsafe_code)]
                 return unsafe { self.encode_stream_unrolled_bmi2_into(src, buf) };
             }
+            crate::kreach::miss(crate::kreach::K_HUF_ENC);
             self.encode_stream_unrolled_into(src, buf)
         } else {
+            crate::kreach::miss(crate::kreach::K_HUF_ENC);
             self.encode_stream_scalar_into(src, buf)
         }
     }
@@ -1909,27 +1916,33 @@ fn huffman_nbits(freq: &[u32; 256]) -> Result<[u8; 256], Error> {
         internal: &[usize],
         ii: &mut usize,
     ) -> Option<usize> {
-        let lc = leaves.get(*li).and_then(|&i| nodes.get(i)).map(|n| n.count);
+        // WIN: carry the node index OUT of the `get`, instead of re-indexing.
+        // Each arm below used to do `leaves[*li]` / `internal[*ii]` after the
+        // `.get()` above had already proven that exact index valid and fetched
+        // it -- so the same element was located twice and the second lookup
+        // paid a bounds check the first had already discharged. Threading the
+        // index through the `Option` removes both checks and their panic pads.
+        // Byte-identical by construction: same values, same tie rule, same
+        // order -- and the tie rule is what the bitstream depends on.
+        let lc = leaves
+            .get(*li)
+            .and_then(|&i| nodes.get(i).map(|n| (n.count, i)));
         let ic = internal
             .get(*ii)
-            .and_then(|&i| nodes.get(i))
-            .map(|n| n.count);
+            .and_then(|&i| nodes.get(i).map(|n| (n.count, i)));
         match (lc, ic) {
             // `<=`: the leaf wins a tie. See the tie-rule note above.
-            (Some(l), Some(x)) if l <= x => {
-                let r = leaves[*li];
+            (Some((l, leaf)), Some((x, _))) if l <= x => {
                 *li += 1;
-                Some(r)
+                Some(leaf)
             }
-            (Some(_), Some(_)) | (None, Some(_)) => {
-                let r = internal[*ii];
+            (Some(_), Some((_, node))) | (None, Some((_, node))) => {
                 *ii += 1;
-                Some(r)
+                Some(node)
             }
-            (Some(_), None) => {
-                let r = leaves[*li];
+            (Some((_, leaf)), None) => {
                 *li += 1;
-                Some(r)
+                Some(leaf)
             }
             (None, None) => None,
         }
@@ -2392,6 +2405,11 @@ fn write_tree_fse(weights: &[u8]) -> Result<Vec<u8>, Error> {
     let norm = fse::normalize_count(&count[..=max_sv], table_log, total, false)?;
     let ncount = fse::write_ncount(&norm, table_log)?;
     let ct = fse::FseCTable::from_norm(&norm, table_log)?;
+    // `normalize_count` hands out a POOLED buffer. `ncount_and_ctable` closes
+    // that loop at its own death site; this caller uses `normalize_count`
+    // directly, so it has to. Without it every call here drained the pool by
+    // one and the next take allocated.
+    fse::give_norm_buf(norm);
     let payload = fse::compress_using_ctable(weights, &ct)?;
     let csize = ncount.len() + payload.len();
     if csize == 0 || csize >= 128 {
@@ -2401,6 +2419,12 @@ fn write_tree_fse(weights: &[u8]) -> Result<Vec<u8>, Error> {
     out.push(csize as u8);
     out.extend_from_slice(&ncount);
     out.extend_from_slice(&payload);
+    // Both of these are POOLED buffers that die here, and neither loop was
+    // closed: `write_ncount` takes from `SC_NCOUNT` and
+    // `compress_using_ctable` allocates its payload. Same defect as the `norm`
+    // buffer above -- a caller that uses the low-level builders directly owns
+    // the give-back that `ncount_and_ctable` performs for its own callers.
+    fse::give_ncount_buf(ncount);
     Ok(out)
 }
 
@@ -2480,6 +2504,20 @@ fn write_lit_huff_header_into(
     let mut h = outbuf;
     h.clear();
     let mut b = [0u8; 5];
+    let n = lit_huff_header_bytes(lit_type, n_streams, regen, csize, &mut b)?;
+    h.extend_from_slice(&b[..n]);
+    Ok(h)
+}
+
+/// The header bytes themselves, shared by the `Vec` and append forms so the
+/// format arithmetic cannot drift between them.
+fn lit_huff_header_bytes(
+    lit_type: u8,
+    n_streams: u32,
+    regen: u32,
+    csize: u32,
+    b: &mut [u8; 5],
+) -> Result<usize, Error> {
     let n: usize = if n_streams == 1 {
         if regen > 0x3FF || csize > 0x3FF {
             return Err(Error::Corruption);
@@ -2507,8 +2545,7 @@ fn write_lit_huff_header_into(
     } else {
         return Err(Error::Corruption);
     };
-    h.extend_from_slice(&b[..n]);
-    Ok(h)
+    Ok(n)
 }
 
 #[cfg(feature = "alloc")]
@@ -2702,6 +2739,31 @@ fn pack_huff_section(
     pack_huff_section_into(lit_type, n_streams, regen, tree, body, Vec::new())
 }
 
+/// Append the packed section to `dst` and return its byte length.
+///
+/// The header needs `csize`, and `csize` is `tree.len() + body.len()` -- both
+/// known here, because the body has already been encoded. So there is nothing
+/// circular about writing this straight into the frame; the only reason the
+/// `_into` twin below stages into its own buffer is that CANDIDATES compete on
+/// size and a loser has to be discardable. The caller resolves that by
+/// appending the candidate that usually wins and truncating on the rare loss.
+fn pack_huff_section_append(
+    dst: &mut Vec<u8>,
+    lit_type: u8,
+    n_streams: u32,
+    regen: u32,
+    tree: &[u8],
+    body: &[u8],
+) -> Result<usize, Error> {
+    let csize = (tree.len() + body.len()) as u32;
+    let mut h = [0u8; 5];
+    let hn = lit_huff_header_bytes(lit_type, n_streams, regen, csize, &mut h)?;
+    dst.extend_from_slice(&h[..hn]);
+    dst.extend_from_slice(tree);
+    dst.extend_from_slice(body);
+    Ok(hn + tree.len() + body.len())
+}
+
 fn pack_huff_section_into(
     lit_type: u8,
     n_streams: u32,
@@ -2831,17 +2893,26 @@ pub(crate) fn lit_sample_peak(lits: &[u8]) -> u32 {
 /// should be remembered for later treeless blocks.
 #[cfg(feature = "alloc")]
 #[inline(always)]
-pub(crate) fn encode_literals_section(
+/// Append the literals section for `lits` to `dst`.
+///
+/// Takes `dst` rather than returning a `Vec` so the four decided-immediately
+/// arms (empty, RLE, tiny, not-worth-Huffman) can write their bytes ONCE. Only
+/// the Huffman arm needs a staging buffer, because its candidates compete on
+/// encoded size and the winner is not known until they are all built.
+pub(crate) fn encode_literals_section_into(
+    dst: &mut Vec<u8>,
     lits: &[u8],
     prev: Option<&HuffCTable>,
-) -> Result<(Vec<u8>, HuffUpdate), Error> {
+) -> Result<HuffUpdate, Error> {
     let n = lits.len() as u32;
     if n == 0 {
-        return Ok((vec![0], HuffUpdate::Unchanged));
+        dst.push(0);
+        return Ok(HuffUpdate::Unchanged);
     }
     let all_same = n >= 2 && lits.iter().all(|&b| b == lits[0]);
     if all_same {
-        return Ok((write_raw_or_rle(lits, true), HuffUpdate::Unchanged));
+        write_raw_or_rle_into(dst, lits, true);
+        return Ok(HuffUpdate::Unchanged);
     }
     // BRICK 60: do NOT materialize the raw section just to hold a baseline
     // LENGTH. It is a full copy of every literal byte, and on Huffman-friendly
@@ -2849,10 +2920,12 @@ pub(crate) fn encode_literals_section(
     // away every time. Its size is exact arithmetic -- `hdr + n` -- so carry the
     // NUMBER and build the bytes only if raw actually wins.
     if n < 8 {
-        return Ok((write_raw_or_rle(lits, false), HuffUpdate::Unchanged));
+        write_raw_or_rle_into(dst, lits, false);
+        return Ok(HuffUpdate::Unchanged);
     }
     if n >= 64 && !literals_worth_huffman(lits) {
-        return Ok((write_raw_or_rle(lits, false), HuffUpdate::Unchanged));
+        write_raw_or_rle_into(dst, lits, false);
+        return Ok(HuffUpdate::Unchanged);
     }
 
     crate::prof::note_lit_try(0);
@@ -2965,42 +3038,59 @@ pub(crate) fn encode_literals_section(
 
     // ALLOC-15: `new_tbl`'s tree is consumed by `try_huff_section` (which copies
     // it into the section) and then dropped -- give it back on the way out.
+    // The new table is Huffman-OPTIMAL for these frequencies, so `body_new <=
+    // body_prev` always and this candidate is the one that usually wins. Append
+    // it STRAIGHT INTO `dst` and truncate on the rare loss, instead of packing
+    // every candidate into a staging buffer and copying the winner out.
+    let mark = dst.len();
+    let mut in_dst = 0usize;
     if let Some((ct, tree)) = new_tbl {
         {
             crate::prof::note_lit_try(3);
-            if let Some(sec) = try_huff_section(2, preferred, n, &tree, &ct, lits) {
-                if sec.len() < best_len {
+            let appended =
+                try_huff_section_append(dst, 2, preferred, n, &tree, &ct, lits).or_else(|| {
+                    if preferred == 4 {
+                        dst.truncate(mark);
+                        try_huff_section_append(dst, 2, 1, n, &tree, &ct, lits)
+                    } else {
+                        None
+                    }
+                });
+            match appended {
+                Some(len) if len < best_len => {
                     crate::prof::note_lit_try(4);
-                    if let Some(old) = best.replace(sec) {
+                    // `best_len` is not updated: this is the LAST candidate, so
+                    // nothing compares against it again, and the emitted length
+                    // travels in `in_dst`.
+                    in_dst = len;
+                    if let Some(old) = best.take() {
                         sec_pool_give(old);
                     }
-                    // ALLOC-11: MOVE, don't clone. The `else if` below is the
-                    // only other user and the two arms are exclusive, so the
-                    // borrow checker accepts the move -- the clone was copying
-                    // a 12 KiB table (4 KiB x1 + 8 KiB x2) for nothing.
+                    // ALLOC-11: MOVE, don't clone -- the clone was copying a
+                    // 12 KiB table for nothing.
                     update = HuffUpdate::New(ct);
                 }
-            } else if preferred == 4 {
-                if let Some(sec) = try_huff_section(2, 1, n, &tree, &ct, lits) {
-                    if sec.len() < best_len {
-                        if let Some(old) = best.replace(sec) {
-                            sec_pool_give(old);
-                        }
-                        update = HuffUpdate::New(ct);
-                    }
-                }
+                // Lost (or failed): rewind, leaving whatever `best` holds.
+                _ => dst.truncate(mark),
             }
         }
         give_tree_buf(tree);
     }
 
-    // Raw only gets built if nothing beat it.
-    let best = match best {
-        Some(sec) => sec,
-        None => {
-            crate::prof::note_lit_try(5);
-            write_raw_or_rle(lits, false)
+    // Raw only gets built if nothing beat it -- and now it is never BUILT at
+    // all, it is written straight out.
+    let Some(best) = best else {
+        if in_dst > 0 {
+            // The winner is already in `dst`; nothing to copy and nothing to
+            // pool. This is the zero-copy path.
+            crate::prof::note_lit_margin(raw_len, in_dst);
+            return Ok(update);
         }
+        crate::prof::note_lit_try(5);
+        let raw_bytes = raw_section_len(n);
+        write_raw_or_rle_into(dst, lits, false);
+        crate::prof::note_lit_margin(raw_len, raw_bytes);
+        return Ok(update);
     };
     // PROMETHEUS margin tap. Measured against `best.len()`, the section ACTUALLY
     // emitted -- NOT against `best_len`, which the new-table branch above leaves
@@ -3008,10 +3098,55 @@ pub(crate) fn encode_literals_section(
     // comparison). Tapping `best_len` reported a perfect hole across four
     // buckets, which is what a stale variable looks like, not a distribution.
     crate::prof::note_lit_margin(raw_len, best.len());
-    Ok((best, update))
+    // The previous-table candidate won, so it is in a staging buffer and still
+    // has to be copied. When the NEW-table candidate wins -- the common case --
+    // this is skipped entirely because it is already in `dst`.
+    crate::copies::add(crate::copies::C_SECTION_TO_DST, best.len());
+    dst.extend_from_slice(&best);
+    sec_pool_give(best);
+    Ok(update)
+}
+
+/// Allocating wrapper. Tests assert on the section bytes; production uses the
+/// `_into` form so the bytes are written once.
+#[cfg(test)]
+pub(crate) fn encode_literals_section(
+    lits: &[u8],
+    prev: Option<&HuffCTable>,
+) -> Result<(Vec<u8>, HuffUpdate), Error> {
+    let mut v = Vec::new();
+    let u = encode_literals_section_into(&mut v, lits, prev)?;
+    Ok((v, u))
 }
 
 #[cfg(feature = "alloc")]
+/// `try_huff_section`, appending onto `dst` instead of returning a `Vec`.
+///
+/// Returns the number of bytes appended, or `None` (having appended nothing) if
+/// the encode failed. The body still needs its own buffer -- it is what the
+/// header's `csize` is measured from -- but the SECTION no longer does, which
+/// is the copy this removes.
+fn try_huff_section_append(
+    dst: &mut Vec<u8>,
+    lit_type: u8,
+    n_streams: u32,
+    regen: u32,
+    tree: &[u8],
+    ct: &HuffCTable,
+    lits: &[u8],
+) -> Option<usize> {
+    let buf = body_pool_take();
+    let body = if n_streams == 1 {
+        ct.encode_stream_into(lits, buf).ok()?
+    } else {
+        encode_4_streams_into(ct, lits, buf).ok()?
+    };
+    crate::copies::add(crate::copies::C_HUFF_EMIT, body.len());
+    let r = pack_huff_section_append(dst, lit_type, n_streams, regen, tree, &body).ok();
+    body_pool_give(body);
+    r
+}
+
 fn try_huff_section(
     lit_type: u8,
     n_streams: u32,
@@ -3032,6 +3167,11 @@ fn try_huff_section(
     } else {
         encode_4_streams_into(ct, lits, buf).ok()?
     };
+    // Census: every CANDIDATE built, and the body bytes `pack_huff_section_into`
+    // copies into it. Compared against sections emitted, this says whether the
+    // winner could have been written straight into `dst` -- a ratio near 1 means
+    // the staging buffer usually serves a single uncontested candidate.
+    crate::copies::add(crate::copies::C_HUFF_EMIT, body.len());
     let sec = pack_huff_section_into(lit_type, n_streams, regen, tree, &body, sec_pool_take()).ok();
     body_pool_give(body);
     sec
@@ -3203,7 +3343,24 @@ fn raw_section_len(n: u32) -> usize {
     hdr + n as usize
 }
 
-fn write_raw_or_rle(lits: &[u8], rle: bool) -> Vec<u8> {
+/// Append the raw/RLE literals section straight to `dst`.
+///
+/// COPY ELIMINATION: the `Vec`-returning twin below built the section into a
+/// fresh allocation which the caller then copied into `dst` and dropped -- so
+/// every raw literal byte was moved TWICE after already being staged out of
+/// `src`, three touches for a byte the format says to store verbatim. Writing
+/// through `dst` removes the allocation and one full traversal of the literals.
+fn write_raw_or_rle_into(dst: &mut Vec<u8>, lits: &[u8], rle: bool) {
+    let (hdr, hn, body) = raw_or_rle_parts(lits, rle);
+    crate::copies::add(crate::copies::C_SECTION_TO_DST, hn + body.len());
+    dst.extend_from_slice(&hdr[..hn]);
+    dst.extend_from_slice(body);
+}
+
+/// The header bytes and payload slice, shared by both forms so they cannot
+/// drift -- this is a format-visible layout.
+#[inline]
+fn raw_or_rle_parts(lits: &[u8], rle: bool) -> ([u8; 3], usize, &[u8]) {
     // C12: eight `Vec` plumbing sites became two. The header is at most three
     // bytes across three size classes, and each `push` inlined its own
     // capacity test and grow path -- the same shape as C5, C7 and C11. Staging
@@ -3235,10 +3392,7 @@ fn write_raw_or_rle(lits: &[u8], rle: bool) -> Vec<u8> {
     } else {
         lits
     };
-    let mut dst = Vec::with_capacity(hn + body.len());
-    dst.extend_from_slice(&hdr[..hn]);
-    dst.extend_from_slice(body);
-    dst
+    (hdr, hn, body)
 }
 
 #[cfg(all(test, feature = "alloc"))]
