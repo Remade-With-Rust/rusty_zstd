@@ -46,7 +46,8 @@ mod imp {
     // This module is FFI by definition: the whole point is to reach a
     // clock the standard library does not expose.
     #![allow(unsafe_code)]
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::census64::AtomicU64;
+    use core::sync::atomic::Ordering;
 
     #[link(name = "kernel32")]
     extern "system" {

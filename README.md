@@ -347,8 +347,13 @@ implementation cannot leak into the dependency graph.
 - **Byte-identity where it is owed.** The XXH64 checksum is gated against the
   published XXH64 vectors and a GOLD oracle; every SIMD kernel is gated against
   its scalar twin; the Huffman and FSE table decoders are gated against C's.
-- **`no_std + alloc` and `wasm32-unknown-unknown` build in CI**, so the portable
-  configuration cannot rot.
+- **`no_std + alloc`, `wasm32-unknown-unknown` and two bare-metal targets build
+  in CI**, so the portable configuration cannot rot. The bare-metal rungs are
+  Cortex-M4F and RV32IMAC, neither of which has 64-bit atomics: a `no-std`
+  category is not a claim, a target that compiles is. Note that the measurement
+  counters need `AtomicU64`, so on a part without it they compile to a
+  zero-sized stub and `census64::CENSUS_LIVE` reads `false` -- a zero from a
+  counter there means "not measurable on this target", never "measured zero".
 
 Fetch the oracle with `pwsh scripts/fetch-oracle.ps1`, or point
 `RUSTY_ZSTD_ORACLE` at any `zstd` binary whose `--version` says 1.5.7. Details:
@@ -363,6 +368,8 @@ Fetch the oracle with `pwsh scripts/fetch-oracle.ps1`, or point
 | macOS (x86-64 / aarch64) | ✅ builds + tests |
 | `wasm32-unknown-unknown` | ✅ builds (`std` and `alloc`) |
 | `no_std + alloc` | ✅ builds |
+| `thumbv7em-none-eabihf` (Cortex-M4F) | ✅ builds (`no_std + alloc`) |
+| `riscv32imac-unknown-none-elf` | ✅ builds (`no_std + alloc`) |
 
 AVX2 and NEON kernels are selected at **runtime**. On a CPU without them, the
 scalar twins run and the output is identical.

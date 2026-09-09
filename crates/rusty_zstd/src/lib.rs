@@ -101,7 +101,7 @@ pub(crate) fn env_knob_is1(name: &str) -> bool {
 
 /// Count of `env_knob` reads -- see the note there.
 #[cfg(feature = "profile")]
-pub static ENV_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static ENV_READS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear the env-read counter.
 #[cfg(feature = "profile")]
@@ -119,6 +119,10 @@ pub(crate) fn env_knob(_name: &str) -> Result<alloc::string::String, ()> {
 
 mod bit;
 mod block;
+/// The census counters' 64-bit atomic, and the zero-sized stub it becomes
+/// on a part without 64-bit atomics. See the module docs: a zero read there
+/// means "not measurable on this target", never "measured zero".
+pub mod census64;
 mod compressed;
 /// Copy census: how many times does the encoder move each input byte?
 pub mod copies;

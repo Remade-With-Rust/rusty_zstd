@@ -180,8 +180,9 @@ fn eqlen_arm() -> u8 {
 /// benches compress single-threaded, so the receipt is exact for them.
 #[cfg(feature = "profile")]
 mod counters {
+    use crate::census64::AtomicU64;
     use core::cell::Cell;
-    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use core::sync::atomic::Ordering::Relaxed;
 
     pub(super) static G_CALLS: AtomicU64 = AtomicU64::new(0);
     pub(super) static G_WIDE: AtomicU64 = AtomicU64::new(0);

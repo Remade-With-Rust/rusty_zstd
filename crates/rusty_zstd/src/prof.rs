@@ -183,9 +183,10 @@ pub struct EncodeCounts {
 #[cfg(feature = "profile")]
 mod on {
     use super::{BlockTap, EncodeCounts, Stage, NAMES, N_STAGES};
+    use crate::census64::AtomicU64;
     use crate::profclock as cpuclock;
     use core::cell::RefCell;
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use core::sync::atomic::Ordering;
 
     thread_local! {
         static BLOCK_TAPS: RefCell<alloc::vec::Vec<BlockTap>> = const { RefCell::new(alloc::vec::Vec::new()) };

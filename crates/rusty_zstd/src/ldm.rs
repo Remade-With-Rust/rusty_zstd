@@ -257,9 +257,9 @@ fn ldm_hash(src: &[u8], ip: usize, hash_log: u32) -> usize {
 /// population the old `memcmp` ran on) and those the 8-byte head let through
 /// to `count_eq`.
 #[cfg(feature = "profile")]
-pub static LDM_CANDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LDM_CANDS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static LDM_COUNTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LDM_COUNTS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// `(candidates, counted)` since the last call.
 #[cfg(feature = "profile")]

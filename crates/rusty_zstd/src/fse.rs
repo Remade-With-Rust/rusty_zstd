@@ -35,10 +35,10 @@ pub(crate) struct FseView<'a> {
 /// applies only when `high_threshold == table_size - 1`. This counts how often
 /// that is true, before anything is built.
 #[cfg(feature = "profile")]
-pub static D6_SPREAD: [core::sync::atomic::AtomicU64; 3] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static D6_SPREAD: [crate::census64::AtomicU64; 3] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 /// Read and clear the D6 probe.
 #[cfg(feature = "profile")]

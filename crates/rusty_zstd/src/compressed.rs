@@ -15,44 +15,44 @@ use crate::reader::Reader;
 /// Only >=32-byte ops can benefit from AVX2 -- a 16-byte copy is already one
 /// `movups`.
 #[cfg(feature = "profile")]
-pub static DEC_LIT32: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DEC_LIT32: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static DEC_MATCH32: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DEC_MATCH32: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static DEC_LIT16: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DEC_LIT16: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Literal copies served by the 64-byte tier (BRICK 80's missing third rung).
 #[cfg(feature = "profile")]
-pub static DEC_LIT64: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DEC_LIT64: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static DEC_MATCH16: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DEC_MATCH16: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// T4 band census for `copy_match`: which route does each match actually take?
 /// 0 = offset 1 splat, 1 = 32-byte tier, 2 = 16-byte tier,
 /// 3 = extend_from_within (offset >= len, runtime-length memcpy CALL),
 /// 4 = overlapping loop (offset < len).
 #[cfg(feature = "profile")]
-pub static DEC_BAND: [core::sync::atomic::AtomicU64; 8] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static DEC_BAND: [crate::census64::AtomicU64; 8] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 
 /// Bytes moved by each route, so a rare-but-long band cannot hide.
 #[cfg(feature = "profile")]
-pub static DEC_BAND_B: [core::sync::atomic::AtomicU64; 8] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static DEC_BAND_B: [crate::census64::AtomicU64; 8] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 
 /// Length histogram for the UN-TIERED bands (3 = `extend_from_within`,
@@ -61,8 +61,8 @@ pub static DEC_BAND_B: [core::sync::atomic::AtomicU64; 8] = [
 /// the high half -- a band's mean hides its distribution, and the tier width has
 /// to be chosen from the distribution.
 #[cfg(feature = "profile")]
-pub static DEC_UNTIERED: [core::sync::atomic::AtomicU64; 16] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 16];
+pub static DEC_UNTIERED: [crate::census64::AtomicU64; 16] =
+    [const { crate::census64::AtomicU64::new(0) }; 16];
 
 #[cfg(feature = "profile")]
 pub fn take_dec_untiered() -> [u64; 16] {
@@ -2109,8 +2109,8 @@ static MATCHCOPY_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU
 /// as out-of-range. Deterministic -- this is what SIZES D9, because a prefetch
 /// only helps the sequences it is actually issued for.
 #[cfg(feature = "pfcensus")]
-pub static PF_CENSUS: [core::sync::atomic::AtomicU64; 3] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+pub static PF_CENSUS: [crate::census64::AtomicU64; 3] =
+    [const { crate::census64::AtomicU64::new(0) }; 3];
 /// Read and clear `(issued, skipped_rep, skipped_oob)`.
 #[cfg(feature = "pfcensus")]
 pub fn take_pf_census() -> (u64, u64, u64) {
@@ -2721,7 +2721,7 @@ fn copy_match_nodict(
 /// Each is a full `from_norm` -- heap alloc + serial spread + finalize -- for a
 /// value fixed by RFC 8878 and identical for the life of the process.
 #[cfg(feature = "profile")]
-pub static N21_PREDEF: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static N21_PREDEF: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Read and clear the N21 probe.
 #[cfg(feature = "profile")]
 pub fn take_n21_predef() -> u64 {
@@ -2731,7 +2731,7 @@ pub fn take_n21_predef() -> u64 {
 /// D3 probe: `extend_from_within` calls made by the overlapping (band 4) loop.
 /// D3 assumes "a memcpy call per period"; this counts what actually happens.
 #[cfg(feature = "profile")]
-pub static D3_ITERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static D3_ITERS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Read and clear the D3 probe.
 #[cfg(feature = "profile")]
 pub fn take_d3_iters() -> u64 {
@@ -2741,10 +2741,10 @@ pub fn take_d3_iters() -> u64 {
 /// D4 coverage census: `[frame_only, dict_only, dict_CROSSING]` calls.
 /// A brick on the crossing path is unverified until index 2 is non-zero.
 #[cfg(feature = "profile")]
-pub static D4_PATHS: [core::sync::atomic::AtomicU64; 3] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static D4_PATHS: [crate::census64::AtomicU64; 3] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 /// Read and clear the D4 coverage census.
 #[cfg(feature = "profile")]

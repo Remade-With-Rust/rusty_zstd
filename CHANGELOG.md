@@ -6,6 +6,51 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Fixed -- the census counters cost the crate BARE METAL; they no longer do
+
+`cargo check -p rusty_zstd --no-default-features --features alloc` failed with
+**204 errors** on `thumbv7em-none-eabihf` (Cortex-M4F) and the same on
+`riscv32imac-unknown-none-elf`. Every one of them was
+`cannot find AtomicU64 in atomic`, and every one was an INSTRUMENT: reload
+counts, decode band histograms, kernel reach, walk exits, copy bytes. Not one
+was a line of codec. Neither part has 64-bit atomics.
+
+This was found by `rusty_RTOS`'s house gate, which consumes the crate for
+on-chip OTA payloads and trace capture, and it is the reason its plan says a
+`no-std` category on the registry is not a claim: **the target that compiles is
+the claim.** The plan estimated eight statics from a capped rustc report; the
+real count is 427 fully-qualified uses plus six imports across sixteen files.
+
+`census64` is now the one seam. On every target that HAS 64-bit atomics it is
+`pub use core::sync::atomic::AtomicU64` -- the same type, not a wrapper -- so
+the public statics keep their published type and the emitted code is unchanged.
+**Proved, not asserted:** the board over every shipping kernel, fill and finder
+is identical to the pre-change assembly in all thirty-two columns, and the
+identity gates still read GOLD `2F6594F7EEDBD12B` / 59,680,638 and LDM
+`57BE83EA4E1199E8` / 57,796,847.
+
+On a part without them it is a zero-sized stub: the statics leave BSS entirely
+and every `fetch_add` folds away.
+
+**Why a stub rather than `portable-atomic`.** That crate would keep the census
+READABLE there, and it is the other honest answer. But on a core with no 64-bit
+atomic instruction it needs a critical-section implementation, and a library
+that turns that feature on conscripts every downstream firmware's interrupt
+policy so a diagnostic counter can increment. The seam is one type wide, so a
+firmware that does want the count can supply `portable_atomic::AtomicU64`.
+
+**A zero there means "not measurable on this target", never "measured zero"**,
+which is the same trap this crate's own rules warn about -- so it is published,
+not buried: `census64::CENSUS_LIVE` is `false` on such a build. The reverse
+mistake would be far worse (a stub selected on a HOSTED target would make every
+count-based verdict fiction while every gate still passed), so it is gated two
+ways: a compile-time size check, and a unit test that asserts on BEHAVIOUR
+rather than on the constant -- it counts to 42 and reads it back.
+
+CI gains the rung, in the job that already guards the portable configurations:
+`--target thumbv7em-none-eabihf` and `--target riscv32imac-unknown-none-elf`,
+both `--no-default-features --features alloc`, on every push.
+
 ### Measured -- what the encode campaign bought: 1.08-1.27x at L3-L12 (2026-09-09)
 
 Every verdict in the sections below is an INSTRUCTION COUNT, because this box

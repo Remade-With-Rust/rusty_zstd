@@ -16,12 +16,12 @@ pub(crate) struct BitRev<'a> {
 
 /// Executed `BitRev::reload` calls. See the note inside `reload`.
 #[cfg(feature = "profile")]
-pub static RELOAD_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static RELOAD_CALLS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Executed refills -- reloads that reached the container load rather than
 /// taking one of the four early-outs. See the note inside `reload`.
 #[cfg(feature = "profile")]
-pub static RELOAD_REFILLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static RELOAD_REFILLS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear the refill counter.
 #[cfg(feature = "profile")]

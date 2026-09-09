@@ -50,10 +50,10 @@ pub(crate) const ROW: usize = 16;
 /// models are evaluated from the SAME mask in one run, so the comparison needs
 /// no A/B build and carries no clock.
 #[cfg(feature = "profile")]
-pub static ROW_WALK: [core::sync::atomic::AtomicU64; 3] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static ROW_WALK: [crate::census64::AtomicU64; 3] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 /// Read and clear the row-walk census.
 #[cfg(feature = "profile")]

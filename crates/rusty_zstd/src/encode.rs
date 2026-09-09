@@ -1850,19 +1850,19 @@ pub fn set_prime_stride_arm(n: usize) {
 /// Deterministic work counter for the priming loop: positions inserted.
 /// Accumulated LOCALLY and published once per call -- an atomic inside the loop
 /// is the bricks 49/64/77 defect this campaign keeps finding.
-pub static PRIME_ITERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PRIME_ITERS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// E4 ceiling probe: `[calls, positions hashed]` in the post-match fill helpers.
 /// E4 proposes batching these into a vector tile; a tile needs positions.
 /// N9 probe: rebuilds of the RFC-constant default FSE ctable in `select_seq_table`.
-pub static N9_BASIC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static N9_BASIC: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// ALLOC-8 probe: `[speculative EntropyState saves, saves actually ROLLED BACK]`.
 /// The save clones 3 FSE tables + a Huffman table per block; if the rollback
 /// almost never fires, the clone is almost pure waste.
-pub static ENT_SAVE: [core::sync::atomic::AtomicU64; 2] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static ENT_SAVE: [crate::census64::AtomicU64; 2] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 /// Read and clear the ALLOC-8 probe.
 pub fn take_ent_save() -> [u64; 2] {
@@ -2203,10 +2203,10 @@ fn adaptive_block_max(
     base
 }
 
-pub static G5_RPREV: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static G5_RPREV_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static G5_DRIFTSUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static G5_DRIFT_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static G5_RPREV: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static G5_RPREV_N: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static G5_DRIFTSUM: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static G5_DRIFT_N: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// GATE 5 inputs, as block means: `(mean r_prev, mean drift)`.
 pub fn take_g5_inputs() -> (f64, f64) {
@@ -2221,9 +2221,9 @@ pub fn take_g5_inputs() -> (f64, f64) {
     )
 }
 
-pub static G5_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static G5_HIT_RATIO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static G5_HIT_DRIFT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static G5_CALLS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static G5_HIT_RATIO: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static G5_HIT_DRIFT: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// GATE 5 coverage: `(calls, raw-escape fires, drift fires)`.
 pub fn take_g5() -> (u64, u64, u64) {
@@ -3303,10 +3303,10 @@ fn raw_probe_period() -> u32 {
 /// 1 = `early_raw_skip` (needs Fast + tlen 1..7)
 /// 2 = payload did not beat `raw_limit`
 #[cfg(feature = "profile")]
-pub static RAW_EXIT: [core::sync::atomic::AtomicU64; 3] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static RAW_EXIT: [crate::census64::AtomicU64; 3] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 
 /// Read and clear the three raw-exit counts.
@@ -3322,15 +3322,15 @@ pub fn take_raw_exits() -> [u64; 3] {
 
 /// GATE 16 study: how far past `raw_limit` did blocks that went RAW land?
 #[cfg(feature = "profile")]
-pub static RAW_MARGIN_SUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static RAW_MARGIN_SUM: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static RAW_MARGIN_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static RAW_MARGIN_N: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static RAW_MARGIN_HIST: [core::sync::atomic::AtomicU64; 4] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static RAW_MARGIN_HIST: [crate::census64::AtomicU64; 4] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 
 /// Read and clear `(sum_permille, n, [<=1.01, <=1.05, <=1.20, >1.20])`.
@@ -6405,9 +6405,9 @@ fn bt_fill_stride() -> usize {
     1
 }
 
-pub static LF_FILLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static LF_NONEMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static LF_INSERTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LF_FILLS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static LF_NONEMPTY: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static LF_INSERTS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// `(fill_sites_reached, sites_with_at_least_one_insert, total_inserts)`
 pub fn take_lazy_fill() -> (u64, u64, u64) {
@@ -6489,19 +6489,19 @@ fn row_fill_stride() -> usize {
 
 /// Set the lazy back-fill stride in-process.
 /// GATE 6 next-long probe outcomes, for GATE 14's dispatch study.
-pub static NL_PROBES_G: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static NL_HITS_G: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static NL_PROBES_G: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static NL_HITS_G: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Total match-length GAIN the next-long probe bought, across its hits.
-pub static NL_GAIN_G: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static NL_GAIN_G: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Hits in the RAISED band (`best_ml >= 8`) -- what a higher cut newly enables.
-pub static NL_BAND_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static NL_BAND_GAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static NL_BAND_OLD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static NL_BAND_HITS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static NL_BAND_GAIN: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static NL_BAND_OLD: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Offsets the raised-band hits take, and the offsets they replace.
-pub static NL_OFF_NEW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static NL_OFF_OLD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static NL_OFF_NEW: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static NL_OFF_OLD: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Raised-band hits whose new offset is LARGER than the one they replaced.
-pub static NL_OFF_WORSE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static NL_OFF_WORSE: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear `(off_new_sum, off_old_sum, hits_with_worse_offset)`.
 pub fn take_nl_off() -> (u64, u64, u64) {
@@ -6769,7 +6769,7 @@ fn dfast_fill_stride() -> usize {
 /// fills (short and long counted separately). The sparse arm's saving is paid
 /// in this unit; §4.39 priced only the main-loop positions it costs and so
 /// called the arm "dominated" while ignoring the larger term.
-pub static DF_ENDFILL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DF_ENDFILL: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear the per-match end-fill write count.
 pub fn take_dfast_endfill() -> u64 {
@@ -6837,7 +6837,7 @@ fn dfast_fill_anchor_c() -> bool {
 }
 
 /// Interior back-fill positions inserted by GATE 12 @ L3's stride arm.
-pub static DF_FILL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DF_FILL: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Bench hook: interior DFast back-fill inserts since the last call.
 pub fn take_dfast_fill() -> u64 {
@@ -7131,11 +7131,11 @@ fn step_probe_on() -> bool {
 
 /// GATE 18 study: the measured step-2 forfeit, per mille x10.
 #[cfg(feature = "profile")]
-pub static STEP_FORFEIT_SUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static STEP_FORFEIT_SUM: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static STEP_FORFEIT_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static STEP_FORFEIT_N: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static STEP_SEQ_SUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static STEP_SEQ_SUM: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear `(sum_x10000, n)`.
 #[cfg(feature = "profile")]
@@ -7423,8 +7423,8 @@ fn hash4_tag_from(v: u64, hash_shift: u32, smask: u64) -> (usize, u8) {
 /// speculation serve? `MM_MISS / MM_TOTAL` is the share of positions that reach
 /// the miss-advance, i.e. where a speculated next-position load is CONSUMED.
 /// Gate 7 audit: tag rejections that `fast_probe` would have ACCEPTED.
-pub static TAG_FALSE_REJECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static TAG_REJECT_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static TAG_FALSE_REJECT: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static TAG_REJECT_TOTAL: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear `(false_rejects, total_rejects)`.
 pub fn take_tag_rejects() -> (u64, u64) {
@@ -7436,12 +7436,12 @@ pub fn take_tag_rejects() -> (u64, u64) {
 }
 
 /// GATE 2 candidate signal: rep match BYTES per rep PROBE.
-pub static REP_PROBES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static REP_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static REP_PROBES: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static REP_BYTES: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
-pub static REP_HITS_G: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static ALL_MATCH_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static ALL_SEQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static REP_HITS_G: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static ALL_MATCH_BYTES: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static ALL_SEQS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// `(rep_probes, rep_bytes, rep_hits, all_match_bytes, all_seqs)`
 pub fn take_rep_rate() -> (u64, u64, u64, u64, u64) {
@@ -7455,8 +7455,8 @@ pub fn take_rep_rate() -> (u64, u64, u64, u64, u64) {
     )
 }
 
-pub static MM_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static MM_MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static MM_TOTAL: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static MM_MISS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear `(main_loop_positions, positions_reaching_the_advance)`.
 pub fn take_mm() -> (u64, u64) {
@@ -7467,11 +7467,11 @@ pub fn take_mm() -> (u64, u64) {
 /// ffanat: dispatch-arm census. 0 = specialised (false,false,pipe),
 /// 1 = tag arm (generic), 2 = rep arms (generic), 3 = rest.
 #[cfg(feature = "profile")]
-pub static FF_ARM: [core::sync::atomic::AtomicU64; 4] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static FF_ARM: [crate::census64::AtomicU64; 4] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 
 /// Read and clear the dispatch-arm census.
@@ -7484,9 +7484,9 @@ pub fn take_ff_arms() -> [u64; 4] {
     o
 }
 
-pub static FF_PIPE_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static FF_SPEC_MADE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static FF_SPEC_USED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static FF_PIPE_BLOCKS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static FF_SPEC_MADE: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static FF_SPEC_USED: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear `(pipelined_blocks, speculations_made, speculations_used)`.
 pub fn take_ff_pipe() -> (u64, u64, u64) {
@@ -7810,9 +7810,9 @@ fn lit_short_min() -> f32 {
 }
 
 /// Deterministic instrument: guard evaluations that FAILED, i.e. wasted work.
-pub static LP_GUARD_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LP_GUARD_FAIL: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Guard evaluations SKIPPED by the Gate 13 dispatch.
-pub static LP_GUARD_SKIP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LP_GUARD_SKIP: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear the Gate 13 guard instruments.
 pub fn take_lp_guard() -> (u64, u64) {
@@ -8017,13 +8017,13 @@ fn push_literals_tiers(
 }
 
 /// Literal run-length histogram: 0-4, 5-8, 9-16, 17-32, 33-64, 65+.
-pub static LP_HIST: [core::sync::atomic::AtomicU64; 6] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static LP_HIST: [crate::census64::AtomicU64; 6] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 
 /// Read and clear the literal run-length histogram.
@@ -8037,8 +8037,8 @@ pub fn take_lit_hist() -> [u64; 6] {
 }
 
 /// Literal appends served by tier 2 (32 bytes) and tier 3 (64 bytes).
-pub static LP_FAST2: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static LP_FAST3: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LP_FAST2: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static LP_FAST3: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear the tier-2 and tier-3 counts.
 pub fn take_lit_tiers() -> (u64, u64) {
@@ -8062,8 +8062,8 @@ pub fn take_lp_stats() -> ([u64; 6], u64, u64) {
     )
 }
 
-pub static LP_FAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static LP_SLOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LP_FAST: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static LP_SLOW: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear `(fixed_width, fallback)` literal-append counts.
 pub fn take_lit_push() -> (u64, u64) {
@@ -9966,14 +9966,14 @@ fn dfast_step_forced() -> usize {
     1
 }
 
-pub static DFAST_MATCH_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static DFAST_SEQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static DFAST_BLOCK_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_MATCH_BYTES: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static DFAST_SEQS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static DFAST_BLOCK_BYTES: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
-pub static DFAST_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static DFAST_REP_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_BLOCKS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static DFAST_REP_BLOCKS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Positions over which `try_rep1` is live -- the work a rep dispatch removes.
-pub static DFAST_REP_POS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_REP_POS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// `(blocks, rep_blocks, rep_positions)`
 pub fn take_dfast_rep_blocks() -> (u64, u64, u64) {
@@ -9985,8 +9985,8 @@ pub fn take_dfast_rep_blocks() -> (u64, u64, u64) {
     )
 }
 
-pub static DFAST_REP_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static DFAST_REP_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_REP_BYTES: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static DFAST_REP_HITS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// `(match_bytes, seqs, block_bytes, rep_bytes, rep_hits)` for DFast.
 pub fn take_dfast_match_stats() -> (u64, u64, u64, u64, u64) {
@@ -10049,8 +10049,8 @@ static DFAST_PIPE_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::Atomic
 
 /// A/B the DFast 2-way software pipeline in-process -- both shapes, one binary,
 /// so the comparison is immune to cross-binary drift.
-pub static DFAST_SPEC_MADE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static DFAST_SPEC_USED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_SPEC_MADE: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static DFAST_SPEC_USED: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear `(speculations_made, speculations_consumed)`.
 pub fn take_dfast_spec() -> (u64, u64) {
@@ -12552,9 +12552,9 @@ fn bt_depth_steps() -> u32 {
     1
 }
 
-pub static BT_WALKS2: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static BT_ITERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static BT_FULL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BT_WALKS2: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static BT_ITERS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static BT_FULL: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// `(walks, total_iterations, walks_that_used_ALL attempts)`
 pub fn take_bt_iters() -> (u64, u64, u64) {
@@ -13347,14 +13347,14 @@ fn opt_rep_enabled() -> bool {
 
 /// GATE 10 @ L19: what the DP's repcode candidate earns. `try_rep1` runs at
 /// every position of every opt block, unconditionally.
-pub static OPT_REP_PROBES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static OPT_REP_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static OPT_REP_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static OPT_REP_PROBES: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static OPT_REP_HITS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static OPT_REP_BYTES: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
-pub static OPT_POS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static OPT_SKIP_INF: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static OPT_SKIP_JUMP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static OPT_SKIP_JUMPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static OPT_POS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static OPT_SKIP_INF: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static OPT_SKIP_JUMP: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static OPT_SKIP_JUMPS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// `(positions, skipped_price_inf, bytes_jumped, jumps)`
 pub fn take_opt_skips() -> (u64, u64, u64, u64) {
@@ -13367,10 +13367,10 @@ pub fn take_opt_skips() -> (u64, u64, u64, u64) {
     )
 }
 
-pub static OPT_BT_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static OPT_BT_DRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static OPT_BT_LEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static OPT_SEQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static OPT_BT_CALLS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static OPT_BT_DRY: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static OPT_BT_LEN: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static OPT_SEQS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// `(bt_calls, bt_calls_returning_nothing, total_match_len, emitted_seqs)`
 pub fn take_opt_bt() -> (u64, u64, u64, u64) {
@@ -13475,7 +13475,7 @@ pub fn set_opt_fill_max_arm(v: usize) {
 }
 
 /// Positions inserted by the opt back-fill -- the work GATE 12 controls at L19.
-pub static OPT_FILL_INS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static OPT_FILL_INS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear the opt back-fill insert count.
 pub fn take_opt_fill_ins() -> u64 {
@@ -14380,9 +14380,9 @@ fn fused_ml(x: u64, src: &[u8], m: usize, ip: usize, block_end: usize) -> usize 
 }
 
 #[cfg(feature = "profile")]
-static FUSED_SHORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FUSED_SHORT: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-static FUSED_LONG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FUSED_LONG: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// (short, long) fused-head resolutions since the last call -- BRICK 11's verdict.
 #[cfg(feature = "profile")]
@@ -14669,8 +14669,8 @@ fn row_auto_ok(params: CompressionParameters, src_len: Option<u64>) -> bool {
 /// WIDE-CHAIN LATCH census: `[events, positions_rescanned]`. The latch does a
 /// full O(window) chain rebuild when it fires; this is what that costs.
 #[cfg(feature = "profile")]
-pub static WIDE_LATCH: [core::sync::atomic::AtomicU64; 2] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+pub static WIDE_LATCH: [crate::census64::AtomicU64; 2] =
+    [const { crate::census64::AtomicU64::new(0) }; 2];
 
 /// Read and clear `(latch_events, positions_rescanned)`.
 #[cfg(feature = "profile")]
@@ -14697,8 +14697,8 @@ pub fn take_wide_latch() -> (u64, u64) {
 /// smaller `chain_mask` aliases many positions onto one slot, so the link a
 /// walk reads may belong to some other position entirely.
 #[cfg(feature = "profile")]
-pub static WALK_EXIT: [core::sync::atomic::AtomicU64; 8] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+pub static WALK_EXIT: [crate::census64::AtomicU64; 8] =
+    [const { crate::census64::AtomicU64::new(0) }; 8];
 
 /// Read and clear the walk-exit census.
 #[cfg(feature = "profile")]
@@ -14716,7 +14716,7 @@ pub fn take_walk_exit() -> [u64; 8] {
 /// the same candidates with FEWER DEPENDENT LOADS, so both numbers are needed:
 /// `ROW_EXAM` is candidates, `ROW_LOADS` is rows touched (one load each).
 #[cfg(feature = "profile")]
-pub static ROW_EXAM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static ROW_EXAM: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
 /// SECTION 14.9 census: the 16-to-1 bucket-sharing cost.
 /// `[examined, same_bucket, mls_eq_pass, gtag0_probes, probes]`.
@@ -14725,12 +14725,12 @@ pub static ROW_EXAM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// ends in a random `src` load inside `mls_eq` and (for mls >= 4) cannot
 /// possibly succeed.
 #[cfg(feature = "profile")]
-pub static ROW_BUCKET: [core::sync::atomic::AtomicU64; 5] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static ROW_BUCKET: [crate::census64::AtomicU64; 5] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 /// Read and clear the bucket-sharing census.
 #[cfg(feature = "profile")]
@@ -14781,12 +14781,11 @@ pub(crate) fn dfast_bext_enabled() -> bool {
 /// backward walk WOULD recover at the commit point, and how many matches could
 /// move at all. Measurement only; the walk is not applied.
 #[cfg(feature = "profile")]
-pub static DFAST_BEXT_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_BEXT_BYTES: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static DFAST_BEXT_MATCHES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_BEXT_MATCHES: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static DFAST_BEXT_SEQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_BEXT_SEQS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear `(bytes_recoverable, matches_that_could_move, matches_seen)`.
 #[cfg(feature = "profile")]
@@ -14800,7 +14799,7 @@ pub fn take_dfast_bext() -> (u64, u64, u64) {
 }
 
 #[cfg(feature = "profile")]
-pub static ROW_LOADS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static ROW_LOADS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Read and clear `(candidates_examined, rows_loaded)`.
 #[cfg(feature = "profile")]
 pub fn take_row_census() -> (u64, u64) {
@@ -15061,9 +15060,9 @@ fn chain_null_tag(src: &[u8], mls: usize) -> u8 {
 /// FALSE-skip re-probe -- a skipped candidate whose bytes would have matched
 /// must never exist.
 #[cfg(feature = "profile")]
-pub static LINK_SKIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LINK_SKIPS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static LINK_FALSE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LINK_FALSE: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
 pub fn take_link_tag() -> (u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
@@ -15138,11 +15137,11 @@ pub static WALK_SIG_REP: core::sync::atomic::AtomicU32 = core::sync::atomic::Ato
 #[cfg(feature = "profile")]
 pub static WALK_SIG_SPB: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 #[cfg(feature = "profile")]
-pub static WALK_SIG_MB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static WALK_SIG_MB: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static WALK_SIG_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static WALK_SIG_NS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static WALK_SIG_OB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static WALK_SIG_OB: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
 pub fn take_walk_signals() -> (f32, f32, f32, u64, u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
@@ -15159,13 +15158,13 @@ pub fn take_walk_signals() -> (f32, f32, f32, u64, u64, u64) {
 /// Back-extension census for the SIMD question: (extensions > 0, total
 /// bytes, extensions >= 8 -- the class a u64 backward step would win).
 #[cfg(feature = "profile")]
-pub static BEXT_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BEXT_N: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static BEXT_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BEXT_BYTES: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static BEXT_GE8: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BEXT_GE8: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static BEXT_MATCHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BEXT_MATCHES: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
 pub fn take_bext() -> (u64, u64, u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
@@ -15192,15 +15191,15 @@ fn note_bext(ext: u64) {
 
 /// Chain-walk census: (candidates examined, byte-mismatch steps).
 #[cfg(feature = "profile")]
-pub static WALK_EXAM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static WALK_EXAM: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static WALK_BYTEMISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static WALK_BYTEMISS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Walk-continue accept classes: (first-find past a collision -- legacy would
 /// have emitted a literal; upgrade past a collision -- legacy had a match).
 #[cfg(feature = "profile")]
-pub static WALK_CONT_FIRST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static WALK_CONT_FIRST: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static WALK_CONT_UPGRADE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static WALK_CONT_UPGRADE: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
 pub fn take_walk_classes() -> (u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
@@ -15222,9 +15221,9 @@ pub fn take_walk_census() -> (u64, u64) {
 /// accept count is what a representation with an unambiguous null would
 /// change.
 #[cfg(feature = "profile")]
-pub static WALK_M0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static WALK_M0: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static WALK_M0_ACCEPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static WALK_M0_ACCEPT: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
 pub fn take_walk_phantom() -> (u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
@@ -15728,9 +15727,8 @@ pub fn set_fast_spec_arm(on: bool) {
 /// Which `find_dfast` body actually executed. Probe counts and output bytes are
 /// IDENTICAL between the two, by design -- they examine the same candidates in
 /// the same order -- so neither can show which one ran. These can.
-pub static DFAST_SPEC_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static DFAST_RUNTIME_CALLS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static DFAST_SPEC_CALLS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static DFAST_RUNTIME_CALLS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear both call counters.
 pub fn take_dfast_calls() -> (u64, u64) {
@@ -15742,9 +15740,9 @@ pub fn take_dfast_calls() -> (u64, u64) {
 }
 
 /// Calls into `find_fast`'s Gate-4 dispatcher, for reachability proofs.
-pub static FAST_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static FAST_CALLS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Calls into `find_opt` (L16+).
-pub static OPT_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static OPT_CALLS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear the finder reachability counters: `(find_fast, find_opt)`.
 pub fn take_finder_calls() -> (u64, u64) {
@@ -15756,8 +15754,8 @@ pub fn take_finder_calls() -> (u64, u64) {
 }
 
 /// Which `bt_find_best` body ran: `(specialised, runtime_fallback)`.
-pub static BT_SPEC_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static BT_RUNTIME_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BT_SPEC_CALLS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static BT_RUNTIME_CALLS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear the bt-path body counters.
 pub fn take_bt_calls() -> (u64, u64) {
@@ -15954,21 +15952,21 @@ static PAIR_T_CACHE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 /// Each of these accessors calls `std::env::var` with no cache -- a
 /// GetEnvironmentVariableW plus a String allocation for a process constant.
 #[cfg(feature = "profile")]
-pub static ENVHIT: [core::sync::atomic::AtomicU64; 14] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static ENVHIT: [crate::census64::AtomicU64; 14] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 
 /// Read and clear the fitted-constant read counts.
@@ -15984,18 +15982,18 @@ pub fn take_envhits() -> [u64; 14] {
 /// Diagnostic counters for Gate 6 candidate variables: how often the pair probe
 /// fires, how often it HITS, and how many bytes those hits cover. Activity vs
 /// outcome -- the campaign's law says the signal must predict the outcome.
-pub static PAIR_PROBES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static PAIR_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static PAIR_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PAIR_PROBES: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static PAIR_HITS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static PAIR_BYTES: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Split the pair probe by the MAIN probe's slot state -- `m0 == 0` means that
 /// hash bucket has never been written, which is free information already in a
 /// register at the probe site.
-pub static PAIR_M0_EMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static PAIR_M0_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static PAIR_HIT_EMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static PAIR_HIT_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static PAIR_BYTES_EMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static PAIR_BYTES_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PAIR_M0_EMPTY: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static PAIR_M0_LIVE: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static PAIR_HIT_EMPTY: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static PAIR_HIT_LIVE: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static PAIR_BYTES_EMPTY: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static PAIR_BYTES_LIVE: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// `(probes_empty, probes_live, hits_empty, hits_live, bytes_empty, bytes_live)`
 pub fn take_pair_split() -> (u64, u64, u64, u64, u64, u64) {
@@ -16010,25 +16008,25 @@ pub fn take_pair_split() -> (u64, u64, u64, u64, u64, u64) {
     )
 }
 
-pub static MAIN_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static MAIN_BYTES: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear: `(probes, hits, pair_match_bytes, all_match_bytes)`.
-static ROUTE_HIST: [core::sync::atomic::AtomicU64; 3] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+static ROUTE_HIST: [crate::census64::AtomicU64; 3] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
-static ROUTE_GAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static ROUTE_REP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static ROUTE_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ROUTE_GAIN: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+static ROUTE_REP: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+static ROUTE_N: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
-static SIG_GAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static SIG_REP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static SIG_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static SIG_TAG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static SIG_REPLEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static SIG_NSEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static SIG_OPTREP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SIG_GAIN: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+static SIG_REP: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+static SIG_N: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+static SIG_TAG: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+static SIG_REPLEN: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+static SIG_NSEQ: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+static SIG_OPTREP: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// EVERY per-block content signal the encoder already maintains, as block means:
 /// `(pair_gain, rep_yield, tag_yield, rep_len_ratio, last_nseq, opt_rep_rate)`.
@@ -16156,9 +16154,9 @@ fn cand_yield((f, t): (u64, u64)) -> f32 {
 
 /// L19-native accounting: tree probes, those too SHORT to use, and those that
 /// could not IMPROVE on the best so far.
-pub static BT_PROBE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static BT_SHORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static BT_NOGAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BT_PROBE: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static BT_SHORT: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
+pub static BT_NOGAIN: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// `(probes, too_short, no_gain)`
 pub fn take_bt_probe_stats() -> (u64, u64, u64) {
@@ -16314,11 +16312,11 @@ fn long_tag_enabled() -> bool {
 /// 1a ledger: (nonempty long probes, rejections, FALSE rejections). Three
 /// counters with one meaning each -- see the tag audit's instrument trap.
 #[cfg(feature = "profile")]
-pub static LTAG_NONEMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LTAG_NONEMPTY: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static LTAG_REJECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LTAG_REJECT: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static LTAG_FALSE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LTAG_FALSE: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear the LONG-table tag audit: `[nonempty, rejected, FALSE]`.
 /// A FALSE rejection is one the byte compare would have ACCEPTED -- i.e. a
@@ -16348,18 +16346,18 @@ pub fn take_long_tag() -> (u64, u64, u64) {
 /// at the MAIN long consume site. The fail share is the ceiling on what a
 /// stronger tag could still remove.
 #[cfg(feature = "profile")]
-pub static LTAG_SURV_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LTAG_SURV_FAIL: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static LTAG_SURV_WFAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LTAG_SURV_WFAIL: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static LTAG_SURV_ACC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LTAG_SURV_ACC: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// SHORT-table consume-site residual, mirror of the long table's.
 #[cfg(feature = "profile")]
-pub static STAG_SURV_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static STAG_SURV_FAIL: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static STAG_SURV_WFAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static STAG_SURV_WFAIL: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static STAG_SURV_ACC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static STAG_SURV_ACC: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// `(bytes_fail, window_fail, accepted)` for the SHORT consume site.
 #[cfg(feature = "profile")]
 pub fn take_short_tag_residual() -> (u64, u64, u64) {
@@ -16386,9 +16384,9 @@ pub fn take_long_tag_residual() -> (u64, u64, u64) {
 /// `TAGARR_READS` is a load from a SECOND random cache line; `PACKED_TAG_READS`
 /// reads the byte that arrived with the position.
 #[cfg(feature = "profile")]
-pub static TAGARR_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static TAGARR_READS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static PACKED_TAG_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PACKED_TAG_READS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear `(tag-array reads, packed reads)`.
 #[cfg(feature = "profile")]
@@ -16423,13 +16421,13 @@ fn fast_pack_enabled() -> bool {
 /// every such candidate costs a random `src[m]` load, a compare, and a
 /// `count_match` that dies below `mls`.
 #[cfg(feature = "profile")]
-pub static FF_LAZY_FIRES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static FF_LAZY_FIRES: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static FF_LATCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static FF_LATCH: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static FF_CAND4: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static FF_CAND4: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 #[cfg(feature = "profile")]
-pub static FF_ACCEPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static FF_ACCEPT: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear `(four-byte passes, accepted matches)`.
 #[cfg(feature = "profile")]

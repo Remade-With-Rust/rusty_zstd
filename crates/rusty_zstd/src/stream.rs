@@ -17,9 +17,9 @@ use crate::DecompressOptions;
 /// The memmove per `decoded.drain(..drop)` is `len - drop` -- the retained
 /// window -- and section 18's dig found it running once per `stream()` CALL.
 #[cfg(feature = "profile")]
-pub static DEC_COMPACT: [core::sync::atomic::AtomicU64; 2] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static DEC_COMPACT: [crate::census64::AtomicU64; 2] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 /// Read and clear the decoder-compaction census.
 #[cfg(feature = "profile")]
@@ -35,9 +35,9 @@ pub fn take_dec_compact() -> [u64; 2] {
 /// Each slide memmoves the retained window, zeroes six match tables and
 /// re-primes the whole window -- section 19's decoder finding, mirrored.
 #[cfg(feature = "profile")]
-pub static ENC_SLIDE: [core::sync::atomic::AtomicU64; 2] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static ENC_SLIDE: [crate::census64::AtomicU64; 2] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 /// History multiplier at which the encoder slides its window.
 ///
