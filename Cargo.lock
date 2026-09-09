@@ -148,14 +148,14 @@ dependencies = [
 
 [[package]]
 name = "rusty_zstd"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "rusty_alloc_default",
 ]
 
 [[package]]
 name = "rusty_zstd-bench"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "rusty_zstd",
  "rzstd-alloc",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_zstd-cli"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "rusty_zstd",
  "rzstd-alloc",
@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "rzstd-alloc"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "rusty_alloc-api 2.0.5",
 ]
