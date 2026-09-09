@@ -370,6 +370,7 @@ Fetch the oracle with `pwsh scripts/fetch-oracle.ps1`, or point
 | `no_std + alloc` | ✅ builds |
 | `thumbv7em-none-eabihf` (Cortex-M4F) | ✅ builds (`no_std + alloc`) |
 | `riscv32imac-unknown-none-elf` | ✅ builds (`no_std + alloc`) |
+| ESP32-S3 (Xtensa LX7) | ✅ **round-trips on the board** ([proof](bare-metal/esp32s3/README.md)) |
 
 AVX2 and NEON kernels are selected at **runtime**. On a CPU without them, the
 scalar twins run and the output is identical.

@@ -22,3 +22,7 @@
 # `rustc scripts/cpuprobe.rs` drops its binary wherever it is run from.
 /cpuprobe.exe
 /cpuprobe.pdb
+
+# The bare-metal firmware builds into its own target dir (it is not a
+# workspace member, so the root /target rule does not cover it).
+bare-metal/*/target/
