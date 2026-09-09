@@ -27,10 +27,10 @@ pub(crate) struct HuffmanTable {
 /// The tree-merge loop is (n-1) iterations of an adaptive sort plus two
 /// `Vec::remove(0)` memmoves, so n^2 is the work proxy.
 #[cfg(feature = "profile")]
-pub static N13_STATS: [core::sync::atomic::AtomicU64; 3] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static N13_STATS: [crate::census64::AtomicU64; 3] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 /// Read and clear the N13 probe.
 #[cfg(feature = "profile")]
@@ -53,9 +53,9 @@ pub fn take_n13_stats() -> [u64; 3] {
 #[cfg(feature = "profile")]
 /// `fast_4x2` outcomes: [bailed, succeeded].
 #[cfg(feature = "profile")]
-pub static F4X2_ARM: [core::sync::atomic::AtomicU64; 2] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static F4X2_ARM: [crate::census64::AtomicU64; 2] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 
 /// Read and clear the `fast_4x2` outcome census.
@@ -70,7 +70,7 @@ pub fn take_f4x2_arm() -> (u64, u64) {
 
 /// Sections that took `decode_4x`'s X1 arm.
 #[cfg(feature = "profile")]
-pub static X4_X1_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static X4_X1_CALLS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Sections that took `decode_4x`'s X2 arm.
 ///
@@ -86,7 +86,7 @@ pub static X4_X1_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// "OUTLINED, on a census" note rests on, and a conflated counter cannot
 /// support it in either direction.
 #[cfg(feature = "profile")]
-pub static X4_X2_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static X4_X2_CALLS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear the X1-arm count.
 #[cfg(feature = "profile")]
@@ -106,9 +106,9 @@ pub fn take_x4_arms() -> (u64, u64) {
 }
 
 #[cfg(feature = "profile")]
-pub static X2_STATS: [core::sync::atomic::AtomicU64; 2] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static X2_STATS: [crate::census64::AtomicU64; 2] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 /// Read and clear the N2 instrument: `(builds, uses)`.
 #[cfg(feature = "profile")]
@@ -1456,9 +1456,9 @@ pub(crate) enum HuffUpdate {
 /// E11 census: `(literal bytes the old O(n) `covers` walk would have read,
 /// calls)`. `profile`-gated; the shipping build carries nothing.
 #[cfg(feature = "profile")]
-pub static E11_WALKED: (core::sync::atomic::AtomicU64, core::sync::atomic::AtomicU64) = (
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static E11_WALKED: (crate::census64::AtomicU64, crate::census64::AtomicU64) = (
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 );
 
 /// Read and clear the E11 census.
@@ -2010,10 +2010,10 @@ fn huffman_nbits(freq: &[u32; 256]) -> Result<[u8; 256], Error> {
 
 /// E12 ceiling probe: `(calls, total inner-scan element visits, adjustment steps)`.
 #[cfg(feature = "profile")]
-pub static E12_SCAN: [core::sync::atomic::AtomicU64; 3] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
+pub static E12_SCAN: [crate::census64::AtomicU64; 3] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
 ];
 /// Read and clear the E12 ceiling probe.
 #[cfg(feature = "profile")]

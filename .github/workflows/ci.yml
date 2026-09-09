@@ -68,13 +68,13 @@ jobs:
 
   # The portable configurations the README advertises, so they cannot rot.
   portable:
-    name: no_std + wasm32
+    name: no_std + wasm32 + bare metal
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown, thumbv7em-none-eabihf, riscv32imac-unknown-none-elf
       - uses: Swatinem/rust-cache@v2
       - name: no_std + alloc
         run: cargo check -p rusty_zstd --no-default-features --features alloc
@@ -84,6 +84,19 @@ jobs:
         run: cargo check -p rusty_zstd --target wasm32-unknown-unknown --no-default-features --features alloc
       - name: profile feature builds
         run: cargo check -p rusty_zstd --features profile
+      # BARE METAL. A `no-std` category on the registry is not a claim; a target
+      # that compiles is. Both of these failed with 204 errors until the census
+      # counters stopped requiring 64-bit atomics -- and every one of those errors
+      # was a counter, not a line of codec. `census64` makes the counter a
+      # zero-sized stub where `AtomicU64` does not exist, so the instrument costs
+      # the crate a diagnostic on those parts instead of costing it the parts.
+      #
+      # Cortex-M4F and RV32IMAC are what rusty_RTOS (Kairos) consumes the codec on,
+      # for on-chip OTA payloads and trace capture. Neither has 64-bit atomics.
+      - name: bare metal (Cortex-M4F, no 64-bit atomics)
+        run: cargo check -p rusty_zstd --target thumbv7em-none-eabihf --no-default-features --features alloc
+      - name: bare metal (RV32IMAC, no 64-bit atomics)
+        run: cargo check -p rusty_zstd --target riscv32imac-unknown-none-elf --no-default-features --features alloc
 
   lint:
     runs-on: ubuntu-latest

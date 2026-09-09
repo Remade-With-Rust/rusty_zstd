@@ -421,7 +421,8 @@ fn finish_tail(mut tail: &[u8], mut acc: u64, total: u64) -> u64 {
 /// `profile`-gated so the shipping path carries nothing.
 #[cfg(feature = "profile")]
 pub mod census {
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::census64::AtomicU64;
+    use core::sync::atomic::Ordering;
     pub static HYBRID_BYTES: AtomicU64 = AtomicU64::new(0);
     pub static SCALAR_BYTES: AtomicU64 = AtomicU64::new(0);
     pub static HYBRID_CALLS: AtomicU64 = AtomicU64::new(0);

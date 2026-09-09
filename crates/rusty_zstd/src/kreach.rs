@@ -91,8 +91,9 @@ mod imp {
 #[cfg(feature = "profile")]
 mod imp {
     use super::N_SLOTS;
+    use crate::census64::AtomicU64;
     use core::cell::Cell;
-    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use core::sync::atomic::Ordering::Relaxed;
 
     pub(super) static G_HIT: [AtomicU64; N_SLOTS] = [const { AtomicU64::new(0) }; N_SLOTS];
     pub(super) static G_MISS: [AtomicU64; N_SLOTS] = [const { AtomicU64::new(0) }; N_SLOTS];

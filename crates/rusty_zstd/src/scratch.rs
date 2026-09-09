@@ -270,20 +270,20 @@ pub(crate) fn note_pool(hit: bool) {
 
 /// Pool hit/miss census. A miss is an allocation.
 #[cfg(feature = "profile")]
-pub static POOL_HIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static POOL_HIT: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Pool misses -- each one is a fresh allocation.
 #[cfg(feature = "profile")]
-pub static POOL_MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static POOL_MISS: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Buffers handed back with real capacity.
 #[cfg(feature = "profile")]
-pub static POOL_GIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static POOL_GIVE: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Buffers handed back with ZERO capacity -- never pooled, so the matching
 /// take must allocate. A take/give imbalance shows up here first.
 #[cfg(feature = "profile")]
-pub static POOL_GIVE_EMPTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static POOL_GIVE_EMPTY: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 /// Buffers DROPPED because the free list was full.
 #[cfg(feature = "profile")]
-pub static POOL_DROP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static POOL_DROP: crate::census64::AtomicU64 = crate::census64::AtomicU64::new(0);
 
 /// Read and clear the pool census: `(hits, misses, drops, gives, give_empty)`.
 #[cfg(feature = "profile")]
