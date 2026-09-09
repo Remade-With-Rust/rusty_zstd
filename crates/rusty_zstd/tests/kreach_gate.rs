@@ -227,11 +227,30 @@ fn every_dispatch_site_routes_to_its_kernel() {
 
     // A gate that checks nothing must fail, not pass. This is the failure mode
     // that let the original defect survive: silence read as success.
+    //
+    // The floor is HOST-DERIVED, not the constant 6 it started as. Eight of the
+    // ten slots need BMI2, which no aarch64 host has -- and macOS runners are
+    // aarch64 -- so they are SKIPPED by design there and a constant 6 failed a
+    // perfectly-routed build. The floor still exists (silence must not pass); it
+    // just tracks what this CPU can actually route.
+    //
+    // The poison self-check still bites on aarch64: `set_xxh_avx2_arm(false)`
+    // gates the NEON stripe path too, so `xxh64 stripes` goes scalar and the
+    // routing assertion below fires. (`count_eq_len`'s NEON arm is chosen at
+    // compile time and cannot be poisoned -- one poisonable slot is enough.)
+    let floor = if bmi2 {
+        6
+    } else if vec {
+        2
+    } else {
+        1
+    };
     assert!(
-        checked >= 6,
-        "kernel-reach gate exercised only {checked} sites -- it is not \
-         measuring what it claims. Either the corpus stopped reaching the \
-         dispatch sites or the census taps were detached from them."
+        checked >= floor,
+        "kernel-reach gate exercised only {checked} sites (floor {floor} for \
+         bmi2={bmi2} vec={vec}) -- it is not measuring what it claims. Either \
+         the corpus stopped reaching the dispatch sites or the census taps \
+         were detached from them."
     );
     assert!(
         failures.is_empty(),

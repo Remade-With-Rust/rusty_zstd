@@ -6,7 +6,9 @@
 //! from the outside. This compresses the same input many times at a high level
 //! and reports the process working set as it goes.
 use rusty_zstd as rz;
-#[cfg(windows)]
+// NOT `#[cfg(windows)]`: `main` calls this unconditionally, so gating the
+// definition made every non-Windows build fail to compile (E0425). The body
+// is a stub on every platform, so there was nothing for the gate to protect.
 fn rss() -> u64 {
     // No winapi dependency: read our own working set via the same counter the
     // parent would sample, through GlobalMemoryStatus-free means -- fall back
