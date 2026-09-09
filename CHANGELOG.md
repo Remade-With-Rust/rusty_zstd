@@ -1596,10 +1596,16 @@ have caught it, so this adds one:
   4 levels x 2 corpora).
 * `tests/kreach_gate.rs` -- a standing gate asserting every exercised site
   routes >=95% of its calls to its kernel. Skips a slot whose ISA the host
-  lacks; fails if fewer than 6 sites were exercised, so it cannot pass on
-  silence. `RZSTD_KREACH_POISON=1` forces the arms scalar and the gate must
-  then FAIL -- CI runs both directions, because an assertion that has never
-  fired is not evidence.
+  lacks; fails if fewer sites were exercised than the host can route, so it
+  cannot pass on silence. That floor is HOST-DERIVED (6 with BMI2, 2 with only
+  a vector ISA, else 1) -- it began as a flat 6 and that failed every aarch64
+  runner, where the eight BMI2 slots are skipped by design and a correct build
+  can only ever check two. `RZSTD_KREACH_POISON=1` forces the arms scalar and
+  the gate must then FAIL -- CI runs both directions, because an assertion that
+  has never fired is not evidence. The poison still bites on aarch64 because
+  `set_xxh_avx2_arm(false)` gates the NEON stripe path too; `count_eq_len`'s
+  NEON arm is compile-time and cannot be poisoned, and one poisonable slot is
+  enough.
 * `rusty_zstd-bench/examples/kreach.rs` -- the corpus-scale report, encode and
   decode censused separately (a combined number is exactly what hides
   "50% of encode and 0% of decode").
