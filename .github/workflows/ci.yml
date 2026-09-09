@@ -34,6 +34,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test -p rusty_zstd -p rusty_zstd-cli -p rzstd-alloc
+      # KERNEL REACH. A twin that exists but is not CALLED passes every other
+      # gate in this file: byte-identity passes because the two paths agree by
+      # design, the round-trip passes, and an arm-toggle A/B reads FLAT --
+      # indistinguishable from "the kernel does not help". Exactly that shipped
+      # here: the xxh64 AVX2 kernel was reachable only from a test and a bench,
+      # and DECODE ran it on 0% of its bytes for months. This counts instead.
+      #
+      # Needs `profile` for the census taps (they compile to nothing without
+      # it, so the shipped build is unaffected). Slots whose ISA the runner
+      # lacks are skipped, not failed.
+      - name: Kernel reach gate
+        run: cargo test -p rusty_zstd --release --features profile --test kreach_gate -- --nocapture
+      # The gate must be able to FAIL. Forcing every arm scalar has to break
+      # it; if this step SUCCEEDS, the census is detached from the dispatch it
+      # names and the green run above meant nothing.
+      - name: Kernel reach gate self-check (must fail)
+        shell: bash
+        run: |
+          if RZSTD_KREACH_POISON=1 cargo test -p rusty_zstd --release --features profile --test kreach_gate; then
+            echo '::error::kreach gate passed with every arm forced scalar -- the census is not wired'
+            exit 1
+          fi
+          echo 'poison check ok: the gate fails when the arms are forced scalar'
       - name: Doc tests (the README's examples)
         run: cargo test -p rusty_zstd --doc
       - name: CLI version + aliases

@@ -57,7 +57,56 @@ compile_error!(
 #[cfg(all(feature = "alloc", feature = "std"))]
 #[inline]
 pub(crate) fn env_knob(name: &str) -> Result<alloc::string::String, ()> {
+    // Every read is an OS lookup AND a `String` allocation, for a value fixed
+    // for the life of the process. A knob read more than once per process has
+    // a broken cache; this counter is how that is detected rather than
+    // grepped for.
+    #[cfg(feature = "profile")]
+    ENV_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     std::env::var(name).map_err(|_| ())
+}
+
+/// Cold, outlined: read a knob and PARSE it (trimmed), or `None`.
+///
+/// Every knob reader used to spell this chain out at its own call site --
+/// `env_knob(..).ok().and_then(|x| x.trim().parse().ok())` -- and LLVM
+/// inlined it, so `std::env::var`, the `String` drop, `trim`'s
+/// `is_whitespace` walk and `from_str` were laid out inside the encoder's
+/// hottest functions: `find_lazy` carried FIVE `env::var` call sites and
+/// THIRTEEN `__rust_dealloc` call sites for values fixed for the life of the
+/// process. The hot path of a knob is one atomic load and a compare; this
+/// is everything else, behind one call the hot path never takes.
+#[cold]
+#[inline(never)]
+pub(crate) fn env_knob_parse<T: core::str::FromStr>(name: &str) -> Option<T> {
+    env_knob(name).ok().and_then(|x| x.trim().parse().ok())
+}
+
+/// Cold, outlined: a boolean knob that is ON unless set to `"0"`.
+#[cold]
+#[inline(never)]
+pub(crate) fn env_knob_not0(name: &str, default: bool) -> bool {
+    match env_knob(name) {
+        Ok(v) => v.trim() != "0",
+        Err(()) => default,
+    }
+}
+
+/// Cold, outlined: a boolean knob that is ON only when set to `"1"`.
+#[cold]
+#[inline(never)]
+pub(crate) fn env_knob_is1(name: &str) -> bool {
+    env_knob(name).map(|v| v.trim() == "1").unwrap_or(false)
+}
+
+/// Count of `env_knob` reads -- see the note there.
+#[cfg(feature = "profile")]
+pub static ENV_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read and clear the env-read counter.
+#[cfg(feature = "profile")]
+pub fn take_env_reads() -> u64 {
+    ENV_READS.swap(0, core::sync::atomic::Ordering::Relaxed)
 }
 
 /// No-std twin: every knob reads as unset, so every call site takes its
@@ -71,6 +120,8 @@ pub(crate) fn env_knob(_name: &str) -> Result<alloc::string::String, ()> {
 mod bit;
 mod block;
 mod compressed;
+/// Copy census: how many times does the encoder move each input byte?
+pub mod copies;
 mod decode;
 #[cfg(feature = "alloc")]
 mod dict;
@@ -82,6 +133,8 @@ mod fse;
 mod huffman;
 #[cfg(all(feature = "alloc", feature = "std"))]
 mod in_bench;
+/// Kernel-reach census: does the shipping path actually call each kernel?
+pub mod kreach;
 #[cfg(feature = "alloc")]
 mod ldm;
 #[cfg(feature = "std")]
@@ -133,6 +186,8 @@ pub use dict::{
     public_dict_id, Dictionary, DICT_ID_PUBLIC_MAX, DICT_ID_PUBLIC_MIN, MAGIC_DICTIONARY,
 };
 #[cfg(feature = "profile")]
+pub use encode::take_fused;
+#[cfg(feature = "profile")]
 pub use encode::take_row_bucket;
 #[cfg(feature = "alloc")]
 pub use encode::{
@@ -145,6 +200,8 @@ pub use in_bench::{
     bench_roundtrip, bench_roundtrip_clocked, mbps, mbps_best, time_loops, InProcessBench,
     LoopTiming,
 };
+#[cfg(feature = "profile")]
+pub use ldm::take_ldm_stats;
 #[cfg(feature = "alloc")]
 pub use ldm::{LdmParams, DEFAULT_LONG_WINDOW_LOG};
 #[cfg(feature = "std")]
@@ -153,9 +210,11 @@ pub use mt::{
     JOB_SIZE_MIN, NB_WORKERS_MAX,
 };
 #[cfg(feature = "alloc")]
-pub use params::{compression_params, CompressionParameters, Strategy};
+pub use params::{compression_params, set_hash_tight_arm, CompressionParameters, Strategy};
 #[cfg(feature = "profile")]
 pub use rowfind::take_row_walk;
+#[cfg(feature = "profile")]
+pub use scratch::take_pool_census;
 #[cfg(feature = "alloc")]
 pub use seekable::{
     compress_seekable, compress_seekable_adv, decompress_frame_at, parse_seek_table, SeekEntry,
@@ -240,7 +299,7 @@ pub use encode::{
     take_bext, take_envhits, take_ff_arms, take_ff_waste, take_link_tag, take_long_tag,
     take_long_tag_residual, take_raw_exits, take_raw_margin, take_row_census,
     take_short_tag_residual, take_step_forfeit, take_tag_reads, take_walk_census,
-    take_walk_classes, take_walk_signals, FF_LATCH, FF_LAZY_FIRES,
+    take_walk_classes, take_walk_phantom, take_walk_signals, FF_LATCH, FF_LAZY_FIRES,
 };
 #[doc(hidden)]
 pub use encode::{take_ent_save, take_n9_basic};
@@ -293,15 +352,16 @@ pub use encode::{
     set_dfast_spec_min_arm, set_dfast_step_arm, set_dfast_tag_arm, set_fast_lazy_arm,
     set_fast_spec_arm, set_finder_scratch_arm, set_g5_arms, set_g5_band_arm, set_g5_fast_arms,
     set_g5_fast_len_arm, set_g5_opt_arms, set_g5_tiny_arm, set_huff_fast_arm, set_incomp_skip_arm,
-    set_lazy_fill_arm, set_lazy_fill_stride_arm, set_lazy_fill_threshold_arm, set_lazy_gain_arm,
-    set_lit_short_arm, set_litpush_arm, set_litpush_hoist_arm, set_long_tag_arm, set_next_long_arm,
-    set_nl_dispatch_arm, set_nl_off_worse_arm, set_opt_fill_max_arm, set_opt_fill_stride_arm,
-    set_opt_hoist_arm, set_opt_lit_arm, set_opt_mlbits_arm, set_opt_ops_arm, set_opt_rep_arm,
-    set_pair_gain_arm, set_pair_hi_arm, set_pair_lo_arm, set_pair_on_arm, set_payload_arm,
-    set_pipe_arm, set_pipe_rep1_arm, set_prefix_bound_arm, set_prefix_window_arm, set_prime_bt_arm,
-    set_prime_bt_depth_arm, set_prime_bt_extent_arm, set_prime_bt_tree_arm, set_prime_stride_arm,
-    set_raw_probe_arm, set_raw_run_min_arm, set_raw_skip_arm, set_rep1_mode, set_rep_reprobe_arm,
-    set_replen_pipe_arm, set_row_arm, set_row_fill_stride_arm, set_search_log_delta, set_step0_arm,
+    set_lazy_accel_arm, set_lazy_fill_arm, set_lazy_fill_stride_arm, set_lazy_fill_threshold_arm,
+    set_lazy_gain_arm, set_lit_short_arm, set_litpush_arm, set_litpush_hoist_arm, set_long_tag_arm,
+    set_next_long_arm, set_nl_dispatch_arm, set_nl_off_worse_arm, set_opt_fill_max_arm,
+    set_opt_fill_stride_arm, set_opt_hoist_arm, set_opt_lit_arm, set_opt_mlbits_arm,
+    set_opt_ops_arm, set_opt_rep_arm, set_pair_gain_arm, set_pair_hi_arm, set_pair_lo_arm,
+    set_pair_on_arm, set_payload_arm, set_pipe_arm, set_pipe_rep1_arm, set_prefix_bound_arm,
+    set_prefix_window_arm, set_prime_bt_arm, set_prime_bt_depth_arm, set_prime_bt_extent_arm,
+    set_prime_bt_tree_arm, set_prime_stride_arm, set_raw_probe_arm, set_raw_run_min_arm,
+    set_raw_skip_arm, set_rep1_mode, set_rep_reprobe_arm, set_replen_pipe_arm, set_row_arm,
+    set_row_arm_auto, set_row_fill_stride_arm, set_search_log_delta, set_step0_arm,
     set_step_forfeit_arm, set_step_probe_arm, set_tag_alloc_arm, set_tag_arm, set_walk_cont_arm,
     set_walk_first_max_arm, set_walk_rep_max_arm, set_wide_chain_arm, set_wide_first_max_arm,
     set_wide_spb_min_arm, take_bt_calls, take_bt_iters, take_bt_probe_stats, take_content_signals,
@@ -316,7 +376,7 @@ pub use encode::{
 pub use encode::{
     set_bt_deep_arm, set_bt_deep_min_arm, set_bt_depth_cached_arm, set_bt_depth_target_arm,
     set_dfast_litpush_arm, set_lit_push_tiers_arm, take_lit_hist, take_lit_push, take_lit_tiers,
-    take_opt_signals, BT_SPEC_PAIRS,
+    take_opt_signals,
 };
 #[doc(hidden)]
 #[cfg(feature = "alloc")]

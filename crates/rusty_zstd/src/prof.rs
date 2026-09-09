@@ -39,9 +39,22 @@ pub enum Stage {
     DecSeqLoop = 17,
     /// The trailing literal run after the last sequence.
     DecSeqTail = 18,
+    /// STREAMING DECODE wrapper anatomy. These partition `Decompressor::
+    /// stream` and exist because the scoped decode stages account for only
+    /// ~1.09x of a 1.5-1.8x streaming-vs-one-shot gap -- the rest is the
+    /// wrapper, and nothing was measuring it. Scoped once per `stream()`
+    /// call (a few hundred per frame), never per block or per byte.
+    /// `input.extend_from_slice` of the caller's chunk.
+    StreamInAcc = 19,
+    /// The decode-until-output-fillable loop (contains the block stages).
+    StreamProgress = 20,
+    /// `output.copy_from_slice` out of the decoded window.
+    StreamOutCopy = 21,
+    /// `compact_input` + `compact` -- the two reclaim paths.
+    StreamCompact = 22,
 }
 
-pub const N_STAGES: usize = 19;
+pub const N_STAGES: usize = 23;
 
 const NAMES: [&str; N_STAGES] = [
     "EncodeTotal",
@@ -63,6 +76,10 @@ const NAMES: [&str; N_STAGES] = [
     "DecSeqTables",
     "DecSeqLoop",
     "DecSeqTail",
+    "StreamInAcc",
+    "StreamProgress",
+    "StreamOutCopy",
+    "StreamCompact",
 ];
 
 /// Per-block Z1 harvest row (profile builds only).
@@ -108,7 +125,34 @@ pub struct BlockTap {
 /// Deterministic encode work counts (`codec-six-whys-unknowns`: count before time).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EncodeCounts {
+    /// SCOPE WARNING -- this field does NOT mean the same thing in every
+    /// finder, and a table that divides it by input bytes across levels is
+    /// comparing two different quantities:
+    ///
+    /// * `find_fast_impl_inner` bumps it at the TOP of the scan loop, before
+    ///   the hash is computed -- so at L1 it counts POSITIONS SCANNED.
+    /// * `find_dfast_impl_inner` bumps it inside `if let Some(m8)`, i.e.
+    ///   only once a tag filter has already returned a candidate -- so at L3
+    ///   it counts SURVIVORS.
+    ///
+    /// So a `probe_hits / hash_probes` "hit rate" reads ~12% at L1 and ~94%
+    /// at L3 for reasons that are entirely about the DENOMINATOR. For a
+    /// cross-finder comparison use `encode::take_mm`, whose `MM_TOTAL` is
+    /// bumped at the loop top in both. See `mfsplit.rs`.
     pub hash_probes: u64,
+    /// SCOPE WARNING -- instrumented on the Fast and DFast paths ONLY.
+    ///
+    /// `note_hash_fill` is called from `fill_fast_after_match` and
+    /// `fill_dfast_after_match`. The chain/row inserters that Greedy, Lazy,
+    /// Lazy2 and BtLazy2 fill through (`MatchTables::lz_insert` and
+    /// `lz_insert_only`) do NOT report, so this field reads a FALSE ZERO at
+    /// L5 and above -- not "those finders perform no fills".
+    ///
+    /// Deliberately not wired there: `lazyfill.rs` measures 41,742,765 fill
+    /// inserts at L9, and a `lock xaddq` on each would be the instrument
+    /// dominating what it measures (the EQ_OPS lesson in `simd::counters`).
+    /// Wiring it needs a per-block local accumulator flushed once, the shape
+    /// the DFast fills already use -- not a counter in `lz_insert`.
     pub hash_fills: u64,
     pub probe_hits: u64,
     pub seqs: u64,

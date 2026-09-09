@@ -39,6 +39,58 @@ pub static ENC_SLIDE: [core::sync::atomic::AtomicU64; 2] = [
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
 ];
+/// History multiplier at which the encoder slides its window.
+///
+/// `k` means: hold up to `k` windows of history, and on overflow drop back to
+/// one. A slide then costs the same as ever but fires every `(k - 1) * window`
+/// bytes, so the slide's whole overhead -- memmove, six table clears and the
+/// re-prime -- scales as `1 / (k - 1)`. Default 2 (the Section 20 value).
+fn enc_slide_mul() -> usize {
+    match crate::env_knob("RZSTD_ENC_SLIDE_MUL")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(k) if (2..=8).contains(&k) => k,
+        _ => 3,
+    }
+}
+
+/// Ceiling on the EXTRA history held beyond two windows.
+///
+/// The slide's cost is per-slide and its frequency is `1 / ((k - 1) * window)`,
+/// so the win from raising `k` is large exactly where the window is SMALL and
+/// slides are constant, and negligible where the window is huge -- at L22 a
+/// 128 MiB window does not slide until 128 MiB of input, which most streams
+/// never reach. The memory cost runs the other way: it is `(k - 2) * window`,
+/// so a flat multiplier would spend +128 MiB at L22 to remove slides that
+/// mostly do not happen. Capping the extra in ABSOLUTE bytes keeps the whole
+/// win at every level that slides often and bounds the worst case at +8 MiB.
+const SLIDE_EXTRA_MAX: usize = 8 << 20;
+
+/// Ablation: the decoded-buffer reserve cap. Shipping value 8 MiB; the probe
+/// lifts it so `decoded` can be reserved to the full content size, making the
+/// streaming buffer structurally identical to the one-shot output buffer.
+#[cfg(feature = "std")]
+fn dec_reserve_cap() -> u64 {
+    static C: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        crate::env_knob("RZSTD_DEC_RESERVE_CAP")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(8 << 20)
+    })
+}
+#[cfg(not(feature = "std"))]
+fn dec_reserve_cap() -> u64 {
+    8 << 20
+}
+
+/// History length at which the window slides, for this `window`.
+fn slide_threshold(mul: usize, window: usize) -> usize {
+    let extra = mul.saturating_sub(2).saturating_mul(window);
+    2 * window + extra.min(SLIDE_EXTRA_MAX)
+}
+
 /// Read and clear the encoder window-slide census.
 #[cfg(feature = "profile")]
 pub fn take_enc_slide() -> [u64; 2] {
@@ -96,6 +148,8 @@ pub fn decompress_stream_out_size() -> usize {
 
 /// Reusable compressor (one frame at a time).
 pub struct Compressor {
+    /// History multiplier at which the window slides; see `set_slide_mul`.
+    slide_mul: usize,
     params: CompressionParameters,
     checksum: bool,
     pledged: Option<u64>,
@@ -106,9 +160,15 @@ pub struct Compressor {
     tables: MatchTables,
     entropy: EntropyState,
     hist: Vec<u8>,
-    in_acc: Vec<u8>,
-    /// Consumed prefix of `in_acc`; compacted once per `stream` call.
-    in_off: usize,
+    /// End of the ENCODED prefix of `hist`; everything after it is pending
+    /// input that no block has coded yet.
+    ///
+    /// There used to be a separate `in_acc` staging buffer, so every input
+    /// byte was copied TWICE before encoding began -- once from the caller
+    /// into `in_acc`, once from `in_acc` into `hist` -- measured at exactly
+    /// 1.000 + 1.000 bytes per input byte. `hist` was always the buffer the
+    /// finders read, so staging bought nothing that a cursor does not.
+    hist_done: usize,
     out_acc: Vec<u8>,
     /// DECSEQ-II CUT 7 -- read cursor into `out_acc`, same shape as the
     /// decoder's `in_off` (CUT 5): the per-call `out_acc.drain(..n)` was an
@@ -141,6 +201,8 @@ impl Compressor {
         // `MatchTables::new` no longer allocates it (see ffanat), so do it here.
         tables.alloc_fast_tags(params);
         Ok(Self {
+            // Defaults to the env knob, which defaults to the shipping 2.
+            slide_mul: enc_slide_mul(),
             tables,
             params,
             checksum: opts.checksum,
@@ -151,8 +213,7 @@ impl Compressor {
             reps: [1, 4, 8],
             entropy: EntropyState::default(),
             hist: Vec::new(),
-            in_acc: Vec::new(),
-            in_off: 0,
+            hist_done: 0,
             out_acc: Vec::new(),
             out_off: 0,
             produced_in: 0,
@@ -182,6 +243,7 @@ impl Compressor {
         self.write_dict_id = self.dict_id.is_some();
         self.hist.clear();
         self.hist.extend_from_slice(dict.content());
+        self.hist_done = self.hist.len();
         let window = 1usize << self.params.window_log.min(31);
         crate::encode::prime_tables(
             &mut self.tables,
@@ -206,6 +268,7 @@ impl Compressor {
         self.write_dict_id = false;
         self.hist.clear();
         self.hist.extend_from_slice(prefix);
+        self.hist_done = self.hist.len();
         let window = 1usize << self.params.window_log.min(31);
         crate::encode::prime_tables(
             &mut self.tables,
@@ -218,6 +281,18 @@ impl Compressor {
     }
 
     /// Omit Dictionary_ID from the frame header (`--no-dictID`).
+    /// Override the history multiplier at which the window slides.
+    ///
+    /// `k` windows of history are held and a slide drops back to one, so the
+    /// slide's whole cost -- memmove, six table clears, and the re-prime that
+    /// dominates it -- scales as `1 / (k - 1)`. It is a MEMORY-for-work trade
+    /// and it also perturbs compressed size, because the re-prime inserts every
+    /// position of the retained window and is therefore acting as a table
+    /// densification pass. Present so both arms can be priced in one process.
+    pub fn set_slide_mul(&mut self, k: usize) {
+        self.slide_mul = k.clamp(2, 8);
+    }
+
     pub fn set_write_dict_id(&mut self, write: bool) {
         if !self.started {
             self.write_dict_id = write;
@@ -239,7 +314,8 @@ impl Compressor {
                 done: self.out_pending() == 0,
             });
         }
-        self.in_acc.extend_from_slice(input);
+        crate::copies::add(crate::copies::C_ENC_IN_ACC, input.len());
+        self.hist.extend_from_slice(input);
         if !self.started {
             write_frame_header(
                 &mut self.out_acc,
@@ -270,7 +346,9 @@ impl Compressor {
                 break;
             }
         }
-        self.compact_in();
+        // `compact_in` is gone with `in_acc`: there is no staging buffer to
+        // reclaim any more. The history buffer's own reclaim is the window
+        // slide in `emit_block`, which now measures the ENCODED prefix.
 
         if flush == Flush::End && !self.ended {
             if self.pending() == 0 {
@@ -302,12 +380,17 @@ impl Compressor {
     /// 64 KiB -- never a per-call memmove of the unread remainder.
     fn take_output(&mut self, output: &mut [u8]) -> usize {
         let n = self.out_pending().min(output.len());
+        crate::copies::add(crate::copies::C_ENC_OUT, n);
         output[..n].copy_from_slice(&self.out_acc[self.out_off..self.out_off + n]);
         self.out_off += n;
         if self.out_off == self.out_acc.len() {
             self.out_acc.clear();
             self.out_off = 0;
         } else if self.out_off >= 64 * 1024 {
+            crate::copies::add(
+                crate::copies::C_ENC_OUT_COMPACT,
+                self.out_acc.len() - self.out_off,
+            );
             self.out_acc.drain(..self.out_off);
             self.out_off = 0;
         }
@@ -315,24 +398,7 @@ impl Compressor {
     }
 
     fn pending(&self) -> usize {
-        self.in_acc.len().saturating_sub(self.in_off)
-    }
-
-    /// CUT 7's input half: this drained on EVERY `stream` call, memmoving the
-    /// unconsumed remainder each time. Reclaim is now free when everything is
-    /// consumed and amortised (64 KiB threshold) otherwise; `pending()` and
-    /// `emit_block` are already offset-aware.
-    fn compact_in(&mut self) {
-        if self.in_off == 0 {
-            return;
-        }
-        if self.in_off == self.in_acc.len() {
-            self.in_acc.clear();
-            self.in_off = 0;
-        } else if self.in_off >= 64 * 1024 {
-            self.in_acc.drain(..self.in_off);
-            self.in_off = 0;
-        }
+        self.hist.len().saturating_sub(self.hist_done)
     }
 
     fn emit_empty_last_if_needed(&mut self) -> Result<(), Error> {
@@ -346,18 +412,22 @@ impl Compressor {
     }
 
     fn emit_block(&mut self, take: usize, last: bool) -> Result<(), Error> {
-        let block_start = self.hist.len();
+        // No copy here any more: the bytes are already in `hist`, appended
+        // by `stream`. This advances a cursor instead, and the checksum is
+        // taken over exactly the block rather than "to the end of hist",
+        // which now has pending bytes past it.
+        let block_start = self.hist_done;
+        let block_end = block_start + take;
         if take > 0 {
-            let end = self.in_off + take;
-            self.hist.extend_from_slice(&self.in_acc[self.in_off..end]);
-            self.xxh.update(&self.hist[block_start..]);
-            self.in_off = end;
+            self.xxh.update(&self.hist[block_start..block_end]);
+            self.hist_done = block_end;
         }
         let window = 1usize << self.params.window_log.min(31);
         encode_block_from_scratch(
             &mut self.out_acc,
             &self.hist,
             block_start,
+            block_end,
             self.params,
             &mut self.tables,
             &mut self.reps,
@@ -382,8 +452,23 @@ impl Compressor {
         // valid frames; the round-trip, the external decoder and the size are
         // the gate). One-shot output is untouched -- `emit_block` is
         // streaming-only.
-        if self.hist.len() >= 2 * window {
-            let drop = self.hist.len() - window;
+        // SECTION 20b -- the same trade, one notch further, made MEASURABLE.
+        // Section 20 moved the trigger from `hist > window` (a slide on every
+        // block) to `hist >= 2 * window`, which cut webster from 240 slides and
+        // 503 MB memmoved to 15 slides and 31 MB. The cost per slide is
+        // unchanged -- memmove the window, zero six tables, re-prime the whole
+        // window -- so the ONLY remaining lever on it is how often it fires,
+        // and that is linear in this multiplier: at `k * window` a slide
+        // happens every `(k - 1) * window` bytes.
+        //
+        // It is a MEMORY trade, not a free win: `k` windows of history are held
+        // instead of two. So it is a knob with a shipping default rather than a
+        // constant, and `streamcopies.rs` prices both arms.
+        // Measured on `hist_done`, not `hist.len()`: the tail past the cursor
+        // is pending input that has not been coded, and dropping any of it
+        // would silently lose caller bytes.
+        if self.hist_done >= slide_threshold(self.slide_mul, window) {
+            let drop = self.hist_done - window;
             #[cfg(feature = "profile")]
             {
                 ENC_SLIDE[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -392,12 +477,14 @@ impl Compressor {
                     core::sync::atomic::Ordering::Relaxed,
                 );
             }
+            crate::copies::add(crate::copies::C_HIST_SLIDE, self.hist.len() - drop);
             self.hist.drain(..drop);
+            self.hist_done -= drop;
             self.tables.reset();
             crate::encode::prime_tables(
                 &mut self.tables,
                 &self.hist,
-                self.hist.len(),
+                self.hist_done,
                 window,
                 self.params,
             );
@@ -484,7 +571,11 @@ impl Decompressor {
         output: &mut [u8],
         end: bool,
     ) -> Result<StreamStatus, Error> {
-        self.input.extend_from_slice(input);
+        crate::copies::add(crate::copies::C_DEC_IN_ACC, input.len());
+        {
+            let _s = crate::prof::scope(crate::prof::Stage::StreamInAcc);
+            self.input.extend_from_slice(input);
+        }
         // SECTION 19 BRICK A -- decode no further than the caller can drink.
         // The old exit only fired when `output` was EMPTY, so a caller feeding
         // a whole frame in one call had ALL of it decoded into `decoded`
@@ -493,21 +584,34 @@ impl Decompressor {
         // once the pending bytes can fill `output` bounds `decoded` at
         // ~output + window + one block, and later calls resume from `input`
         // exactly where this one stopped.
-        loop {
-            let have = self.decoded.len() - self.decoded_off;
-            if have > 0 && have >= output.len() {
-                break;
-            }
-            if !self.progress()? {
-                break;
+        {
+            let _s = crate::prof::scope(crate::prof::Stage::StreamProgress);
+            loop {
+                let have = self.decoded.len() - self.decoded_off;
+                if have > 0 && have >= output.len() {
+                    break;
+                }
+                if !self.progress()? {
+                    break;
+                }
             }
         }
-        self.compact_input();
+        {
+            let _s = crate::prof::scope(crate::prof::Stage::StreamCompact);
+            self.compact_input();
+        }
         let avail = self.decoded.len() - self.decoded_off;
         let n = avail.min(output.len());
-        output[..n].copy_from_slice(&self.decoded[self.decoded_off..self.decoded_off + n]);
+        crate::copies::add(crate::copies::C_DEC_OUT, n);
+        {
+            let _s = crate::prof::scope(crate::prof::Stage::StreamOutCopy);
+            output[..n].copy_from_slice(&self.decoded[self.decoded_off..self.decoded_off + n]);
+        }
         self.decoded_off += n;
-        self.compact();
+        {
+            let _s = crate::prof::scope(crate::prof::Stage::StreamCompact);
+            self.compact();
+        }
         if end && self.in_avail() != 0 && self.header.is_none() && n == 0 && avail == 0 {
             return Err(Error::UnexpectedEof);
         }
@@ -537,10 +641,45 @@ impl Decompressor {
         &self.input[self.in_off..]
     }
 
+    /// STREAMING-VS-ONE-SHOT GAP, measured and still OPEN. Streaming decode
+    /// runs at 0.703-0.776x of `decompress_into` on identical bytes (ABBA
+    /// interleaved, null arm 0.95-1.08x, z = -1.67 to -3.00). Eight causes
+    /// have been eliminated by measurement, so none of these is worth
+    /// re-testing without new information:
+    ///
+    ///  1. copy traffic -- cut 74% (9.87 -> 2.53 B/output), ratio unchanged
+    ///  2. structural re-entry -- stage call counts are IDENTICAL (256/256)
+    ///  3. a single hot stage -- scoped stages grow only 1.09x
+    ///  4. the decoded-window compaction -- ablated, no change
+    ///  5. per-call overhead -- 32x fewer `stream` calls, no change
+    ///  6. buffer reallocation -- the header-time reserve already exists
+    ///  7. buffer SHAPE -- made structurally one-shot-like, gap persists
+    ///  8. the content checksum -- disabled, no change
+    ///
+    /// A ninth, the benchmark itself, WAS real and is why the figure above is
+    /// lower than first reported: a harness that fed a chunk and read once
+    /// under-drained and inflated the gap to ~1.8x. The next instrument is a
+    /// sampling profiler on the two binaries; the stage profiler cannot
+    /// resolve it (its rdtsc tax is 27-29% of wall and compresses the
+    /// measured 1.4x into 1.04x).
+    ///
     /// CUT 5's amortiser: reclaim consumed input only when it is all consumed
     /// (a `clear`, no memmove) or the dead prefix has grown past 64 KiB -- so
     /// the per-unit O(remaining) drains become O(1) cursor bumps and the total
-    /// moved is bounded by the bytes fed, not units x remaining.
+    /// moved is genuinely bounded by the bytes fed.
+    ///
+    /// `2 * in_off >= len` is what makes that claim true, and it was missing.
+    /// The trigger fired on an ABSOLUTE dead prefix (64 KiB) while the drain
+    /// memmoves the LIVE remainder -- and Brick A deliberately stops decoding
+    /// the moment the caller's buffer can be filled, so that remainder grows
+    /// against a fixed trigger. Measured before the fix, 32 MiB streamed with
+    /// a 64 KiB feed: **244 MB memmoved on webster, 7.63 bytes per OUTPUT
+    /// byte** -- the O(n^2) front-drain this module's own header warns about,
+    /// one level below where CUT 5 removed it.
+    ///
+    /// Requiring the reclaim to cover the move also bounds the buffer: the
+    /// live tail is never more than half, so `input` holds at most ~2x what
+    /// the caller has fed ahead of consumption.
     fn compact_input(&mut self) {
         if self.in_off == 0 {
             return;
@@ -548,7 +687,23 @@ impl Decompressor {
         if self.in_off == self.input.len() {
             self.input.clear();
             self.in_off = 0;
-        } else if self.in_off >= 64 * 1024 {
+        // `3 * dead >= 2 * total` means the dead prefix is at least TWICE the
+        // live tail, so each compaction reclaims twice what it moves rather
+        // than merely matching it -- the same frequency lever as the decoded
+        // window above, and it halves this traffic again for one more buffer's
+        // worth of held input. The bound stays real: the live tail is never
+        // more than a third, so `input` holds at most ~1.5x what the caller has
+        // fed ahead.
+        } else if self.in_off >= 64 * 1024 && 3 * self.in_off >= 2 * self.input.len() {
+            // Counted AT the drain, so it records bytes actually memmoved. An
+            // earlier version of this tap sat in `stream()` and recorded
+            // `input.len() - in_off` once per call -- the standing unconsumed
+            // input, a LEVEL summed as though it were a FLOW. It read 15.27
+            // "bytes per output byte" and meant nothing.
+            crate::copies::add(
+                crate::copies::C_DEC_IN_COMPACT,
+                self.input.len() - self.in_off,
+            );
             self.input.drain(..self.in_off);
             self.in_off = 0;
         }
@@ -647,7 +802,7 @@ impl Decompressor {
                         .content_size
                         .map(|cs| cs.saturating_add(u64::from(h.block_size_max())).min(keep))
                         .unwrap_or(keep)
-                        .min(8 << 20) as usize;
+                        .min(dec_reserve_cap()) as usize;
                     self.decoded.reserve(want);
                 }
                 self.header = Some(h);
@@ -763,7 +918,21 @@ impl Decompressor {
         // compaction reclaim at least as much as it moves, so total traffic is
         // bounded by ~1x the decoded bytes, for at most one extra window of
         // memory held.
-        if drop >= window.max(64 * 1024) {
+        // SECTION 19c -- the same frequency lever the ENCODER slide took, and
+        // strictly cheaper here. Brick B made each compaction reclaim at least
+        // as much as it moves, bounding traffic at ~1x the decoded bytes.
+        // Waiting for TWO windows of dead prefix halves how often it fires and
+        // so halves that bound, for one more window of memory.
+        //
+        // Unlike the encoder's slide this has NO ratio cost: the encoder's
+        // slide re-primes the match tables, so sliding less often changes which
+        // matches are found and costs 0.06-0.14% size. Decode output is fixed
+        // by the bitstream -- the only thing that changes is when the buffer is
+        // reclaimed. The extra is capped in ABSOLUTE bytes for the same reason
+        // as the encoder's: the win scales with compaction FREQUENCY (high when
+        // the window is small) and the memory cost with window SIZE.
+        let extra = window.min(SLIDE_EXTRA_MAX);
+        if drop >= (window + extra).max(64 * 1024) {
             #[cfg(feature = "profile")]
             {
                 DEC_COMPACT[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -772,6 +941,7 @@ impl Decompressor {
                     core::sync::atomic::Ordering::Relaxed,
                 );
             }
+            crate::copies::add(crate::copies::C_DEC_COMPACT, self.decoded.len() - drop);
             self.decoded.drain(..drop);
             self.decoded_off -= drop;
             if drop <= self.frame_start {
@@ -792,6 +962,38 @@ impl Default for Decompressor {
 
 #[cfg(test)]
 mod tests {
+    /// The slide threshold must hold the extra history where slides are
+    /// FREQUENT and refuse to at high levels, where the window is huge and
+    /// slides are rare. A flat multiplier costs +128 MiB at L22 to remove
+    /// slides a 128 MiB window mostly never performs.
+    #[test]
+    fn slide_threshold_caps_the_extra_history() {
+        // Small windows: the full extra window is held.
+        for wlog in 19..=23u32 {
+            let w = 1usize << wlog;
+            let t = super::slide_threshold(3, w);
+            let extra = t - 2 * w;
+            assert!(
+                extra <= super::SLIDE_EXTRA_MAX,
+                "wlog {wlog}: extra {extra} exceeds the cap"
+            );
+            assert_eq!(extra, w.min(super::SLIDE_EXTRA_MAX));
+        }
+        // L22-class window: capped, NOT 3x.
+        let w = 1usize << 27;
+        let t = super::slide_threshold(3, w);
+        assert_eq!(t, 2 * w + super::SLIDE_EXTRA_MAX);
+        assert!(
+            t < 3 * w,
+            "a flat 3x would cost a whole extra 128 MiB window"
+        );
+        // k=2 reproduces the pre-change threshold exactly, at every size.
+        for wlog in 10..=27u32 {
+            let w = 1usize << wlog;
+            assert_eq!(super::slide_threshold(2, w), 2 * w);
+        }
+    }
+
     use super::*;
     use crate::compress;
 

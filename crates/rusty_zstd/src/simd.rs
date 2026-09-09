@@ -132,7 +132,9 @@ pub fn bench_eq_words(a: &[u8], b: &[u8]) -> usize {
 }
 
 /// GATE 15 arm. 0 = shipped (AVX2 where available), 1 = force the word loop,
-/// 2 = peek the first 8 bytes before going wide.
+/// 2 = peek the first 8 bytes before going wide, 3 = census poison: take
+/// the wide dispatch's SCALAR arm -- what a non-AVX2 CPU takes -- so the
+/// kernel-reach census can prove its MISS branch actually fires.
 ///
 /// The question the CPU-capability dispatch does not answer: AVX2's first loop
 /// reads 64 bytes per side before it can return, and at L3 the mean match is
@@ -186,7 +188,8 @@ mod counters {
     /// Compare operations executed: wide (32B cmpeq), word (8B), byte.
     pub(super) static G_OPS: [AtomicU64; 3] =
         [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-    pub(super) static G_HIST: [AtomicU64; 5] = [
+    pub(super) static G_HIST: [AtomicU64; 6] = [
+        AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
@@ -198,7 +201,7 @@ mod counters {
         pub(super) calls: Cell<u64>,
         pub(super) wide: Cell<u64>,
         pub(super) ops: [Cell<u64>; 3],
-        pub(super) hist: [Cell<u64>; 5],
+        pub(super) hist: [Cell<u64>; 6],
     }
 
     fn fold(c: &Cell<u64>, g: &AtomicU64) {
@@ -215,6 +218,7 @@ mod counters {
                 wide: Cell::new(0),
                 ops: [Cell::new(0), Cell::new(0), Cell::new(0)],
                 hist: [
+                    Cell::new(0),
                     Cell::new(0),
                     Cell::new(0),
                     Cell::new(0),
@@ -312,12 +316,12 @@ pub fn take_eq_ops() -> (u64, u64, u64) {
     )
 }
 
-/// Read and clear `(calls, wide_eligible, [<8, 8-31, 32-63, 64-255, 256+])`.
+/// Read and clear `(calls, wide_eligible, [<3, 3-7, 8-31, 32-63, 64-255, 256+])`.
 #[cfg(feature = "profile")]
-pub fn take_eqlen_stats() -> (u64, u64, [u64; 5]) {
+pub fn take_eqlen_stats() -> (u64, u64, [u64; 6]) {
     use core::sync::atomic::Ordering::Relaxed;
     counters::flush_this_thread();
-    let mut h = [0u64; 5];
+    let mut h = [0u64; 6];
     for (i, v) in counters::G_HIST.iter().enumerate() {
         h[i] = v.swap(0, Relaxed);
     }
@@ -474,6 +478,9 @@ unsafe fn finish_words(a: *const u8, b: *const u8, mut n: usize, max: usize) -> 
 /// This is the "bounds-check tax is ~0" law landing again: LLVM had already
 /// folded both range checks into six instructions shared by every path.
 #[inline(always)]
+/// No production caller since `count_match` went to raw pointers; kept as
+/// the SAFE oracle entry for the kernel tests.
+#[allow(dead_code)]
 pub(crate) fn count_eq_len_ge8(a: &[u8], b: &[u8], max: usize) -> usize {
     debug_assert!(max >= 8 && a.len() >= max && b.len() >= max);
     // SAFETY: `max <= a.len()` and `max <= b.len()` are the caller's contract,
@@ -559,9 +566,25 @@ pub(crate) unsafe fn count_eq_len_ge8_raw(a: *const u8, b: *const u8, max: usize
                 // one of ~71M calls at L19, to serve a branch taken once per
                 // process. Branching on the raw cache state instead means
                 // nothing is live across anything.
+                // Arm 3 exists ONLY so the kernel-reach census can prove its
+                // MISS branch fires. Arm 1 short-circuits above this dispatch,
+                // so it can show the hit counter going to zero but never
+                // exercises the scalar side of the tap -- and a counter whose
+                // failure branch has never run is not yet evidence. This routes
+                // through the same site a non-AVX2 CPU would take.
+                if arm == 3 {
+                    crate::kreach::miss(crate::kreach::K_COUNT_EQ_WIDE);
+                    return count_eq_len_words_raw(a, b, 32, max);
+                }
                 match AVX2_CACHE.load(core::sync::atomic::Ordering::Relaxed) {
-                    1 => return count_eq_len_avx2(a, b, max),
-                    2 => return count_eq_len_words_raw(a, b, 32, max),
+                    1 => {
+                        crate::kreach::hit(crate::kreach::K_COUNT_EQ_WIDE);
+                        return count_eq_len_avx2(a, b, max);
+                    }
+                    2 => {
+                        crate::kreach::miss(crate::kreach::K_COUNT_EQ_WIDE);
+                        return count_eq_len_words_raw(a, b, 32, max);
+                    }
                     _ => return avx2_first_call(a, b, max),
                 }
             }
@@ -569,15 +592,18 @@ pub(crate) unsafe fn count_eq_len_ge8_raw(a: *const u8, b: *const u8, max: usize
             {
                 // No `std` means no runtime probe: the ISA is proven at compile
                 // time and there is nothing to dispatch on.
+                crate::kreach::hit(crate::kreach::K_COUNT_EQ_WIDE);
                 return count_eq_len_avx2(a, b, max);
             }
             #[cfg(target_arch = "aarch64")]
             {
                 // NEON is baseline aarch64.
+                crate::kreach::hit(crate::kreach::K_COUNT_EQ_WIDE);
                 return count_eq_len_neon(a, b, max);
             }
             #[allow(unreachable_code)]
             {
+                crate::kreach::miss(crate::kreach::K_COUNT_EQ_WIDE);
                 return count_eq_len_words_raw(a, b, 32, max);
             }
         }
@@ -601,8 +627,10 @@ unsafe fn avx2_first_call(a: *const u8, b: *const u8, max: usize) -> usize {
     // SAFETY: contract forwarded unchanged to whichever arm wins.
     unsafe {
         if avx2_detect() {
+            crate::kreach::hit(crate::kreach::K_COUNT_EQ_WIDE);
             count_eq_len_avx2(a, b, max)
         } else {
+            crate::kreach::miss(crate::kreach::K_COUNT_EQ_WIDE);
             count_eq_len_words_raw(a, b, 32, max)
         }
     }
@@ -634,22 +662,27 @@ unsafe fn count_eq_len_small(a: *const u8, b: *const u8, max: usize) -> usize {
 #[cfg(feature = "profile")]
 #[inline]
 pub(crate) fn note_eqlen(n: usize) {
-    // bits = 0..=64; bucket = [<8, 8-31, 32-63, 64-255, 256+].
-    // bits<=3 -> 0 | 4..=5 -> 1 | 6 -> 2 | 7..=8 -> 3 | >=9 -> 4
+    // bits = 0..=64; bucket = [<3, 3-7, 8-31, 32-63, 64-255, 256+].
+    // bits<=2 -> 0 | 3 -> 1 | 4..=5 -> 2 | 6 -> 3 | 7..=8 -> 4 | >=9 -> 5
+    // The `<3` split exists for one question: at the FAST finder (mls 5)
+    // a fused 8-byte head resolves a candidate without the count call
+    // exactly when n <= 2 (5 + n < 8). Read it with `eqshare`.
     const BUCKET: [u8; 65] = {
-        let mut t = [4u8; 65];
+        let mut t = [5u8; 65];
         let mut i = 0;
         while i <= 64 {
-            t[i] = if i <= 3 {
+            t[i] = if i <= 2 {
                 0
-            } else if i <= 5 {
+            } else if i == 3 {
                 1
-            } else if i == 6 {
+            } else if i <= 5 {
                 2
-            } else if i <= 8 {
+            } else if i == 6 {
                 3
-            } else {
+            } else if i <= 8 {
                 4
+            } else {
+                5
             };
             i += 1;
         }
