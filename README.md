@@ -211,10 +211,10 @@ cargo add rusty_zstd
 
 ```toml
 [dependencies]
-rusty_zstd = "0.1"
+rusty_zstd = "0.2"
 
 # …or for embedded / wasm targets with no `std`:
-rusty_zstd = { version = "0.1", default-features = false, features = ["alloc"] }
+rusty_zstd = { version = "0.2", default-features = false, features = ["alloc"] }
 ```
 
 The minimum supported configuration is `no_std + alloc` — every entry point
