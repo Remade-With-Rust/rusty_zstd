@@ -5,16 +5,39 @@ edition = "2021"
 
 # On-board proof for rusty_zstd's bare-metal support: an ESP32-S3 (Xtensa LX7,
 # 32-bit, NO 64-bit atomics) compressing and decompressing in `no_std + alloc`.
-# Deliberately outside the codec repo: it needs the `esp` toolchain, which CI
-# does not have, so it is a hand-run instrument, not a gate.
+# Deliberately outside the codec repo's workspace: it needs the `esp` toolchain,
+# which CI does not have, so it is a hand-run instrument, not a gate.
+#
+# TWO ARMS, ONE SOURCE. The allocator is a cargo feature, so the only difference
+# between the builds is which allocator serves the codec:
+#
+#   cargo build --release                                       # esp-alloc
+#   cargo build --release --no-default-features -F arm-rusty-alloc
+#
+# rusty_alloc additionally needs `--cfg ra_single_threaded --cfg ra_small_profile`
+# (both are in .cargo/config.toml). Without the second, SEGMENT_SIZE stays at
+# 32 MiB, a chip-scale region yields zero segments, and every allocation fails.
+
+[features]
+default = ["arm-esp-alloc"]
+arm-esp-alloc = ["dep:esp-alloc"]
+arm-rusty-alloc = ["dep:rusty_alloc", "dep:rusty_alloc-api"]
 
 [dependencies]
 esp-hal = { version = "1.2.1", features = ["esp32s3", "unstable"] }
-esp-alloc = { version = "0.11.0", features = ["esp32s3"] }
-esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3"] }
 esp-println = { version = "0.18.0", default-features = false, features = ["esp32s3", "jtag-serial"] }
 esp-backtrace = { version = "0.20.0", features = ["esp32s3", "println", "panic-handler"] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3"] }
 rusty_zstd = { path = "../../crates/rusty_zstd", default-features = false, features = ["alloc"] }
+
+# `internal-heap-stats` is what makes `max_usage` readable, which is the whole
+# point of the footprint arm.
+esp-alloc = { version = "0.11.0", features = ["esp32s3", "internal-heap-stats"], optional = true }
+
+# The core crate carries `prim::fixed::Region` and `good_region_size`; the api
+# crate carries the `GlobalAlloc`. Both pinned, both default-features off.
+rusty_alloc = { version = "=2.0.5", default-features = false, optional = true }
+rusty_alloc-api = { version = "=2.0.5", default-features = false, optional = true }
 
 [profile.release]
 opt-level = "s"

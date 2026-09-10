@@ -1,8 +1,14 @@
 [target.xtensa-esp32s3-none-elf]
-runner = "espflash flash --monitor "
+runner = "espflash flash --monitor"
 rustflags = [
   "-C", "link-arg=-nostartfiles",
   "-C", "link-arg=-Wl,-Tlinkall.x",
+  # rusty_alloc refuses to build without the first (loudly), and SILENTLY yields
+  # zero segments on a chip-scale region without the second: SEGMENT_SIZE stays
+  # at 32 MiB and every allocation fails. Harmless under the esp-alloc arm,
+  # where nothing reads them.
+  "--cfg", "ra_single_threaded",
+  "--cfg", "ra_small_profile",
 ]
 
 [build]
