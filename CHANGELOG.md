@@ -6,6 +6,56 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Changed -- `encode.rs` split into modules, with the asm board as the gate
+
+`encode.rs` was **17,912 lines**. It is now **7,646**, with seven siblings,
+none over 2,100:
+
+| file | lines | what |
+|---|---|---|
+| `encode.rs` | 7,646 | entry points, priming, sequence dispatch, the chain/greedy/lazy core |
+| `encode/knobs.rs` | 2,015 | the tuning arms and census counters |
+| `encode/fast.rs` | 1,737 | the Fast ladder (L1-L2) |
+| `encode/tests.rs` | 1,445 | the unit tests |
+| `encode/block.rs` | 1,384 | block encoding: sequences and literals into a block |
+| `encode/dfast.rs` | 1,343 | the DFast ladder (L3-L4) |
+| `encode/tree.rs` | 1,308 | bt-lazy (L13-L15) and opt (L16-L22) |
+| `encode/tables.rs` | 1,175 | `MatchTables` and every accessor over it |
+
+**Why this needed a gate at all.** The crate builds at the default
+`codegen-units = 16` with no LTO, and rustc partitions codegen units BY
+MODULE. Moving code into a child module can change which unit the code that
+STAYS lands in, and therefore what can be inlined into it -- and this file's
+wins are measured in single instructions, with 129 `#[inline(always)]` and 42
+`#[inline(never)]` markers carrying them. A module split here is not
+obviously free, so it was not assumed to be.
+
+**Measured, not assumed: the asm board is identical in all thirty-two
+columns** after every cut, and the per-byte model holds at 263.8. The board
+covers the chain kernels, the fills and the lazy/greedy finders -- the code
+that REMAINED in `encode.rs` -- so it is evidence about exactly the code a
+module move could have disturbed. Identity gates unchanged throughout: GOLD
+`2F6594F7EEDBD12B` / 59,680,638 and LDM `57BE83EA4E1199E8` / 57,796,847.
+
+**The moves are verbatim.** The only edit to moved code is a visibility
+prefix: a private item becomes `pub(crate)` so the parent can still name it,
+and a moved struct's fields widen with it (a private field is private to the
+module that declares it, so the parent would otherwise lose `.field` on a
+type it still uses). Visibility changes who may reference a symbol, not what
+is emitted for it. A child reaches the parent's private items through
+`use super::*`; the parent reaches back through the `use` beside its `mod`.
+
+Five consequences of doing that mechanically, every one caught by a gate
+rather than by reading: `const _` declares no name so a qualifier on it is an
+error; a `pub use` glob over a module with no `pub` items re-exports nothing
+(twice); a moved inherent-impl's methods must widen while a TRAIT impl's must
+not; and `thread_local!` needs the qualifier spelled inside the macro, which a
+regex over `static` does not see -- that one surfaced as six errors in the
+test build, where a sibling module reads the override.
+
+What did NOT move: the chain walk, the fills, and the greedy and lazy
+finders. That is the hot core the campaign tuned, and it stays in one file.
+
 ### Added -- the bare-metal claim, run on silicon (ESP32-S3)
 
 CI proves rusty_zstd COMPILES for Cortex-M4F and RV32. That is a different
