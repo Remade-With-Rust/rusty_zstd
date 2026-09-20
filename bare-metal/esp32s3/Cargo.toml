@@ -37,7 +37,7 @@ esp-alloc = { version = "0.11.0", features = ["esp32s3", "internal-heap-stats"],
 # The core crate carries `prim::fixed::Region` and `good_region_size`; the api
 # crate carries the `GlobalAlloc`. Both pinned, both default-features off.
 rusty_alloc = { version = "=2.0.5", default-features = false, optional = true }
-rusty_alloc-api = { version = "=2.0.5", default-features = false, optional = true }
+rusty_alloc-api = { version = "=2.2.0", default-features = false, optional = true }
 
 [profile.release]
 opt-level = "s"
