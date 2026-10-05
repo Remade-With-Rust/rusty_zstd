@@ -2519,6 +2519,77 @@ pub(crate) fn ml_code(len: u32, lut: bool) -> (u8, u32, u8) {
     code_from_base(len, &ML_BASE, &ML_BITS)
 }
 
+/// SEQ-5: a coded length as ONE word -- `code | width << 8 | extra << 16`,
+/// with `extra` already below `1 << width`.
+///
+/// `ll_code` / `ml_code` answer through three tables: the code LUT, then the
+/// code's base (subtract, and test `len >= base` for the fall-off), then its
+/// width -- three dependent loads and a branch per length, twice per
+/// sequence. Everything they compute is a pure function of the length, so
+/// for the LUT range it is precomputed whole and the coding pass takes one
+/// load. Built by running the oracle scan at compile time, like
+/// `build_code_lut`, so it cannot drift from [`code_from_base`].
+const fn build_len_enc<const N: usize>(base: &[u32], bits: &[u8]) -> [u32; N] {
+    let mut out = [0u32; N];
+    let mut v = 0usize;
+    while v < N {
+        // Highest code whose base is <= v; below `base[0]` the scan falls off
+        // as code 0 with no extra bits, which is the all-zero word.
+        let mut i = base.len();
+        while i > 0 {
+            i -= 1;
+            if v as u32 >= base[i] {
+                out[v] = i as u32 | (bits[i] as u32) << 8 | (v as u32 - base[i]) << 16;
+                break;
+            }
+        }
+        v += 1;
+    }
+    out
+}
+
+static LL_ENC: [u32; LL_LUT_LEN] = build_len_enc::<LL_LUT_LEN>(&LL_BASE, &LL_BITS);
+static ML_ENC: [u32; ML_LUT_LEN] = build_len_enc::<ML_LUT_LEN>(&ML_BASE, &ML_BITS);
+
+/// The oracle scan, packed like [`build_len_enc`]: the path for lengths past
+/// the LUT (at most 1.4% of literal lengths and 3.1% of match lengths on
+/// silesia at L1-L19, bar the 56 sequences of x-ray at L1) and for the
+/// `lut == false` arm. Out of line and cold as a PAIR --
+/// both callers share it -- so its compare ladder holds no registers in the
+/// coding pass's loop.
+///
+/// The extra value is masked to its width, so the word is well-formed for
+/// EVERY `u32`: the `(0, len, 0)` fall-off carries no stray value, and a
+/// length past the top code keeps its low 16 bits -- what `BitCStream`'s
+/// per-add mask did to it before the extra bits were merged.
+#[cold]
+#[inline(never)]
+fn len_enc_scan(len: u32, base: &[u32], bits: &[u8]) -> u32 {
+    let (code, extra, width) = code_from_base(len, base, bits);
+    let mask = (1u32 << width) - 1;
+    u32::from(code) | u32::from(width) << 8 | (extra & mask) << 16
+}
+
+/// SEQ-5: literal length -> `code | width << 8 | extra << 16`.
+#[inline(always)]
+pub(crate) fn ll_enc(len: u32, lut: bool) -> u32 {
+    if lut && (len as usize) < LL_LUT_LEN {
+        LL_ENC[len as usize]
+    } else {
+        len_enc_scan(len, &LL_BASE, &LL_BITS)
+    }
+}
+
+/// SEQ-5: match length -> `code | width << 8 | extra << 16`.
+#[inline(always)]
+pub(crate) fn ml_enc(len: u32, lut: bool) -> u32 {
+    if lut && (len as usize) < ML_LUT_LEN {
+        ML_ENC[len as usize]
+    } else {
+        len_enc_scan(len, &ML_BASE, &ML_BITS)
+    }
+}
+
 pub(crate) fn of_code(offset_value: u32) -> (u8, u32) {
     if offset_value <= 1 {
         return (0, 0);
@@ -2549,6 +2620,70 @@ pub(crate) fn offset_value_for(offset: u32, litlen: u32, reps: &[u32; 3]) -> u32
     } else {
         offset.saturating_add(3)
     }
+}
+
+/// SEQ-4: [`offset_value_for`] and the repcode history update, FUSED and
+/// BRANCH-FREE. Returns the offset value and advances `(r0, r1, r2)`.
+///
+/// The encoder's coding pass ran `offset_value_for` -- up to four tests of the
+/// history, in an order that depends on `litlen == 0` -- and then re-derived
+/// the history move from its answer. Every one of those tests is a coin the
+/// branch predictor cannot call: across silesia, `litlen == 0` is 20-71% of
+/// sequences and a repcode hit 0-49%, file by file. The pass measured 7.3
+/// ns/sequence on the one file with neither (x-ray) and 11-13 on the rest.
+///
+/// The two RFC 8878 tables are ONE table read at a shifted position: behind
+/// literals the candidates for codes 1, 2, 3 are `r0, r1, r2`; without them,
+/// `r1, r2, r0 - 1`. And the history has only three moves, for either table:
+///   * code 1 behind literals            -> nothing moves;
+///   * the offset is `r1` (code 2 or 1)  -> `(r1, r0, r2)`;
+///   * anything else                     -> `(offset, r0, r1)` -- a new
+///     offset, `r0 - 1`, and also the `r2` rotation, which is the same move
+///     because there `offset == r2`.
+///
+/// In all three the new `r0` is the offset itself.
+///
+/// Equal to `offset_value_for` + `resolve_offset`'s history for every offset
+/// of 1 or more (a match cannot have offset 0); `rep_code_step_matches_oracle`
+/// checks it exhaustively over a small history space.
+#[inline(always)]
+pub(crate) fn rep_code_step(
+    offset: u32,
+    litlen: u32,
+    r0: &mut u32,
+    r1: &mut u32,
+    r2: &mut u32,
+) -> u32 {
+    debug_assert!(offset != 0);
+    let (h0, h1, h2) = (*r0, *r1, *r2);
+    let no_lit = litlen == 0;
+    let c1 = if no_lit { h1 } else { h0 };
+    let c2 = if no_lit { h2 } else { h1 };
+    let c3 = if no_lit { h0.wrapping_sub(1) } else { h2 };
+    // `offset_value_for` admits `r0 - 1` only when `r0 > 1`.
+    let c3_ok = !no_lit | (h0 > 1);
+    // Lowest code wins, so the selects run from the highest down.
+    let mut ov = offset.saturating_add(3);
+    ov = if (offset == c3) & c3_ok { 3 } else { ov };
+    ov = if offset == c2 { 2 } else { ov };
+    ov = if offset == c1 { 1 } else { ov };
+    let hold = !no_lit & (offset == h0);
+    let keep2 = hold | (offset == h1);
+    *r2 = if keep2 { h2 } else { h1 };
+    *r1 = if hold { h1 } else { h0 };
+    *r0 = offset;
+    ov
+}
+
+/// SEQ-4: [`of_code`] without its `offset_value <= 1` test -- a branch taken
+/// on every code-1 repcode, 10-39% of sequences on repcode-heavy input.
+/// `| 1` makes the bit scan total and leaves every value above 1 alone, and
+/// clearing the top bit is the same as subtracting it (and yields the `(0, 0)`
+/// the early return did for 0 and 1).
+#[inline(always)]
+pub(crate) fn of_code_nb(offset_value: u32) -> (u32, u32) {
+    let code = 31 - (offset_value | 1).leading_zeros();
+    (code, offset_value & !(1u32 << code))
 }
 
 pub(crate) fn resolve_offset(
@@ -3425,6 +3560,96 @@ mod tests {
         for v in 0..(ML_LUT_LEN as u32 * 2) {
             assert_eq!(ll_code(v, true), code_from_base(v, &LL_BASE, &LL_BITS));
             assert_eq!(ml_code(v, true), code_from_base(v, &ML_BASE, &ML_BITS));
+        }
+    }
+
+    /// SEQ-5: the packed length words against the oracle scan -- every length
+    /// a 128 KiB block can hold and some past it, on both arms. The packed
+    /// extra is the oracle's masked to the code's width, which is the oracle's
+    /// own value everywhere but the two places the oracle is not well-formed:
+    /// its `(0, len, 0)` fall-off below the first base, and a length past the
+    /// top code.
+    #[test]
+    fn len_enc_matches_code_from_base() {
+        fn unpack(e: u32) -> (u8, u32, u8) {
+            ((e & 63) as u8, e >> 16, ((e >> 8) & 31) as u8)
+        }
+        let tail = [140_000u32, 1 << 20, u32::MAX];
+        for v in (0..=131_080u32).chain(tail) {
+            let (c, x, b) = code_from_base(v, &LL_BASE, &LL_BITS);
+            let want = (c, x & ((1u32 << b) - 1), b);
+            assert_eq!(unpack(ll_enc(v, true)), want, "ll_enc({v}, lut)");
+            assert_eq!(unpack(ll_enc(v, false)), want, "ll_enc({v}, scan)");
+            if v < 131_072 {
+                assert_eq!(want.1, x, "LL extra is exact inside a block, {v}");
+            }
+            let (c, x, b) = code_from_base(v, &ML_BASE, &ML_BITS);
+            let want = (c, x & ((1u32 << b) - 1), b);
+            assert_eq!(unpack(ml_enc(v, true)), want, "ml_enc({v}, lut)");
+            assert_eq!(unpack(ml_enc(v, false)), want, "ml_enc({v}, scan)");
+            if (3..131_075).contains(&v) {
+                assert_eq!(want.1, x, "ML extra is exact inside a block, {v}");
+            }
+        }
+    }
+
+    /// SEQ-4: the fused, branch-free repcode step against its two-part
+    /// oracle -- `offset_value_for` for the code and the DECODER's
+    /// `resolve_offset` for the history -- over every history drawn from a
+    /// small alphabet (so equal entries, `r0 == 1` and `offset == r0 - 1` all
+    /// occur), with and without literals, plus the top of the offset range.
+    #[test]
+    fn rep_code_step_matches_oracle() {
+        let mut cases = 0u32;
+        let mut codes = [0u32; 5];
+        let vals = [1u32, 2, 3, 4, 5, 9];
+        for &h0 in &vals {
+            for &h1 in &vals {
+                for &h2 in &vals {
+                    for offset in (1u32..=12).chain([1 << 20, u32::MAX - 3, u32::MAX - 1, u32::MAX])
+                    {
+                        for litlen in [0u32, 1, 77] {
+                            let mut want = [h0, h1, h2];
+                            let want_ov = offset_value_for(offset, litlen, &want);
+                            // The decoder rebuilds the offset from the value;
+                            // past `u32::MAX - 3` the value saturated, so only
+                            // the history move is comparable there.
+                            let got_off = resolve_offset(want_ov, litlen, &mut want).unwrap();
+                            if offset <= u32::MAX - 3 {
+                                assert_eq!(got_off, offset);
+                            } else {
+                                want[0] = offset;
+                            }
+                            let (mut r0, mut r1, mut r2) = (h0, h1, h2);
+                            let ov = rep_code_step(offset, litlen, &mut r0, &mut r1, &mut r2);
+                            assert_eq!(
+                                (ov, [r0, r1, r2]),
+                                (want_ov, want),
+                                "offset {offset} litlen {litlen} history {h0},{h1},{h2}"
+                            );
+                            codes[ov.min(4) as usize] += 1;
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 6 * 6 * 6 * 16 * 3);
+        // Every repcode and the new-offset arm must have been exercised.
+        assert!(codes[1..].iter().all(|&n| n > 0), "codes {codes:?}");
+    }
+
+    /// SEQ-4: the branch-free offset code against `of_code`, over every small
+    /// value and around every power of two.
+    #[test]
+    fn of_code_nb_matches_of_code() {
+        let around_pow2 = (1..32u32).flat_map(|b| {
+            let p = 1u32 << b;
+            [p - 1, p, p + 1]
+        });
+        for v in (0..70_000u32).chain(around_pow2).chain([u32::MAX]) {
+            let (code, extra) = of_code(v);
+            assert_eq!(of_code_nb(v), (u32::from(code), extra), "offset value {v}");
         }
     }
 }

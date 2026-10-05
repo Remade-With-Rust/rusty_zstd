@@ -789,10 +789,15 @@ impl FseCTable {
             *cs = cs.wrapping_add(1);
         }
 
+        // SEQ-1: `delta` is never shorter than `SEQ_DELTA_LEN`, so the sequence
+        // coder's hoisted view (`seq_enc`) can index it by a masked code with
+        // no bounds check. The slots past `max_sv` are filled below as ABSENT
+        // symbols, which is what they are.
+        let delta_len = (max_sv + 1).max(SEQ_DELTA_LEN);
         #[cfg(all(feature = "std", feature = "alloc"))]
-        let mut delta = ct_pool::take_delta(max_sv + 1);
+        let mut delta = ct_pool::take_delta(delta_len);
         #[cfg(not(all(feature = "std", feature = "alloc")))]
-        let mut delta = vec![FseCDelta { nb: 0, find: 0 }; max_sv + 1];
+        let mut delta = vec![FseCDelta { nb: 0, find: 0 }; delta_len];
         let mut total: u32 = 0;
         for s in 0..=max_sv {
             // SAFETY: `s <= max_sv` is `norm`'s range (non-empty, checked at
@@ -824,6 +829,19 @@ impl FseCTable {
                 }
             }
         }
+        // SEQ-1: the padding must read as ZERO-PROBABILITY, exactly like a
+        // `norm == 0` slot above -- NOT as the pool's `{0, 0}` fill. The table
+        // selector asks `can_encode_symbol` about every symbol in a block's
+        // histogram, and `{nb: 0}` answers yes: a Repeat table would then be
+        // accepted for a symbol past its alphabet. (Before the padding those
+        // slots did not exist and `delta.get` answered `None`, i.e. no.)
+        let absent = FseCDelta {
+            nb: ((u32::from(table_log) + 1) << 16) - (1 << table_log),
+            find: 0,
+        };
+        for d in delta.iter_mut().skip(max_sv + 1) {
+            *d = absent;
+        }
 
         Ok(Self {
             table_log,
@@ -833,7 +851,7 @@ impl FseCTable {
     }
 
     pub(crate) fn rle(symbol: u16) -> Self {
-        let n = 64usize;
+        let n = SEQ_DELTA_LEN;
         let mut delta = vec![
             FseCDelta {
                 nb: u32::MAX,
@@ -889,6 +907,79 @@ impl FseCTable {
     pub(crate) fn flush(&self, state: u32, bits: &mut crate::bit::BitCStream) {
         bits.add_bits(u64::from(state), u32::from(self.table_log));
         bits.flush();
+    }
+
+    /// Accuracy log (0 for an RLE table): the most bits one step can emit for
+    /// a symbol this table encodes, and the width of the final state flush.
+    #[inline(always)]
+    pub(crate) fn table_log(&self) -> u8 {
+        self.table_log
+    }
+
+    /// SEQ-1: the table as the sequence coder's loop wants it -- both buffers
+    /// resolved to slices ONCE per block.
+    ///
+    /// `encode` above reaches `delta` and `state_table` through `&self` on
+    /// every symbol: two pointer loads and two length loads per symbol, six
+    /// symbols' worth per sequence, each with its own bounds test. `None`
+    /// only for a table this module did not build (both constructors make
+    /// `delta` at least `SEQ_DELTA_LEN` long and `state_table` non-empty).
+    #[inline(always)]
+    pub(crate) fn seq_enc(&self) -> Option<FseSeqEnc<'_>> {
+        if self.state_table.is_empty() {
+            return None;
+        }
+        Some(FseSeqEnc {
+            delta: self.delta.first_chunk::<SEQ_DELTA_LEN>()?,
+            states: &self.state_table,
+            table_log: u32::from(self.table_log),
+        })
+    }
+}
+
+/// Slots every `FseCTable::delta` is padded to. A power of two above the
+/// widest sequence alphabet (ML, 53 codes), so `code & (SEQ_DELTA_LEN - 1)` is
+/// the identity on every real code and proves the index in range.
+#[cfg(feature = "alloc")]
+pub(crate) const SEQ_DELTA_LEN: usize = 64;
+
+/// See [`FseCTable::seq_enc`].
+#[cfg(feature = "alloc")]
+#[derive(Clone, Copy)]
+pub(crate) struct FseSeqEnc<'a> {
+    delta: &'a [FseCDelta; SEQ_DELTA_LEN],
+    states: &'a [u16],
+    table_log: u32,
+}
+
+#[cfg(feature = "alloc")]
+impl FseSeqEnc<'_> {
+    /// One `FSE_encodeSymbol` with the bit write left to the caller: returns
+    /// `(next_state, nb_bits)`, and the caller emits the low `nb_bits` of the
+    /// state it passed in. Same arithmetic as [`FseCTable::encode`].
+    ///
+    /// Both index proofs are SAFE code, not `get_unchecked`:
+    ///   * `symbol & 63` into a `[_; 64]` -- the identity on a real code;
+    ///   * `idx & (len - 1)` into `states`, with `len != 0` established by
+    ///     `seq_enc` -- the identity whenever `idx < len`, which holds for
+    ///     every state of a table built by `from_norm` and every symbol it
+    ///     gives a probability (the only ones the selector lets through).
+    ///
+    /// `encode` answers an out-of-range index with state 0 instead; the two
+    /// differ only on a symbol the table cannot encode, where both are garbage.
+    #[inline(always)]
+    pub(crate) fn step(&self, state: u32, symbol: usize) -> (u32, u32) {
+        let d = self.delta[symbol & (SEQ_DELTA_LEN - 1)];
+        let nb = state.wrapping_add(d.nb) >> 16;
+        let idx = (state.wrapping_shr(nb) as i32).wrapping_add(d.find) as usize;
+        let next = self.states[idx & (self.states.len() - 1)];
+        (u32::from(next), nb)
+    }
+
+    /// Bits of the final state flush (`FSE_flushCState`).
+    #[inline(always)]
+    pub(crate) fn table_log(&self) -> u32 {
+        self.table_log
     }
 }
 
@@ -1314,6 +1405,59 @@ pub(crate) fn ncount_and_ctable(
     let ct = FseCTable::from_norm(&norm, table_log)?;
     crate::scratch::pool_give(&SC_NORM, norm);
     Ok((header, ct))
+}
+
+/// SEQ-7: [`ncount_and_ctable`] WITHOUT the table -- the NCount header, the
+/// normalised counts it was written from, and their log. The caller prices
+/// the candidate with [`norm_bit_cost`] and builds the table only if it wins;
+/// the normalised counts go back through [`give_norm_buf`].
+#[cfg(feature = "alloc")]
+#[inline(always)]
+pub(crate) fn ncount_and_norm(
+    count: &[u32],
+    max_log: u8,
+    use_low_prob: bool,
+) -> Result<(Vec<u8>, Vec<i16>, u8), Error> {
+    let total: u32 = count.iter().sum();
+    let max_sv = count
+        .iter()
+        .rposition(|&c| c > 0)
+        .ok_or(Error::Corruption)?;
+    if count[max_sv] == total {
+        return Err(Error::Corruption);
+    }
+    let table_log = optimal_table_log(max_log, total as usize, max_sv);
+    let norm = normalize_count(&count[..=max_sv], table_log, total, use_low_prob)?;
+    let header = write_ncount(&norm, table_log)?;
+    Ok((header, norm, table_log))
+}
+
+/// SEQ-7: exactly `FseCTable::from_norm(norm, table_log)?.bit_cost(counts)`,
+/// read off the normalised counts instead of off a built table.
+///
+/// `bit_cost` needs one number per symbol -- `FSE_getMaxNbBits`, the rounded
+/// `deltaNbBits` -- and `from_norm` derives that from `norm[s]` and
+/// `table_log` alone: `table_log` for a probability of 1 (or the low-prob
+/// -1), `table_log - highbit(norm - 1)` above that, and "cannot encode" for
+/// 0. The spread, the state table and the pool traffic are 60% of a
+/// candidate's build and none of it reaches the price.
+#[cfg(feature = "alloc")]
+pub(crate) fn norm_bit_cost(norm: &[i16], table_log: u8, counts: &[u32]) -> u64 {
+    let log = u32::from(table_log);
+    let mut c = 0u64;
+    for (s, &n) in counts.iter().enumerate() {
+        if n == 0 {
+            continue;
+        }
+        let nb = match norm.get(s).copied().unwrap_or(0) {
+            // libzstd ZSTD_fseBitCost: illegal when Prob[s] == 0.
+            0 => return u64::MAX / 4,
+            -1 | 1 => log,
+            freq => log - (31 - (freq as u32 - 1).leading_zeros()),
+        };
+        c += u64::from(n) * u64::from(nb.max(1));
+    }
+    c
 }
 
 #[cfg(feature = "alloc")]
@@ -1750,5 +1894,61 @@ mod tests {
             }
         }
         assert_eq!(out, syms);
+    }
+
+    /// SEQ-7: the price read off the normalised counts must be the price the
+    /// built table gives -- for the histogram the table was built from, for
+    /// the same histogram with one more of a symbol (the sequence coder
+    /// builds from `counts - last` and prices `counts`), and for a histogram
+    /// holding a symbol the table gave no probability (both must say "cannot
+    /// encode"). Every alphabet and log the sequence coder uses, with and
+    /// without low-probability symbols.
+    #[test]
+    fn norm_bit_cost_matches_built_table() {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut checked = 0u32;
+        let mut refused = 0u32;
+        for round in 0..4000u32 {
+            let (alphabet, max_log) = [(36usize, 9u8), (32, 8), (53, 9)][round as usize % 3];
+            let mut count = vec![0u32; alphabet];
+            // From two live symbols to all of them, flat to steeply skewed.
+            let live = 2 + (next() as usize) % (alphabet - 1);
+            let skew = 1 + (next() % 12) as u32;
+            for _ in 0..live {
+                let sym = (next() as usize) % alphabet;
+                count[sym] += 1 + ((next() % 4000) as u32 >> (next() as u32 % skew));
+            }
+            let use_low = round % 2 == 0;
+            let Ok((_hdr, norm, table_log)) = ncount_and_norm(&count, max_log, use_low) else {
+                continue; // a single live symbol: RLE, never priced
+            };
+            let ct = FseCTable::from_norm(&norm, table_log).expect("table");
+            assert_eq!(
+                norm_bit_cost(&norm, table_log, &count),
+                ct.bit_cost(&count),
+                "round {round} log {table_log}"
+            );
+            let mut plus = count.clone();
+            let bump = plus.iter().position(|&c| c > 0).unwrap();
+            plus[bump] += 1;
+            assert_eq!(norm_bit_cost(&norm, table_log, &plus), ct.bit_cost(&plus));
+            checked += 1;
+            if let Some(absent) = count.iter().position(|&c| c == 0) {
+                let mut other = count.clone();
+                other[absent] = 3;
+                let want = ct.bit_cost(&other);
+                assert_eq!(want, u64::MAX / 4);
+                assert_eq!(norm_bit_cost(&norm, table_log, &other), want);
+                refused += 1;
+            }
+            give_norm_buf(norm);
+        }
+        assert!(checked > 3000 && refused > 1000, "{checked} {refused}");
     }
 }

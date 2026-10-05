@@ -949,74 +949,81 @@ pub(crate) fn build_coded_pass(
         // sequence, while the two copy arms beside it are both resolved once
         // per block.
         let lut_arm = crate::compressed::lut_on();
+        // SEQ-3: the scratch is SIZED to the block up front and the loop
+        // writes its slots through a zip. `push` re-tested the capacity on
+        // every sequence -- a compare against a stack slot, a `grow_one` call
+        // site inside the loop, and the length stored back twice per trip --
+        // for a capacity that was ensured three lines earlier. `resize`
+        // only writes the slots a LARGER block adds; shrinking is free.
         let mut coded: Vec<CodedSeq> = core::mem::take(&mut tables.coded_scratch);
-        coded.clear();
-        if coded.capacity() < seqs.len() {
-            coded = Vec::with_capacity(seqs.len());
-        }
+        coded.resize(seqs.len(), CodedSeq::EMPTY);
         // The code histograms and the of_needs_comp scan were SEPARATE full
         // passes over `coded`; both fold into this loop.
-        let mut ll_count = [0u32; 36];
+        // SEQ-5: the two length histograms are 64 wide in here, indexed by a
+        // code masked to 6 bits -- the identity on every real code (LL has
+        // 36, ML 53), and a range the optimiser can see, where the code as it
+        // comes out of a table is not. The format-sized arrays the callers
+        // want are copied out below.
+        let mut ll_count = [0u32; 64];
         let mut of_count = [0u32; 32];
-        let mut ml_count = [0u32; 53];
-        let mut of_max = 0u8;
-        for s in seqs {
-            let ov = offset_value_for(s.offset, s.litlen, reps);
-            // BRICK 62: advance the repcodes directly instead of calling the
-            // DECODER's `resolve_offset` and discarding its result.
-            //
-            // `resolve_offset` reconstructs the offset from `ov` through a
-            // branchy match plus a `Result` -- but the encoder already HAS that
-            // offset in `s.offset`, and it is provably the same value:
-            //   * `ov > 3`  => `offset_value_for` produced `s.offset + 3`, so
-            //     `ov - 3 == s.offset` (offsets are window-bounded, so the
-            //     `saturating_add(3)` there never saturates);
-            //   * `ov == 3 && litlen == 0` => that arm is only taken when
-            //     `s.offset == reps[0] - 1`, which is what it reconstructs.
-            // The repcode SHUFFLE below is `resolve_offset`'s verbatim.
-            let is_new = ov > 3 || (ov == 3 && s.litlen == 0);
-            if is_new {
-                reps[2] = reps[1];
-                reps[1] = reps[0];
-                reps[0] = s.offset;
-            } else {
-                let which = if s.litlen == 0 { ov + 1 } else { ov };
-                match which {
-                    2 => reps.swap(0, 1),
-                    3 => reps.rotate_right(1),
-                    _ => {}
-                }
-            }
-            let (llc, llx, llb) = ll_code(s.litlen, lut_arm);
-            let (mlc, mlx, mlb) = ml_code(s.matchlen, lut_arm);
-            let (ofc, ofx) = of_code(ov);
-            if ofc > 31 {
-                return Err(Error::Corruption);
-            }
-            // WIN: the two clamps are NO-OPS and exist only so LLVM can drop a
-            // bounds check, the same idiom as `rtb[(proba as usize).min(7)]` in
-            // `fse::normalize`. `llc` and `mlc` come out of a LUT, so their range
-            // (0..=35 and 0..=52, the lengths of LL_BASE and ML_BASE) is true by
-            // construction but invisible to the optimiser -- unlike `ofc`, which
-            // the explicit `ofc > 31` check above already makes provable, which is
-            // exactly why only these two lines carried a guard branch.
-            ll_count[(llc as usize).min(ll_count.len() - 1)] += 1;
+        let mut ml_count = [0u32; 64];
+        // SEQ-3: the repcode history lives in three LOCALS for the pass and is
+        // written back once. Behind `&mut [u32; 3]` every test of it was a
+        // load and every update a store (or, for the rotate, an overlapping
+        // 8-byte move through memory).
+        let [mut r0, mut r1, mut r2] = *reps;
+        for (s, slot) in seqs.iter().zip(coded.iter_mut()) {
+            // BRICK 62 advanced the repcodes directly instead of calling the
+            // DECODER's `resolve_offset` and discarding its result -- the
+            // encoder already has the offset. SEQ-4 goes one further: the code
+            // and the history move are one branch-free step (see
+            // `rep_code_step` for why the branches were the cost here).
+            let ov =
+                crate::compressed::rep_code_step(s.offset, s.litlen, &mut r0, &mut r1, &mut r2);
+            // SEQ-5: each length arrives coded in one word (one load inside
+            // the LUT range): `code | width << 8 | extra << 16`.
+            let le = crate::compressed::ll_enc(s.litlen, lut_arm);
+            let me = crate::compressed::ml_enc(s.matchlen, lut_arm);
+            let (llc, llb, llx) = (le & 63, (le >> 8) & 31, le >> 16);
+            let (mlc, mlb, mlx) = (me & 63, (me >> 8) & 31, me >> 16);
+            // At most 31 by construction (a bit index of a `u32`), which the
+            // optimiser can see -- the `ofc > 31` error exit this replaced was
+            // already folded away.
+            let (ofc, ofx) = crate::compressed::of_code_nb(ov);
+            // The two length codes were clamped here (`.min(len - 1)`, a
+            // compare and a select each) so LLVM could drop a bounds check on
+            // a value out of a LUT; the 6-bit mask above proves the same
+            // thing for nothing. `ofc` is a bit index and needs no help.
+            ll_count[llc as usize] += 1;
             of_count[ofc as usize] += 1;
-            ml_count[(mlc as usize).min(ml_count.len() - 1)] += 1;
-            of_max = of_max.max(ofc);
-            coded.push(CodedSeq {
-                llc,
-                mlc,
-                ofc,
-                llx,
-                mlx,
-                ofx,
-                llb,
-                mlb,
-            });
+            ml_count[mlc as usize] += 1;
+            // SEQ-2: the three extra-bit fields leave here as ONE word, already
+            // in stream order (LL lowest, then ML, then the offset), with its
+            // total width beside it. Each field is below `1 << width` by
+            // construction -- a length minus its code's base, an offset value
+            // minus its top bit -- so nothing needs masking again downstream.
+            debug_assert!(llx >> llb == 0 && mlx >> mlb == 0 && ofx >> ofc == 0);
+            let lm = llb + mlb;
+            let ex = u64::from(llx) | (u64::from(mlx) << llb) | (u64::from(ofx) << lm);
+            *slot = CodedSeq {
+                ex,
+                ex_bits: (lm + ofc) as u8,
+                llc: llc as u8,
+                mlc: mlc as u8,
+                ofc: ofc as u8,
+            };
         }
+        *reps = [r0, r1, r2];
+        // SEQ-3: the largest offset code is READ OFF THE HISTOGRAM. It was a
+        // running maximum kept in a stack slot -- load, compare, select, store
+        // on every sequence -- for a number the pass has by construction.
+        let of_max = of_count.iter().rposition(|&c| c != 0).unwrap_or(0) as u8;
+        let mut ll_out = [0u32; 36];
+        ll_out.copy_from_slice(&ll_count[..36]);
+        let mut ml_out = [0u32; 53];
+        ml_out.copy_from_slice(&ml_count[..53]);
 
-        (coded, ll_count, of_count, ml_count, of_max)
+        (coded, ll_out, of_count, ml_out, of_max)
     };
     Ok(out)
 }
@@ -1117,37 +1124,18 @@ pub(crate) fn write_sequences_inner(
     fse::give_ncount_buf(ml_hdr);
 
     let _fs = crate::prof::scope(crate::prof::Stage::EncodeFseSeq);
-    let mut ml_s = ml_t.init_state2(last_seq.mlc as usize);
-    let mut of_s = of_t.init_state2(last_seq.ofc as usize);
-    let mut ll_s = ll_t.init_state2(last_seq.llc as usize);
-
-    let mut bits = BitCStream::from_vec(
-        core::mem::take(&mut tables.bits_scratch),
-        coded.len() * 4 + 16,
-    );
-    bits.add_bits(u64::from(last_seq.llx), u32::from(last_seq.llb));
-    bits.add_bits(u64::from(last_seq.mlx), u32::from(last_seq.mlb));
-    bits.add_bits(u64::from(last_seq.ofx), u32::from(last_seq.ofc));
-    bits.flush();
-
-    if coded.len() >= 2 {
-        for n in (0..coded.len() - 1).rev() {
-            let c = &coded[n];
-            of_t.encode(&mut of_s, &mut bits, c.ofc as usize);
-            ml_t.encode(&mut ml_s, &mut bits, c.mlc as usize);
-            ll_t.encode(&mut ll_s, &mut bits, c.llc as usize);
-            bits.add_bits(u64::from(c.llx), u32::from(c.llb));
-            bits.add_bits(u64::from(c.mlx), u32::from(c.mlb));
-            bits.add_bits(u64::from(c.ofx), u32::from(c.ofc));
-        }
+    let need = seq_stream_bound(&ll_count, &of_count, &ml_count, &ll_t, &of_t, &ml_t);
+    // The scratch is kept INITIALISED at its high-water length across blocks
+    // (never cleared), so the writes below are plain slice stores: no
+    // `set_len`, no per-block zeroing. A quarter of headroom keeps a frame
+    // whose blocks creep upward from reallocating on each of them.
+    let mut bits = core::mem::take(&mut tables.bits_scratch);
+    if bits.len() < need {
+        bits = vec![0u8; need + need / 4];
     }
-
-    ml_t.flush(ml_s, &mut bits);
-    of_t.flush(of_s, &mut bits);
-    ll_t.flush(ll_s, &mut bits);
-    let out = bits.close();
-    dst.extend_from_slice(&out);
-    tables.bits_scratch = out;
+    let n = encode_seq_bits(&coded, &ll_t, &of_t, &ml_t, &mut bits)?;
+    dst.extend_from_slice(bits.get(..n).ok_or(Error::Corruption)?);
+    tables.bits_scratch = bits;
     tables.coded_scratch = coded;
     // ALLOC-5 (N11): write back ONLY a table that is actually new.
     //
@@ -1184,6 +1172,233 @@ pub(crate) fn write_sequences_inner(
     Ok(())
 }
 
+/// SEQ-1: bytes `encode_seq_bits` may touch for a block with these histograms
+/// and tables -- the bound that lets its loop write through a slice that
+/// never grows.
+///
+/// Every term is a number the caller already holds. The extra bits are EXACT:
+/// each code's count times its width, read off the three histograms (121
+/// multiply-adds per block, nothing per sequence). An FSE step emits at most
+/// `table_log` bits for a symbol its table encodes, and each table takes one
+/// step per sequence but the last plus one final state flush -- `table_log`
+/// bits per sequence, all told. `+ 1` is the end mark; `+ 8` is the width of
+/// the last store, which starts at or before the stream's final whole byte.
+pub(crate) fn seq_stream_bound(
+    ll_count: &[u32; 36],
+    of_count: &[u32; 32],
+    ml_count: &[u32; 53],
+    ll_t: &FseCTable,
+    of_t: &FseCTable,
+    ml_t: &FseCTable,
+) -> usize {
+    let logs =
+        u64::from(ll_t.table_log()) + u64::from(of_t.table_log()) + u64::from(ml_t.table_log());
+    let mut seqs = 0u64;
+    let mut bits = 1u64;
+    for (&n, &w) in ll_count.iter().zip(&crate::compressed::LL_BITS) {
+        seqs += u64::from(n);
+        bits += u64::from(n) * u64::from(w);
+    }
+    for (&n, &w) in ml_count.iter().zip(&crate::compressed::ML_BITS) {
+        bits += u64::from(n) * u64::from(w);
+    }
+    for (code, &n) in of_count.iter().enumerate() {
+        bits += u64::from(n) * code as u64;
+    }
+    ((bits + seqs * logs) >> 3) as usize + 8
+}
+
+/// SEQ-6: `LOW_MASK[n]` keeps the low `n` bits of a `u32` (all of them from 32
+/// up) -- libzstd's `BIT_mask`. An FSE step emits the low `nb` bits of its
+/// state with `nb` only known at run time; computed, that mask is a load of
+/// -1, a variable shift (three micro-ops on the baseline x86-64 this crate
+/// ships, where there is no `bzhi`) and a `not`, three times per sequence.
+const LOW_MASK: [u32; 64] = {
+    let mut m = [u32::MAX; 64];
+    let mut n = 0;
+    while n < 32 {
+        m[n] = (1u32 << n) - 1;
+        n += 1;
+    }
+    m
+};
+
+/// SEQ-1: the sequence section's bit accumulator -- libzstd's `BIT_CStream_t`
+/// shape, as four locals over a slice sized before the loop.
+///
+/// `BitCStream` is the general writer and pays for it at every add: a test
+/// for `nb_bits == 0`, a test for a full container, and a flush that reserves
+/// through a growable `Vec` -- whose address escapes into the grow call, so
+/// the container and the bit count are stored back to the stack after EVERY
+/// add (88 spill stores in the loop this replaces). Here an add is three
+/// operations with no test (zero bits add nothing, by arithmetic) and the
+/// flushes sit at fixed points the caller proves safe.
+struct SeqBitWriter<'a> {
+    out: &'a mut [u8],
+    pos: usize,
+    acc: u64,
+    nbits: u32,
+}
+
+impl SeqBitWriter<'_> {
+    /// Append the low `nb` bits of `value`. The caller keeps `nbits + nb`
+    /// under 64 (see the schedule in `encode_seq_bits`).
+    #[inline(always)]
+    fn add(&mut self, value: u32, nb: u32) {
+        let low = value & LOW_MASK[(nb & 63) as usize];
+        self.acc |= u64::from(low).wrapping_shl(self.nbits);
+        self.nbits = self.nbits.wrapping_add(nb);
+    }
+
+    /// Append `nb` bits of a value that is ALREADY below `1 << nb` -- the
+    /// merged extra bits, masked where they were computed.
+    #[inline(always)]
+    fn add_raw(&mut self, value: u64, nb: u32) {
+        self.acc |= value.wrapping_shl(self.nbits);
+        self.nbits = self.nbits.wrapping_add(nb);
+    }
+
+    /// Store the container, commit its whole bytes, keep the 0..=7 bit tail.
+    /// The one bounds test is the price of writing through a safe slice; it
+    /// fails only if the caller's size bound was wrong, and then cleanly.
+    #[inline(always)]
+    fn flush(&mut self) -> Result<(), Error> {
+        let Some(w) = self.out.get_mut(self.pos..self.pos + 8) else {
+            return Err(Error::Corruption);
+        };
+        w.copy_from_slice(&self.acc.to_le_bytes());
+        self.pos += (self.nbits >> 3) as usize;
+        self.acc = self.acc.wrapping_shr(self.nbits & !7);
+        self.nbits &= 7;
+        Ok(())
+    }
+
+    /// SEQ-2, the rare arm: extra bits that do not fit behind this
+    /// sequence's three FSE steps. Flush first; a field wider than 56 bits
+    /// (it can reach 63) then goes in two pieces, low 32 bits first -- the
+    /// stream is LSB-first, so the split is invisible in the bytes.
+    ///
+    /// By VALUE in and out, and out of line: taking `&mut self` here would
+    /// let the writer's address escape into a call inside the hot loop, which
+    /// is exactly what pinned `BitCStream`'s fields to the stack.
+    #[cold]
+    #[inline(never)]
+    fn add_wide(mut self, mut ex: u64, mut ex_bits: u32) -> Result<Self, Error> {
+        self.flush()?;
+        if ex_bits > 56 {
+            self.add_raw(ex & 0xFFFF_FFFF, 32);
+            self.flush()?;
+            ex >>= 32;
+            ex_bits -= 32;
+        }
+        self.add_raw(ex, ex_bits);
+        self.flush()?;
+        Ok(self)
+    }
+}
+
+/// SEQ-1: the FSE bit-writing loop of the sequence section, in its OWN frame.
+/// Writes the stream into `out` and returns its length.
+///
+/// It was inlined into `encode_block` (4,161 instructions, a 2.3 KiB frame),
+/// where the loop had no registers to itself: 501 instructions, 88 spill
+/// stores and 103 stack reads per trip round, six `Vec` grow call sites, and
+/// every table reached through two pointer loads. Out of line, with the
+/// tables hoisted to slices (`FseCTable::seq_enc`) and the stream bounded up
+/// front, the loop holds its state in registers and calls nothing.
+///
+/// THE FLUSH SCHEDULE (SEQ-2). A flush leaves at most 7 bits, and three FSE
+/// steps add at most 27 (`table_log` <= 9), so the container holds at most 34
+/// bits when the merged extra bits arrive. They are one field of 0..=63 bits:
+///   * `nbits + ex_bits <= 63`, nearly always: one add, one flush;
+///   * otherwise `add_wide`, out of line.
+///
+/// That one test is on the container's ACTUAL fill, so it fires only when the
+/// bits truly do not fit -- libzstd (`ZSTD_encodeSequences_body`, 64-bit)
+/// guards its two mid-sequence flushes on worst-case sums instead. SEQ-1 had
+/// two unconditional flushes and three masked adds here. Flush points do not
+/// change the bytes -- the stream is the same bits in the same order.
+/// Counted on silesia at L1, L3, L9 and L19 (16 MiB caps): the wide arm ran
+/// for under 0.0005% of every file's sequences (the census's resolution),
+/// where a worst-case test (`ex_bits > 29`) would have fired on up to 0.57%
+/// of them (nci at L19), and on 12 of the 56 that x-ray has at L1.
+///
+/// DECLINED, recorded (SEQ-8): copying the block's three tables side by side
+/// (delta 3 x 64, states 3 x 512: 4.6 KiB of heap) so that every table read
+/// is one base register plus a constant. The loop went 94 -> 89 instructions
+/// and its stack reads 13 -> 7, and `EncodeFseSeq` measured 0.919 (0.876 to
+/// 0.946 in all 11 cells, same harness as SEQ-1..7). But the copy costs ~68 ns
+/// per BLOCK -- measured on the cell with one sequence per block, 150 -> 218
+/// ns -- which puts the break-even near 160 sequences per block. The win is
+/// ~0.4 ns/sequence on 128 KiB blocks, under 1% of an encode; the loss lands
+/// on small payloads, where it is several percent. Not taken.
+///
+/// What still reloads from the stack in this loop is nine invariants -- three
+/// delta pointers, three state-table pointers, three state masks -- against
+/// fifteen registers. An `FseCTable` that kept `delta` and `state_table` in
+/// ONE buffer would get the SEQ-8 loop without the copy.
+#[inline(never)]
+pub(crate) fn encode_seq_bits(
+    coded: &[CodedSeq],
+    ll_t: &FseCTable,
+    of_t: &FseCTable,
+    ml_t: &FseCTable,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    let (Some(ll), Some(of), Some(ml)) = (ll_t.seq_enc(), of_t.seq_enc(), ml_t.seq_enc()) else {
+        return Err(Error::Corruption);
+    };
+    let Some((last, rest)) = coded.split_last() else {
+        return Err(Error::Corruption);
+    };
+    // libzstd `ZSTD_encodeSequences`: the LAST sequence only initialises the
+    // three states (`FSE_initCState2`) and writes its extra bits.
+    let mut ml_s = ml_t.init_state2(last.mlc as usize);
+    let mut of_s = of_t.init_state2(last.ofc as usize);
+    let mut ll_s = ll_t.init_state2(last.llc as usize);
+    let mut w = SeqBitWriter {
+        out,
+        pos: 0,
+        acc: 0,
+        nbits: 0,
+    };
+    // At most 16 + 16 + 31 = 63 bits, into an empty container.
+    w.add_raw(last.ex, u32::from(last.ex_bits));
+    w.flush()?;
+
+    for c in rest.iter().rev() {
+        let (s, nb) = of.step(of_s, c.ofc as usize);
+        w.add(of_s, nb);
+        of_s = s;
+        let (s, nb) = ml.step(ml_s, c.mlc as usize);
+        w.add(ml_s, nb);
+        ml_s = s;
+        let (s, nb) = ll.step(ll_s, c.llc as usize);
+        w.add(ll_s, nb);
+        ll_s = s;
+        let ex_bits = u32::from(c.ex_bits);
+        if w.nbits + ex_bits > 63 {
+            w = w.add_wide(c.ex, ex_bits)?;
+            continue;
+        }
+        w.add_raw(c.ex, ex_bits);
+        w.flush()?;
+    }
+
+    // `FSE_flushCState` x3, then `BIT_closeCStream`: the end mark and the
+    // zero-padded tail byte. 7 + 9 + 9 + 9 + 1 = 35 bits.
+    w.add(ml_s, ml.table_log());
+    w.add(of_s, of.table_log());
+    w.add(ll_s, ll.table_log());
+    w.add(1, 1);
+    w.flush()?;
+    if w.nbits > 0 {
+        *w.out.get_mut(w.pos).ok_or(Error::Corruption)? = w.acc as u8;
+        w.pos += 1;
+    }
+    Ok(w.pos)
+}
+
 /// libzstd `ZSTD_buildCTable`: last sequence is `FSE_initCState2` only.
 #[inline(always)]
 pub(crate) fn ncount_seq_table(
@@ -1192,6 +1407,21 @@ pub(crate) fn ncount_seq_table(
     max_log: u8,
     use_low_prob: bool,
 ) -> Result<(Vec<u8>, FseCTable), Error> {
+    let (hdr, norm, table_log) = ncount_seq_norm(counts, last_sym, max_log, use_low_prob)?;
+    let ct = FseCTable::from_norm(&norm, table_log)?;
+    fse::give_norm_buf(norm);
+    Ok((hdr, ct))
+}
+
+/// SEQ-7: `ncount_seq_table` up to, but not including, the table build -- the
+/// NCount header, the normalised counts and their log. See `select_seq_table`.
+#[inline(always)]
+pub(crate) fn ncount_seq_norm(
+    counts: &[u32],
+    last_sym: usize,
+    max_log: u8,
+    use_low_prob: bool,
+) -> Result<(Vec<u8>, Vec<i16>, u8), Error> {
     // libzstd ZSTD_buildCTable: last sequence is FSE_initCState2 only, so drop
     // it from the normalized counts when it still leaves a usable distribution.
     //
@@ -1209,7 +1439,7 @@ pub(crate) fn ncount_seq_table(
         if last_sym < n && buf[last_sym] > 1 {
             buf[last_sym] -= 1;
         }
-        return fse::ncount_and_ctable(&buf[..n], max_log, use_low_prob);
+        return fse::ncount_and_norm(&buf[..n], max_log, use_low_prob);
     }
     // Not reachable for the three sequence tables; kept so a future caller with
     // a wider alphabet cannot silently truncate.
@@ -1217,7 +1447,7 @@ pub(crate) fn ncount_seq_table(
     if last_sym < buf.len() && buf[last_sym] > 1 {
         buf[last_sym] -= 1;
     }
-    fse::ncount_and_ctable(&buf, max_log, use_low_prob)
+    fse::ncount_and_norm(&buf, max_log, use_low_prob)
 }
 
 /// ALLOC-5 (N11): a seq table that may be BORROWED.
@@ -1321,9 +1551,27 @@ pub(crate) fn select_seq_table<'a>(
     }
 
     if total >= 8 {
-        if let Ok((hdr, ct)) = ncount_seq_table(counts, last_sym, max_log, use_low_prob) {
-            let c = ct.bit_cost(counts) + (hdr.len() as u64) * 8;
-            if c < best_cost || force_compressed {
+        // SEQ-7: PRICE the Compressed candidate before BUILDING it.
+        //
+        // This built the whole `FseCTable` -- symbol spread, state table,
+        // delta table, two pool round trips -- only to ask it `bit_cost`, and
+        // then dropped it whenever Repeat or Predefined had already won:
+        // 14-61% of calls on silesia at L1-L9, by file. The price needs only
+        // the normalised counts (`fse::norm_bit_cost` is `bit_cost` read off
+        // them, and a test holds the two equal), so the build now happens for
+        // the winner alone. The decision and its inputs are unchanged.
+        if let Ok((hdr, norm, table_log)) = ncount_seq_norm(counts, last_sym, max_log, use_low_prob)
+        {
+            let c = fse::norm_bit_cost(&norm, table_log, counts) + (hdr.len() as u64) * 8;
+            // A candidate whose build fails was never a candidate -- the same
+            // outcome as when the build came first.
+            let built = if c < best_cost || force_compressed {
+                FseCTable::from_norm(&norm, table_log).ok()
+            } else {
+                None
+            };
+            fse::give_norm_buf(norm);
+            if let Some(ct) = built {
                 best_mode = 2;
                 best_table = Some(SeqTable::Own(ct));
                 best_hdr = hdr;
@@ -1371,14 +1619,30 @@ pub(crate) fn select_seq_table<'a>(
     ))
 }
 
+/// One sequence between the coding pass and the bit-writing loop: 16 bytes.
+///
+/// SEQ-2: this was 20 bytes of five fields the writer added one at a time --
+/// `llx`/`llb`, `mlx`/`mlb`, `ofx` -- each add masking its value again and
+/// shifting it into the container. The three are consecutive in the stream,
+/// so they are one field: `ex`, `ex_bits` wide.
 #[derive(Clone, Copy)]
 pub(crate) struct CodedSeq {
+    /// `llx | mlx << llb | ofx << (llb + mlb)`: the extra bits, in stream order.
+    pub(crate) ex: u64,
+    /// `llb + mlb + ofc`: at most 16 + 16 + 31 = 63.
+    pub(crate) ex_bits: u8,
     pub(crate) llc: u8,
     pub(crate) mlc: u8,
     pub(crate) ofc: u8,
-    pub(crate) llx: u32,
-    pub(crate) mlx: u32,
-    pub(crate) ofx: u32,
-    pub(crate) llb: u8,
-    pub(crate) mlb: u8,
+}
+
+impl CodedSeq {
+    /// Fill value for scratch slots a block has not written yet.
+    pub(crate) const EMPTY: Self = Self {
+        ex: 0,
+        ex_bits: 0,
+        llc: 0,
+        mlc: 0,
+        ofc: 0,
+    };
 }
