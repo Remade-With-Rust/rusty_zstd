@@ -387,6 +387,253 @@ impl Clone for MatchTables {
     }
 }
 
+/// What `MatchTables::new_sized` allocates for `params`, as LENGTHS: the one
+/// place the sizing rule lives, so a caller can ask "how big would this table
+/// set be" (the pool's bound, the dictionary digest's key) without building
+/// one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TableShape {
+    /// The clamped, authoritative `hash_log` (see `MatchTables::hash_log`).
+    pub(crate) hash_log: u32,
+    /// Entries in `hash`.
+    pub(crate) hash: usize,
+    /// Entries in `hash_long`: `hash` for DFast, else 0.
+    pub(crate) long: usize,
+    /// Entries in `chain`: 0 for Fast and DFast.
+    pub(crate) chain: usize,
+    /// The row table's geometry, `(entries_log, row_log)`, when one is
+    /// allocated (see `row_geometry`); `None` = the hash chain. The width and
+    /// size are part of the shape because a digested dictionary snapshot is
+    /// only valid for the table it was primed into.
+    pub(crate) rows: Option<(u32, u32)>,
+}
+
+impl TableShape {
+    pub(crate) fn of(params: CompressionParameters, src_len: Option<u64>) -> Self {
+        let hash_log = params.hash_log.clamp(6, 24);
+        let hsz = 1usize << hash_log;
+        let use_chain = !matches!(params.strategy, Strategy::Fast | Strategy::DFast);
+        Self {
+            hash_log,
+            hash: hsz,
+            long: if matches!(params.strategy, Strategy::DFast) {
+                hsz
+            } else {
+                0
+            },
+            chain: if use_chain {
+                1usize << params.chain_log.min(24)
+            } else {
+                0
+            },
+            rows: if use_chain {
+                row_geometry(params, src_len)
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Bytes of hash / long / chain table this shape allocates.
+    pub(crate) fn table_bytes(&self) -> usize {
+        (self.hash + self.long + self.chain).saturating_mul(4)
+    }
+}
+
+/// The heap buffers of a table set, detached from every piece of frame state:
+/// the three tables and the per-block scratch. `Default` is "no buffers", and
+/// `MatchTables::new_reusing` over that IS `MatchTables::new_sized`.
+#[derive(Default)]
+pub(crate) struct TableBufs {
+    pub(crate) hash: Vec<u32>,
+    pub(crate) hash_long: Vec<u32>,
+    pub(crate) chain: Vec<u32>,
+    pub(crate) coded: Vec<CodedSeq>,
+    pub(crate) bits: Vec<u8>,
+    pub(crate) seq: Vec<Seq>,
+    pub(crate) lit: Vec<u8>,
+    pub(crate) opt_ops: Vec<(u32, u32, u32)>,
+    pub(crate) opt_price: Vec<u32>,
+    pub(crate) opt_prev: Vec<u32>,
+    pub(crate) opt_om: Vec<u64>,
+}
+
+impl TableBufs {
+    /// No buffers. `const`, so a thread-local slot can start from it.
+    pub(crate) const EMPTY: Self = Self {
+        hash: Vec::new(),
+        hash_long: Vec::new(),
+        chain: Vec::new(),
+        coded: Vec::new(),
+        bits: Vec::new(),
+        seq: Vec::new(),
+        lit: Vec::new(),
+        opt_ops: Vec::new(),
+        opt_price: Vec::new(),
+        opt_prev: Vec::new(),
+        opt_om: Vec::new(),
+    };
+
+    /// Heap bytes these buffers hold (capacity, not length).
+    pub(crate) fn retained_bytes(&self) -> usize {
+        use core::mem::size_of;
+        (self.hash.capacity() + self.hash_long.capacity() + self.chain.capacity()) * 4
+            + self.coded.capacity() * size_of::<CodedSeq>()
+            + self.bits.capacity()
+            + self.seq.capacity() * size_of::<Seq>()
+            + self.lit.capacity()
+            + self.opt_ops.capacity() * size_of::<(u32, u32, u32)>()
+            + (self.opt_price.capacity() + self.opt_prev.capacity()) * 4
+            + self.opt_om.capacity() * 8
+    }
+}
+
+/// The most heap ONE THREAD's one-shot pool may hold between calls -- hash,
+/// long and chain tables plus the per-block scratch, by capacity.
+///
+/// This bound is the whole difference from the pool that was probed and
+/// refused (docs/plans/finished/allocation-census.md, "The BYTES problem"):
+/// that one kept whatever the last frame used, which at L19 is ~80 MiB per
+/// thread, to save two allocations on a frame that takes seconds. This one
+/// keeps a table set only while it is small, which is exactly when the two
+/// allocations are a visible share of the call:
+///
+///   * a frame whose tables alone exceed the bound never touches the pool --
+///     it allocates and frees precisely as before, and leaves whatever small
+///     set the pool holds in place for the next small frame;
+///   * a set that grew past the bound during the frame (scratch) is freed on
+///     return instead of kept.
+///
+/// 2 MiB admits every level up to a ~64 KiB message (L19 at 64 KiB is 768 KiB
+/// of tables, L3 at 256 KiB is 512 KiB) and nothing megabyte-class.
+pub(crate) const ONESHOT_POOL_MAX_BYTES: usize = 2 << 20;
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    static ONESHOT_BUFS: core::cell::RefCell<TableBufs> =
+        const { core::cell::RefCell::new(TableBufs::EMPTY) };
+}
+
+/// The table set for ONE one-shot frame, drawing its buffers from the
+/// thread's bounded pool and handing them back on drop -- on every exit,
+/// including the `?` ones.
+///
+/// What the pool removes is the per-CALL allocation traffic: the hash (and
+/// long / chain) table, and the four scratch buffers the first block of every
+/// frame used to grow from nothing (`seq`, `lit`, `coded`, `bits`). For a
+/// small message those were 6 of the call's 14 allocations. The zero-fill of
+/// the tables stays -- a frame must start from an empty table -- but it is a
+/// fill of memory that is already mapped and usually still in cache.
+///
+/// Under `no_std` there are no thread-locals: this is a plain owned
+/// `MatchTables`, built and dropped exactly as before.
+pub(crate) struct OneshotTables {
+    t: MatchTables,
+    #[cfg(feature = "std")]
+    pooled: bool,
+}
+
+impl OneshotTables {
+    pub(crate) fn new(params: CompressionParameters, src_len: Option<u64>) -> Self {
+        #[cfg(feature = "std")]
+        {
+            if TableShape::of(params, src_len).table_bytes() <= ONESHOT_POOL_MAX_BYTES {
+                // An empty slot (first call on this thread, or a nested call
+                // holding the buffers) just means fresh allocations.
+                let bufs = ONESHOT_BUFS
+                    .try_with(|c| {
+                        c.try_borrow_mut()
+                            .map(|mut b| core::mem::take(&mut *b))
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                return Self {
+                    t: MatchTables::new_reusing(params, src_len, bufs),
+                    pooled: true,
+                };
+            }
+            Self {
+                t: MatchTables::new_sized(params, src_len),
+                pooled: false,
+            }
+        }
+        #[cfg(not(feature = "std"))]
+        Self {
+            t: MatchTables::new_sized(params, src_len),
+        }
+    }
+}
+
+impl core::ops::Deref for OneshotTables {
+    type Target = MatchTables;
+    #[inline(always)]
+    fn deref(&self) -> &MatchTables {
+        &self.t
+    }
+}
+
+impl core::ops::DerefMut for OneshotTables {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut MatchTables {
+        &mut self.t
+    }
+}
+
+#[cfg(feature = "std")]
+impl Drop for OneshotTables {
+    fn drop(&mut self) {
+        if !self.pooled {
+            return;
+        }
+        let bufs = self.t.take_bufs();
+        if bufs.retained_bytes() > ONESHOT_POOL_MAX_BYTES {
+            // Grew past the bound: freed here, as every set was before.
+            return;
+        }
+        let _ = ONESHOT_BUFS.try_with(|c| {
+            if let Ok(mut cur) = c.try_borrow_mut() {
+                *cur = bufs;
+            }
+        });
+    }
+}
+
+/// Heap bytes this thread's one-shot pool is holding right now -- for the
+/// test that pins `ONESHOT_POOL_MAX_BYTES`.
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn oneshot_pool_retained_bytes() -> usize {
+    ONESHOT_BUFS.with(|c| c.borrow().retained_bytes())
+}
+
+/// `n` zeroed table slots, in `v`'s allocation when it is large enough.
+///
+/// A table that does NOT fit still comes from `vec![0; n]`, exactly as before:
+/// that is `alloc_zeroed`, which for a large table is lazily-zeroed pages, and
+/// swapping it for an eager fill would be a regression on precisely the frames
+/// that never touch most of their table. `n == 0` keeps the allocation (as an
+/// empty `Vec`, which is what every "is this table present" test reads) so a
+/// thread alternating DFast and Fast frames does not free and re-request the
+/// long table each time.
+#[inline]
+fn zeroed_table(mut v: Vec<u32>, n: usize) -> Vec<u32> {
+    if v.capacity() >= n {
+        v.clear();
+        v.resize(n, 0);
+        v
+    } else {
+        vec![0; n]
+    }
+}
+
+/// A scratch buffer handed to a new frame: length 0, capacity kept. Length 0
+/// is what makes a reused buffer indistinguishable from a fresh `Vec::new()`
+/// to the grow-only users (`ensure_len`), which read whatever is below `len`.
+#[inline]
+fn emptied<T>(mut v: Vec<T>) -> Vec<T> {
+    v.clear();
+    v
+}
+
 impl MatchTables {
     pub(crate) fn new(params: CompressionParameters) -> Self {
         // Size unknown (streaming, dict harvest, tests): the row finder's
@@ -396,15 +643,58 @@ impl MatchTables {
     }
 
     pub(crate) fn new_sized(params: CompressionParameters, src_len: Option<u64>) -> Self {
-        let hash_log = params.hash_log.clamp(6, 24);
-        let hsz = 1usize << hash_log;
-        let csz = 1usize << params.chain_log.min(24);
+        Self::new_reusing(params, src_len, TableBufs::default())
+    }
+
+    /// `new_sized`, built over the heap buffers of an EARLIER table set.
+    pub(crate) fn new_reusing(
+        params: CompressionParameters,
+        src_len: Option<u64>,
+        bufs: TableBufs,
+    ) -> Self {
+        Self::build(params, TableShape::of(params, src_len), bufs, true)
+    }
+
+    /// The ONLY constructor body: `new_sized` is this with empty buffers.
+    ///
+    /// That is what makes reuse byte-identical by construction rather than by
+    /// audit -- every scalar a frame starts from (`rep_yield`, the probe
+    /// countdowns, the latches, `pack_tags`, ...) is written by the struct
+    /// literal below on every path, so a field added later is reset for a
+    /// reused set exactly as it is initialised for a fresh one. What carries
+    /// over is allocation CAPACITY and nothing else: every scratch buffer is
+    /// emptied (each of their users clears on take anyway; see the `Clone`
+    /// note above), and with `zero` the three tables are zero-filled to this
+    /// frame's lengths.
+    ///
+    /// `zero == false` is the DIGESTED-DICTIONARY path: the caller hands over
+    /// tables that already hold a primed snapshot at exactly `shape`'s
+    /// lengths, and they are taken as they are.
+    pub(crate) fn build(
+        // The table sizes come from `shape`; `params` stays for callers that
+        // build from a digest key, which carries both.
+        _params: CompressionParameters,
+        shape: TableShape,
+        bufs: TableBufs,
+        zero: bool,
+    ) -> Self {
+        let table = |v: Vec<u32>, n: usize| {
+            if zero {
+                zeroed_table(v, n)
+            } else {
+                debug_assert_eq!(v.len(), n);
+                v
+            }
+        };
+        let hash_log = shape.hash_log;
+        let hsz = shape.hash;
+        let csz = shape.chain;
         // Report what is ACTUALLY allocated, not what the level table implies.
         // This reported all three tables at full size regardless of brick 47, so
         // `unused_long_chain=98304` kept appearing for allocations that no
         // longer exist -- an instrument describing the code as it was two
         // bricks ago.
-        let use_long = matches!(params.strategy, Strategy::DFast);
+        let use_long = shape.long != 0;
         // A/B: does the tag array EARN its per-probe store? It is a SECOND
         // array, so every probe writes two cache lines instead of one, and the
         // write happens even on blocks where Gate 7's filter is off and nothing
@@ -422,7 +712,7 @@ impl MatchTables {
         // for the streaming compressor, right after construction.
         let use_tags = false;
         let _ = tag_alloc_enabled;
-        let use_chain = !matches!(params.strategy, Strategy::Fast | Strategy::DFast);
+        let use_chain = shape.chain != 0;
         let hash_b = (hsz as u64).saturating_mul(4);
         let long_b = if use_long { hash_b } else { 0 };
         let chain_b = if use_chain {
@@ -450,21 +740,19 @@ impl MatchTables {
         let mut t = Self {
             rep_yield: 1.0,
             hash_log,
-            hash: vec![0; hsz],
+            hash: table(bufs.hash, hsz),
             wcls: (0, 0),
             null_link: 0,
-            hash_long: if use_long { vec![0; hsz] } else { Vec::new() },
+            hash_long: table(bufs.hash_long, shape.long),
             ltags: Vec::new(),
-            chain: if use_chain { vec![0; csz] } else { Vec::new() },
+            chain: table(bufs.chain, shape.chain),
             // Sized to the CHAIN it replaces, and only when the arm is on --
             // an empty `head` is what every hot-path site tests, so the
             // default build allocates nothing and branches once per insert.
             rows: {
                 let mut r = crate::rowfind::RowTable::default();
-                if use_chain {
-                    if let Some((entries_log, row_log)) = row_geometry(params, src_len) {
-                        r.reset(entries_log, row_log);
-                    }
+                if let Some((entries_log, row_log)) = shape.rows {
+                    r.reset(entries_log, row_log);
                 }
                 r
             },
@@ -487,15 +775,15 @@ impl MatchTables {
             ctags: Vec::new(),
             chain_wide: false,
             row_ntu: usize::MAX,
-            coded_scratch: Vec::new(),
-            bits_scratch: Vec::new(),
+            coded_scratch: emptied(bufs.coded),
+            bits_scratch: emptied(bufs.bits),
             blocks_done: 0,
-            seq_scratch: Vec::new(),
-            lit_scratch: Vec::new(),
-            opt_ops: Vec::new(),
-            opt_price: Vec::new(),
-            opt_prev: Vec::new(),
-            opt_om: Vec::new(),
+            seq_scratch: emptied(bufs.seq),
+            lit_scratch: emptied(bufs.lit),
+            opt_ops: emptied(bufs.opt_ops),
+            opt_price: emptied(bufs.opt_price),
+            opt_prev: emptied(bufs.opt_prev),
+            opt_om: emptied(bufs.opt_om),
             rep_run: 0,
             next_long_yield: 1.0,
             nl_off_worse: 0.0,
@@ -533,6 +821,26 @@ impl MatchTables {
         // then agrees on it without each having to remember to.
         t.chain_wide = !t.rows.head.is_empty() && row_wide_start();
         t
+    }
+
+    /// Detach the reusable heap buffers, leaving this set empty (and about to
+    /// be dropped). The tag arrays and the row table stay behind: they exist
+    /// only on frames far above anything the pool retains.
+    pub(crate) fn take_bufs(&mut self) -> TableBufs {
+        use core::mem::take;
+        TableBufs {
+            hash: take(&mut self.hash),
+            hash_long: take(&mut self.hash_long),
+            chain: take(&mut self.chain),
+            coded: take(&mut self.coded_scratch),
+            bits: take(&mut self.bits_scratch),
+            seq: take(&mut self.seq_scratch),
+            lit: take(&mut self.lit_scratch),
+            opt_ops: take(&mut self.opt_ops),
+            opt_price: take(&mut self.opt_price),
+            opt_prev: take(&mut self.opt_prev),
+            opt_om: take(&mut self.opt_om),
+        }
     }
 
     pub(crate) fn reset(&mut self) {

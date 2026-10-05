@@ -15,6 +15,8 @@ fn main(){
     for st in ["1","4","16"] {
         std::env::set_var("RZSTD_OPT_FILL","1");
         std::env::set_var("RZSTD_OPT_FILL_S",st);
+        // The knob is cached per process now; make the next compress re-read it.
+        rusty_zstd::reset_env_arms();
         let (mut sz,mut pr)=(0usize,0u64); let mut best=0.0f64; let mut bc="";
         for (i,(id,s)) in srcs.iter().enumerate() {
             let _=rusty_zstd::take_bt_probe_stats();
@@ -29,4 +31,5 @@ fn main(){
             100.0*(pr as f64-bp as f64)/bp as f64, 100.0*(sz as f64-bs as f64)/bs as f64);
     }
     std::env::remove_var("RZSTD_OPT_FILL"); std::env::remove_var("RZSTD_OPT_FILL_S");
+    rusty_zstd::reset_env_arms();
 }

@@ -493,11 +493,37 @@ pub(crate) fn opt_fill_max() -> usize {
     }
     #[cfg(feature = "std")]
     {
-        crate::env_knob_parse("RZSTD_OPT_FILL_MAX").unwrap_or(usize::MAX)
+        // CACHED, like its two siblings above. This and `opt_fill_stride`
+        // were the last knobs read straight from the environment: an OS
+        // lookup and a `String` each, once per BLOCK on the whole optimal
+        // ladder (L13+), i.e. twice per call on a small message.
+        // `env_reads_gate` could not see it -- that test compresses at L3.
+        use core::sync::atomic::Ordering;
+        let c = OPT_FILL_MAX_C.load(Ordering::Relaxed);
+        if c != OPT_FILL_MAX_UNRESOLVED {
+            return c;
+        }
+        let v = crate::env_knob_parse("RZSTD_OPT_FILL_MAX").unwrap_or(usize::MAX);
+        OPT_FILL_MAX_C.store(v, Ordering::Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     usize::MAX
 }
+/// `RZSTD_OPT_FILL_MAX`, resolved once. The sentinel is NOT the default: the
+/// default is `usize::MAX` (uncapped), and a sentinel that collides with the
+/// value it caches is a cache that never takes -- the `dfast_step_forced`
+/// defect `env_reads_gate` was written about. `usize::MAX - 1` is a cap
+/// nobody sets; set to exactly that, the knob is merely re-read.
+#[cfg(feature = "std")]
+pub(crate) const OPT_FILL_MAX_UNRESOLVED: usize = usize::MAX - 1;
+#[cfg(feature = "std")]
+pub(crate) static OPT_FILL_MAX_C: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(OPT_FILL_MAX_UNRESOLVED);
+/// `RZSTD_OPT_FILL_S`, resolved once. 0 = unresolved (a stride is >= 1).
+#[cfg(feature = "std")]
+pub(crate) static OPT_FILL_S_C: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 /// Stride for that back-fill; 1 inserts every skipped position.
 /// GATE 12 @ L19 arms: the opt back-fill's stride and span cap, as atomics so
@@ -541,9 +567,17 @@ pub(crate) fn opt_fill_stride() -> usize {
     }
     #[cfg(feature = "std")]
     {
-        crate::env_knob_parse("RZSTD_OPT_FILL_S")
+        // Cached: see `opt_fill_max`.
+        use core::sync::atomic::Ordering;
+        let c = OPT_FILL_S_C.load(Ordering::Relaxed);
+        if c != 0 {
+            return c;
+        }
+        let v: usize = crate::env_knob_parse("RZSTD_OPT_FILL_S")
             .filter(|v| *v >= 1)
-            .unwrap_or(1)
+            .unwrap_or(1);
+        OPT_FILL_S_C.store(v, Ordering::Relaxed);
+        v
     }
     #[cfg(not(feature = "std"))]
     1

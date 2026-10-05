@@ -607,10 +607,14 @@ fn caller_sweep(srcs: &[(&'static str, Vec<u8>)]) {
         Err(e) => row("2/10 prefix", false, format!("ERROR {e:?}")),
     }
 
-    // Gate 5 — RZSTD_BLOCK_KB (an UNCACHED env read, so it moves mid-process)
+    // Gate 5 -- RZSTD_BLOCK_KB. The knob is cached per process now (it was an
+    // OS lookup per compress call), so each change is followed by
+    // `reset_env_arms()` to make the next call re-read it.
     std::env::set_var("RZSTD_BLOCK_KB", "32");
+    rusty_zstd::reset_env_arms();
     let z32 = enc(src, lvl);
     std::env::remove_var("RZSTD_BLOCK_KB");
+    rusty_zstd::reset_env_arms();
     let z_re = enc(src, lvl);
     row(
         "5 BLOCK_KB=32",

@@ -319,6 +319,9 @@ pub use encode::take_dfast_bext;
 pub use encode::take_walk_exit;
 #[cfg(feature = "profile")]
 pub use encode::take_wide_latch;
+#[doc(hidden)]
+#[cfg(feature = "alloc")]
+pub use encode::{set_digest_arm, set_digest_verify_arm};
 #[cfg(feature = "profile")]
 pub use huffman::{take_e11_walked, take_e12_scan, take_n13_stats, take_x2_stats};
 #[cfg(feature = "profile")]
@@ -344,6 +347,9 @@ pub fn xxh64_pub(d: &[u8]) -> u64 {
     xxh64::xxh64(d)
 }
 
+#[doc(hidden)]
+#[cfg(feature = "profile")]
+pub use encode::take_digest_census;
 #[doc(hidden)]
 #[cfg(feature = "profile")]
 pub use encode::take_ltag_audit;

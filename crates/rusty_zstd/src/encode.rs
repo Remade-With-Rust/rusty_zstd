@@ -312,7 +312,7 @@ pub(crate) use tables::*;
 /// to store a copy of something already `&'static`. After ALLOC-5 removed the
 /// Repeat-path clone this was the single largest remaining allocation site in
 /// the encoder.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum RetainedTable {
     Static(&'static FseCTable),
     Own(FseCTable),
@@ -351,23 +351,21 @@ pub(crate) struct EntropyState {
     ml: Option<alloc::sync::Arc<RetainedTable>>,
 }
 
-/// One outlined copy of the dictionary-seed table wrap. See
-/// `EntropyState::seed_from_dict`.
-#[inline(never)]
-fn retain_ctable(t: &fse::FseCTable) -> alloc::sync::Arc<RetainedTable> {
-    alloc::sync::Arc::new(RetainedTable::Own(t.clone()))
-}
-
 impl EntropyState {
+    /// Start a frame from a trained dictionary's entropy tables.
+    ///
+    /// FOUR REFCOUNT BUMPS. This used to deep-clone all four tables and wrap
+    /// each in a fresh `Arc` -- nine allocations and ~4.5 KB per call -- under
+    /// a comment saying it "runs once per dictionary". It runs once per
+    /// FRAME: every `compress_using_dict*` call and every streaming
+    /// `set_dictionary`. The dictionary now holds its encode-side tables in
+    /// the `Arc`s this state wants (`DictEntropy`), which is sound for the
+    /// reason ALLOC-8 gives above: nothing mutates a retained table in place.
     pub(crate) fn seed_from_dict(&mut self, e: &crate::dict::DictEntropy) {
-        // C9: the encode-side mirror of C8. `Arc::new(RetainedTable::Own(
-        // t.clone()))` -- an allocation, an enum construction and a table
-        // clone -- was expanded at all three sites. One outlined helper leaves
-        // that body once. Runs once per dictionary.
-        self.huff = Some(alloc::sync::Arc::new(e.huff_c.clone()));
-        self.ll = Some(retain_ctable(&e.ll_c));
-        self.of = Some(retain_ctable(&e.of_c));
-        self.ml = Some(retain_ctable(&e.ml_c));
+        self.huff = Some(e.huff_c.clone());
+        self.ll = Some(e.ll_c.clone());
+        self.of = Some(e.of_c.clone());
+        self.ml = Some(e.ml_c.clone());
     }
 }
 
@@ -389,11 +387,23 @@ pub(crate) fn encode_oneshot(
     } else {
         None
     };
+    // A `Dictionary` seen before carries its primed table state: serve the
+    // frame from that instead of re-priming (see THE DIGESTED DICTIONARY).
+    #[cfg(feature = "std")]
+    if let Some(d) = dict {
+        if !src.is_empty() && adv == AdvancedOptions::default() && digest_mode() != 1 {
+            if let Some(r) = encode_with_digest(src, params, checksum, pledged, d, dict_id) {
+                return r;
+            }
+        }
+    }
     let mut tables = {
         let _t = crate::prof::scope(crate::prof::Stage::EncodeTables);
         // The one-shot path KNOWS the source length, which is what the row
-        // finder's AUTO band is measured against.
-        MatchTables::new_sized(params, Some(src.len() as u64))
+        // finder's AUTO band is measured against. `OneshotTables` is a
+        // `MatchTables` whose buffers come from, and return to, the thread's
+        // bounded pool (see `ONESHOT_POOL_MAX_BYTES`).
+        OneshotTables::new(params, Some(src.len() as u64))
     };
     // T1: DFast's short-table rejection tag, packed into the slot it already
     // loads. Decided against the real buffer length, so the 24-bit bound is
@@ -465,6 +475,22 @@ pub(crate) fn encode_oneshot(
     {
         tables.ltags = alloc::vec![0u8; tables.hash_long.len()];
     }
+    // `tag_rep` is the same decision made without a table (the digest key
+    // needs it before one exists). The two must never drift.
+    debug_assert_eq!(
+        tag_rep(
+            params,
+            &TableShape::of(params, Some(src.len() as u64)),
+            hist_prefix.len() + src.len()
+        ),
+        TagRep {
+            pack_tags: tables.pack_tags,
+            chain_pack: tables.chain_pack,
+            tags: !tables.tags.is_empty(),
+            ltags: !tables.ltags.is_empty(),
+            ctags: !tables.ctags.is_empty(),
+        }
+    );
     let mut reps = [1u32, 4, 8];
     let mut entropy = EntropyState::default();
     if let Some(d) = dict {
@@ -491,20 +517,7 @@ pub(crate) fn encode_oneshot(
         return Ok(out);
     }
     let window = 1usize << params.window_log.min(31);
-    let mut block_max = (window.min(BLOCKSIZE_MAX as usize)).max(1);
-    // EXPERIMENT ONLY (RZSTD_BLOCK_KB): C emits ~84 KiB regen blocks on mozilla
-    // where we emit 128 KiB, so it re-adapts its entropy tables ~1.56x more
-    // often. This knob tests whether that explains our literals gap. Ratio is
-    // deterministic, so the answer needs no quiet box.
-    if let Some(kb) = crate::env_knob_parse::<usize>("RZSTD_BLOCK_KB") {
-        if kb > 0 {
-            block_max = block_max.min(kb * 1024);
-        }
-    }
-    if adv.target_cblock_size > 0 {
-        let t = adv.target_cblock_size as usize;
-        block_max = block_max.min(t.saturating_mul(4).max(256));
-    }
+    let block_max = frame_block_max(window, adv);
     let ldm_res = if adv.ldm.enable {
         Some(adv.ldm.resolved(params.window_log))
     } else {
@@ -553,6 +566,100 @@ pub(crate) fn encode_oneshot(
     if let (Some(lt), Some(rp)) = (ldm_tables.as_mut(), ldm_res) {
         crate::ldm::prime_ldm(lt, workspace, payload_off, window, rp);
     }
+    encode_frame_blocks(
+        &mut out,
+        workspace,
+        payload_off,
+        src.len(),
+        params,
+        window,
+        block_max,
+        checksum,
+        adv,
+        &mut tables,
+        &mut reps,
+        &mut entropy,
+        ldm_tables.as_mut(),
+    )?;
+    Ok(out)
+}
+
+/// How a frame represents its match-filter tags: packed into the table slots
+/// (every frame under 16 MiB), or in the byte arrays beside them. Decided from
+/// the strategy, the arms and the buffer length BEFORE any table exists, so
+/// the digested-dictionary path can ask without building one.
+///
+/// `encode_oneshot` still derives the same five facts step by step on the
+/// tables themselves (that code is the original and is left alone); a
+/// `debug_assert` there pins the two derivations together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TagRep {
+    pack_tags: bool,
+    chain_pack: bool,
+    tags: bool,
+    ltags: bool,
+    ctags: bool,
+}
+
+fn tag_rep(params: CompressionParameters, shape: &TableShape, total_len: usize) -> TagRep {
+    let s = params.strategy;
+    let short = total_len < 0x00FF_FFFF;
+    let fast_tag = s == Strategy::Fast && tag_alloc_enabled();
+    let dfast_tag = s == Strategy::DFast && dfast_tag_enabled();
+    let pack_tags = (dfast_tag || (fast_tag && fast_pack_enabled())) && short;
+    let lazy = matches!(s, Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2)
+        && chain_tag_enabled()
+        && (params.min_match.max(3) as usize) < 8;
+    let chain_pack = lazy && short;
+    let ctags = lazy && !chain_pack && shape.chain != 0;
+    TagRep {
+        pack_tags,
+        chain_pack,
+        tags: (!pack_tags && (fast_tag || dfast_tag)) || ctags,
+        ltags: dfast_tag && long_tag_enabled() && !pack_tags && shape.long != 0,
+        ctags,
+    }
+}
+
+/// The frame's block ceiling: the window, 128 KiB, and the two caps.
+#[inline]
+fn frame_block_max(window: usize, adv: AdvancedOptions) -> usize {
+    let mut block_max = (window.min(BLOCKSIZE_MAX as usize)).max(1);
+    // EXPERIMENT ONLY (RZSTD_BLOCK_KB): C emits ~84 KiB regen blocks on mozilla
+    // where we emit 128 KiB, so it re-adapts its entropy tables ~1.56x more
+    // often. This knob tests whether that explains our literals gap. Ratio is
+    // deterministic, so the answer needs no quiet box.
+    let kb = block_kb_knob();
+    if kb > 0 {
+        block_max = block_max.min(kb.saturating_mul(1024));
+    }
+    if adv.target_cblock_size > 0 {
+        let t = adv.target_cblock_size as usize;
+        block_max = block_max.min(t.saturating_mul(4).max(256));
+    }
+    block_max
+}
+
+/// The block loop and the trailing checksum of a one-shot frame: everything
+/// after the header is written and the tables are ready. ONE body for the
+/// plain driver and the digested-dictionary driver -- a second copy of this
+/// loop is how `find_dfast_runtime` drifted from the body it mirrored.
+#[allow(clippy::too_many_arguments)]
+fn encode_frame_blocks(
+    out: &mut Vec<u8>,
+    workspace: &[u8],
+    payload_off: usize,
+    src_len: usize,
+    params: CompressionParameters,
+    window: usize,
+    block_max: usize,
+    checksum: bool,
+    adv: AdvancedOptions,
+    tables: &mut MatchTables,
+    reps: &mut [u32; 3],
+    entropy: &mut EntropyState,
+    mut ldm_tables: Option<&mut crate::ldm::LdmTables>,
+) -> Result<(), Error> {
     let rbits = if adv.rsyncable {
         crate::ldm::rsync_bits(params.window_log)
     } else {
@@ -584,17 +691,17 @@ pub(crate) fn encode_oneshot(
             let last = end == workspace.len();
             let before_block = out.len();
             encode_block(
-                &mut out,
+                out,
                 workspace,
                 off,
                 end,
                 window,
                 params,
-                &mut tables,
-                &mut reps,
-                &mut entropy,
+                tables,
+                reps,
+                entropy,
                 last,
-                ldm_tables.as_mut(),
+                ldm_tables.as_deref_mut(),
                 adv.ldm,
             )?;
             if let Some(h) = xxh.as_mut() {
@@ -609,10 +716,804 @@ pub(crate) fn encode_oneshot(
     }
     if let Some(h) = xxh {
         let _c = crate::prof::scope(crate::prof::Stage::EncodeChecksum);
-        crate::prof::note_checksum_bytes(src.len() as u64);
+        crate::prof::note_checksum_bytes(src_len as u64);
         out.extend_from_slice(&(h.digest() as u32).to_le_bytes());
     }
-    Ok(out)
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// THE DIGESTED DICTIONARY -- libzstd's CDict idea, without a new type.
+//
+// `compress_using_dict*` used to do O(dictionary) work on EVERY call: allocate
+// and zero the tables, copy the dictionary's tail in front of the message, and
+// re-insert every dictionary position (`prime_tables`). Measured on a 112 KiB
+// raw dictionary at L3: 114,681 positions primed and 646,756 bytes requested
+// per call, 400 us per 1 KiB message -- of which the message itself is ~20 us.
+//
+// The primed table state is a pure function of (dictionary tail, parameters,
+// table representation): `prime_tables` stops at `payload_off - 8`, and that
+// position's 8-byte read ends exactly at `payload_off`, so it NEVER reads a
+// message byte. (The last 7 dictionary positions, whose hashes would straddle
+// into the message, are simply never primed -- by the legacy path either.)
+// The digest is therefore built by priming over the dictionary tail ALONE,
+// a slice that ends where the message would begin, which makes "does not
+// depend on the message" a property of the types rather than of the loop
+// bounds; debug builds re-prime over tail + message and assert equality.
+//
+// What is kept, and where:
+//   * `Digest` -- the primed `hash` / `hash_long` / `chain` and `null_link`,
+//     immutable, owned by the `Dictionary` (shared by its clones) behind a
+//     lock that is taken only when a thread changes dictionary or key.
+//   * `DictWork` -- one WORKING set per thread: tables that equal the
+//     snapshot whenever the set is at rest, the per-block scratch, and a
+//     workspace buffer whose front is the dictionary tail. A call appends the
+//     message, runs the frame, and restores the tables to the snapshot.
+//
+// Byte identity: the frame starts from `MatchTables::build` (the one
+// constructor body, so every dispatch scalar is fresh), the same tag
+// representation, the snapshot's `null_link`, and tables equal to what
+// `prime_tables` would have produced -- so it is the legacy frame.
+// `smallboard` is the gate; it alternates dictionaries, levels and sizes.
+//
+// NOT digested (the legacy path runs, unchanged): no `std`; a prefix rather
+// than a `Dictionary`; any non-default `AdvancedOptions` (LDM, rsyncable,
+// MT overlap); frames whose tags live in byte arrays (>= 16 MiB) or that use
+// the row finder; the Bt-tree priming arm; a table set above
+// `DIGEST_MAX_TABLE_BYTES` or a tail outside `DIGEST_MIN_TAIL..=MAX`; and the
+// FIRST sighting of a (dictionary, key) -- a dictionary used once never pays
+// for a snapshot.
+// ---------------------------------------------------------------------------
+
+/// Tails shorter than this prime nothing worth keeping.
+#[cfg(feature = "std")]
+const DIGEST_MIN_TAIL: usize = 16;
+/// Longest dictionary tail a working set will hold a copy of.
+#[cfg(feature = "std")]
+const DIGEST_MAX_TAIL: usize = 2 << 20;
+/// Largest table set (hash + long + chain) a digest is kept for. Above this
+/// the full-copy restore costs what the priming it replaces costs.
+#[cfg(feature = "std")]
+const DIGEST_MAX_TABLE_BYTES: usize = 4 << 20;
+/// Distinct keys remembered per dictionary (a workload whose message sizes
+/// straddle one parameter-table boundary needs two).
+#[cfg(feature = "std")]
+const DIGEST_SLOTS: usize = 2;
+/// Message capacity a resting workspace may keep beyond the tail.
+#[cfg(feature = "std")]
+const DIGEST_WORKSPACE_SLACK: usize = 256 << 10;
+
+// MEMORY BOUND, stated once:
+//   per `Dictionary` (all clones together): at most `DIGEST_SLOTS` snapshots,
+//     each at most `DIGEST_MAX_TABLE_BYTES`  ->  <= 8 MiB, and exactly the
+//     table bytes ONE legacy call allocates per key in use (512 KiB for a
+//     112 KiB dictionary at L3). Freed with the dictionary.
+//   per THREAD: one working set -- tables <= `DIGEST_MAX_TABLE_BYTES`, the
+//     tail copy <= `DIGEST_MAX_TAIL` + `DIGEST_WORKSPACE_SLACK`, scratch <=
+//     `ONESHOT_POOL_MAX_BYTES` -- <= 8.25 MiB worst case, ~0.65 MiB for the
+//     shape above; plus a strong reference to the one snapshot it mirrors.
+//     Replaced when the thread compresses with another dictionary or key,
+//     freed when the thread exits.
+
+/// Digest reach census, per dictionary call: `[0] served at rest, [1] served
+/// after a re-seat, [2] snapshots built, [3] first sightings (legacy path),
+/// [4] not eligible (legacy path)`; and per restore: `[5] dirty-slot
+/// restores, [6] full-copy restores, [7] restores compared against the
+/// snapshot, [8] comparisons that FAILED`. A digest that nothing reaches
+/// passes every byte gate -- the two paths agree by design -- so the boards
+/// print this.
+#[cfg(feature = "profile")]
+pub static DIGEST_CENSUS: [crate::census64::AtomicU64; 9] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+];
+
+/// Read and clear the digest reach census.
+#[cfg(feature = "profile")]
+pub fn take_digest_census() -> [u64; 9] {
+    use core::sync::atomic::Ordering::Relaxed;
+    core::array::from_fn(|i| DIGEST_CENSUS[i].swap(0, Relaxed))
+}
+
+#[inline(always)]
+fn note_digest(_slot: usize) {
+    #[cfg(feature = "profile")]
+    DIGEST_CENSUS[_slot].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The digest arm. 0 = unresolved, 1 = OFF (prime on every call, the old
+/// behaviour and the byte-identical fallback), 2 = digest with a FULL-COPY
+/// restore, 3 = digest with the dirty-slot restore where it is proven
+/// (shipped). `RZSTD_DIGEST=0` / `=copy` select 1 / 2.
+static DIGEST_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: 0 = off, 1 = full-copy restore, 2 = dirty-slot restore.
+pub fn set_digest_arm(mode: u8) {
+    DIGEST_ARM.store(mode.min(2) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn digest_mode() -> u8 {
+    use core::sync::atomic::Ordering;
+    let v = DIGEST_ARM.load(Ordering::Relaxed);
+    if v != 0 {
+        return v;
+    }
+    let m = match crate::env_knob("RZSTD_DIGEST") {
+        Ok(s) if s.trim() == "0" => 1,
+        Ok(s) if s.trim() == "copy" => 2,
+        _ => 3,
+    };
+    DIGEST_ARM.store(m, Ordering::Relaxed);
+    m
+}
+
+/// `RZSTD_DIGEST_VERIFY=1` (or the hook): compare the working tables with the
+/// snapshot after EVERY restore and panic on a difference. Debug builds
+/// always do. 0 = unresolved, 1 = off, 2 = on.
+static DIGEST_VERIFY_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for the restore verification.
+pub fn set_digest_verify_arm(on: bool) {
+    DIGEST_VERIFY_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn digest_verify() -> bool {
+    use core::sync::atomic::Ordering;
+    match DIGEST_VERIFY_ARM.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::env_knob_is1("RZSTD_DIGEST_VERIFY");
+            DIGEST_VERIFY_ARM.store(u8::from(on) + 1, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Set when a SAMPLED comparison finds a dirty-slot restore that did not
+/// reproduce the snapshot: every later restore in the process is a full copy.
+/// See `DictWork::restore`.
+#[cfg(feature = "std")]
+static DIGEST_DIRTY_BROKEN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// The dirty-slot restore runs while
+/// `message bytes * tables restored * this <= table bytes`.
+///
+/// Restoring one position's slot is a hash, a random read of the snapshot
+/// and a random store; the full copy is a streaming memcpy. Measured IN ONE
+/// BINARY with the arm flipped between adjacent reps (`set_digest_arm`,
+/// 112 KiB dictionary, pinned, two runs agreeing to 1%), dirty / full time
+/// per call:
+///
+/// ```text
+///   message           256 B   512 B   1 KiB   2 KiB   3 KiB   4 KiB   8 KiB  16 KiB
+///   L3 (2 x 256 KiB)   0.55    0.65    0.74    0.88    0.95    1.01    1.09    1.18
+///   L1 (1 x  32 KiB)   0.97    0.98    1.01    1.05     --      --      --      --
+/// ```
+///
+/// Break-even is 4 KiB for the two 256 KiB tables and ~800 B for the one
+/// 32 KiB table -- 64 table bytes per position-table in both. 80 keeps the
+/// dirty path to where it is at least a few percent ahead.
+#[cfg(feature = "std")]
+const DIGEST_DIRTY_RATIO: usize = 80;
+
+/// Everything the primed table state depends on besides the dictionary bytes.
+#[cfg(feature = "std")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DigestKey {
+    /// The whole parameter set, not the level: the level's row moves with the
+    /// size hint, and two calls at one level can differ in every log.
+    params: CompressionParameters,
+    shape: TableShape,
+    rep: TagRep,
+    /// Bytes of dictionary tail in front of the message (`payload_off`).
+    tail_len: usize,
+    // The arms `prime_tables` resolves. They are process-global and a bench
+    // can flip them between calls; a digest primed under one value must not
+    // serve a call made under another.
+    stride: usize,
+    bt_chain_write: bool,
+    fast_wide: bool,
+}
+
+#[cfg(feature = "std")]
+impl DigestKey {
+    /// The key for this frame, or `None` when it is not served from a digest.
+    fn for_frame(
+        params: CompressionParameters,
+        src_len: usize,
+        dict_len: usize,
+        tail_len: usize,
+    ) -> Option<Self> {
+        if !(DIGEST_MIN_TAIL..=DIGEST_MAX_TAIL).contains(&tail_len) {
+            return None;
+        }
+        let shape = TableShape::of(params, Some(src_len as u64));
+        if shape.rows.is_some() || shape.table_bytes() > DIGEST_MAX_TABLE_BYTES {
+            return None;
+        }
+        let rep = tag_rep(params, &shape, dict_len + src_len);
+        if rep.tags || rep.ltags || rep.ctags {
+            return None;
+        }
+        let uses_bt = matches!(
+            params.strategy,
+            Strategy::BtLazy2 | Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2
+        );
+        // The tree-priming arm runs the tree kernel over the prefix; its
+        // inputs are not enumerated here, so it keeps the legacy path.
+        if uses_bt && prime_bt_tree_enabled() {
+            return None;
+        }
+        let mls = params.min_match.clamp(3, 7) as usize;
+        Some(Self {
+            params,
+            shape,
+            rep,
+            tail_len,
+            stride: prime_stride(),
+            bt_chain_write: uses_bt && prime_bt_chain_write(),
+            fast_wide: params.strategy == Strategy::Fast
+                && fast_hash_spec(mls, shape.hash_log).wide,
+        })
+    }
+}
+
+/// One primed table state.
+#[cfg(feature = "std")]
+pub(crate) struct Digest {
+    key: DigestKey,
+    hash: Vec<u32>,
+    hash_long: Vec<u32>,
+    /// EMPTY when priming left the chain all-zero -- always on the Bt ladder
+    /// (heads only) -- so the snapshot does not carry megabytes of zeros.
+    chain: Vec<u32>,
+    null_link: u32,
+}
+
+#[cfg(feature = "std")]
+impl Digest {
+    /// Prime a fresh table set over the dictionary tail and keep the result.
+    /// Once per (dictionary, key): cold, and kept out of the per-call path.
+    #[cold]
+    #[inline(never)]
+    fn build(key: &DigestKey, tail: &[u8], _src: &[u8]) -> Self {
+        let prime = |hist: &[u8]| {
+            let mut t = MatchTables::build(key.params, key.shape, TableBufs::default(), true);
+            t.pack_tags = key.rep.pack_tags;
+            t.chain_pack = key.rep.chain_pack;
+            t.chain_wide = false;
+            let window = 1usize << key.params.window_log.min(31);
+            prime_tables(&mut t, hist, tail.len(), window, key.params);
+            t
+        };
+        let mut t = prime(tail);
+        // The claim the whole digest rests on, checked rather than argued:
+        // priming over tail + message leaves the same tables as priming over
+        // the tail alone.
+        #[cfg(debug_assertions)]
+        {
+            let mut full = Vec::with_capacity(tail.len() + _src.len());
+            full.extend_from_slice(tail);
+            full.extend_from_slice(_src);
+            let f = prime(&full);
+            assert!(
+                f.hash == t.hash
+                    && f.hash_long == t.hash_long
+                    && f.chain == t.chain
+                    && f.null_link == t.null_link,
+                "dictionary priming depends on the message"
+            );
+        }
+        let chain = if t.chain.iter().all(|&x| x == 0) {
+            Vec::new()
+        } else {
+            core::mem::take(&mut t.chain)
+        };
+        Self {
+            key: key.clone(),
+            hash: core::mem::take(&mut t.hash),
+            hash_long: core::mem::take(&mut t.hash_long),
+            chain,
+            null_link: t.null_link,
+        }
+    }
+}
+
+/// `dst := snap`, or `n` zeros when the snapshot is the all-zero table.
+/// Never reallocates once `dst` has held a table of this shape.
+#[cfg(feature = "std")]
+#[inline]
+fn seat_table(dst: &mut Vec<u32>, snap: &[u32], n: usize) {
+    dst.clear();
+    if snap.is_empty() {
+        dst.resize(n, 0);
+    } else {
+        debug_assert_eq!(snap.len(), n);
+        dst.extend_from_slice(snap);
+    }
+}
+
+/// The digests one `Dictionary` owns: up to `DIGEST_SLOTS` keys, least
+/// recently looked-up evicted first. A slot is a key SEEN once (no snapshot
+/// yet) or a key with its snapshot.
+#[cfg(feature = "std")]
+#[derive(Default)]
+pub(crate) struct DictDigests {
+    slots: std::sync::Mutex<DigestSlots>,
+}
+
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct DigestSlots {
+    tick: u64,
+    v: Vec<(u64, DigestKey, Option<alloc::sync::Arc<Digest>>)>,
+}
+
+#[cfg(feature = "std")]
+impl core::fmt::Debug for DictDigests {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DictDigests")
+    }
+}
+
+#[cfg(feature = "std")]
+enum DigestLookup {
+    Ready(alloc::sync::Arc<Digest>),
+    /// Second sighting of this key: worth a snapshot now.
+    Build,
+    /// First sighting: remembered, and this call takes the legacy path.
+    FirstSight,
+}
+
+#[cfg(feature = "std")]
+impl DictDigests {
+    fn lock(&self) -> std::sync::MutexGuard<'_, DigestSlots> {
+        // The guarded data is a small Vec that every critical section leaves
+        // consistent, so a poisoned lock is still usable.
+        self.slots.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lookup(&self, key: &DigestKey) -> DigestLookup {
+        let mut g = self.lock();
+        g.tick += 1;
+        let tick = g.tick;
+        if let Some(s) = g.v.iter_mut().find(|s| s.1 == *key) {
+            s.0 = tick;
+            return match &s.2 {
+                Some(d) => DigestLookup::Ready(d.clone()),
+                None => DigestLookup::Build,
+            };
+        }
+        if g.v.len() >= DIGEST_SLOTS {
+            if let Some(i) = (0..g.v.len()).min_by_key(|&i| g.v[i].0) {
+                g.v.swap_remove(i);
+            }
+        }
+        g.v.push((tick, key.clone(), None));
+        DigestLookup::FirstSight
+    }
+
+    /// Publish a freshly built digest; if another thread got there first,
+    /// theirs is returned (the two are equal -- same bytes, same key).
+    fn publish(&self, d: alloc::sync::Arc<Digest>) -> alloc::sync::Arc<Digest> {
+        let mut g = self.lock();
+        if let Some(s) = g.v.iter_mut().find(|s| s.1 == d.key) {
+            if let Some(have) = &s.2 {
+                return have.clone();
+            }
+            s.2 = Some(d.clone());
+        }
+        // Evicted between `lookup` and here: still usable by this caller.
+        d
+    }
+}
+
+/// One thread's working set for one (dictionary, key). AT REST its tables
+/// equal `digest`'s snapshot and `workspace[..tail_len]` is the tail.
+#[cfg(feature = "std")]
+struct DictWork {
+    /// Identity of the owning dictionary. A `Weak` rather than an address:
+    /// while it lives the allocation cannot be reused, so pointer equality
+    /// cannot be fooled by a new dictionary landing where an old one was.
+    owner: alloc::sync::Weak<DictDigests>,
+    digest: alloc::sync::Arc<Digest>,
+    bufs: TableBufs,
+    workspace: Vec<u8>,
+    /// Dirty-slot restores this set has made (drives the sampled comparison).
+    dirty_restores: u32,
+}
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    static DICT_WORK: core::cell::RefCell<Option<DictWork>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "std")]
+impl DictWork {
+    /// This thread's working set, seated on `key`'s digest of `dict` -- or
+    /// `None` on the first sighting of the key.
+    fn acquire(dict: &Dictionary, key: &DigestKey, tail: &[u8], src: &[u8]) -> Option<Self> {
+        use alloc::sync::Arc;
+        let owner = dict.digests();
+        let prev = DICT_WORK
+            .try_with(|c| c.try_borrow_mut().ok().and_then(|mut b| b.take()))
+            .ok()
+            .flatten();
+        if let Some(w) = &prev {
+            if core::ptr::eq(w.owner.as_ptr(), Arc::as_ptr(owner)) && w.digest.key == *key {
+                note_digest(0);
+                return prev;
+            }
+        }
+        let digest = match owner.lookup(key) {
+            DigestLookup::Ready(d) => {
+                note_digest(1);
+                d
+            }
+            DigestLookup::Build => {
+                note_digest(2);
+                owner.publish(Arc::new(Digest::build(key, tail, src)))
+            }
+            DigestLookup::FirstSight => {
+                note_digest(3);
+                // Leave the thread's set where it was: this dictionary may
+                // never be seen again.
+                if let Some(w) = prev {
+                    w.release();
+                }
+                return None;
+            }
+        };
+        // Another dictionary or key: re-seat the set on the new snapshot,
+        // inside whatever allocations the old one leaves behind.
+        let (mut bufs, mut workspace) = match prev {
+            Some(w) => (w.bufs, w.workspace),
+            None => (TableBufs::default(), Vec::new()),
+        };
+        seat_table(&mut bufs.hash, &digest.hash, key.shape.hash);
+        seat_table(&mut bufs.hash_long, &digest.hash_long, key.shape.long);
+        seat_table(&mut bufs.chain, &digest.chain, key.shape.chain);
+        workspace.clear();
+        workspace.extend_from_slice(tail);
+        Some(Self {
+            owner: Arc::downgrade(owner),
+            digest,
+            bufs,
+            workspace,
+            dirty_restores: 0,
+        })
+    }
+
+    /// Put the tables back to the snapshot after a frame of `msg_len` bytes.
+    ///
+    /// The full copy is O(tables) -- 512 KiB for a 112 KiB dictionary at L3,
+    /// about 14 us, half of what a 1 KiB message then costs in total. The
+    /// DIRTY-SLOT restore is O(message): it re-derives which slots the frame
+    /// can have written and copies just those back.
+    ///
+    /// WHAT THE DIRTY RESTORE RESTS ON. `one_block` frames of the Fast and
+    /// DFast finders only, because for those the write set is closed-form:
+    ///
+    ///   * every table store in block 0 is `table[H(bytes at p)] = ..` for a
+    ///     position `p` of THIS message (`p >= payload_off`; the finders
+    ///     start at `block_start` and their fills sit at `match + 2` and
+    ///     `match_end - 2`), under ONE hash per table for the whole block --
+    ///     Fast: `fast_hash_tag` with the block's (wide, mask, shift), the
+    ///     tail-zero-extended load included; DFast: `hash4` of the low word
+    ///     into `hash`, `hash8` of the full word into `hash_long`, always at
+    ///     `p + 8 <= len`;
+    ///   * block 0 cannot switch representation: the legacy-key relatch, the
+    ///     Fast->Lazy route, the step probe's clone and the raw short circuit
+    ///     all need a previous block's measurements (and `flags_ok` below
+    ///     refuses the dirty path if `pack_tags` / `fast_hash_legacy` moved
+    ///     anyway).
+    ///
+    /// So recomputing those hashes for EVERY position from 8 bytes before the
+    /// message to its end, and copying the snapshot's value into each slot,
+    /// restores a superset of what was written. The message is still in the
+    /// workspace, so the recomputation reads the same bytes the finder did.
+    ///
+    /// That is an argument about code in `encode/fast.rs` and
+    /// `encode/dfast.rs`, so it is CHECKED, three ways:
+    ///   1. debug builds (every `cargo test`) and `RZSTD_DIGEST_VERIFY=1`
+    ///      (the `smallboard` gate runs it) compare the whole table set with
+    ///      the snapshot after EVERY restore and panic on a difference;
+    ///   2. release builds compare on a set's first four dirty restores and
+    ///      every 64th after (0.25 us amortised); a difference repairs the
+    ///      set with a full copy and turns the dirty path OFF for the process;
+    ///   3. a missed slot cannot produce an invalid frame: both finders
+    ///      order-, window- and byte-check every candidate (`fast_probe`,
+    ///      `match_ok`), so a stale slot can only cost byte identity.
+    ///
+    /// A FINDER CHANGE THAT ADDS A STORE UNDER A NEW HASH MUST EXTEND
+    /// `restore_dirty`; (1) is the tripwire that says so.
+    fn restore(&mut self, one_block: bool, flags_ok: bool, msg_len: usize) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let strategy = self.digest.key.params.strategy;
+        let dirty = {
+            let key = &self.digest.key;
+            one_block
+                && flags_ok
+                && digest_mode() == 3
+                && matches!(strategy, Strategy::Fast | Strategy::DFast)
+                && (3..=7).contains(&key.params.min_match)
+                && msg_len
+                    .saturating_mul(if strategy == Strategy::DFast { 2 } else { 1 })
+                    .saturating_mul(DIGEST_DIRTY_RATIO)
+                    <= key.shape.table_bytes()
+                && !DIGEST_DIRTY_BROKEN.load(Relaxed)
+        };
+        if dirty {
+            note_digest(5);
+            self.restore_dirty(msg_len);
+            self.dirty_restores = self.dirty_restores.wrapping_add(1);
+        } else {
+            note_digest(6);
+            self.restore_full();
+        }
+        let strict = cfg!(debug_assertions) || digest_verify();
+        let sampled = dirty && (self.dirty_restores <= 4 || self.dirty_restores % 64 == 0);
+        if strict || sampled {
+            note_digest(7);
+            if !self.at_rest() {
+                note_digest(8);
+                assert!(
+                    !strict,
+                    "digest restore left the tables different from the snapshot \
+                     (strategy {strategy:?}, {msg_len} message bytes, dirty = {dirty})"
+                );
+                DIGEST_DIRTY_BROKEN.store(true, Relaxed);
+                self.restore_full();
+            }
+        }
+    }
+
+    /// Do the tables equal the snapshot?
+    fn at_rest(&self) -> bool {
+        let d = &*self.digest;
+        self.bufs.hash == d.hash
+            && self.bufs.hash_long == d.hash_long
+            && if d.chain.is_empty() {
+                self.bufs.chain.iter().all(|&x| x == 0)
+            } else {
+                self.bufs.chain == d.chain
+            }
+    }
+
+    fn restore_full(&mut self) {
+        let d = &*self.digest;
+        seat_table(&mut self.bufs.hash, &d.hash, d.key.shape.hash);
+        seat_table(&mut self.bufs.hash_long, &d.hash_long, d.key.shape.long);
+        seat_table(&mut self.bufs.chain, &d.chain, d.key.shape.chain);
+    }
+
+    /// See `restore`. Fast and DFast only; `min_match` in 3..=7.
+    fn restore_dirty(&mut self, msg_len: usize) {
+        let d = &*self.digest;
+        let key = &d.key;
+        let len = key.tail_len + msg_len;
+        let ws = &self.workspace[..len];
+        let lo = key.tail_len.saturating_sub(8);
+        let hash_log = key.shape.hash_log;
+        let hash = &mut self.bufs.hash[..];
+        let snap = &d.hash[..];
+        if key.params.strategy == Strategy::Fast {
+            // The block's key, exactly as `find_fast` resolves it for block 0
+            // of a frame (`wide_block`): wide needs the packed representation.
+            let mls = key.params.min_match.clamp(3, 7) as usize;
+            let wide = key.fast_wide && key.rep.pack_tags;
+            let (mask, shift) = if wide {
+                (
+                    fast_hash_spec(mls, hash_log).mask,
+                    64u32.saturating_sub(hash_log),
+                )
+            } else {
+                (0, 32u32.saturating_sub(hash_log))
+            };
+            // The wide key's tail load zero-extends, so every position hashes;
+            // the 4-byte key needs its four bytes.
+            let end = if wide { len } else { len.saturating_sub(3) };
+            for p in lo..end {
+                let (h, _) = fast_hash_tag::<false>(ws, p, wide, mask, shift);
+                hash[h] = snap[h];
+            }
+        } else {
+            let long = &mut self.bufs.hash_long[..];
+            let snap_long = &d.hash_long[..];
+            let s4 = 32u32.saturating_sub(hash_log);
+            let s8 = 64u32.saturating_sub(hash_log);
+            let mut p = lo;
+            while p + 8 <= len {
+                let v = load_u64le(ws, p);
+                let h4 = hash4_shift(v as u32, s4);
+                let h8 = hash8_from(v, s8);
+                hash[h4] = snap[h4];
+                long[h8] = snap_long[h8];
+                p += 1;
+            }
+            // DFast never stores a position without eight bytes under it;
+            // the short key of the last few is restored anyway (a superset).
+            while p + 4 <= len {
+                let h4 = hash4_shift(load_u32le(ws, p), s4);
+                hash[h4] = snap[h4];
+                p += 1;
+            }
+        }
+    }
+
+    /// Park the set for this thread's next call, inside the stated bound.
+    fn release(mut self) {
+        let tail_len = self.digest.key.tail_len;
+        self.workspace.truncate(tail_len);
+        if self.workspace.capacity() > tail_len + DIGEST_WORKSPACE_SLACK {
+            self.workspace.shrink_to(tail_len + DIGEST_WORKSPACE_SLACK);
+        }
+        // The three tables are seated INSIDE whatever allocations the set's
+        // previous shape left (`seat_table`), so after a change of shape a
+        // table can hold more capacity than it has entries -- a 4 MiB Fast
+        // hash followed by a 3 MiB chain would otherwise park 7 MiB under a
+        // bound that says 4. Give the excess back.
+        let table_cap =
+            |b: &TableBufs| (b.hash.capacity() + b.hash_long.capacity() + b.chain.capacity()) * 4;
+        if table_cap(&self.bufs) > DIGEST_MAX_TABLE_BYTES {
+            self.bufs.hash.shrink_to_fit();
+            self.bufs.hash_long.shrink_to_fit();
+            self.bufs.chain.shrink_to_fit();
+        }
+        if self.bufs.retained_bytes() - table_cap(&self.bufs) > ONESHOT_POOL_MAX_BYTES {
+            // Oversized scratch (one very large message): keep the tables only.
+            let b = core::mem::take(&mut self.bufs);
+            self.bufs = TableBufs {
+                hash: b.hash,
+                hash_long: b.hash_long,
+                chain: b.chain,
+                ..TableBufs::default()
+            };
+        }
+        let _ = DICT_WORK.try_with(|c| {
+            if let Ok(mut slot) = c.try_borrow_mut() {
+                *slot = Some(self);
+            }
+        });
+    }
+}
+
+/// The one-shot frame for `src` against a digested `dict`. `None` = not
+/// served from a digest (see the list above); the caller runs the legacy path.
+///
+/// Its own frame, not inlined: the plain (no dictionary) driver should not
+/// carry this body, and the two never run in the same call.
+#[cfg(feature = "std")]
+#[inline(never)]
+fn encode_with_digest(
+    src: &[u8],
+    params: CompressionParameters,
+    checksum: bool,
+    pledged: Option<u64>,
+    dict: &Dictionary,
+    dict_id: Option<u32>,
+) -> Option<Result<Vec<u8>, Error>> {
+    let content = dict.content();
+    let window = 1usize << params.window_log.min(31);
+    // The same reachable-tail cut the legacy path makes (GATE 2 @ L3).
+    let keep = window.saturating_add(BLOCKSIZE_MAX as usize);
+    let cut = if prefix_bound_enabled() {
+        content.len().saturating_sub(keep)
+    } else {
+        0
+    };
+    let tail = &content[cut..];
+    let Some(key) = DigestKey::for_frame(params, src.len(), content.len(), tail.len()) else {
+        note_digest(4);
+        return None;
+    };
+    let mut work = DictWork::acquire(dict, &key, tail, src)?;
+    let tail_len = key.tail_len;
+    // The dictionary bytes are already at the front; only the message moves.
+    work.workspace.truncate(tail_len);
+    work.workspace.extend_from_slice(src);
+    let mut tables = {
+        let _t = crate::prof::scope(crate::prof::Stage::EncodeTables);
+        let mut t = MatchTables::build(params, key.shape, core::mem::take(&mut work.bufs), false);
+        t.pack_tags = key.rep.pack_tags;
+        t.chain_pack = key.rep.chain_pack;
+        t.chain_wide = false;
+        t.null_link = work.digest.null_link;
+        t
+    };
+    let mut reps = [1u32, 4, 8];
+    let mut entropy = EntropyState::default();
+    if let Some(e) = dict.entropy() {
+        entropy.seed_from_dict(e);
+        reps = e.reps;
+    }
+    let mut out = Vec::with_capacity(crate::compress_bound(src.len()));
+    write_frame_header(
+        &mut out,
+        src.len() as u64,
+        params.window_log,
+        checksum,
+        pledged,
+        dict_id,
+        true,
+    );
+    let adv = AdvancedOptions::default();
+    let block_max = frame_block_max(window, adv);
+    let r = encode_frame_blocks(
+        &mut out,
+        &work.workspace,
+        tail_len,
+        src.len(),
+        params,
+        window,
+        block_max,
+        checksum,
+        adv,
+        &mut tables,
+        &mut reps,
+        &mut entropy,
+        None,
+    );
+    // Did the frame end in the representation it started in?
+    let flags_ok = tables.pack_tags == key.rep.pack_tags
+        && tables.chain_pack == key.rep.chain_pack
+        && !tables.fast_hash_legacy
+        && !tables.chain_wide;
+    work.bufs = tables.take_bufs();
+    if r.is_ok() {
+        // Only a set that finished its frame is known to be restorable; an
+        // error path drops it and the next call re-seats from the snapshot.
+        // `adaptive_block_max` returns its base for a frame's first block, so
+        // a message no longer than `block_max` was exactly one block.
+        work.restore(src.len() <= block_max, flags_ok, src.len());
+        work.release();
+    }
+    Some(r.map(|()| out))
+}
+
+/// `RZSTD_BLOCK_KB`, resolved ONCE per process. 0 = unresolved, else `kb + 1`
+/// (so 1 means "resolved: unset or 0", the shipping default of no cap).
+///
+/// This was the one knob in the crate read UNCACHED, and it sat on the
+/// one-shot driver's per-CALL path: an OS environment lookup plus a `String`
+/// allocation for every `compress*` call, at every level. On megabyte inputs
+/// that is nothing; on a 256-byte message it was one of the call's fifteen
+/// allocations and a syscall-class lookup beside ~9 us of real work
+/// (`percall.rs`: env reads 1.00/call -> 0.00). `env_reads_gate` could not
+/// see it -- that gate asserts reads do not scale with INPUT SIZE, and this
+/// one scaled with the CALL COUNT.
+///
+/// The probes that sweep the knob mid-process (`allgates`, `g19full`,
+/// `g19l1`, `g19rle`) relied on the read being uncached; they now call
+/// `reset_env_arms()` after each `set_var`, which clears this.
+static BLOCK_KB_ARM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn block_kb_knob() -> usize {
+    use core::sync::atomic::Ordering;
+    let v = BLOCK_KB_ARM.load(Ordering::Relaxed);
+    if v != 0 {
+        return v - 1;
+    }
+    let kb = crate::env_knob_parse::<usize>("RZSTD_BLOCK_KB")
+        .unwrap_or(0)
+        .min(usize::MAX - 1);
+    BLOCK_KB_ARM.store(kb + 1, Ordering::Relaxed);
+    kb
 }
 
 /// GATE 1 @ L19 -- the Bt tree is primed in the WRONG LAYOUT.
@@ -7744,6 +8645,12 @@ pub fn reset_env_arms() {
     FAST_LAZY_ARM.store(0, Ordering::Relaxed);
     PAIR_GAIN_ARM.store(u32::MAX, Ordering::Relaxed);
     PAIR_HI_ARM.store(u32::MAX, Ordering::Relaxed);
+    BLOCK_KB_ARM.store(0, Ordering::Relaxed);
+    #[cfg(feature = "std")]
+    {
+        OPT_FILL_MAX_C.store(OPT_FILL_MAX_UNRESOLVED, Ordering::Relaxed);
+        OPT_FILL_S_C.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Arm for the `find_dfast` HLOG specialisation, so it can be A/B'd IN-PROCESS

@@ -30,7 +30,7 @@ fn main(){
     for id in IDS{
         let Some(f)=load(id) else{continue};
         let src=&f[..f.len().min(8<<20)];
-        unsafe{ std::env::remove_var("RZSTD_BLOCK_KB"); }
+        unsafe{ std::env::remove_var("RZSTD_BLOCK_KB"); } rusty_zstd::reset_env_arms();
         g5_on();
         let _=rusty_zstd::take_g5(); let _=rusty_zstd::take_g5_inputs(); let _=rusty_zstd::take_content_signals();
         let z=rusty_zstd::compress(src,1).unwrap().len();
@@ -50,14 +50,14 @@ fn main(){
         let Some(f)=load(id) else{continue};
         let src=&f[..f.len().min(8<<20)];
         g5_on();
-        unsafe{ std::env::remove_var("RZSTD_BLOCK_KB"); }
+        unsafe{ std::env::remove_var("RZSTD_BLOCK_KB"); } rusty_zstd::reset_env_arms();
         let base=rusty_zstd::compress(src,1).unwrap().len() as f64;
         let mut v=vec![];
         for k in KB{
-            unsafe{ std::env::set_var("RZSTD_BLOCK_KB", k.to_string()); }
+            unsafe{ std::env::set_var("RZSTD_BLOCK_KB", k.to_string()); } rusty_zstd::reset_env_arms();
             v.push(rusty_zstd::compress(src,1).unwrap().len() as f64);
         }
-        unsafe{ std::env::remove_var("RZSTD_BLOCK_KB"); }
+        unsafe{ std::env::remove_var("RZSTD_BLOCK_KB"); } rusty_zstd::reset_env_arms();
         let bi=(0..v.len()).min_by_key(|&i|v[i] as i64).unwrap();
         print!("{id:<14}"); for x in &v{ print!("{:>8.3}%",100.0*(x-base)/base); }
         println!("{:>8}",format!("{}KB",KB[bi]));

@@ -16,6 +16,8 @@ fn main(){
         let (_,_,j,_)=rusty_zstd::take_opt_skips();
         std::env::set_var("RZSTD_OPT_FILL","1");
         std::env::set_var("RZSTD_OPT_FILL_S",&st);
+        // The knob is cached per process now; make the next compress re-read it.
+        rusty_zstd::reset_env_arms();
         let z=rusty_zstd::compress(src,lvl).unwrap();
         assert_eq!(rusty_zstd::decompress(&z).unwrap(),src,"{id}");
         std::env::remove_var("RZSTD_OPT_FILL");

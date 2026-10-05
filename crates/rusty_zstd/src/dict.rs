@@ -1,9 +1,11 @@
 //! RFC 8878 dictionaries: raw content and trained (`0xEC30A437`).
 
+use crate::encode::RetainedTable;
 use crate::error::Error;
-use crate::fse::{self, FseCTable, FseTable};
+use crate::fse::{self, FseTable};
 use crate::huffman::{self, HuffCTable, HuffmanTable};
 use crate::xxh64::content_checksum;
+use alloc::sync::Arc;
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
@@ -20,22 +22,38 @@ pub const DICT_ID_PUBLIC_MAX: u32 = 0x8000_0000;
 #[derive(Clone, Debug)]
 pub(crate) struct DictEntropy {
     pub huff_d: HuffmanTable,
-    pub huff_c: HuffCTable,
     pub ll_d: FseTable,
     pub of_d: FseTable,
     pub ml_d: FseTable,
-    pub ll_c: FseCTable,
-    pub of_c: FseCTable,
-    pub ml_c: FseCTable,
+    // The ENCODE-side tables, already in the shared form a frame's
+    // `EntropyState` retains them in, so seeding a frame from the dictionary
+    // is four refcount bumps and no copy (see `seed_from_dict`).
+    pub huff_c: alloc::sync::Arc<HuffCTable>,
+    pub ll_c: alloc::sync::Arc<crate::encode::RetainedTable>,
+    pub of_c: alloc::sync::Arc<crate::encode::RetainedTable>,
+    pub ml_c: alloc::sync::Arc<crate::encode::RetainedTable>,
     pub reps: [u32; 3],
 }
 
 /// A zstd dictionary (raw bytes or trained with entropy tables).
+///
+/// Compressing many inputs against the SAME `Dictionary` (or clones of it) is
+/// the fast path: from the second call on, the match-table state the
+/// dictionary primes is kept with it and reused instead of being rebuilt from
+/// the dictionary bytes on every call -- libzstd's `ZSTD_CDict`, without a
+/// separate type to manage. Build the `Dictionary` once and keep it; a
+/// `Dictionary` rebuilt from the same bytes for every call starts cold every
+/// time. The output is byte-identical either way.
 #[derive(Clone, Debug)]
 pub struct Dictionary {
     id: u32,
     content: Vec<u8>,
     entropy: Option<DictEntropy>,
+    /// The digested (primed) table states, shared by every clone. See
+    /// `encode::DictDigests` for what is kept and its bound. `std` only: it
+    /// needs a lock, and the working tables that mirror it are thread-local.
+    #[cfg(feature = "std")]
+    digests: alloc::sync::Arc<crate::encode::DictDigests>,
 }
 
 impl Dictionary {
@@ -47,20 +65,12 @@ impl Dictionary {
                 return parse_trained(src);
             }
         }
-        Ok(Self {
-            id: 0,
-            content: src.to_vec(),
-            entropy: None,
-        })
+        Ok(Self::with_parts(0, src.to_vec(), None))
     }
 
     /// Raw-content dictionary (no entropy tables, Dictionary_ID 0).
     pub fn raw(content: impl Into<Vec<u8>>) -> Self {
-        Self {
-            id: 0,
-            content: content.into(),
-            entropy: None,
-        }
+        Self::with_parts(0, content.into(), None)
     }
 
     /// Dictionary_ID (0 for raw content).
@@ -82,7 +92,15 @@ impl Dictionary {
             id,
             content,
             entropy,
+            #[cfg(feature = "std")]
+            digests: Default::default(),
         }
+    }
+
+    /// The digest cache this dictionary (and every clone of it) owns.
+    #[cfg(feature = "std")]
+    pub(crate) fn digests(&self) -> &alloc::sync::Arc<crate::encode::DictDigests> {
+        &self.digests
     }
 }
 
@@ -127,13 +145,13 @@ fn parse_trained(src: &[u8]) -> Result<Dictionary, Error> {
         content,
         Some(DictEntropy {
             huff_d,
-            huff_c,
             ll_d,
             of_d,
             ml_d,
-            ll_c,
-            of_c,
-            ml_c,
+            huff_c: Arc::new(huff_c),
+            ll_c: Arc::new(RetainedTable::Own(ll_c)),
+            of_c: Arc::new(RetainedTable::Own(of_c)),
+            ml_c: Arc::new(RetainedTable::Own(ml_c)),
             reps: [r0, r1, r2],
         }),
     ))
