@@ -949,19 +949,26 @@ pub(crate) fn build_coded_pass(
         // sequence, while the two copy arms beside it are both resolved once
         // per block.
         let lut_arm = crate::compressed::lut_on();
+        // SEQ-3: the scratch is SIZED to the block up front and the loop
+        // writes its slots through a zip. `push` re-tested the capacity on
+        // every sequence -- a compare against a stack slot, a `grow_one` call
+        // site inside the loop, and the length stored back twice per trip --
+        // for a capacity that was ensured three lines earlier. `resize`
+        // only writes the slots a LARGER block adds; shrinking is free.
         let mut coded: Vec<CodedSeq> = core::mem::take(&mut tables.coded_scratch);
-        coded.clear();
-        if coded.capacity() < seqs.len() {
-            coded = Vec::with_capacity(seqs.len());
-        }
+        coded.resize(seqs.len(), CodedSeq::EMPTY);
         // The code histograms and the of_needs_comp scan were SEPARATE full
         // passes over `coded`; both fold into this loop.
         let mut ll_count = [0u32; 36];
         let mut of_count = [0u32; 32];
         let mut ml_count = [0u32; 53];
-        let mut of_max = 0u8;
-        for s in seqs {
-            let ov = offset_value_for(s.offset, s.litlen, reps);
+        // SEQ-3: the repcode history lives in three LOCALS for the pass and is
+        // written back once. Behind `&mut [u32; 3]` every test of it was a
+        // load and every update a store (or, for the rotate, an overlapping
+        // 8-byte move through memory).
+        let [mut r0, mut r1, mut r2] = *reps;
+        for (s, slot) in seqs.iter().zip(coded.iter_mut()) {
+            let ov = offset_value_for(s.offset, s.litlen, &[r0, r1, r2]);
             // BRICK 62: advance the repcodes directly instead of calling the
             // DECODER's `resolve_offset` and discarding its result.
             //
@@ -976,14 +983,14 @@ pub(crate) fn build_coded_pass(
             // The repcode SHUFFLE below is `resolve_offset`'s verbatim.
             let is_new = ov > 3 || (ov == 3 && s.litlen == 0);
             if is_new {
-                reps[2] = reps[1];
-                reps[1] = reps[0];
-                reps[0] = s.offset;
+                r2 = r1;
+                r1 = r0;
+                r0 = s.offset;
             } else {
                 let which = if s.litlen == 0 { ov + 1 } else { ov };
                 match which {
-                    2 => reps.swap(0, 1),
-                    3 => reps.rotate_right(1),
+                    2 => core::mem::swap(&mut r0, &mut r1),
+                    3 => (r0, r1, r2) = (r2, r0, r1),
                     _ => {}
                 }
             }
@@ -1003,7 +1010,6 @@ pub(crate) fn build_coded_pass(
             ll_count[(llc as usize).min(ll_count.len() - 1)] += 1;
             of_count[ofc as usize] += 1;
             ml_count[(mlc as usize).min(ml_count.len() - 1)] += 1;
-            of_max = of_max.max(ofc);
             // SEQ-2: the three extra-bit fields leave here as ONE word, already
             // in stream order (LL lowest, then ML, then the offset), with its
             // total width beside it. Each field is below `1 << width` by
@@ -1012,14 +1018,19 @@ pub(crate) fn build_coded_pass(
             debug_assert!(llx >> llb == 0 && mlx >> mlb == 0 && ofx >> ofc == 0);
             let lm = u32::from(llb) + u32::from(mlb);
             let ex = u64::from(llx) | (u64::from(mlx) << llb) | (u64::from(ofx) << lm);
-            coded.push(CodedSeq {
+            *slot = CodedSeq {
                 ex,
                 ex_bits: (lm + u32::from(ofc)) as u8,
                 llc,
                 mlc,
                 ofc,
-            });
+            };
         }
+        *reps = [r0, r1, r2];
+        // SEQ-3: the largest offset code is READ OFF THE HISTOGRAM. It was a
+        // running maximum kept in a stack slot -- load, compare, select, store
+        // on every sequence -- for a number the pass has by construction.
+        let of_max = of_count.iter().rposition(|&c| c != 0).unwrap_or(0) as u8;
 
         (coded, ll_count, of_count, ml_count, of_max)
     };
@@ -1565,4 +1576,15 @@ pub(crate) struct CodedSeq {
     pub(crate) llc: u8,
     pub(crate) mlc: u8,
     pub(crate) ofc: u8,
+}
+
+impl CodedSeq {
+    /// Fill value for scratch slots a block has not written yet.
+    pub(crate) const EMPTY: Self = Self {
+        ex: 0,
+        ex_bits: 0,
+        llc: 0,
+        mlc: 0,
+        ofc: 0,
+    };
 }
