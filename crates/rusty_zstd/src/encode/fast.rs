@@ -211,13 +211,75 @@ pub(crate) fn find_fast(
             // that stood in each arm was selecting between two
             // monomorphisations that W7 merged -- so it had become a branch
             // plus a second 11-argument call setup to reach the same function.
+            // V2 (2026-10-04): the shapes that carry the traffic get their own
+            // body; see the `SHAPE` parameter of `find_fast_impl_inner`.
+            //   1  wide key + packed tags + tag filter: every L1/L2 block of
+            //      a frame under 16 MiB at the default knobs.
+            //   2  legacy 4-byte key + tag ARRAY + tag filter: the same levels
+            //      on a frame of 16 MiB and over (V4).
+            //   0  everything else, on runtime flags.
+            let shape: u8 = if wide_block && $p {
+                1
+            } else if !wide_block && $p && !tables.pack_tags {
+                2
+            } else {
+                0
+            };
             #[cfg(all(target_arch = "x86_64", feature = "std"))]
             #[allow(unsafe_code)]
             let out = if crate::simd::has_bmi2() {
                 crate::kreach::hit(crate::kreach::K_FIND_FAST);
                 // SAFETY: runtime CPUID guard, identical body.
                 unsafe {
-                    find_fast_impl_bmi2(
+                    match shape {
+                        1 => find_fast_impl_bmi2::<1>(
+                            $p,
+                            $r,
+                            wide_block,
+                            s0,
+                            pipe_on,
+                            src,
+                            block_start,
+                            block_end,
+                            window,
+                            params,
+                            tables,
+                            reps,
+                        ),
+                        2 => find_fast_impl_bmi2::<2>(
+                            $p,
+                            $r,
+                            wide_block,
+                            s0,
+                            pipe_on,
+                            src,
+                            block_start,
+                            block_end,
+                            window,
+                            params,
+                            tables,
+                            reps,
+                        ),
+                        _ => find_fast_impl_bmi2::<0>(
+                            $p,
+                            $r,
+                            wide_block,
+                            s0,
+                            pipe_on,
+                            src,
+                            block_start,
+                            block_end,
+                            window,
+                            params,
+                            tables,
+                            reps,
+                        ),
+                    }
+                }
+            } else {
+                crate::kreach::miss(crate::kreach::K_FIND_FAST);
+                match shape {
+                    1 => find_fast_impl::<1>(
                         $p,
                         $r,
                         wide_block,
@@ -230,11 +292,40 @@ pub(crate) fn find_fast(
                         params,
                         tables,
                         reps,
-                    )
+                    ),
+                    2 => find_fast_impl::<2>(
+                        $p,
+                        $r,
+                        wide_block,
+                        s0,
+                        pipe_on,
+                        src,
+                        block_start,
+                        block_end,
+                        window,
+                        params,
+                        tables,
+                        reps,
+                    ),
+                    _ => find_fast_impl::<0>(
+                        $p,
+                        $r,
+                        wide_block,
+                        s0,
+                        pipe_on,
+                        src,
+                        block_start,
+                        block_end,
+                        window,
+                        params,
+                        tables,
+                        reps,
+                    ),
                 }
-            } else {
-                crate::kreach::miss(crate::kreach::K_FIND_FAST);
-                find_fast_impl(
+            };
+            #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
+            let out = match shape {
+                1 => find_fast_impl::<1>(
                     $p,
                     $r,
                     wide_block,
@@ -247,23 +338,36 @@ pub(crate) fn find_fast(
                     params,
                     tables,
                     reps,
-                )
+                ),
+                2 => find_fast_impl::<2>(
+                    $p,
+                    $r,
+                    wide_block,
+                    s0,
+                    pipe_on,
+                    src,
+                    block_start,
+                    block_end,
+                    window,
+                    params,
+                    tables,
+                    reps,
+                ),
+                _ => find_fast_impl::<0>(
+                    $p,
+                    $r,
+                    wide_block,
+                    s0,
+                    pipe_on,
+                    src,
+                    block_start,
+                    block_end,
+                    window,
+                    params,
+                    tables,
+                    reps,
+                ),
             };
-            #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
-            let out = find_fast_impl(
-                $p,
-                $r,
-                wide_block,
-                s0,
-                pipe_on,
-                src,
-                block_start,
-                block_end,
-                window,
-                params,
-                tables,
-                reps,
-            );
             out
         }};
     }
@@ -369,7 +473,7 @@ pub(crate) fn find_fast(
 /// C's equivalent is a small standalone function that keeps those in registers,
 /// which is where our ~3x per-probe cost was going. Splitting restores that.
 #[inline(never)]
-pub(crate) fn find_fast_impl(
+pub(crate) fn find_fast_impl<const SHAPE: u8>(
     packed: bool,
     rep: bool,
     wide: bool,
@@ -386,7 +490,7 @@ pub(crate) fn find_fast_impl(
     // W5: the BMI2 branch used to live here, once per monomorphisation. It is
     // now made ONCE at the dispatch (see the `go!` macro), which is what lets
     // the twin tree drop the HLOG axis. This wrapper is the baseline arm only.
-    find_fast_impl_inner::<false>(
+    find_fast_impl_inner::<false, SHAPE>(
         packed,
         rep,
         wide,
@@ -407,7 +511,7 @@ pub(crate) fn find_fast_impl(
 #[allow(clippy::too_many_arguments)]
 #[allow(unsafe_code)]
 #[inline(never)]
-pub(crate) unsafe fn find_fast_impl_bmi2(
+pub(crate) unsafe fn find_fast_impl_bmi2<const SHAPE: u8>(
     packed: bool,
     rep: bool,
     wide: bool,
@@ -421,7 +525,7 @@ pub(crate) unsafe fn find_fast_impl_bmi2(
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    find_fast_impl_inner::<true>(
+    find_fast_impl_inner::<true, SHAPE>(
         packed,
         rep,
         wide,
@@ -526,6 +630,25 @@ pub(crate) fn find_fast_impl_inner<
     // W1: which ISA twin is running, so the outlined emitter can be selected
     // at compile time instead of re-deciding per match.
     const BMI2: bool,
+    // V2 (2026-10-04): `SHAPE == 1` = wide key AND packed tags AND tag filter, as
+    // CONSTANTS. W7/W9/W10 made `wide`, `rep` and `packed` runtime flags on a
+    // STATIC count (46,327 -> 7,852 instructions across the copies), reasoning
+    // that a loop-invariant test is perfectly predicted and therefore free.
+    // It is predicted; it is not free. Counted on the path that RUNS
+    // (callgrind, dickens L1, every block on the pair route): the main loop
+    // executed 127 instructions per iteration, 44 of them in the pair
+    // pre-load alone, because each slot helper re-tested `pack`, `packed`
+    // and `wide` from the stack and kept the tag-array arm's state live.
+    // One extra body for the one shape that carries the traffic (every block
+    // of a frame under 16 MiB); every other shape keeps the runtime body.
+    // Byte-identical for the reason the old axes were: the const takes the
+    // value the runtime variable already held.
+    //
+    // V4: `SHAPE == 2` = legacy 4-byte key AND the tag ARRAY AND tag filter --
+    // what the same levels run on a frame of 16 MiB and over (mozilla, samba,
+    // nci), where the packed word has no room for the position. `SHAPE == 0`
+    // is the runtime body.
+    const SHAPE: u8,
 >(
     // W7: wide arrives at RUNTIME -- see the note in `find_fast`.
     // W9: rep joins WIDE at runtime. It gated the `try_rep1` block -- ~25
@@ -555,6 +678,13 @@ pub(crate) fn find_fast_impl_inner<
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
+    debug_assert!(SHAPE != 1 || (wide && packed));
+    debug_assert!(SHAPE != 2 || (!wide && packed && !tables.pack_tags && !tables.tags.is_empty()));
+    let (packed, wide) = match SHAPE {
+        1 => (true, true),
+        2 => (true, false),
+        _ => (packed, wide),
+    };
     let mls = params.min_match.max(3) as usize;
     // W12: state the block invariant ONCE, per block, so the body does not
     // pay for re-proving it per copy.
@@ -598,7 +728,7 @@ pub(crate) fn find_fast_impl_inner<
     // exit below.
     let mut hash_v = core::mem::take(&mut tables.hash);
     let mut tags_v = core::mem::take(&mut tables.tags);
-    let pack = tables.pack_tags;
+    let pack = if SHAPE == 2 { false } else { tables.pack_tags };
     // Guard unification (see the dispatch): wide implies pack, so in wide
     // copies this is const-true -- the slot helpers' pack branches fold and
     // `tags_v` is provably untouched.
@@ -614,7 +744,7 @@ pub(crate) fn find_fast_impl_inner<
     // the packed bound, where the array is legitimately absent.
     //
     // Ask the array that is actually in play.
-    let tags_live = !tags_v.is_empty();
+    let tags_live = if SHAPE == 2 { true } else { !tags_v.is_empty() };
     // BRICK 51: `probes`/`hits` feed ONLY `note_search`, which is a no-op
     // without the `profile` feature (their other consumers, `last_hit_rate` and
     // `tag_latch`, were write-only dead state left by the brick-41 revert).
@@ -724,6 +854,9 @@ pub(crate) fn find_fast_impl_inner<
     // Local repeat-offset state, mirroring C's `offset_1`/`offset_2`. A repcode
     // match leaves them unchanged; a normal match shifts them.
     let mut rep1 = reps[0] as usize;
+    // PHASE 2 prize probe (profile only): see `Rep2Probe`.
+    #[cfg(feature = "profile")]
+    let mut r2 = Rep2Probe::new(reps);
     // Shift from the table's OWN clamped hash_log -- never from `params`.
     //
     // BRICK 54: when `HLOG` is specialized (non-zero) this folds to a compile-
@@ -972,6 +1105,8 @@ pub(crate) fn find_fast_impl_inner<
                     });
                     ip = mstart + ml;
                     anchor = ip;
+                    #[cfg(feature = "profile")]
+                    r2.after(&seqs, src, ip, lowest, ilimit, block_end);
                     if ip > ilimit {
                         break;
                     }
@@ -1056,6 +1191,8 @@ pub(crate) fn find_fast_impl_inner<
                     ml,
                 );
                 anchor = ip;
+                #[cfg(feature = "profile")]
+                r2.after(&seqs, src, ip, lowest, ilimit, block_end);
                 // The non-pipelined loop does this after EVERY emitted match;
                 // this loop did not, so `rep1` stayed frozen at its block-entry
                 // value and every `try_rep1` tested a STALE offset for the whole
@@ -1106,6 +1243,8 @@ pub(crate) fn find_fast_impl_inner<
         // the same multiplier: this return was stamped into every one of the
         // 48+8 copies, and its `push_lits_range` was the `memcpy` call the asm
         // attribution kept finding twice per copy.
+        #[cfg(feature = "profile")]
+        r2.flush();
         fast_pipe_epilogue(
             tables, src, &seqs, &mut lits, anchor, block_end, rep, rep_hits, rep_bytes, rep_probes,
             cand, probes, hits, pipe_pos, ff_made, ff_used, hash_v, tags_v,
@@ -1160,8 +1299,11 @@ pub(crate) fn find_fast_impl_inner<
         // aliasing `h1 == h0` observes the same value it did before), and
         // nothing between here and the pair branch writes the table -- the rep
         // and match paths both `continue`. Only the issue order moves.
+        // V2: `SAFE = true`. `ip < ilimit` is `ip + 1 <= block_end - 8`, the
+        // exact bound the loads need; the tail-safe loader this used carried
+        // a bounds ladder and a byte loop for a case the guard excludes.
         let pair_pre = if pair && ip < ilimit {
-            let (h1, g1) = fast_hash_tag::<false>(src, ip + 1, wide, f_mask, f_shift);
+            let (h1, g1) = fast_hash_tag::<true>(src, ip + 1, wide, f_mask, f_shift);
             Some((
                 h1,
                 g1,
@@ -1191,6 +1333,8 @@ pub(crate) fn find_fast_impl_inner<
                 });
                 ip = mstart + ml;
                 anchor = ip;
+                #[cfg(feature = "profile")]
+                r2.after(&seqs, src, ip, lowest, ilimit, block_end);
                 continue;
             }
         }
@@ -1223,6 +1367,8 @@ pub(crate) fn find_fast_impl_inner<
                 ml,
             );
             anchor = ip;
+            #[cfg(feature = "profile")]
+            r2.after(&seqs, src, ip, lowest, ilimit, block_end);
             // Same decision as the pipelined loop -- see GATE 8 above. Guarding
             // only ONE loop would make the heuristic a property of which loop
             // ran, which is exactly the byte-identity break this gate exposed.
@@ -1231,9 +1377,12 @@ pub(crate) fn find_fast_impl_inner<
             }
             continue;
         }
-        if pair {
+        // V2: `pair_pre` is `Some` exactly when `pair && ip + 1 <= ilimit`,
+        // the two tests that stood here, so it IS the guard -- and the
+        // recompute arm for a `None` that could not reach this block goes.
+        if let Some((h1, g1, m1)) = pair_pre {
             let ip1 = ip + 1;
-            if ip1 <= ilimit {
+            {
                 if COUNT {
                     probes += 1;
                 }
@@ -1249,18 +1398,6 @@ pub(crate) fn find_fast_impl_inner<
                 if COUNT {
                     PAIR_PROBES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
-                // Already issued above, next to the main probe's load.
-                let (h1, g1, m1) = match pair_pre {
-                    Some(v) => v,
-                    None => {
-                        let (h, g) = fast_hash_tag::<false>(src, ip1, wide, f_mask, f_shift);
-                        (
-                            h,
-                            g,
-                            fast_slot_load(packed, &hash_v, &tags_v, pack_eff, tags_live, h, g),
-                        )
-                    }
-                };
                 if COUNT && packed {
                     let raw = fast_slot_raw(&hash_v, pack_eff, h1);
                     if m1 == 0 && raw != 0 {
@@ -1284,7 +1421,7 @@ pub(crate) fn find_fast_impl_inner<
                 // (repcode already covers that span) and not of the candidate.
                 // That is why `rep_yield` is the right and sufficient variable.
                 if let Some((m, ml)) = (if wide {
-                    fast_probe_wide::<false>(
+                    fast_probe_wide::<true>(
                         &mut cand, src, m1, ip1, window, lowest, accept_ml, f_mask, block_end,
                     )
                 } else {
@@ -1322,6 +1459,8 @@ pub(crate) fn find_fast_impl_inner<
                         ml,
                     );
                     anchor = ip;
+                    #[cfg(feature = "profile")]
+                    r2.after(&seqs, src, ip, lowest, ilimit, block_end);
                     continue;
                 }
             }
@@ -1338,6 +1477,8 @@ pub(crate) fn find_fast_impl_inner<
     // None of it depends on the const generics except rep and COUNT -- rep is
     // now a runtime bool (per block, free), COUNT is a cfg constant the helper
     // shares. Pure code motion: byte-identical by construction.
+    #[cfg(feature = "profile")]
+    r2.flush();
     fast_finder_epilogue(
         tables,
         src,

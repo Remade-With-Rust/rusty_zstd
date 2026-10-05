@@ -349,6 +349,159 @@ pub(crate) fn dfast_finder_prologue(
     Ok((seqs, lits, gates))
 }
 
+/// PHASE 2 PRIZE PROBE -- the second repcode, measured before it is built.
+/// Profile only; it reads the emitted sequences and the source, and changes
+/// nothing.
+///
+/// C's fast and dfast loops, right after storing a match, test
+/// `read32(ip) == read32(ip - offset_2)` in a loop and emit zero-literal
+/// repcode matches, swapping the two offsets each time. docs/plans/m7-anatomy
+/// 8.6 found `rep2` matched by none of this crate's finders and asked for the
+/// prize first. This counts it: after EVERY sequence a Fast or DFast block
+/// emits, with the exact two-deep offset history the entropy stage will
+/// derive (`offset_value_for`'s rule: a zero-literal match or a new offset
+/// pushes the old first offset down), would C's test fire at the position the
+/// scan resumes at, and how many bytes would the match cover?
+///
+/// `[0]` sequences seen, `[1]` tests that fire, `[2]` bytes those matches
+/// cover, `[3]`/`[4]` further matches and bytes when C's loop is followed
+/// (swap, re-test), `[5]`/`[6]` fires our own parse ALREADY takes -- the next
+/// sequence it emits is a zero-literal match at that same offset -- and the
+/// bytes of overlap. `[1] - [5]` is the new opportunity.
+#[cfg(feature = "profile")]
+pub static REP2_PRIZE: [crate::census64::AtomicU64; 8] =
+    [const { crate::census64::AtomicU64::new(0) }; 8];
+
+/// Read and clear the PHASE 2 prize probe. See `REP2_PRIZE`.
+#[cfg(feature = "profile")]
+pub fn take_rep2_prize() -> [u64; 8] {
+    let mut o = [0u64; 8];
+    for (i, c) in REP2_PRIZE.iter().enumerate() {
+        o[i] = c.swap(0, core::sync::atomic::Ordering::Relaxed);
+    }
+    o
+}
+
+/// One block's side of `REP2_PRIZE`: block-local accumulators, never an atomic
+/// per sequence.
+#[cfg(feature = "profile")]
+pub(crate) struct Rep2Probe {
+    off1: usize,
+    off2: usize,
+    pend_off: usize,
+    pend_n: usize,
+    acc: [u64; 8],
+}
+
+#[cfg(feature = "profile")]
+impl Rep2Probe {
+    pub(crate) fn new(reps: [u32; 3]) -> Self {
+        Self {
+            off1: reps[0] as usize,
+            off2: reps[1] as usize,
+            pend_off: 0,
+            pend_n: 0,
+            acc: [0; 8],
+        }
+    }
+
+    /// Call after every sequence the finder pushes, with the position the scan
+    /// resumes at.
+    pub(crate) fn after(
+        &mut self,
+        seqs: &[Seq],
+        src: &[u8],
+        ip: usize,
+        lowest: usize,
+        ilimit: usize,
+        block_end: usize,
+    ) {
+        let Some(q) = seqs.last() else { return };
+        let o = q.offset as usize;
+        // Did our own parse take the opportunity the last call predicted?
+        if self.pend_off != 0 {
+            if q.litlen == 0 && o == self.pend_off {
+                self.acc[5] += 1;
+                self.acc[6] += self.pend_n.min(q.matchlen as usize) as u64;
+            }
+            self.pend_off = 0;
+        }
+        // The two-deep history after `q`: reps[0] is always the offset just
+        // used; the old reps[0] becomes reps[1] unless `q` was repcode 1 (same
+        // offset WITH literals).
+        if o != self.off1 || q.litlen == 0 {
+            self.off2 = self.off1;
+        }
+        self.off1 = o;
+        self.acc[0] += 1;
+        let (mut a, mut b, mut p) = (self.off1, self.off2, ip);
+        let mut first = true;
+        while p <= ilimit
+            && b != 0
+            && p >= lowest + b
+            && load_u32le(src, p) == load_u32le(src, p - b)
+        {
+            let n = 4 + count_match(src, p - b + 4, p + 4, block_end);
+            if first {
+                self.acc[1] += 1;
+                self.acc[2] += n as u64;
+                self.pend_off = b;
+                self.pend_n = n;
+                first = false;
+            } else {
+                self.acc[3] += 1;
+                self.acc[4] += n as u64;
+            }
+            core::mem::swap(&mut a, &mut b);
+            p += n;
+        }
+    }
+
+    /// Publish this block's counts.
+    pub(crate) fn flush(&mut self) {
+        for (i, v) in self.acc.iter_mut().enumerate() {
+            REP2_PRIZE[i].fetch_add(*v, core::sync::atomic::Ordering::Relaxed);
+            *v = 0;
+        }
+    }
+}
+
+/// `MatchTables::get_h_tag` for a PACKED frame, in the table's own encoding:
+/// the tag-filtered short slot as `pos + 1`, or 0 for "no candidate". Same
+/// load, same filter, same answer -- `get_h_tag(..)` is `None` exactly when
+/// this is 0 and `Some(this - 1)` otherwise.
+///
+/// No emptiness test is needed: an empty slot is the all-zero word, whose low
+/// 24 bits are already the "none" value, and a written slot's low 24 bits are
+/// `pos + 1 >= 1` (`pack_tags` requires the frame to fit 24 bits).
+#[inline(always)]
+#[allow(unsafe_code)]
+pub(crate) fn dfast_short_slot_packed(tables: &MatchTables, h: usize, tag: u8) -> u32 {
+    debug_assert!(tables.pack_tags);
+    debug_assert!(h < tables.hash.len());
+    // SAFETY: `h` is this table's own hash index (the shift bounds it).
+    let v = *unsafe { tables.hash.get_unchecked(h) };
+    if (v >> 24) as u8 != tag {
+        return 0;
+    }
+    v & 0x00FF_FFFF
+}
+
+/// `MatchTables::get_hl_tag` for a PACKED frame, in the table's own encoding.
+/// See `dfast_short_slot_packed`; `on` gates the compare only, as there.
+#[inline(always)]
+#[allow(unsafe_code)]
+pub(crate) fn dfast_long_slot_packed(tables: &MatchTables, h: usize, tag: u8, on: bool) -> u32 {
+    debug_assert!(tables.pack_tags);
+    debug_assert!(h < tables.hash_long.len());
+    // SAFETY: `h` is this table's own hash index (the shift bounds it).
+    let v = *unsafe { tables.hash_long.get_unchecked(h) };
+    if on && (v >> 24) as u8 != tag {
+        return 0;
+    }
+    v & 0x00FF_FFFF
+}
+
 /// The dfast STRIDE fill (`RZSTD_DFAST_FILL_S`), outlined -- see the call site
 /// in `find_dfast_impl_inner` for why it left the loop. Body is the former
 /// inline loop verbatim: `put_h_tag`/`put_hl_tag` inlined, same representation.
@@ -495,6 +648,8 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
     // makes an immediate shut safe.
     let use_rep = rep_search_on(tables.rep_yield, params.strategy) || tables.rep_probe == 0;
     let mut rep1 = reps[0] as usize;
+    #[cfg(feature = "profile")]
+    let mut r2 = Rep2Probe::new(reps);
     let mut rep_hits = 0u64;
     // W5: hoisted for the back-extension loop -- see its use.
     let fstart_c = tables.frame_start;
@@ -716,6 +871,8 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
                 });
                 ip = mstart + ml;
                 anchor = ip;
+                #[cfg(feature = "profile")]
+                r2.after(&seqs, src, ip, lowest_rep, ilimit, block_end);
                 // W8: see `spec_dropped`.
                 spec_dropped += u64::from(carried.live);
                 carried.live = false;
@@ -739,15 +896,75 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
         // `find_dfast_runtime` drifted until Gate 6 silently broke Gate 4's
         // byte-identity: an issue-order change must not be able to become an
         // algorithm change.
-        let (h4, g4, h8, m4, m8) = if carried.live {
+        // V3 (2026-10-04): in the PACKED body the two candidates stay in the
+        // TABLE's encoding (`pos + 1`, 0 for none) from the slot load to the
+        // match test: `c4`/`c8` here, straight into the carry, straight back
+        // out. The `Option<usize>` form made each candidate a flag AND a value
+        // -- the filter built the flag with `setcc`, the carry re-encoded the
+        // pair to `pos + 1`, and the next position decoded it again.
+        //
+        // The tag-array body keeps the `Option` flow it had (`o4`/`o8`), on the
+        // count: with the raw form its registers re-rolled and samba L3
+        // executed 423.8M -> 443.0M match-find instructions. `PACKED` is this
+        // body's const, so each body carries only its own arm.
+        let (h4, g4, h8, c4, c8, o4, o8) = if carried.live {
             carried.live = false;
-            (
-                carried.h4 as usize,
-                carried.g4,
-                carried.h8 as usize,
-                dec(carried.v4),
-                dec(carried.v8),
-            )
+            if PACKED {
+                (
+                    carried.h4 as usize,
+                    carried.g4,
+                    carried.h8 as usize,
+                    carried.v4,
+                    carried.v8,
+                    None,
+                    None,
+                )
+            } else {
+                (
+                    carried.h4 as usize,
+                    carried.g4,
+                    carried.h8 as usize,
+                    0,
+                    0,
+                    dec(carried.v4),
+                    dec(carried.v8),
+                )
+            }
+        } else if PACKED {
+            let (a, ga, b) = dfast_hash_pair(src, ip, dtag_shift, smask, dlong_shift);
+            let c = dfast_short_slot_packed(tables, a, ga);
+            #[cfg(feature = "profile")]
+            if COUNT && dtag_on && tables.raw_fast(a) != 0 {
+                use core::sync::atomic::Ordering::Relaxed;
+                TAG_REJECT_TOTAL.fetch_add(1, Relaxed);
+                if c == 0 {
+                    let mr = (tables.raw_fast(a) as usize) - 1;
+                    if match_ok(src, mr, ip, window, block_start, mlx_c, frame_start_c)
+                        && count_match(src, mr, ip, block_end) >= mls
+                    {
+                        TAG_FALSE_REJECT.fetch_add(1, Relaxed);
+                    }
+                }
+            }
+            let d = dfast_long_slot_packed(tables, b, ga, lt_on);
+            #[cfg(feature = "profile")]
+            if COUNT && lt_on {
+                use core::sync::atomic::Ordering::Relaxed;
+                let raw = tables.raw_hl(b);
+                if raw != 0 {
+                    LTAG_NONEMPTY.fetch_add(1, Relaxed);
+                    if d == 0 {
+                        LTAG_REJECT.fetch_add(1, Relaxed);
+                        let mr = (raw as usize) - 1;
+                        if match_ok(src, mr, ip, window, block_start, mlx_c, frame_start_c)
+                            && count_match(src, mr, ip, block_end) >= mls
+                        {
+                            LTAG_FALSE.fetch_add(1, Relaxed);
+                        }
+                    }
+                }
+            }
+            (a, ga, b, c, d, None, None)
         } else {
             {
                 let (a, ga, b) = dfast_hash_pair(src, ip, dtag_shift, smask, dlong_shift);
@@ -797,9 +1014,10 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
                         }
                     }
                 }
-                (a, ga, b, m, ml8)
+                (a, ga, b, 0, 0, m, ml8)
             }
         };
+        let (m4, m8) = if PACKED { (dec(c4), dec(c8)) } else { (o4, o8) };
         tables.put_h_tag(h4, ip, g4, packed, stag_live);
         tables.put_hl_tag(h8, ip, g4, packed, ltag_live);
         // Issue the NEXT position's two loads NOW, so they are in flight while
@@ -812,43 +1030,73 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
         // an aliasing slot is forwarded by hand -- `put_h` writes `ip+1`, so
         // `get_h` on that slot would return `Some(ip)`. The two tables are
         // distinct, so `h4` can only alias `h4` and `h8` only `h8`.
+        // V1 (2026-10-04): the next-long probe below asks the long table for
+        // `ip + 1`. When the speculation just issued is FOR `ip + 1` (step 1
+        // inside the first 256 literals -- the dickens/mozilla/x-ray shape)
+        // it has already hashed that position, loaded that slot and applied
+        // the same tag filter, and nothing writes either table in between.
+        // `nl_spec` says the carried long candidate IS the probe's answer, so
+        // the probe does not hash, load and filter the same slot a second time.
+        //
+        // PACKED body only, on the count: the tag-array body (frames >= 16 MiB
+        // and streaming) re-rolled its registers under the same edit and
+        // executed MORE -- samba L3 423.8M -> 437.7M match-find instructions
+        // (callgrind, +3.3%) against dickens -3.2%, x-ray -5.2%, xml -1.5% on
+        // the packed body. `PACKED &&` folds the flag away there, so that body
+        // is the one it was.
+        let mut nl_spec = false;
         if dpipe {
             let nip = ip + dstep + ((ip - anchor) >> accel);
             if nip <= ilimit {
                 let (a, ga, b) = dfast_hash_pair(src, nip, dtag_shift, smask, dlong_shift);
-                // The hand-forward has to respect the filter: `put_h_tag` just
-                // wrote `g4` at slot `h4`, so a speculation landing on that slot
-                // sees `ip` only when its own tag matches what is now stored.
-                let va = if a == h4 {
-                    if !dtag_on || ga == g4 {
-                        Some(ip)
-                    } else {
-                        None
-                    }
+                let (va, vb) = if PACKED {
+                    // V3: NO hand-forward. The two stores above precede these
+                    // loads in program order, so a speculation landing on a
+                    // slot this position just wrote reads `(ip + 1) | g4 << 24`
+                    // and the filter compares `ga` with that top byte -- which
+                    // is exactly what the forward computed by hand, at two
+                    // compares per position to decide whether to compute it.
+                    (
+                        dfast_short_slot_packed(tables, a, ga),
+                        dfast_long_slot_packed(tables, b, ga, lt_on),
+                    )
                 } else {
-                    tables.get_h_tag(a, ga, dtag_on, packed)
-                };
-                // The long hand-forward mirrors `get_hl_tag`: the store
-                // above wrote tag `g4` at `h8`, so a speculation landing on
-                // that slot sees `ip` only when its own short tag matches.
-                let vb = if b == h8 {
-                    if !lt_on || ga == g4 {
-                        Some(ip)
+                    // The hand-forward has to respect the filter: `put_h_tag` just
+                    // wrote `g4` at slot `h4`, so a speculation landing on that slot
+                    // sees `ip` only when its own tag matches what is now stored.
+                    let va = if a == h4 {
+                        if !dtag_on || ga == g4 {
+                            Some(ip)
+                        } else {
+                            None
+                        }
                     } else {
-                        None
-                    }
-                } else {
-                    tables.get_hl_tag(b, ga, lt_on, packed)
+                        tables.get_h_tag(a, ga, dtag_on, packed)
+                    };
+                    // The long hand-forward mirrors `get_hl_tag`: the store
+                    // above wrote tag `g4` at `h8`, so a speculation landing on
+                    // that slot sees `ip` only when its own short tag matches.
+                    let vb = if b == h8 {
+                        if !lt_on || ga == g4 {
+                            Some(ip)
+                        } else {
+                            None
+                        }
+                    } else {
+                        tables.get_hl_tag(b, ga, lt_on, packed)
+                    };
+                    (enc(va), enc(vb))
                 };
                 spec_made += 1;
                 carried = Carried {
                     h4: a as u32,
                     h8: b as u32,
-                    v4: enc(va),
-                    v8: enc(vb),
+                    v4: va,
+                    v8: vb,
                     g4: ga,
                     live: true,
                 };
+                nl_spec = PACKED && nip == ip + 1;
             }
         }
 
@@ -911,17 +1159,31 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
         let mut best_ip = ip;
         if best_ml < good_ml && nl_on && ip < ilimit {
             nl_probes += 1;
-            // W42: resolved shift, like W40 one branch away.
-            let h8b = hash8_shift(src, ip + 1, dlong_shift);
-            // The only long consumer without a free tag: `ip + 1` never
-            // computed a short hash. One mul+xor on a path already gated by
-            // `best_ml < good_ml && nl_on`.
-            let g8b = if lt_on {
-                hash4_tag_mls(src, ip + 1, dtag_shift, smask).1
+            // V1: the speculation's own filtered load when it was for `ip + 1`
+            // (see `nl_pre`); otherwise the probe's own hash, tag and load.
+            // Same slot, same tag, same filter, no store in between -- the
+            // hand-forward arm included, which mirrors `get_hl_tag` on the
+            // slot `put_hl_tag` just wrote.
+            let m8b_slot = if nl_spec {
+                dec(carried.v8)
             } else {
-                0
+                // W42: resolved shift, like W40 one branch away.
+                let h8b = hash8_shift(src, ip + 1, dlong_shift);
+                // The only long consumer without a free tag: `ip + 1` never
+                // computed a short hash. One mul+xor on a path already gated by
+                // `best_ml < good_ml && nl_on`.
+                let g8b = if lt_on {
+                    hash4_tag_mls(src, ip + 1, dtag_shift, smask).1
+                } else {
+                    0
+                };
+                if PACKED {
+                    dec(dfast_long_slot_packed(tables, h8b, g8b, lt_on))
+                } else {
+                    tables.get_hl_tag(h8b, g8b, lt_on, packed)
+                }
             };
-            if let Some(m8b) = tables.get_hl_tag(h8b, g8b, lt_on, packed) {
+            if let Some(m8b) = m8b_slot {
                 if COUNT {
                     probes += 1;
                 }
@@ -1115,6 +1377,8 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
             }
             ip = end;
             anchor = ip;
+            #[cfg(feature = "profile")]
+            r2.after(&seqs, src, ip, lowest_rep, ilimit, block_end);
             // The two fills rewrite many entries, so anything speculated before
             // them is stale.
             spec_dropped += u64::from(carried.live);
@@ -1130,6 +1394,8 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
     let spec_used = spec_made
         .saturating_sub(spec_dropped)
         .saturating_sub(u64::from(carried.live));
+    #[cfg(feature = "profile")]
+    r2.flush();
     #[cfg(feature = "profile")]
     {
         use core::sync::atomic::Ordering::Relaxed;
