@@ -1208,6 +1208,21 @@ pub(crate) fn seq_stream_bound(
     ((bits + seqs * logs) >> 3) as usize + 8
 }
 
+/// SEQ-6: `LOW_MASK[n]` keeps the low `n` bits of a `u32` (all of them from 32
+/// up) -- libzstd's `BIT_mask`. An FSE step emits the low `nb` bits of its
+/// state with `nb` only known at run time; computed, that mask is a load of
+/// -1, a variable shift (three micro-ops on the baseline x86-64 this crate
+/// ships, where there is no `bzhi`) and a `not`, three times per sequence.
+const LOW_MASK: [u32; 64] = {
+    let mut m = [u32::MAX; 64];
+    let mut n = 0;
+    while n < 32 {
+        m[n] = (1u32 << n) - 1;
+        n += 1;
+    }
+    m
+};
+
 /// SEQ-1: the sequence section's bit accumulator -- libzstd's `BIT_CStream_t`
 /// shape, as four locals over a slice sized before the loop.
 ///
@@ -1229,9 +1244,9 @@ impl SeqBitWriter<'_> {
     /// Append the low `nb` bits of `value`. The caller keeps `nbits + nb`
     /// under 64 (see the schedule in `encode_seq_bits`).
     #[inline(always)]
-    fn add(&mut self, value: u64, nb: u32) {
-        let mask = 1u64.wrapping_shl(nb).wrapping_sub(1);
-        self.acc |= (value & mask).wrapping_shl(self.nbits);
+    fn add(&mut self, value: u32, nb: u32) {
+        let low = value & LOW_MASK[(nb & 63) as usize];
+        self.acc |= u64::from(low).wrapping_shl(self.nbits);
         self.nbits = self.nbits.wrapping_add(nb);
     }
 
@@ -1334,13 +1349,13 @@ pub(crate) fn encode_seq_bits(
 
     for c in rest.iter().rev() {
         let (s, nb) = of.step(of_s, c.ofc as usize);
-        w.add(u64::from(of_s), nb);
+        w.add(of_s, nb);
         of_s = s;
         let (s, nb) = ml.step(ml_s, c.mlc as usize);
-        w.add(u64::from(ml_s), nb);
+        w.add(ml_s, nb);
         ml_s = s;
         let (s, nb) = ll.step(ll_s, c.llc as usize);
-        w.add(u64::from(ll_s), nb);
+        w.add(ll_s, nb);
         ll_s = s;
         let ex_bits = u32::from(c.ex_bits);
         if w.nbits + ex_bits > 63 {
@@ -1353,9 +1368,9 @@ pub(crate) fn encode_seq_bits(
 
     // `FSE_flushCState` x3, then `BIT_closeCStream`: the end mark and the
     // zero-padded tail byte. 7 + 9 + 9 + 9 + 1 = 35 bits.
-    w.add(u64::from(ml_s), ml.table_log());
-    w.add(u64::from(of_s), of.table_log());
-    w.add(u64::from(ll_s), ll.table_log());
+    w.add(ml_s, ml.table_log());
+    w.add(of_s, of.table_log());
+    w.add(ll_s, ll.table_log());
     w.add(1, 1);
     w.flush()?;
     if w.nbits > 0 {
