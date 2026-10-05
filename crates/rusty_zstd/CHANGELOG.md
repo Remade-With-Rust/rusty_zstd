@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.2.5...rusty_zstd-v0.2.6) - 2026-10-04
+
+Compressed output is byte-identical to 0.2.5 at every level: everything new
+below ships behind arms that default off.
+
+### Added
+
+- *(rowfind)* the row match finder takes a row width (16 / 32 / 64 slots),
+  a table size and a policy as parameters (`RZSTD_ROW_LOG`,
+  `RZSTD_ROW_SIZING`, `RZSTD_ROW_POLICY`)
+- *(rowfind)* libzstd's lazy parse for row frames (`RZSTD_ROW_PARSE`), with
+  a wide row key (`RZSTD_ROW_WIDE`), the long-match fill skip
+  (`RZSTD_ROW_SKIP`) and a rule that leaves repcode-covered positions out of
+  the table (`RZSTD_ROW_REPSKIP`). Together, against the shipped hash chain:
+  0.87x time / -3.5% size at L7, 0.73x / -4.1% at L9, 0.56x / -3.7% at L12
+  (six silesia files); not yet the default
+- bench hooks `set_row_geom_arm`, `set_row_policy_arm`, `set_row_wide_arm`,
+  `set_row_skip_arm`, `set_row_parse_arm`, `set_row_repskip_arm`,
+  `set_row_reptake_arm`, `set_row_nice_arm`, `set_row_pf_arm`
+
+### Changed
+
+- *(rowfind)* the row walk gathers every candidate and prefetches its source
+  line before the first compare, and names the next search's row as soon as
+  a match is chosen: 11-14% faster on row frames, same output
+- *(encode)* `encode.rs` split into seven modules; the asm board is identical
+  in all thirty-two columns (#18)
+
 ## [0.2.5](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.2.4...rusty_zstd-v0.2.5) - 2026-09-09
 
 ### Fixed
