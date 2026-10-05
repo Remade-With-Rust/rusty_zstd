@@ -1363,8 +1363,19 @@ impl DictWork {
         if self.workspace.capacity() > tail_len + DIGEST_WORKSPACE_SLACK {
             self.workspace.shrink_to(tail_len + DIGEST_WORKSPACE_SLACK);
         }
-        let tables = self.digest.key.shape.table_bytes();
-        if self.bufs.retained_bytes() > tables + ONESHOT_POOL_MAX_BYTES {
+        // The three tables are seated INSIDE whatever allocations the set's
+        // previous shape left (`seat_table`), so after a change of shape a
+        // table can hold more capacity than it has entries -- a 4 MiB Fast
+        // hash followed by a 3 MiB chain would otherwise park 7 MiB under a
+        // bound that says 4. Give the excess back.
+        let table_cap =
+            |b: &TableBufs| (b.hash.capacity() + b.hash_long.capacity() + b.chain.capacity()) * 4;
+        if table_cap(&self.bufs) > DIGEST_MAX_TABLE_BYTES {
+            self.bufs.hash.shrink_to_fit();
+            self.bufs.hash_long.shrink_to_fit();
+            self.bufs.chain.shrink_to_fit();
+        }
+        if self.bufs.retained_bytes() - table_cap(&self.bufs) > ONESHOT_POOL_MAX_BYTES {
             // Oversized scratch (one very large message): keep the tables only.
             let b = core::mem::take(&mut self.bufs);
             self.bufs = TableBufs {

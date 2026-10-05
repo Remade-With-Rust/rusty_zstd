@@ -586,6 +586,13 @@ impl Drop for OneshotTables {
     }
 }
 
+/// Heap bytes this thread's one-shot pool is holding right now -- for the
+/// test that pins `ONESHOT_POOL_MAX_BYTES`.
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn oneshot_pool_retained_bytes() -> usize {
+    ONESHOT_BUFS.with(|c| c.borrow().retained_bytes())
+}
+
 /// `n` zeroed table slots, in `v`'s allocation when it is large enough.
 ///
 /// A table that does NOT fit still comes from `vec![0; n]`, exactly as before:

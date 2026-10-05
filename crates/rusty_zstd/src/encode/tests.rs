@@ -1499,6 +1499,7 @@ fn wordy(seed: u64, n: usize) -> Vec<u8> {
 /// Run in a debug build this also drives the digest's own tripwires on every
 /// call: the build-time "priming does not depend on the message" assert and
 /// the post-restore "tables equal the snapshot" assert.
+#[cfg(feature = "std")]
 #[test]
 fn digested_dictionary_serves_the_legacy_bytes() {
     use crate::{compress_using_dict, compress_using_dict_with, decompress_using_dict, Dictionary};
@@ -1548,6 +1549,7 @@ fn digested_dictionary_serves_the_legacy_bytes() {
 /// every buffer from scratch. The main thread compresses the same message
 /// after frames chosen to leave the dispatch state as far from its defaults
 /// as content can push it (raw runs, RLE, long repeats, other levels).
+#[cfg(feature = "std")]
 #[test]
 fn pooled_tables_start_every_frame_fresh() {
     let text = wordy(0xF00D, 300_000);
@@ -1577,6 +1579,7 @@ fn pooled_tables_start_every_frame_fresh() {
 /// concurrent callers must each get exactly the bytes a lone caller gets --
 /// including the threads that race to build the same digest, and the ones
 /// that alternate two dictionaries and re-seat on every call.
+#[cfg(feature = "std")]
 #[test]
 fn digested_dictionary_is_shared_across_threads() {
     use crate::{compress_using_dict, Dictionary};
@@ -1626,5 +1629,88 @@ fn digested_dictionary_is_shared_across_threads() {
         .collect();
     for h in threads {
         h.join().expect("worker panicked");
+    }
+}
+
+/// THE STATED MEMORY BOUND, measured where it is kept. After any sequence of
+/// dictionary calls a thread's parked working set must hold no more than
+/// `DIGEST_MAX_TABLE_BYTES` of table capacity, `tail + DIGEST_WORKSPACE_SLACK`
+/// of workspace and `ONESHOT_POOL_MAX_BYTES` of scratch; and the one-shot pool
+/// no more than `ONESHOT_POOL_MAX_BYTES` in all.
+///
+/// The sequence is chosen to break the easy version: a 4 MiB Fast hash, then a
+/// chain-strategy shape (the set is re-seated INSIDE the old allocations, so
+/// without the shrink it would park both), then a 300 KiB message (scratch and
+/// workspace growth), then a small one.
+#[cfg(feature = "std")]
+#[test]
+fn retained_memory_stays_inside_the_stated_bound() {
+    use crate::{compress_with_history, Dictionary};
+    let data = wordy(0xB0D, 900_000);
+    let dict = Dictionary::raw(data[..200_000].to_vec());
+    let small = &data[300_000..301_500];
+    let big = &data[400_000..700_000];
+    let parked = || {
+        DICT_WORK.with(|c| {
+            let b = c.borrow();
+            let w = b.as_ref().expect("a working set is parked");
+            let tables =
+                (w.bufs.hash.capacity() + w.bufs.hash_long.capacity() + w.bufs.chain.capacity())
+                    * 4;
+            (
+                tables,
+                w.bufs.retained_bytes() - tables,
+                w.workspace.capacity(),
+                w.digest.key.tail_len,
+            )
+        })
+    };
+    let check = |what: &str| {
+        let (tables, scratch, ws, tail) = parked();
+        assert!(
+            tables <= DIGEST_MAX_TABLE_BYTES,
+            "{what}: {tables} B of table capacity parked"
+        );
+        assert!(
+            scratch <= ONESHOT_POOL_MAX_BYTES,
+            "{what}: {scratch} B of scratch parked"
+        );
+        assert!(
+            ws <= tail + DIGEST_WORKSPACE_SLACK,
+            "{what}: workspace {ws} B for a {tail} B tail"
+        );
+    };
+    // Shape 1: Fast with a 4 MiB hash table (the largest a digest is kept for).
+    let mut fast = compression_params(1, Some(1 << 22)).unwrap();
+    fast.hash_log = 20;
+    // Shape 2: Lazy2 with 1 MiB of hash and 2 MiB of chain.
+    let mut lazy = compression_params(9, Some(1 << 22)).unwrap();
+    lazy.hash_log = 18;
+    lazy.chain_log = 19;
+    for (name, p) in [
+        ("fast 4 MiB", fast),
+        ("lazy 1+2 MiB", lazy),
+        ("fast again", fast),
+    ] {
+        for _ in 0..3 {
+            let _ = compress_with_history(small, p, false, Some(&dict), &[], true).unwrap();
+        }
+        check(name);
+        // One large message: multi-block, large scratch, large workspace.
+        for _ in 0..2 {
+            let _ = compress_with_history(big, p, false, Some(&dict), &[], true).unwrap();
+        }
+        let _ = compress_with_history(small, p, false, Some(&dict), &[], true).unwrap();
+        check(name);
+    }
+    // And the plain pool, after frames below and above its bound.
+    for src in [small, big, &data[..], small] {
+        let _ = compress(src, 3).unwrap();
+        let _ = compress(src, 19).unwrap();
+        let held = oneshot_pool_retained_bytes();
+        assert!(
+            held <= ONESHOT_POOL_MAX_BYTES,
+            "one-shot pool holds {held} B"
+        );
     }
 }
