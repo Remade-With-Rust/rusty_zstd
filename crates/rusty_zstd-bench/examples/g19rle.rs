@@ -11,13 +11,13 @@ fn main(){
     for id in IDS{
         let Some(f)=load(id) else{continue};
         let src=&f[..f.len().min(8<<20)];
-        unsafe{ std::env::remove_var("RZSTD_BLOCK_KB"); }
+        unsafe{ std::env::remove_var("RZSTD_BLOCK_KB"); } rusty_zstd::reset_env_arms();
         let _=rusty_zstd::take_g5_inputs();
         let a=rusty_zstd::compress(src,1).unwrap().len() as f64;
         let (rp,_)=rusty_zstd::take_g5_inputs();
-        unsafe{ std::env::set_var("RZSTD_BLOCK_KB","96"); }
+        unsafe{ std::env::set_var("RZSTD_BLOCK_KB","96"); } rusty_zstd::reset_env_arms();
         let b=rusty_zstd::compress(src,1).unwrap().len() as f64;
-        unsafe{ std::env::remove_var("RZSTD_BLOCK_KB"); }
+        unsafe{ std::env::remove_var("RZSTD_BLOCK_KB"); } rusty_zstd::reset_env_arms();
         let d=100.0*(b-a)/a;
         println!("{id:<14}{rp:>12.6}{d:>13.3}%{:>14}",
             if d < -0.05 {"WANTS SPLIT"} else if d > 0.5 {"MUST NOT"} else {"neutral"});

@@ -497,10 +497,9 @@ pub(crate) fn encode_oneshot(
     // where we emit 128 KiB, so it re-adapts its entropy tables ~1.56x more
     // often. This knob tests whether that explains our literals gap. Ratio is
     // deterministic, so the answer needs no quiet box.
-    if let Some(kb) = crate::env_knob_parse::<usize>("RZSTD_BLOCK_KB") {
-        if kb > 0 {
-            block_max = block_max.min(kb * 1024);
-        }
+    let kb = block_kb_knob();
+    if kb > 0 {
+        block_max = block_max.min(kb.saturating_mul(1024));
     }
     if adv.target_cblock_size > 0 {
         let t = adv.target_cblock_size as usize;
@@ -614,6 +613,37 @@ pub(crate) fn encode_oneshot(
         out.extend_from_slice(&(h.digest() as u32).to_le_bytes());
     }
     Ok(out)
+}
+
+/// `RZSTD_BLOCK_KB`, resolved ONCE per process. 0 = unresolved, else `kb + 1`
+/// (so 1 means "resolved: unset or 0", the shipping default of no cap).
+///
+/// This was the one knob in the crate read UNCACHED, and it sat on the
+/// one-shot driver's per-CALL path: an OS environment lookup plus a `String`
+/// allocation for every `compress*` call, at every level. On megabyte inputs
+/// that is nothing; on a 256-byte message it was one of the call's fifteen
+/// allocations and a syscall-class lookup beside ~9 us of real work
+/// (`percall.rs`: env reads 1.00/call -> 0.00). `env_reads_gate` could not
+/// see it -- that gate asserts reads do not scale with INPUT SIZE, and this
+/// one scaled with the CALL COUNT.
+///
+/// The probes that sweep the knob mid-process (`allgates`, `g19full`,
+/// `g19l1`, `g19rle`) relied on the read being uncached; they now call
+/// `reset_env_arms()` after each `set_var`, which clears this.
+static BLOCK_KB_ARM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn block_kb_knob() -> usize {
+    use core::sync::atomic::Ordering;
+    let v = BLOCK_KB_ARM.load(Ordering::Relaxed);
+    if v != 0 {
+        return v - 1;
+    }
+    let kb = crate::env_knob_parse::<usize>("RZSTD_BLOCK_KB")
+        .unwrap_or(0)
+        .min(usize::MAX - 1);
+    BLOCK_KB_ARM.store(kb + 1, Ordering::Relaxed);
+    kb
 }
 
 /// GATE 1 @ L19 -- the Bt tree is primed in the WRONG LAYOUT.
@@ -6873,6 +6903,7 @@ pub fn reset_env_arms() {
     FAST_LAZY_ARM.store(0, Ordering::Relaxed);
     PAIR_GAIN_ARM.store(u32::MAX, Ordering::Relaxed);
     PAIR_HI_ARM.store(u32::MAX, Ordering::Relaxed);
+    BLOCK_KB_ARM.store(0, Ordering::Relaxed);
 }
 
 /// Arm for the `find_dfast` HLOG specialisation, so it can be A/B'd IN-PROCESS

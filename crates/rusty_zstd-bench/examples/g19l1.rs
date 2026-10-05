@@ -8,7 +8,7 @@ fn load(id:&str)->Option<Vec<u8>>{
         .or_else(|_|std::fs::read(format!("corpora/data/silesia/{id}"))).ok()
 }
 fn sz(src:&[u8],kb:usize)->usize{
-    unsafe{ std::env::set_var("RZSTD_BLOCK_KB", kb.to_string()); }
+    unsafe{ std::env::set_var("RZSTD_BLOCK_KB", kb.to_string()); } rusty_zstd::reset_env_arms();
     rusty_zstd::compress(src,1).unwrap().len()
 }
 fn main(){
@@ -24,7 +24,7 @@ fn main(){
         let mut sizes=vec![];
         for (i,k) in KB.iter().enumerate(){ let s=sz(src,*k); sizes.push(s); tot[i]+=s; }
         // shipped default (no cap) + Gate 5 coverage
-        unsafe{ std::env::remove_var("RZSTD_BLOCK_KB"); }
+        unsafe{ std::env::remove_var("RZSTD_BLOCK_KB"); } rusty_zstd::reset_env_arms();
         let _=rusty_zstd::take_g5();
         let _=rusty_zstd::compress(src,1).unwrap();
         let (c,r,d)=rusty_zstd::take_g5();
