@@ -217,7 +217,9 @@ fn main() {
     let sites = std::env::var("PERCALL_SITES").is_ok();
     println!("PER-CALL COST (counts per call; profile={})", cfg!(feature = "profile"));
     for lvl in [1, 3, 5, 9, 19] {
-        for n in [256usize, 1024, 4096, 16384, 65536] {
+        // 1 and 8 bytes are the FLOOR shapes: too small to hold a match, so
+        // the call is the driver plus one tiny block and nothing else.
+        for n in [1usize, 8, 64, 256, 1024, 4096, 16384, 65536] {
             let name = format!("plain:{lvl}:{n}");
             if !want.is_empty() && want != name {
                 continue;
@@ -229,6 +231,36 @@ fn main() {
                 rusty_zstd::compress_with(m, rusty_zstd::CompressOptions { level: lvl, checksum: false })
                     .unwrap()
                     .len()
+            });
+        }
+    }
+    // A TRAINED dictionary too: it carries entropy tables, and seeding the
+    // frame's entropy state from them is per-call work a raw one never does.
+    if want.is_empty() || want.starts_with("tdict:") {
+        let samples: Vec<&[u8]> = full[..64 << 10].chunks(2048).collect();
+        let opts = rusty_zstd::TrainOptions {
+            max_dict: 12 * 1024,
+            k: 256,
+            d: 8,
+            steps: 1,
+            f: 16,
+            ..rusty_zstd::TrainOptions::fastcover()
+        };
+        let trained = rusty_zstd::Dictionary::from_bytes(&rusty_zstd::train(&samples, opts).unwrap()).unwrap();
+        for lvl in [3, 1] {
+            let name = format!("tdict:{lvl}:1024");
+            if !want.is_empty() && want != name {
+                continue;
+            }
+            run(&name, &body[..2 << 20], 1024, sites && !want.is_empty(), |m| {
+                rusty_zstd::compress_using_dict_with(
+                    m,
+                    &trained,
+                    rusty_zstd::CompressOptions { level: lvl, checksum: false },
+                    false,
+                )
+                .unwrap()
+                .len()
             });
         }
     }

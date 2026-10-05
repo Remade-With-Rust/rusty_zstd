@@ -313,7 +313,7 @@ pub(crate) use tables::*;
 /// to store a copy of something already `&'static`. After ALLOC-5 removed the
 /// Repeat-path clone this was the single largest remaining allocation site in
 /// the encoder.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum RetainedTable {
     Static(&'static FseCTable),
     Own(FseCTable),
@@ -352,23 +352,21 @@ pub(crate) struct EntropyState {
     ml: Option<alloc::sync::Arc<RetainedTable>>,
 }
 
-/// One outlined copy of the dictionary-seed table wrap. See
-/// `EntropyState::seed_from_dict`.
-#[inline(never)]
-fn retain_ctable(t: &fse::FseCTable) -> alloc::sync::Arc<RetainedTable> {
-    alloc::sync::Arc::new(RetainedTable::Own(t.clone()))
-}
-
 impl EntropyState {
+    /// Start a frame from a trained dictionary's entropy tables.
+    ///
+    /// FOUR REFCOUNT BUMPS. This used to deep-clone all four tables and wrap
+    /// each in a fresh `Arc` -- nine allocations and ~4.5 KB per call -- under
+    /// a comment saying it "runs once per dictionary". It runs once per
+    /// FRAME: every `compress_using_dict*` call and every streaming
+    /// `set_dictionary`. The dictionary now holds its encode-side tables in
+    /// the `Arc`s this state wants (`DictEntropy`), which is sound for the
+    /// reason ALLOC-8 gives above: nothing mutates a retained table in place.
     pub(crate) fn seed_from_dict(&mut self, e: &crate::dict::DictEntropy) {
-        // C9: the encode-side mirror of C8. `Arc::new(RetainedTable::Own(
-        // t.clone()))` -- an allocation, an enum construction and a table
-        // clone -- was expanded at all three sites. One outlined helper leaves
-        // that body once. Runs once per dictionary.
-        self.huff = Some(alloc::sync::Arc::new(e.huff_c.clone()));
-        self.ll = Some(retain_ctable(&e.ll_c));
-        self.of = Some(retain_ctable(&e.of_c));
-        self.ml = Some(retain_ctable(&e.ml_c));
+        self.huff = Some(e.huff_c.clone());
+        self.ll = Some(e.ll_c.clone());
+        self.of = Some(e.of_c.clone());
+        self.ml = Some(e.ml_c.clone());
     }
 }
 

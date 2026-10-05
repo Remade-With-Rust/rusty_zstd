@@ -1,9 +1,11 @@
 //! RFC 8878 dictionaries: raw content and trained (`0xEC30A437`).
 
+use crate::encode::RetainedTable;
 use crate::error::Error;
-use crate::fse::{self, FseCTable, FseTable};
+use crate::fse::{self, FseTable};
 use crate::huffman::{self, HuffCTable, HuffmanTable};
 use crate::xxh64::content_checksum;
+use alloc::sync::Arc;
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
@@ -20,13 +22,16 @@ pub const DICT_ID_PUBLIC_MAX: u32 = 0x8000_0000;
 #[derive(Clone, Debug)]
 pub(crate) struct DictEntropy {
     pub huff_d: HuffmanTable,
-    pub huff_c: HuffCTable,
     pub ll_d: FseTable,
     pub of_d: FseTable,
     pub ml_d: FseTable,
-    pub ll_c: FseCTable,
-    pub of_c: FseCTable,
-    pub ml_c: FseCTable,
+    // The ENCODE-side tables, already in the shared form a frame's
+    // `EntropyState` retains them in, so seeding a frame from the dictionary
+    // is four refcount bumps and no copy (see `seed_from_dict`).
+    pub huff_c: alloc::sync::Arc<HuffCTable>,
+    pub ll_c: alloc::sync::Arc<crate::encode::RetainedTable>,
+    pub of_c: alloc::sync::Arc<crate::encode::RetainedTable>,
+    pub ml_c: alloc::sync::Arc<crate::encode::RetainedTable>,
     pub reps: [u32; 3],
 }
 
@@ -140,13 +145,13 @@ fn parse_trained(src: &[u8]) -> Result<Dictionary, Error> {
         content,
         Some(DictEntropy {
             huff_d,
-            huff_c,
             ll_d,
             of_d,
             ml_d,
-            ll_c,
-            of_c,
-            ml_c,
+            huff_c: Arc::new(huff_c),
+            ll_c: Arc::new(RetainedTable::Own(ll_c)),
+            of_c: Arc::new(RetainedTable::Own(of_c)),
+            ml_c: Arc::new(RetainedTable::Own(ml_c)),
             reps: [r0, r1, r2],
         }),
     ))
