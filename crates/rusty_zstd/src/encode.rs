@@ -3,7 +3,6 @@
 //! Compressed bytes are not required to match C. Dual gate: our decoder and
 //! C `zstd -d` reconstruct the source bit-exact.
 
-use crate::bit::BitCStream;
 use crate::block::BlockType;
 use crate::compressed::{ll_code, ml_code, of_code, offset_value_for, resolve_offset};
 use crate::dict::Dictionary;

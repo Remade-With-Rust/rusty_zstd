@@ -1443,3 +1443,182 @@ fn skip_off_fast_roundtrip_and_on_skips_noise() {
         "skip-on should dump at least as many raw blocks"
     );
 }
+
+/// SEQ-1 ORACLE: the sequence bit-writing loop exactly as it stood before
+/// `encode_seq_bits` -- the general `BitCStream`, with its per-add room test
+/// and growable buffer, driven through `FseCTable::encode`. Kept as the
+/// reference the fixed-schedule writer must equal bit for bit.
+fn seq_bits_oracle(
+    coded: &[CodedSeq],
+    ll_t: &FseCTable,
+    of_t: &FseCTable,
+    ml_t: &FseCTable,
+) -> Vec<u8> {
+    let last = *coded.last().expect("non-empty");
+    let mut ml_s = ml_t.init_state2(last.mlc as usize);
+    let mut of_s = of_t.init_state2(last.ofc as usize);
+    let mut ll_s = ll_t.init_state2(last.llc as usize);
+    let mut bits = crate::bit::BitCStream::new();
+    bits.add_bits(u64::from(last.llx), u32::from(last.llb));
+    bits.add_bits(u64::from(last.mlx), u32::from(last.mlb));
+    bits.add_bits(u64::from(last.ofx), u32::from(last.ofc));
+    bits.flush();
+    for c in coded[..coded.len() - 1].iter().rev() {
+        of_t.encode(&mut of_s, &mut bits, c.ofc as usize);
+        ml_t.encode(&mut ml_s, &mut bits, c.mlc as usize);
+        ll_t.encode(&mut ll_s, &mut bits, c.llc as usize);
+        bits.add_bits(u64::from(c.llx), u32::from(c.llb));
+        bits.add_bits(u64::from(c.mlx), u32::from(c.mlb));
+        bits.add_bits(u64::from(c.ofx), u32::from(c.ofc));
+    }
+    ml_t.flush(ml_s, &mut bits);
+    of_t.flush(of_s, &mut bits);
+    ll_t.flush(ll_s, &mut bits);
+    bits.close()
+}
+
+/// Sequences for the SEQ-1 oracle test. `shape` picks the population:
+/// 0 = text-like (short lengths, near offsets, offsets reused so every repcode
+/// arm runs), 1 = the widest codes the format has (16 + 16 + 31 extra bits in
+/// one sequence, the case the flush schedule is sized for), 2 = one repeated
+/// sequence (single-symbol histograms, i.e. RLE tables).
+fn oracle_seqs(seed: u64, n: usize, shape: u32) -> Vec<Seq> {
+    let mut s = seed | 1;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let mut recent = [1u32, 4, 8];
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let r = next();
+        let seq = match shape {
+            0 => {
+                let offset = if r & 3 == 0 {
+                    recent[(r >> 8) as usize % 3]
+                } else {
+                    1 + ((r >> 8) as u32 % 60_000)
+                };
+                recent[i % 3] = offset;
+                Seq {
+                    litlen: (r >> 32) as u32 % 24,
+                    matchlen: 3 + (r >> 40) as u32 % 60,
+                    offset,
+                }
+            }
+            1 => {
+                const LL: [u32; 8] = [0, 1, 15, 16, 63, 64, 65_535, 131_071];
+                const ML: [u32; 8] = [3, 4, 34, 35, 130, 258, 65_538, 131_074];
+                const OF: [u32; 8] = [1, 2, 3, 5, 1 << 16, 1 << 24, 1 << 30, u32::MAX - 3];
+                Seq {
+                    litlen: LL[(r & 7) as usize],
+                    matchlen: ML[((r >> 3) & 7) as usize],
+                    offset: OF[((r >> 6) & 7) as usize],
+                }
+            }
+            _ => Seq {
+                litlen: 1,
+                matchlen: 4,
+                offset: 7,
+            },
+        };
+        out.push(seq);
+    }
+    out
+}
+
+/// SEQ-1: `encode_seq_bits` -- unconditional adds, two fixed flushes per
+/// sequence, a slice sized by `seq_stream_bound` -- must produce the oracle's
+/// bytes for every table mode (Predefined, RLE, Compressed, Repeat), and the
+/// bound must be enough room every time.
+#[test]
+fn seq_bits_match_bitcstream_oracle() {
+    let params = compression_params(1, Some(4096)).unwrap();
+    let mut tables = MatchTables::new(params);
+    let mut blocks = 0u32;
+    let mut modes = [0u32; 4];
+    for shape in 0..3u32 {
+        // The previous block's tables, so the Repeat mode is exercised too.
+        let mut prev: [Option<FseCTable>; 3] = [None, None, None];
+        for (round, &n) in [1usize, 2, 3, 7, 8, 9, 64, 500, 5000, 5000]
+            .iter()
+            .enumerate()
+        {
+            let seqs = oracle_seqs(0x5EED_0000 + u64::from(shape) * 97 + round as u64, n, shape);
+            let mut reps = [1u32, 4, 8];
+            let (coded, ll_count, of_count, ml_count, of_max) =
+                build_coded_pass(&seqs, &mut reps, &mut tables).expect("coded pass");
+            let last = *coded.last().expect("non-empty");
+            let use_low = round % 2 == 1;
+            let (ll_mode, ll_t, _) = select_seq_table(
+                &ll_count,
+                36,
+                9,
+                &fse::DEFAULT_LL_NORM,
+                6,
+                prev[0].as_ref(),
+                use_low,
+                false,
+                last.llc as usize,
+            )
+            .expect("ll table");
+            let (of_mode, of_t, _) = select_seq_table(
+                &of_count,
+                32,
+                8,
+                &fse::DEFAULT_OF_NORM,
+                5,
+                prev[1].as_ref(),
+                use_low,
+                of_max as usize >= fse::DEFAULT_OF_NORM.len(),
+                last.ofc as usize,
+            )
+            .expect("of table");
+            let (ml_mode, ml_t, _) = select_seq_table(
+                &ml_count,
+                53,
+                9,
+                &fse::DEFAULT_ML_NORM,
+                6,
+                prev[2].as_ref(),
+                use_low,
+                false,
+                last.mlc as usize,
+            )
+            .expect("ml table");
+            for m in [ll_mode, of_mode, ml_mode] {
+                modes[m as usize] += 1;
+            }
+            let want = seq_bits_oracle(&coded, &ll_t, &of_t, &ml_t);
+            let need = seq_stream_bound(&ll_count, &of_count, &ml_count, &ll_t, &of_t, &ml_t);
+            // Exactly `need` bytes, pre-filled with a non-zero pattern: the
+            // writer must neither want more room nor depend on zeroed scratch.
+            let mut buf = vec![0xA5u8; need];
+            let got = encode_seq_bits(&coded, &ll_t, &of_t, &ml_t, &mut buf)
+                .expect("bound must be enough room");
+            assert_eq!(
+                &buf[..got],
+                &want[..],
+                "shape {shape} round {round} n {n} modes {ll_mode}/{of_mode}/{ml_mode}"
+            );
+            // One byte short of the final store must fail CLEANLY, not panic.
+            if got >= 8 {
+                let mut short = vec![0u8; got - 1];
+                assert!(encode_seq_bits(&coded, &ll_t, &of_t, &ml_t, &mut short).is_err());
+            }
+            let next_prev = [(*ll_t).clone(), (*of_t).clone(), (*ml_t).clone()];
+            drop((ll_t, of_t, ml_t));
+            prev = next_prev.map(Some);
+            tables.coded_scratch = coded;
+            blocks += 1;
+        }
+    }
+    assert_eq!(blocks, 30);
+    // The test is only worth its name if every mode actually ran.
+    assert!(
+        modes.iter().all(|&m| m > 0),
+        "table modes predefined/rle/compressed/repeat = {modes:?}"
+    );
+}

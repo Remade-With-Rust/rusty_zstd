@@ -789,10 +789,15 @@ impl FseCTable {
             *cs = cs.wrapping_add(1);
         }
 
+        // SEQ-1: `delta` is never shorter than `SEQ_DELTA_LEN`, so the sequence
+        // coder's hoisted view (`seq_enc`) can index it by a masked code with
+        // no bounds check. The slots past `max_sv` are filled below as ABSENT
+        // symbols, which is what they are.
+        let delta_len = (max_sv + 1).max(SEQ_DELTA_LEN);
         #[cfg(all(feature = "std", feature = "alloc"))]
-        let mut delta = ct_pool::take_delta(max_sv + 1);
+        let mut delta = ct_pool::take_delta(delta_len);
         #[cfg(not(all(feature = "std", feature = "alloc")))]
-        let mut delta = vec![FseCDelta { nb: 0, find: 0 }; max_sv + 1];
+        let mut delta = vec![FseCDelta { nb: 0, find: 0 }; delta_len];
         let mut total: u32 = 0;
         for s in 0..=max_sv {
             // SAFETY: `s <= max_sv` is `norm`'s range (non-empty, checked at
@@ -824,6 +829,19 @@ impl FseCTable {
                 }
             }
         }
+        // SEQ-1: the padding must read as ZERO-PROBABILITY, exactly like a
+        // `norm == 0` slot above -- NOT as the pool's `{0, 0}` fill. The table
+        // selector asks `can_encode_symbol` about every symbol in a block's
+        // histogram, and `{nb: 0}` answers yes: a Repeat table would then be
+        // accepted for a symbol past its alphabet. (Before the padding those
+        // slots did not exist and `delta.get` answered `None`, i.e. no.)
+        let absent = FseCDelta {
+            nb: ((u32::from(table_log) + 1) << 16) - (1 << table_log),
+            find: 0,
+        };
+        for d in delta.iter_mut().skip(max_sv + 1) {
+            *d = absent;
+        }
 
         Ok(Self {
             table_log,
@@ -833,7 +851,7 @@ impl FseCTable {
     }
 
     pub(crate) fn rle(symbol: u16) -> Self {
-        let n = 64usize;
+        let n = SEQ_DELTA_LEN;
         let mut delta = vec![
             FseCDelta {
                 nb: u32::MAX,
@@ -889,6 +907,79 @@ impl FseCTable {
     pub(crate) fn flush(&self, state: u32, bits: &mut crate::bit::BitCStream) {
         bits.add_bits(u64::from(state), u32::from(self.table_log));
         bits.flush();
+    }
+
+    /// Accuracy log (0 for an RLE table): the most bits one step can emit for
+    /// a symbol this table encodes, and the width of the final state flush.
+    #[inline(always)]
+    pub(crate) fn table_log(&self) -> u8 {
+        self.table_log
+    }
+
+    /// SEQ-1: the table as the sequence coder's loop wants it -- both buffers
+    /// resolved to slices ONCE per block.
+    ///
+    /// `encode` above reaches `delta` and `state_table` through `&self` on
+    /// every symbol: two pointer loads and two length loads per symbol, six
+    /// symbols' worth per sequence, each with its own bounds test. `None`
+    /// only for a table this module did not build (both constructors make
+    /// `delta` at least `SEQ_DELTA_LEN` long and `state_table` non-empty).
+    #[inline(always)]
+    pub(crate) fn seq_enc(&self) -> Option<FseSeqEnc<'_>> {
+        if self.state_table.is_empty() {
+            return None;
+        }
+        Some(FseSeqEnc {
+            delta: self.delta.first_chunk::<SEQ_DELTA_LEN>()?,
+            states: &self.state_table,
+            table_log: u32::from(self.table_log),
+        })
+    }
+}
+
+/// Slots every `FseCTable::delta` is padded to. A power of two above the
+/// widest sequence alphabet (ML, 53 codes), so `code & (SEQ_DELTA_LEN - 1)` is
+/// the identity on every real code and proves the index in range.
+#[cfg(feature = "alloc")]
+pub(crate) const SEQ_DELTA_LEN: usize = 64;
+
+/// See [`FseCTable::seq_enc`].
+#[cfg(feature = "alloc")]
+#[derive(Clone, Copy)]
+pub(crate) struct FseSeqEnc<'a> {
+    delta: &'a [FseCDelta; SEQ_DELTA_LEN],
+    states: &'a [u16],
+    table_log: u32,
+}
+
+#[cfg(feature = "alloc")]
+impl FseSeqEnc<'_> {
+    /// One `FSE_encodeSymbol` with the bit write left to the caller: returns
+    /// `(next_state, nb_bits)`, and the caller emits the low `nb_bits` of the
+    /// state it passed in. Same arithmetic as [`FseCTable::encode`].
+    ///
+    /// Both index proofs are SAFE code, not `get_unchecked`:
+    ///   * `symbol & 63` into a `[_; 64]` -- the identity on a real code;
+    ///   * `idx & (len - 1)` into `states`, with `len != 0` established by
+    ///     `seq_enc` -- the identity whenever `idx < len`, which holds for
+    ///     every state of a table built by `from_norm` and every symbol it
+    ///     gives a probability (the only ones the selector lets through).
+    ///
+    /// `encode` answers an out-of-range index with state 0 instead; the two
+    /// differ only on a symbol the table cannot encode, where both are garbage.
+    #[inline(always)]
+    pub(crate) fn step(&self, state: u32, symbol: usize) -> (u32, u32) {
+        let d = self.delta[symbol & (SEQ_DELTA_LEN - 1)];
+        let nb = state.wrapping_add(d.nb) >> 16;
+        let idx = (state.wrapping_shr(nb) as i32).wrapping_add(d.find) as usize;
+        let next = self.states[idx & (self.states.len() - 1)];
+        (u32::from(next), nb)
+    }
+
+    /// Bits of the final state flush (`FSE_flushCState`).
+    #[inline(always)]
+    pub(crate) fn table_log(&self) -> u32 {
+        self.table_log
     }
 }
 

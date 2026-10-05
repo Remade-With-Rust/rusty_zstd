@@ -1117,37 +1117,18 @@ pub(crate) fn write_sequences_inner(
     fse::give_ncount_buf(ml_hdr);
 
     let _fs = crate::prof::scope(crate::prof::Stage::EncodeFseSeq);
-    let mut ml_s = ml_t.init_state2(last_seq.mlc as usize);
-    let mut of_s = of_t.init_state2(last_seq.ofc as usize);
-    let mut ll_s = ll_t.init_state2(last_seq.llc as usize);
-
-    let mut bits = BitCStream::from_vec(
-        core::mem::take(&mut tables.bits_scratch),
-        coded.len() * 4 + 16,
-    );
-    bits.add_bits(u64::from(last_seq.llx), u32::from(last_seq.llb));
-    bits.add_bits(u64::from(last_seq.mlx), u32::from(last_seq.mlb));
-    bits.add_bits(u64::from(last_seq.ofx), u32::from(last_seq.ofc));
-    bits.flush();
-
-    if coded.len() >= 2 {
-        for n in (0..coded.len() - 1).rev() {
-            let c = &coded[n];
-            of_t.encode(&mut of_s, &mut bits, c.ofc as usize);
-            ml_t.encode(&mut ml_s, &mut bits, c.mlc as usize);
-            ll_t.encode(&mut ll_s, &mut bits, c.llc as usize);
-            bits.add_bits(u64::from(c.llx), u32::from(c.llb));
-            bits.add_bits(u64::from(c.mlx), u32::from(c.mlb));
-            bits.add_bits(u64::from(c.ofx), u32::from(c.ofc));
-        }
+    let need = seq_stream_bound(&ll_count, &of_count, &ml_count, &ll_t, &of_t, &ml_t);
+    // The scratch is kept INITIALISED at its high-water length across blocks
+    // (never cleared), so the writes below are plain slice stores: no
+    // `set_len`, no per-block zeroing. A quarter of headroom keeps a frame
+    // whose blocks creep upward from reallocating on each of them.
+    let mut bits = core::mem::take(&mut tables.bits_scratch);
+    if bits.len() < need {
+        bits = vec![0u8; need + need / 4];
     }
-
-    ml_t.flush(ml_s, &mut bits);
-    of_t.flush(of_s, &mut bits);
-    ll_t.flush(ll_s, &mut bits);
-    let out = bits.close();
-    dst.extend_from_slice(&out);
-    tables.bits_scratch = out;
+    let n = encode_seq_bits(&coded, &ll_t, &of_t, &ml_t, &mut bits)?;
+    dst.extend_from_slice(bits.get(..n).ok_or(Error::Corruption)?);
+    tables.bits_scratch = bits;
     tables.coded_scratch = coded;
     // ALLOC-5 (N11): write back ONLY a table that is actually new.
     //
@@ -1182,6 +1163,167 @@ pub(crate) fn write_sequences_inner(
         entropy.ml = Some(alloc::sync::Arc::new(t));
     }
     Ok(())
+}
+
+/// SEQ-1: bytes `encode_seq_bits` may touch for a block with these histograms
+/// and tables -- the bound that lets its loop write through a slice that
+/// never grows.
+///
+/// Every term is a number the caller already holds. The extra bits are EXACT:
+/// each code's count times its width, read off the three histograms (121
+/// multiply-adds per block, nothing per sequence). An FSE step emits at most
+/// `table_log` bits for a symbol its table encodes, and each table takes one
+/// step per sequence but the last plus one final state flush -- `table_log`
+/// bits per sequence, all told. `+ 1` is the end mark; `+ 8` is the width of
+/// the last store, which starts at or before the stream's final whole byte.
+pub(crate) fn seq_stream_bound(
+    ll_count: &[u32; 36],
+    of_count: &[u32; 32],
+    ml_count: &[u32; 53],
+    ll_t: &FseCTable,
+    of_t: &FseCTable,
+    ml_t: &FseCTable,
+) -> usize {
+    let logs =
+        u64::from(ll_t.table_log()) + u64::from(of_t.table_log()) + u64::from(ml_t.table_log());
+    let mut seqs = 0u64;
+    let mut bits = 1u64;
+    for (&n, &w) in ll_count.iter().zip(&crate::compressed::LL_BITS) {
+        seqs += u64::from(n);
+        bits += u64::from(n) * u64::from(w);
+    }
+    for (&n, &w) in ml_count.iter().zip(&crate::compressed::ML_BITS) {
+        bits += u64::from(n) * u64::from(w);
+    }
+    for (code, &n) in of_count.iter().enumerate() {
+        bits += u64::from(n) * code as u64;
+    }
+    ((bits + seqs * logs) >> 3) as usize + 8
+}
+
+/// SEQ-1: the sequence section's bit accumulator -- libzstd's `BIT_CStream_t`
+/// shape, as four locals over a slice sized before the loop.
+///
+/// `BitCStream` is the general writer and pays for it at every add: a test
+/// for `nb_bits == 0`, a test for a full container, and a flush that reserves
+/// through a growable `Vec` -- whose address escapes into the grow call, so
+/// the container and the bit count are stored back to the stack after EVERY
+/// add (88 spill stores in the loop this replaces). Here an add is three
+/// operations with no test (zero bits add nothing, by arithmetic) and the
+/// flushes sit at fixed points the caller proves safe.
+struct SeqBitWriter<'a> {
+    out: &'a mut [u8],
+    pos: usize,
+    acc: u64,
+    nbits: u32,
+}
+
+impl SeqBitWriter<'_> {
+    /// Append the low `nb` bits of `value`. The caller keeps `nbits + nb`
+    /// under 64 (see the schedule in `encode_seq_bits`).
+    #[inline(always)]
+    fn add(&mut self, value: u64, nb: u32) {
+        let mask = 1u64.wrapping_shl(nb).wrapping_sub(1);
+        self.acc |= (value & mask).wrapping_shl(self.nbits);
+        self.nbits = self.nbits.wrapping_add(nb);
+    }
+
+    /// Store the container, commit its whole bytes, keep the 0..=7 bit tail.
+    /// The one bounds test is the price of writing through a safe slice; it
+    /// fails only if the caller's size bound was wrong, and then cleanly.
+    #[inline(always)]
+    fn flush(&mut self) -> Result<(), Error> {
+        let Some(w) = self.out.get_mut(self.pos..self.pos + 8) else {
+            return Err(Error::Corruption);
+        };
+        w.copy_from_slice(&self.acc.to_le_bytes());
+        self.pos += (self.nbits >> 3) as usize;
+        self.acc = self.acc.wrapping_shr(self.nbits & !7);
+        self.nbits &= 7;
+        Ok(())
+    }
+}
+
+/// SEQ-1: the FSE bit-writing loop of the sequence section, in its OWN frame.
+/// Writes the stream into `out` and returns its length.
+///
+/// It was inlined into `encode_block` (4,161 instructions, a 2.3 KiB frame),
+/// where the loop had no registers to itself: 501 instructions, 88 spill
+/// stores and 103 stack reads per trip round, six `Vec` grow call sites, and
+/// every table reached through two pointer loads. Out of line, with the
+/// tables hoisted to slices (`FseCTable::seq_enc`) and the stream bounded up
+/// front, the loop holds its state in registers and calls nothing.
+///
+/// THE FLUSH SCHEDULE. A flush leaves at most 7 bits. Per sequence:
+///   7 + three FSE steps (<= 9 bits each, `table_log` <= 9) + LL extra (<= 16)
+///     = 50  -> flush
+///   7 + ML extra (<= 16) + offset extra (<= 31)
+///     = 54  -> flush
+/// so the container never reaches 64 and no add needs a room test. libzstd
+/// (`ZSTD_encodeSequences_body`, 64-bit) flushes once and guards two more
+/// behind sums of the extra-bit widths; two unconditional flushes keep the
+/// loop free of data-dependent branches entirely. Flush points do not change
+/// the bytes -- the stream is the same bits in the same order.
+#[inline(never)]
+pub(crate) fn encode_seq_bits(
+    coded: &[CodedSeq],
+    ll_t: &FseCTable,
+    of_t: &FseCTable,
+    ml_t: &FseCTable,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    let (Some(ll), Some(of), Some(ml)) = (ll_t.seq_enc(), of_t.seq_enc(), ml_t.seq_enc()) else {
+        return Err(Error::Corruption);
+    };
+    let Some((last, rest)) = coded.split_last() else {
+        return Err(Error::Corruption);
+    };
+    // libzstd `ZSTD_encodeSequences`: the LAST sequence only initialises the
+    // three states (`FSE_initCState2`) and writes its extra bits.
+    let mut ml_s = ml_t.init_state2(last.mlc as usize);
+    let mut of_s = of_t.init_state2(last.ofc as usize);
+    let mut ll_s = ll_t.init_state2(last.llc as usize);
+    let mut w = SeqBitWriter {
+        out,
+        pos: 0,
+        acc: 0,
+        nbits: 0,
+    };
+    // 16 + 16 + 31 = 63 bits into an empty container.
+    w.add(u64::from(last.llx), u32::from(last.llb));
+    w.add(u64::from(last.mlx), u32::from(last.mlb));
+    w.add(u64::from(last.ofx), u32::from(last.ofc));
+    w.flush()?;
+
+    for c in rest.iter().rev() {
+        let (s, nb) = of.step(of_s, c.ofc as usize);
+        w.add(u64::from(of_s), nb);
+        of_s = s;
+        let (s, nb) = ml.step(ml_s, c.mlc as usize);
+        w.add(u64::from(ml_s), nb);
+        ml_s = s;
+        let (s, nb) = ll.step(ll_s, c.llc as usize);
+        w.add(u64::from(ll_s), nb);
+        ll_s = s;
+        w.add(u64::from(c.llx), u32::from(c.llb));
+        w.flush()?;
+        w.add(u64::from(c.mlx), u32::from(c.mlb));
+        w.add(u64::from(c.ofx), u32::from(c.ofc));
+        w.flush()?;
+    }
+
+    // `FSE_flushCState` x3, then `BIT_closeCStream`: the end mark and the
+    // zero-padded tail byte. 7 + 9 + 9 + 9 + 1 = 35 bits.
+    w.add(u64::from(ml_s), ml.table_log());
+    w.add(u64::from(of_s), of.table_log());
+    w.add(u64::from(ll_s), ll.table_log());
+    w.add(1, 1);
+    w.flush()?;
+    if w.nbits > 0 {
+        *w.out.get_mut(w.pos).ok_or(Error::Corruption)? = w.acc as u8;
+        w.pos += 1;
+    }
+    Ok(w.pos)
 }
 
 /// libzstd `ZSTD_buildCTable`: last sequence is `FSE_initCState2` only.
