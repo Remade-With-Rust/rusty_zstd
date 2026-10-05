@@ -1571,3 +1571,60 @@ fn pooled_tables_start_every_frame_fresh() {
         }
     }
 }
+
+/// One `Dictionary`, many threads. The snapshot is shared (behind the
+/// dictionary's lock) and every thread seats its own working set on it, so
+/// concurrent callers must each get exactly the bytes a lone caller gets --
+/// including the threads that race to build the same digest, and the ones
+/// that alternate two dictionaries and re-seat on every call.
+#[test]
+fn digested_dictionary_is_shared_across_threads() {
+    use crate::{compress_using_dict, Dictionary};
+    use std::sync::Arc;
+    let data = Arc::new(wordy(0x7EAD, 300_000));
+    let dict_a = Arc::new(Dictionary::raw(data[..30_000].to_vec()));
+    let dict_b = Arc::new(Dictionary::raw(data[100_000..104_000].to_vec()));
+    let job = |i: usize| -> (usize, usize, i32, bool) {
+        let n = [900usize, 1024, 300, 4000, 64][i % 5];
+        (
+            150_000 + (i * 6151) % 100_000,
+            n,
+            [3, 1, 5, 3][i % 4],
+            i % 3 == 2,
+        )
+    };
+    // The oracle: fresh dictionaries (first sightings, the per-call path).
+    let want: Vec<Vec<u8>> = (0..48)
+        .map(|i| {
+            let (at, n, level, b) = job(i);
+            let bytes = if b {
+                &data[100_000..104_000]
+            } else {
+                &data[..30_000]
+            };
+            compress_using_dict(&data[at..at + n], &Dictionary::raw(bytes.to_vec()), level).unwrap()
+        })
+        .collect();
+    let want = Arc::new(want);
+    let threads: Vec<_> = (0..6)
+        .map(|t| {
+            let (data, dict_a, dict_b, want) =
+                (data.clone(), dict_a.clone(), dict_b.clone(), want.clone());
+            std::thread::spawn(move || {
+                for round in 0..3 {
+                    for k in 0..48 {
+                        // Each thread walks the jobs from its own offset.
+                        let i = (k + t * 7 + round) % 48;
+                        let (at, n, level, b) = job(i);
+                        let d = if b { &dict_b } else { &dict_a };
+                        let got = compress_using_dict(&data[at..at + n], d, level).unwrap();
+                        assert_eq!(got, want[i], "thread {t} round {round} job {i}");
+                    }
+                }
+            })
+        })
+        .collect();
+    for h in threads {
+        h.join().expect("worker panicked");
+    }
+}
