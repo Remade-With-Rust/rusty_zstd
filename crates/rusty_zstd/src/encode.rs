@@ -437,7 +437,7 @@ pub(crate) fn encode_oneshot(
     // measured walk_first_share says the deeper effective search PAYS gets
     // the wide key -- smallmsg-class content (first-find dominated, prefers
     // its literal+rep economy) never latches. Frame init only resets it.
-    tables.chain_wide = false;
+    tables.chain_wide = row_wide_start() && !tables.rows.head.is_empty();
     // Array route where the 24-bit proof fails (>= 16 MiB): link tags in
     // `ctags`, head tags in `tags` (same hash index). Priced by `linkbig`.
     if matches!(
@@ -3613,10 +3613,22 @@ fn row_find_best<const MLS: usize, const RL: u32>(
     } else {
         hash4_link_tag_w(src, ip, hash_shift32, mls)
     };
-    // W11: probe returns the WALK STATE, not a collected array. The row is
-    // still read strictly before `ip` is inserted -- the insert now sits below
-    // the walk instead of the walk being pre-materialised above it, which is
-    // the same snapshot with none of the copying.
+    // GATHER, INSERT, COMPARE -- libzstd's `matchBuffer` shape (2026-10-04).
+    //
+    // W11 walked the mask and compared each candidate as it came, to save
+    // "the copying". That reading was an instruction count, and it missed
+    // what the copy buys: a row hands back ALL of its candidates before the
+    // first compare, so their source lines can be named up front and the
+    // misses overlap -- which a chain can never do, and which the one-at-a-
+    // time walk threw away by putting a data-dependent branch between every
+    // two candidate loads. Three short phases also split the walk's live
+    // state three ways (the mask and the row die before the first compare;
+    // the row slot dies at the insert), where the single loop held all of it
+    // across the call to `count_match`.
+    //
+    // Output is unchanged: the row is snapshotted before `ip` is inserted,
+    // candidates are examined in the same newest-first order, and the accept
+    // rule is the same.
     let r = tables.rows.row_of_c::<RL>(h);
     let (mut w, rhead, row, rat) = tables.rows.probe_view::<RL>(r, gtag);
     #[cfg(feature = "profile")]
@@ -3630,12 +3642,6 @@ fn row_find_best<const MLS: usize, const RL: u32>(
     }
 
     const COUNT: bool = cfg!(feature = "profile");
-    let mut probes = 0u64;
-    let mut best_m = 0usize;
-    let mut best_ml = 0usize;
-    // W7's acceptance bar, unchanged: `best_ml` is 0 or already >= mls, so one
-    // compare against a running bar replaces two.
-    let mut bar = mls;
     if ip + mls > src_len {
         tables.lz_insert_rowknown::<RL>(r, rat, rhead, ip, gtag);
         return (0, 0);
@@ -3645,8 +3651,7 @@ fn row_find_best<const MLS: usize, const RL: u32>(
     // `m == 0` and `m < low` become the same rejection.
     let low = lowest1.max(ip.saturating_sub(window));
     // W10: an acceptable candidate needs `low <= m < ip`. When that range is
-    // empty the whole walk cannot produce one, and the old code discovered
-    // this by rejecting every candidate in turn. It also makes W7's fused
+    // empty the whole walk cannot produce one. It also makes W7's fused
     // compare sound, by guaranteeing `low <= ip`.
     if ip <= low {
         tables.lz_insert_rowknown::<RL>(r, rat, rhead, ip, gtag);
@@ -3654,41 +3659,89 @@ fn row_find_best<const MLS: usize, const RL: u32>(
     }
     let span = ip - low;
     // W15: the attempt budget is applied to the MASK, once, instead of counted
-    // down per candidate. Section 14.9's census measured 4.83 candidates per
-    // probe against `attempts = 1 << search_log` (32 at L9, 64+ at L12), so the
-    // countdown fired on essentially no walk yet cost a decrement, a compare
-    // and a branch on all 86.9M of them. Trimming instead: the walk visits set
-    // bits from the high end, so "the newest `attempts` candidates" is "clear
-    // the lowest set bits until popcount == attempts" -- and `w &= w - 1`
-    // clears exactly the lowest. The fixup loop runs only when a row actually
-    // over-delivers, which the census says is rare; the walk itself is then
-    // unconditional.
+    // down per candidate: the walk visits set bits from the high end, so "the
+    // newest `attempts` candidates" is "clear the lowest set bits until
+    // popcount == attempts", and `w &= w - 1` clears exactly the lowest.
     let mut extra = (w.count_ones() as usize).saturating_sub(attempts);
     while extra != 0 {
         w &= w - 1;
         extra -= 1;
     }
+    // Phase 1 -- GATHER. At most `1 << RL <= 64` candidates; only the prefix
+    // `cand[..n]` is ever read, so the buffer is left uninitialised rather
+    // than zeroed on every searched position.
+    let mut cand = [core::mem::MaybeUninit::<u32>::uninit(); 1 << crate::rowfind::ROW_LOG_MAX];
+    let mut n = 0usize;
     while w != 0 {
-        // W11's walk, inline: highest set bit is the newest slot. `w` only
-        // ever has its low `1 << RL` bits set (see `row_rot`), so the highest
-        // set bit is a slot distance and `s` masks to a slot of THIS row --
-        // which is also what lets the optimiser drop the bounds check on
-        // `row`, a `1 << RL`-element slice.
+        // Highest set bit is the newest slot. `w` only ever has its low
+        // `1 << RL` bits set (see `row_rot`), so `s` masks to a slot of THIS
+        // row -- which is also what lets the optimiser drop the bounds check
+        // on `row`, a `1 << RL`-element slice.
         let b = 63 - w.leading_zeros();
         w &= !(1u64 << b);
         let s = ((b + rhead) & ((1u32 << RL) - 1)) as usize;
-        let m = row[s] as usize;
+        let m = row[s];
         // W7: THREE rejects, ONE compare. `m - low` is borrow-free exactly
         // when `m >= low`, and below `span` exactly when `m < ip`; the
-        // sentinel rides along via W6. Same accepted set, one branch.
-        if m.wrapping_sub(low) >= span {
+        // sentinel rides along via W6.
+        if (m as usize).wrapping_sub(low) >= span {
             continue;
         }
-        if COUNT {
-            probes += 1;
-            #[cfg(feature = "profile")]
-            ROW_EXAM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
+        crate::simd::prefetch_read(src, m as usize);
+        // `n < 1 << RL` here: each iteration clears one of at most
+        // `1 << RL` set bits before it can reach this store.
+        cand[n & ((1 << crate::rowfind::ROW_LOG_MAX) - 1)].write(m);
+        n += 1;
+    }
+    // Phase 2 -- INSERT. Every candidate is already in hand, so the row can
+    // take `ip` now and the row's slot state is dead from here.
+    tables.lz_insert_rowknown::<RL>(r, rat, rhead, ip, gtag);
+    if ip + 9 <= src_len {
+        // The NEXT search is at `ip + 1` far more often than anywhere else
+        // (the no-match step is 1 until a literal run is long, and the lazy
+        // look-ahead probes `ip + 1` after a hit). Its row is a random line
+        // in a multi-megabyte table: name it now, one search early.
+        let (h1, _) = if hash_mode & 2 != 0 {
+            (hash8_shift(src, ip + 1, hash_shift64), 0u8)
+        } else if hash_mode & 1 != 0 {
+            hash_wide_link_tag_b(src, ip + 1, hash_shift64, smask, mls)
+        } else {
+            hash4_link_tag_w(src, ip + 1, hash_shift32, mls)
+        };
+        tables.rows.prefetch_row::<RL>(h1);
+    }
+    if COUNT {
+        crate::prof::note_probes(n as u64);
+        #[cfg(feature = "profile")]
+        ROW_EXAM.fetch_add(n as u64, core::sync::atomic::Ordering::Relaxed);
+    }
+    // Phase 3 -- COMPARE, newest first.
+    //
+    // Two selection rules tried 2026-10-04 against "longest candidate wins,
+    // ties to the newest", so neither is retried blindly:
+    //   * PRICED -- a farther candidate must also win on libzstd's lazy gain
+    //     `4*ml - log2(offset + 1)`. Size: +-0.02% total on 18 corpora capped
+    //     at 64 KiB..4 MiB, -0.09% to -0.13% on the same corpora at full
+    //     size (worst corpus +0.8%), and it does not help the two corpora
+    //     rows lose on (jsonlog, smallmsg). Speed: its mere PRESENCE behind
+    //     a runtime bit made this walk 17% slower at L7 and 26% at L9 with
+    //     the bit off (same output, pinned, three rounds). REMOVED.
+    //   * FIRST-FIND -- stop at the nearest acceptable candidate. REFUTED:
+    //     +2.0% to +3.2% total at 4 MiB, xml +39%, and jsonlog / smallmsg get
+    //     WORSE (+14% / +7%), so "the nearest match wins" is not their
+    //     mechanism either.
+    let mut best_m = 0usize;
+    let mut best_ml = 0usize;
+    // W7's acceptance bar: `best_ml` is 0 or already >= mls, so one compare
+    // against a running bar replaces two.
+    let mut bar = mls;
+    let mut i = 0usize;
+    while i < n {
+        // SAFETY: `i < n`, and phase 1 wrote exactly `cand[0..n]`.
+        #[allow(unsafe_code)]
+        let m =
+            unsafe { cand[i & ((1 << crate::rowfind::ROW_LOG_MAX) - 1)].assume_init() } as usize;
+        i += 1;
         #[cfg(feature = "profile")]
         {
             use core::sync::atomic::Ordering::Relaxed;
@@ -3712,7 +3765,8 @@ fn row_find_best<const MLS: usize, const RL: u32>(
         if let Some(x) = mls_xor(src, m, ip, mls, smask) {
             // C's `match[ml] == ip[ml]` prefilter, same as the chain walk.
             if best_ml == 0 || pre_eq(src, m, ip, best_ml) {
-                let ml = fused_ml(x, src, m, ip, block_end); // BRICK 11: see `mls_xor`
+                // BRICK 11: see `mls_xor`.
+                let ml = fused_ml(x, src, m, ip, block_end);
                 if ml >= bar {
                     best_ml = ml;
                     best_m = m;
@@ -3723,14 +3777,6 @@ fn row_find_best<const MLS: usize, const RL: u32>(
                 }
             }
         }
-    }
-    // W11's other half: the insert the walk was moved above. `row` (a borrow of
-    // `tables.rows`) is dead by here, so the mutable borrow is free to start --
-    // and every early return above does its own insert, so this path is reached
-    // exactly when the walk ran.
-    tables.lz_insert_rowknown::<RL>(r, rat, rhead, ip, gtag);
-    if COUNT {
-        crate::prof::note_probes(probes);
     }
     (best_m, best_ml)
 }
@@ -4395,6 +4441,7 @@ fn find_lazy_impl<const MLS: usize, const KIND: u8>(
     } else {
         lazy_fill_stride()
     };
+    let row_skip = use_rows && row_fill_skip();
     // WALK-CONTINUE dispatch: see `walk_rep_max`. BRICK 58: for the inlined
     // shapes it is the finder's const; the expression is still evaluated
     // (and asserted equal) in debug builds, dead in release.
@@ -4441,6 +4488,17 @@ fn find_lazy_impl<const MLS: usize, const KIND: u8>(
     let cfb: ChainFn = if use_rows {
         // One row kernel per WIDTH, picked here with the rest of the block's
         // shape. The table's width is fixed for the frame.
+        //
+        // The row walk STAYS behind the pointer. REFUTED 2026-10-04: giving
+        // it the chain's brick-58 treatment (three more `KIND`s with the
+        // walk `inline(always)` in the finder's frame) was byte-identical
+        // and SLOWER on the clock at every level -- +7.5% at L6, +24.4% at
+        // L7, +26.6% at L9, +45.2% at L12 (six full silesia files, pinned,
+        // three ABBA pairs, floor) -- while `find_lazy` grew 6,487 ->
+        // 11,023 instructions. The row walk holds a 64-bit mask, the row
+        // base and the head across a call to `count_match`; in the
+        // finder's frame those compete with the position loop's own
+        // state, and the walk is where the time is.
         match tables.rows.row_log() {
             6 => row_find_best::<MLS, 6>,
             5 => row_find_best::<MLS, 5>,
@@ -4720,10 +4778,45 @@ fn find_lazy_impl<const MLS: usize, const KIND: u8>(
                 // frame those invariants are register-resident for the loop's whole life;
                 // the caller pays one call per match, amortised over the match's length.
                 if use_rows {
-                    match tables.rows.row_log() {
-                        6 => row_fill_range::<6>(&mut tables.rows, src, p, stop, &fill_ctx),
-                        5 => row_fill_range::<5>(&mut tables.rows, src, p, stop, &fill_ctx),
-                        _ => row_fill_range::<4>(&mut tables.rows, src, p, stop, &fill_ctx),
+                    macro_rules! rfill {
+                        ($from:expr, $to:expr) => {
+                            match tables.rows.row_log() {
+                                6 => row_fill_range::<6>(
+                                    &mut tables.rows,
+                                    src,
+                                    $from,
+                                    $to,
+                                    &fill_ctx,
+                                ),
+                                5 => row_fill_range::<5>(
+                                    &mut tables.rows,
+                                    src,
+                                    $from,
+                                    $to,
+                                    &fill_ctx,
+                                ),
+                                _ => row_fill_range::<4>(
+                                    &mut tables.rows,
+                                    src,
+                                    $from,
+                                    $to,
+                                    &fill_ctx,
+                                ),
+                            }
+                        };
+                    }
+                    // libzstd's `ZSTD_row_update_internal`: a LONG match does
+                    // not index its interior. Past `ROW_SKIP_GAP` positions
+                    // only the first `ROW_SKIP_HEAD` and the last
+                    // `ROW_SKIP_TAIL` are inserted -- the ends are where the
+                    // next match can start; the middle is one long run of
+                    // table writes for positions the parse has already
+                    // jumped over.
+                    if row_skip && stop.saturating_sub(p) > ROW_SKIP_GAP {
+                        rfill!(p, p + ROW_SKIP_HEAD);
+                        rfill!(stop - ROW_SKIP_TAIL, stop);
+                    } else {
+                        rfill!(p, stop);
                     }
                 } else {
                     if cp {
@@ -5857,6 +5950,67 @@ pub(crate) fn row_find_enabled() -> bool {
     row_arm() != 1
 }
 
+/// ROW KEY arm: start a row frame on the WIDE (`mls`-byte) hash key instead
+/// of the 4-byte key. 0 = narrow (the chain's default; the mid-frame latch is
+/// driven by chain-walk statistics a row frame never produces, so a row frame
+/// otherwise stays narrow for life), 1 = wide from the first byte.
+/// `u32::MAX` = unresolved; `RZSTD_ROW_WIDE`.
+static ROW_WIDE_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+/// The shipped row key.
+const ROW_WIDE_DEFAULT: u32 = 0;
+
+/// Bench hook for the row key (see `ROW_WIDE_ARM`).
+pub fn set_row_wide_arm(v: u32) {
+    ROW_WIDE_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn row_wide_start() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let v = ROW_WIDE_ARM.load(Relaxed);
+    if v != u32::MAX {
+        return v == 1;
+    }
+    let n = crate::env_knob_parse::<u32>("RZSTD_ROW_WIDE")
+        .filter(|v| *v <= 1)
+        .unwrap_or(ROW_WIDE_DEFAULT);
+    ROW_WIDE_ARM.store(n, Relaxed);
+    n == 1
+}
+
+/// ROW FILL SKIP arm: 1 = a match longer than `ROW_SKIP_GAP` inserts only its
+/// first `ROW_SKIP_HEAD` and last `ROW_SKIP_TAIL` positions into the rows
+/// (libzstd's constants: 384 / 96 / 32). `u32::MAX` = unresolved;
+/// `RZSTD_ROW_SKIP`.
+static ROW_SKIP_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+/// The shipped row fill-skip setting.
+const ROW_SKIP_DEFAULT: u32 = 0;
+/// libzstd `kSkipThreshold`.
+const ROW_SKIP_GAP: usize = 384;
+/// libzstd `kMaxMatchStartPositionsToUpdate`.
+const ROW_SKIP_HEAD: usize = 96;
+/// libzstd `kMaxMatchEndPositionsToUpdate`.
+const ROW_SKIP_TAIL: usize = 32;
+
+/// Bench hook for the row fill skip (see `ROW_SKIP_ARM`).
+pub fn set_row_skip_arm(v: u32) {
+    ROW_SKIP_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn row_fill_skip() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let v = ROW_SKIP_ARM.load(Relaxed);
+    if v != u32::MAX {
+        return v == 1;
+    }
+    let n = crate::env_knob_parse::<u32>("RZSTD_ROW_SKIP")
+        .filter(|v| *v <= 1)
+        .unwrap_or(ROW_SKIP_DEFAULT);
+    ROW_SKIP_ARM.store(n, Relaxed);
+    n == 1
+}
+
 /// Row GEOMETRY arms, for the boards that price a width or a table size
 /// against the policy in ONE binary. `u32::MAX` = unresolved, 0 = policy.
 /// `ROW_LOG_ARM`: 4, 5 or 6 forces the row width (`RZSTD_ROW_LOG`).
@@ -5935,10 +6089,19 @@ const ROW_AUTO_MAX: u64 = 2 << 20;
 ///
 /// * `0` -- the 2026-09-08 band above: 16 slots, table sized to the chain it
 ///   replaces, `Lazy`/`Lazy2` only, known source length in 512 KiB..=2 MiB.
-/// * `1` -- libzstd's shape: EVERY `Greedy`/`Lazy`/`Lazy2` frame whose window
-///   log is above 14, whatever its length (so streaming frames too); row
-///   width from the search log (`clamp(search_log, 4, 6)`), table sized from
-///   the hash log, and a full (stride 1) back-fill.
+/// * `1` -- libzstd's shape: EVERY `Lazy`/`Lazy2` frame whose window log is
+///   above 14, whatever its length (so streaming frames too); row width from
+///   the search log (`clamp(search_log, 4, 6)`), table sized from the hash
+///   log, and a full (stride 1) back-fill.
+///
+///   `Greedy` is NOT in it yet. Routed through the lazy finder at depth 0
+///   (see `find_sequences_strategy_sel`) it is -1.0% to -1.5% total size at
+///   256 KiB / 1 MiB and -4% on text, but `versions-16m` goes 8,278 -> 15,106
+///   bytes at 1 MiB (+82%): the loss starts where the second 512 KiB version
+///   begins, is identical under every row width / table size / fill stride,
+///   and `Lazy` (depth 1) on the same tables does not have it -- so it is the
+///   depth-0 parse, not the rows. Open; the forced arm (`RZSTD_ROW=1`) still
+///   reaches it.
 ///
 /// `u32::MAX` = unresolved; `RZSTD_ROW_POLICY` selects, `set_row_policy_arm`
 /// is the bench hook.
@@ -5972,10 +6135,8 @@ fn row_auto_ok(params: CompressionParameters, src_len: Option<u64>) -> bool {
         2 => true,
         _ => match row_policy() {
             1 => {
-                matches!(
-                    params.strategy,
-                    Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
-                ) && params.window_log > 14
+                matches!(params.strategy, Strategy::Lazy | Strategy::Lazy2)
+                    && params.window_log > 14
             }
             _ => {
                 matches!(params.strategy, Strategy::Lazy | Strategy::Lazy2)

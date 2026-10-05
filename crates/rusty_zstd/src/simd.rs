@@ -25,9 +25,7 @@
 /// The match copy in `decode_sequences` reads from a random earlier offset,
 /// which is the decoder's one unpredictable load. C ships a whole separate
 /// path for this (`ZSTD_decompressSequencesLong` + `ZSTD_DECODESEQUENCE_PREFETCH`).
-#[cfg(test)]
 #[inline(always)]
-#[allow(dead_code)] // ISA hint kept beside its kernel; no shipping caller today.
 pub(crate) fn prefetch_read(slice: &[u8], at: usize) {
     if at >= slice.len() {
         return;
