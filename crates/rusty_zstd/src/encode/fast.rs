@@ -211,19 +211,28 @@ pub(crate) fn find_fast(
             // that stood in each arm was selecting between two
             // monomorphisations that W7 merged -- so it had become a branch
             // plus a second 11-argument call setup to reach the same function.
-            // V2 (2026-10-04): ONE shape gets its own body -- wide key, packed
-            // tags, tag filter on. That is every L1/L2 block of a frame under
-            // 16 MiB with the default knobs. See the `WP` parameter of
-            // `find_fast_impl_inner`.
-            let wp = wide_block && $p;
+            // V2 (2026-10-04): the shapes that carry the traffic get their own
+            // body; see the `SHAPE` parameter of `find_fast_impl_inner`.
+            //   1  wide key + packed tags + tag filter: every L1/L2 block of
+            //      a frame under 16 MiB at the default knobs.
+            //   2  legacy 4-byte key + tag ARRAY + tag filter: the same levels
+            //      on a frame of 16 MiB and over (V4).
+            //   0  everything else, on runtime flags.
+            let shape: u8 = if wide_block && $p {
+                1
+            } else if !wide_block && $p && !tables.pack_tags {
+                2
+            } else {
+                0
+            };
             #[cfg(all(target_arch = "x86_64", feature = "std"))]
             #[allow(unsafe_code)]
             let out = if crate::simd::has_bmi2() {
                 crate::kreach::hit(crate::kreach::K_FIND_FAST);
                 // SAFETY: runtime CPUID guard, identical body.
                 unsafe {
-                    if wp {
-                        find_fast_impl_bmi2::<true>(
+                    match shape {
+                        1 => find_fast_impl_bmi2::<1>(
                             $p,
                             $r,
                             wide_block,
@@ -236,9 +245,8 @@ pub(crate) fn find_fast(
                             params,
                             tables,
                             reps,
-                        )
-                    } else {
-                        find_fast_impl_bmi2::<false>(
+                        ),
+                        2 => find_fast_impl_bmi2::<2>(
                             $p,
                             $r,
                             wide_block,
@@ -251,13 +259,27 @@ pub(crate) fn find_fast(
                             params,
                             tables,
                             reps,
-                        )
+                        ),
+                        _ => find_fast_impl_bmi2::<0>(
+                            $p,
+                            $r,
+                            wide_block,
+                            s0,
+                            pipe_on,
+                            src,
+                            block_start,
+                            block_end,
+                            window,
+                            params,
+                            tables,
+                            reps,
+                        ),
                     }
                 }
             } else {
                 crate::kreach::miss(crate::kreach::K_FIND_FAST);
-                if wp {
-                    find_fast_impl::<true>(
+                match shape {
+                    1 => find_fast_impl::<1>(
                         $p,
                         $r,
                         wide_block,
@@ -270,9 +292,8 @@ pub(crate) fn find_fast(
                         params,
                         tables,
                         reps,
-                    )
-                } else {
-                    find_fast_impl::<false>(
+                    ),
+                    2 => find_fast_impl::<2>(
                         $p,
                         $r,
                         wide_block,
@@ -285,12 +306,26 @@ pub(crate) fn find_fast(
                         params,
                         tables,
                         reps,
-                    )
+                    ),
+                    _ => find_fast_impl::<0>(
+                        $p,
+                        $r,
+                        wide_block,
+                        s0,
+                        pipe_on,
+                        src,
+                        block_start,
+                        block_end,
+                        window,
+                        params,
+                        tables,
+                        reps,
+                    ),
                 }
             };
             #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
-            let out = if wp {
-                find_fast_impl::<true>(
+            let out = match shape {
+                1 => find_fast_impl::<1>(
                     $p,
                     $r,
                     wide_block,
@@ -303,9 +338,8 @@ pub(crate) fn find_fast(
                     params,
                     tables,
                     reps,
-                )
-            } else {
-                find_fast_impl::<false>(
+                ),
+                2 => find_fast_impl::<2>(
                     $p,
                     $r,
                     wide_block,
@@ -318,7 +352,21 @@ pub(crate) fn find_fast(
                     params,
                     tables,
                     reps,
-                )
+                ),
+                _ => find_fast_impl::<0>(
+                    $p,
+                    $r,
+                    wide_block,
+                    s0,
+                    pipe_on,
+                    src,
+                    block_start,
+                    block_end,
+                    window,
+                    params,
+                    tables,
+                    reps,
+                ),
             };
             out
         }};
@@ -425,7 +473,7 @@ pub(crate) fn find_fast(
 /// C's equivalent is a small standalone function that keeps those in registers,
 /// which is where our ~3x per-probe cost was going. Splitting restores that.
 #[inline(never)]
-pub(crate) fn find_fast_impl<const WP: bool>(
+pub(crate) fn find_fast_impl<const SHAPE: u8>(
     packed: bool,
     rep: bool,
     wide: bool,
@@ -442,7 +490,7 @@ pub(crate) fn find_fast_impl<const WP: bool>(
     // W5: the BMI2 branch used to live here, once per monomorphisation. It is
     // now made ONCE at the dispatch (see the `go!` macro), which is what lets
     // the twin tree drop the HLOG axis. This wrapper is the baseline arm only.
-    find_fast_impl_inner::<false, WP>(
+    find_fast_impl_inner::<false, SHAPE>(
         packed,
         rep,
         wide,
@@ -463,7 +511,7 @@ pub(crate) fn find_fast_impl<const WP: bool>(
 #[allow(clippy::too_many_arguments)]
 #[allow(unsafe_code)]
 #[inline(never)]
-pub(crate) unsafe fn find_fast_impl_bmi2<const WP: bool>(
+pub(crate) unsafe fn find_fast_impl_bmi2<const SHAPE: u8>(
     packed: bool,
     rep: bool,
     wide: bool,
@@ -477,7 +525,7 @@ pub(crate) unsafe fn find_fast_impl_bmi2<const WP: bool>(
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    find_fast_impl_inner::<true, WP>(
+    find_fast_impl_inner::<true, SHAPE>(
         packed,
         rep,
         wide,
@@ -582,7 +630,7 @@ pub(crate) fn find_fast_impl_inner<
     // W1: which ISA twin is running, so the outlined emitter can be selected
     // at compile time instead of re-deciding per match.
     const BMI2: bool,
-    // V2 (2026-10-04): `WP` = wide key AND packed tags AND tag filter, as
+    // V2 (2026-10-04): `SHAPE == 1` = wide key AND packed tags AND tag filter, as
     // CONSTANTS. W7/W9/W10 made `wide`, `rep` and `packed` runtime flags on a
     // STATIC count (46,327 -> 7,852 instructions across the copies), reasoning
     // that a loop-invariant test is perfectly predicted and therefore free.
@@ -595,7 +643,12 @@ pub(crate) fn find_fast_impl_inner<
     // of a frame under 16 MiB); every other shape keeps the runtime body.
     // Byte-identical for the reason the old axes were: the const takes the
     // value the runtime variable already held.
-    const WP: bool,
+    //
+    // V4: `SHAPE == 2` = legacy 4-byte key AND the tag ARRAY AND tag filter --
+    // what the same levels run on a frame of 16 MiB and over (mozilla, samba,
+    // nci), where the packed word has no room for the position. `SHAPE == 0`
+    // is the runtime body.
+    const SHAPE: u8,
 >(
     // W7: wide arrives at RUNTIME -- see the note in `find_fast`.
     // W9: rep joins WIDE at runtime. It gated the `try_rep1` block -- ~25
@@ -625,8 +678,13 @@ pub(crate) fn find_fast_impl_inner<
     tables: &mut MatchTables,
     reps: [u32; 3],
 ) -> (Vec<Seq>, Vec<u8>) {
-    debug_assert!(!WP || (wide && packed));
-    let (packed, wide) = if WP { (true, true) } else { (packed, wide) };
+    debug_assert!(SHAPE != 1 || (wide && packed));
+    debug_assert!(SHAPE != 2 || (!wide && packed && !tables.pack_tags && !tables.tags.is_empty()));
+    let (packed, wide) = match SHAPE {
+        1 => (true, true),
+        2 => (true, false),
+        _ => (packed, wide),
+    };
     let mls = params.min_match.max(3) as usize;
     // W12: state the block invariant ONCE, per block, so the body does not
     // pay for re-proving it per copy.
@@ -670,7 +728,7 @@ pub(crate) fn find_fast_impl_inner<
     // exit below.
     let mut hash_v = core::mem::take(&mut tables.hash);
     let mut tags_v = core::mem::take(&mut tables.tags);
-    let pack = tables.pack_tags;
+    let pack = if SHAPE == 2 { false } else { tables.pack_tags };
     // Guard unification (see the dispatch): wide implies pack, so in wide
     // copies this is const-true -- the slot helpers' pack branches fold and
     // `tags_v` is provably untouched.
@@ -686,7 +744,7 @@ pub(crate) fn find_fast_impl_inner<
     // the packed bound, where the array is legitimately absent.
     //
     // Ask the array that is actually in play.
-    let tags_live = !tags_v.is_empty();
+    let tags_live = if SHAPE == 2 { true } else { !tags_v.is_empty() };
     // BRICK 51: `probes`/`hits` feed ONLY `note_search`, which is a no-op
     // without the `profile` feature (their other consumers, `last_hit_rate` and
     // `tag_latch`, were write-only dead state left by the brick-41 revert).
