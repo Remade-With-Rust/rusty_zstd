@@ -812,6 +812,21 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
         // an aliasing slot is forwarded by hand -- `put_h` writes `ip+1`, so
         // `get_h` on that slot would return `Some(ip)`. The two tables are
         // distinct, so `h4` can only alias `h4` and `h8` only `h8`.
+        // V1 (2026-10-04): the next-long probe below asks the long table for
+        // `ip + 1`. When the speculation just issued is FOR `ip + 1` (step 1
+        // inside the first 256 literals -- the dickens/mozilla/x-ray shape)
+        // it has already hashed that position, loaded that slot and applied
+        // the same tag filter, and nothing writes either table in between.
+        // `nl_spec` says the carried long candidate IS the probe's answer, so
+        // the probe does not hash, load and filter the same slot a second time.
+        //
+        // PACKED body only, on the count: the tag-array body (frames >= 16 MiB
+        // and streaming) re-rolled its registers under the same edit and
+        // executed MORE -- samba L3 423.8M -> 437.7M match-find instructions
+        // (callgrind, +3.3%) against dickens -3.2%, x-ray -5.2%, xml -1.5% on
+        // the packed body. `PACKED &&` folds the flag away there, so that body
+        // is the one it was.
+        let mut nl_spec = false;
         if dpipe {
             let nip = ip + dstep + ((ip - anchor) >> accel);
             if nip <= ilimit {
@@ -849,6 +864,7 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
                     g4: ga,
                     live: true,
                 };
+                nl_spec = PACKED && nip == ip + 1;
             }
         }
 
@@ -911,17 +927,27 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
         let mut best_ip = ip;
         if best_ml < good_ml && nl_on && ip < ilimit {
             nl_probes += 1;
-            // W42: resolved shift, like W40 one branch away.
-            let h8b = hash8_shift(src, ip + 1, dlong_shift);
-            // The only long consumer without a free tag: `ip + 1` never
-            // computed a short hash. One mul+xor on a path already gated by
-            // `best_ml < good_ml && nl_on`.
-            let g8b = if lt_on {
-                hash4_tag_mls(src, ip + 1, dtag_shift, smask).1
+            // V1: the speculation's own filtered load when it was for `ip + 1`
+            // (see `nl_pre`); otherwise the probe's own hash, tag and load.
+            // Same slot, same tag, same filter, no store in between -- the
+            // hand-forward arm included, which mirrors `get_hl_tag` on the
+            // slot `put_hl_tag` just wrote.
+            let m8b_slot = if nl_spec {
+                dec(carried.v8)
             } else {
-                0
+                // W42: resolved shift, like W40 one branch away.
+                let h8b = hash8_shift(src, ip + 1, dlong_shift);
+                // The only long consumer without a free tag: `ip + 1` never
+                // computed a short hash. One mul+xor on a path already gated by
+                // `best_ml < good_ml && nl_on`.
+                let g8b = if lt_on {
+                    hash4_tag_mls(src, ip + 1, dtag_shift, smask).1
+                } else {
+                    0
+                };
+                tables.get_hl_tag(h8b, g8b, lt_on, packed)
             };
-            if let Some(m8b) = tables.get_hl_tag(h8b, g8b, lt_on, packed) {
+            if let Some(m8b) = m8b_slot {
                 if COUNT {
                     probes += 1;
                 }
