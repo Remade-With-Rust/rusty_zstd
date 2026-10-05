@@ -394,7 +394,7 @@ pub(crate) fn encode_oneshot(
     // frame from that instead of re-priming (see THE DIGESTED DICTIONARY).
     #[cfg(feature = "std")]
     if let Some(d) = dict {
-        if !src.is_empty() && adv == AdvancedOptions::default() {
+        if !src.is_empty() && adv == AdvancedOptions::default() && digest_mode() != 1 {
             if let Some(r) = encode_with_digest(src, params, checksum, pledged, d, dict_id) {
                 return r;
             }
@@ -798,12 +798,19 @@ const DIGEST_WORKSPACE_SLACK: usize = 256 << 10;
 //     Replaced when the thread compresses with another dictionary or key,
 //     freed when the thread exits.
 
-/// Digest reach census: `[served at rest, served after a re-seat, snapshots
-/// built, first sightings (legacy path), not eligible (legacy path)]`, per
-/// dictionary call. A digest that nothing reaches passes every byte gate --
-/// the two paths agree by design -- so the boards print this.
+/// Digest reach census, per dictionary call: `[0] served at rest, [1] served
+/// after a re-seat, [2] snapshots built, [3] first sightings (legacy path),
+/// [4] not eligible (legacy path)`; and per restore: `[5] dirty-slot
+/// restores, [6] full-copy restores, [7] restores compared against the
+/// snapshot, [8] comparisons that FAILED`. A digest that nothing reaches
+/// passes every byte gate -- the two paths agree by design -- so the boards
+/// print this.
 #[cfg(feature = "profile")]
-pub static DIGEST_CENSUS: [crate::census64::AtomicU64; 5] = [
+pub static DIGEST_CENSUS: [crate::census64::AtomicU64; 9] = [
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
+    crate::census64::AtomicU64::new(0),
     crate::census64::AtomicU64::new(0),
     crate::census64::AtomicU64::new(0),
     crate::census64::AtomicU64::new(0),
@@ -813,7 +820,7 @@ pub static DIGEST_CENSUS: [crate::census64::AtomicU64; 5] = [
 
 /// Read and clear the digest reach census.
 #[cfg(feature = "profile")]
-pub fn take_digest_census() -> [u64; 5] {
+pub fn take_digest_census() -> [u64; 9] {
     use core::sync::atomic::Ordering::Relaxed;
     core::array::from_fn(|i| DIGEST_CENSUS[i].swap(0, Relaxed))
 }
@@ -823,6 +830,87 @@ fn note_digest(_slot: usize) {
     #[cfg(feature = "profile")]
     DIGEST_CENSUS[_slot].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
+
+/// The digest arm. 0 = unresolved, 1 = OFF (prime on every call, the old
+/// behaviour and the byte-identical fallback), 2 = digest with a FULL-COPY
+/// restore, 3 = digest with the dirty-slot restore where it is proven
+/// (shipped). `RZSTD_DIGEST=0` / `=copy` select 1 / 2.
+static DIGEST_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook: 0 = off, 1 = full-copy restore, 2 = dirty-slot restore.
+pub fn set_digest_arm(mode: u8) {
+    DIGEST_ARM.store(mode.min(2) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn digest_mode() -> u8 {
+    use core::sync::atomic::Ordering;
+    let v = DIGEST_ARM.load(Ordering::Relaxed);
+    if v != 0 {
+        return v;
+    }
+    let m = match crate::env_knob("RZSTD_DIGEST") {
+        Ok(s) if s.trim() == "0" => 1,
+        Ok(s) if s.trim() == "copy" => 2,
+        _ => 3,
+    };
+    DIGEST_ARM.store(m, Ordering::Relaxed);
+    m
+}
+
+/// `RZSTD_DIGEST_VERIFY=1` (or the hook): compare the working tables with the
+/// snapshot after EVERY restore and panic on a difference. Debug builds
+/// always do. 0 = unresolved, 1 = off, 2 = on.
+static DIGEST_VERIFY_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Bench hook for the restore verification.
+pub fn set_digest_verify_arm(on: bool) {
+    DIGEST_VERIFY_ARM.store(u8::from(on) + 1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn digest_verify() -> bool {
+    use core::sync::atomic::Ordering;
+    match DIGEST_VERIFY_ARM.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::env_knob_is1("RZSTD_DIGEST_VERIFY");
+            DIGEST_VERIFY_ARM.store(u8::from(on) + 1, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Set when a SAMPLED comparison finds a dirty-slot restore that did not
+/// reproduce the snapshot: every later restore in the process is a full copy.
+/// See `DictWork::restore`.
+#[cfg(feature = "std")]
+static DIGEST_DIRTY_BROKEN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// The dirty-slot restore runs while
+/// `message bytes * tables restored * this <= table bytes`.
+///
+/// Restoring one position's slot is a hash, a random read of the snapshot
+/// and a random store; the full copy is a streaming memcpy. Measured IN ONE
+/// BINARY with the arm flipped between adjacent reps (`set_digest_arm`,
+/// 112 KiB dictionary, pinned, two runs agreeing to 1%), dirty / full time
+/// per call:
+///
+/// ```text
+///   message           256 B   512 B   1 KiB   2 KiB   3 KiB   4 KiB   8 KiB  16 KiB
+///   L3 (2 x 256 KiB)   0.55    0.65    0.74    0.88    0.95    1.01    1.09    1.18
+///   L1 (1 x  32 KiB)   0.97    0.98    1.01    1.05     --      --      --      --
+/// ```
+///
+/// Break-even is 4 KiB for the two 256 KiB tables and ~800 B for the one
+/// 32 KiB table -- 64 table bytes per position-table in both. 80 keeps the
+/// dirty path to where it is at least a few percent ahead.
+#[cfg(feature = "std")]
+const DIGEST_DIRTY_RATIO: usize = 80;
 
 /// Everything the primed table state depends on besides the dictionary bytes.
 #[cfg(feature = "std")]
@@ -1047,6 +1135,8 @@ struct DictWork {
     digest: alloc::sync::Arc<Digest>,
     bufs: TableBufs,
     workspace: Vec<u8>,
+    /// Dirty-slot restores this set has made (drives the sampled comparison).
+    dirty_restores: u32,
 }
 
 #[cfg(feature = "std")]
@@ -1107,15 +1197,165 @@ impl DictWork {
             digest,
             bufs,
             workspace,
+            dirty_restores: 0,
         })
     }
 
-    /// Put the tables back to the snapshot after a frame.
-    fn restore(&mut self) {
+    /// Put the tables back to the snapshot after a frame of `msg_len` bytes.
+    ///
+    /// The full copy is O(tables) -- 512 KiB for a 112 KiB dictionary at L3,
+    /// about 14 us, half of what a 1 KiB message then costs in total. The
+    /// DIRTY-SLOT restore is O(message): it re-derives which slots the frame
+    /// can have written and copies just those back.
+    ///
+    /// WHAT THE DIRTY RESTORE RESTS ON. `one_block` frames of the Fast and
+    /// DFast finders only, because for those the write set is closed-form:
+    ///
+    ///   * every table store in block 0 is `table[H(bytes at p)] = ..` for a
+    ///     position `p` of THIS message (`p >= payload_off`; the finders
+    ///     start at `block_start` and their fills sit at `match + 2` and
+    ///     `match_end - 2`), under ONE hash per table for the whole block --
+    ///     Fast: `fast_hash_tag` with the block's (wide, mask, shift), the
+    ///     tail-zero-extended load included; DFast: `hash4` of the low word
+    ///     into `hash`, `hash8` of the full word into `hash_long`, always at
+    ///     `p + 8 <= len`;
+    ///   * block 0 cannot switch representation: the legacy-key relatch, the
+    ///     Fast->Lazy route, the step probe's clone and the raw short circuit
+    ///     all need a previous block's measurements (and `flags_ok` below
+    ///     refuses the dirty path if `pack_tags` / `fast_hash_legacy` moved
+    ///     anyway).
+    ///
+    /// So recomputing those hashes for EVERY position from 8 bytes before the
+    /// message to its end, and copying the snapshot's value into each slot,
+    /// restores a superset of what was written. The message is still in the
+    /// workspace, so the recomputation reads the same bytes the finder did.
+    ///
+    /// That is an argument about code in `encode/fast.rs` and
+    /// `encode/dfast.rs`, so it is CHECKED, three ways:
+    ///   1. debug builds (every `cargo test`) and `RZSTD_DIGEST_VERIFY=1`
+    ///      (the `smallboard` gate runs it) compare the whole table set with
+    ///      the snapshot after EVERY restore and panic on a difference;
+    ///   2. release builds compare on a set's first four dirty restores and
+    ///      every 64th after (0.25 us amortised); a difference repairs the
+    ///      set with a full copy and turns the dirty path OFF for the process;
+    ///   3. a missed slot cannot produce an invalid frame: both finders
+    ///      order-, window- and byte-check every candidate (`fast_probe`,
+    ///      `match_ok`), so a stale slot can only cost byte identity.
+    ///
+    /// A FINDER CHANGE THAT ADDS A STORE UNDER A NEW HASH MUST EXTEND
+    /// `restore_dirty`; (1) is the tripwire that says so.
+    fn restore(&mut self, one_block: bool, flags_ok: bool, msg_len: usize) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let strategy = self.digest.key.params.strategy;
+        let dirty = {
+            let key = &self.digest.key;
+            one_block
+                && flags_ok
+                && digest_mode() == 3
+                && matches!(strategy, Strategy::Fast | Strategy::DFast)
+                && (3..=7).contains(&key.params.min_match)
+                && msg_len
+                    .saturating_mul(if strategy == Strategy::DFast { 2 } else { 1 })
+                    .saturating_mul(DIGEST_DIRTY_RATIO)
+                    <= key.shape.table_bytes()
+                && !DIGEST_DIRTY_BROKEN.load(Relaxed)
+        };
+        if dirty {
+            note_digest(5);
+            self.restore_dirty(msg_len);
+            self.dirty_restores = self.dirty_restores.wrapping_add(1);
+        } else {
+            note_digest(6);
+            self.restore_full();
+        }
+        let strict = cfg!(debug_assertions) || digest_verify();
+        let sampled = dirty && (self.dirty_restores <= 4 || self.dirty_restores % 64 == 0);
+        if strict || sampled {
+            note_digest(7);
+            if !self.at_rest() {
+                note_digest(8);
+                assert!(
+                    !strict,
+                    "digest restore left the tables different from the snapshot \
+                     (strategy {strategy:?}, {msg_len} message bytes, dirty = {dirty})"
+                );
+                DIGEST_DIRTY_BROKEN.store(true, Relaxed);
+                self.restore_full();
+            }
+        }
+    }
+
+    /// Do the tables equal the snapshot?
+    fn at_rest(&self) -> bool {
+        let d = &*self.digest;
+        self.bufs.hash == d.hash
+            && self.bufs.hash_long == d.hash_long
+            && if d.chain.is_empty() {
+                self.bufs.chain.iter().all(|&x| x == 0)
+            } else {
+                self.bufs.chain == d.chain
+            }
+    }
+
+    fn restore_full(&mut self) {
         let d = &*self.digest;
         seat_table(&mut self.bufs.hash, &d.hash, d.key.shape.hash);
         seat_table(&mut self.bufs.hash_long, &d.hash_long, d.key.shape.long);
         seat_table(&mut self.bufs.chain, &d.chain, d.key.shape.chain);
+    }
+
+    /// See `restore`. Fast and DFast only; `min_match` in 3..=7.
+    fn restore_dirty(&mut self, msg_len: usize) {
+        let d = &*self.digest;
+        let key = &d.key;
+        let len = key.tail_len + msg_len;
+        let ws = &self.workspace[..len];
+        let lo = key.tail_len.saturating_sub(8);
+        let hash_log = key.shape.hash_log;
+        let hash = &mut self.bufs.hash[..];
+        let snap = &d.hash[..];
+        if key.params.strategy == Strategy::Fast {
+            // The block's key, exactly as `find_fast` resolves it for block 0
+            // of a frame (`wide_block`): wide needs the packed representation.
+            let mls = key.params.min_match.clamp(3, 7) as usize;
+            let wide = key.fast_wide && key.rep.pack_tags;
+            let (mask, shift) = if wide {
+                (
+                    fast_hash_spec(mls, hash_log).mask,
+                    64u32.saturating_sub(hash_log),
+                )
+            } else {
+                (0, 32u32.saturating_sub(hash_log))
+            };
+            // The wide key's tail load zero-extends, so every position hashes;
+            // the 4-byte key needs its four bytes.
+            let end = if wide { len } else { len.saturating_sub(3) };
+            for p in lo..end {
+                let (h, _) = fast_hash_tag::<false>(ws, p, wide, mask, shift);
+                hash[h] = snap[h];
+            }
+        } else {
+            let long = &mut self.bufs.hash_long[..];
+            let snap_long = &d.hash_long[..];
+            let s4 = 32u32.saturating_sub(hash_log);
+            let s8 = 64u32.saturating_sub(hash_log);
+            let mut p = lo;
+            while p + 8 <= len {
+                let v = load_u64le(ws, p);
+                let h4 = hash4_shift(v as u32, s4);
+                let h8 = hash8_from(v, s8);
+                hash[h4] = snap[h4];
+                long[h8] = snap_long[h8];
+                p += 1;
+            }
+            // DFast never stores a position without eight bytes under it;
+            // the short key of the last few is restored anyway (a superset).
+            while p + 4 <= len {
+                let h4 = hash4_shift(load_u32le(ws, p), s4);
+                hash[h4] = snap[h4];
+                p += 1;
+            }
+        }
     }
 
     /// Park the set for this thread's next call, inside the stated bound.
@@ -1204,6 +1444,7 @@ fn encode_with_digest(
         true,
     );
     let adv = AdvancedOptions::default();
+    let block_max = frame_block_max(window, adv);
     let r = encode_frame_blocks(
         &mut out,
         &work.workspace,
@@ -1211,7 +1452,7 @@ fn encode_with_digest(
         src.len(),
         params,
         window,
-        frame_block_max(window, adv),
+        block_max,
         checksum,
         adv,
         &mut tables,
@@ -1219,11 +1460,18 @@ fn encode_with_digest(
         &mut entropy,
         None,
     );
+    // Did the frame end in the representation it started in?
+    let flags_ok = tables.pack_tags == key.rep.pack_tags
+        && tables.chain_pack == key.rep.chain_pack
+        && !tables.fast_hash_legacy
+        && !tables.chain_wide;
     work.bufs = tables.take_bufs();
     if r.is_ok() {
         // Only a set that finished its frame is known to be restorable; an
         // error path drops it and the next call re-seats from the snapshot.
-        work.restore();
+        // `adaptive_block_max` returns its base for a frame's first block, so
+        // a message no longer than `block_max` was exactly one block.
+        work.restore(src.len() <= block_max, flags_ok, src.len());
         work.release();
     }
     Some(r.map(|()| out))

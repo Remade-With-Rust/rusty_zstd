@@ -547,6 +547,10 @@ fn main() {
             "    digest reach: at rest {}  re-seated {}  built {}  first sight {}  not eligible {}",
             c[0], c[1], c[2], c[3], c[4]
         );
+        println!(
+            "    restores: dirty-slot {}  full-copy {}  compared {}  FAILED {}",
+            c[5], c[6], c[7], c[8]
+        );
     }
     tick("B done");
 
