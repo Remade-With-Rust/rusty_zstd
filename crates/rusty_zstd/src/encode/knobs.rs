@@ -171,9 +171,11 @@ pub(crate) fn row_fill_stride() -> usize {
     if v != 0 {
         return v;
     }
+    // The wide-row policy fills at stride 1 (libzstd inserts every position);
+    // the legacy band keeps its measured knee of 2. See `ROW_POLICY_ARM`.
     let s: usize = crate::env_knob_parse("RZSTD_ROW_FILL_S")
         .filter(|&v: &usize| v >= 1)
-        .unwrap_or(2);
+        .unwrap_or(if row_policy() == 1 { 1 } else { 2 });
     ROW_FILL_S_ARM.store(s, Ordering::Relaxed);
     s
 }

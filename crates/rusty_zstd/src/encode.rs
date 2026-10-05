@@ -1753,7 +1753,20 @@ fn find_sequences_strategy_sel(
 ) -> (Vec<Seq>, Vec<u8>) {
     match params.strategy {
         Strategy::DFast => find_dfast(src, block_start, block_end, window, params, tables, reps),
-        Strategy::Greedy => find_greedy(src, block_start, block_end, window, params, tables, reps),
+        Strategy::Greedy => {
+            // ROWS AT THE GREEDY LEVEL go through the lazy finder at depth 0.
+            // `find_greedy_impl` carries its own hand-copied CHAIN walk and
+            // only ever mirrored inserts into the rows; `find_lazy_impl` is
+            // the finder the row kernel is wired into, and with `depth == 0`
+            // its look-ahead loop (`for d in 1..=depth`) never runs, which is
+            // greedy. Reached only when the frame was allocated with rows
+            // (`row_geometry`), so chain frames are untouched.
+            if row_find_enabled() && !tables.rows.head.is_empty() {
+                find_lazy(src, block_start, block_end, window, params, tables, 0, reps)
+            } else {
+                find_greedy(src, block_start, block_end, window, params, tables, reps)
+            }
+        }
         Strategy::Lazy => find_lazy(src, block_start, block_end, window, params, tables, 1, reps),
         Strategy::Lazy2 => find_lazy(src, block_start, block_end, window, params, tables, 2, reps),
         Strategy::BtLazy2 => {
@@ -2966,7 +2979,7 @@ fn lz_fill_range<const ROWS: bool, const CP: bool, const CA: bool, const SPEC: b
 /// The row-table fill loop, outlined (BRICK 10) -- `find_lazy_impl`'s row arm.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn row_fill_range(
+fn row_fill_range<const RL: u32>(
     rows: &mut crate::rowfind::RowTable,
     src: &[u8],
     mut p: usize,
@@ -2991,7 +3004,7 @@ fn row_fill_range(
                 #[cfg(feature = "profile")]
                 LF_INSERTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 let (hh, gt) = $hash;
-                rows.insert_h(hh, rmask, p as u32, gt);
+                rows.insert_h::<RL>(hh, rmask, p as u32, gt);
                 p += stride;
             }
         }};
@@ -3557,8 +3570,12 @@ type ChainFn = for<'a> fn(&ChainCtx<'a>, usize, &mut MatchTables) -> (usize, usi
 /// nothing to classify -- every candidate in the row is visited regardless.
 ///
 /// Bitstream-CHANGING; see `set_row_arm`.
+///
+/// `RL` is the row width as a log (4, 5, 6 = 16, 32, 64 slots): one
+/// instantiation per width, selected once per block, so the row shift, the
+/// slot mask and the tag-compare trip count are immediates in each.
 #[inline(never)]
-fn row_find_best<const MLS: usize>(
+fn row_find_best<const MLS: usize, const RL: u32>(
     ctx: &ChainCtx,
     ip: usize,
     tables: &mut MatchTables,
@@ -3600,8 +3617,8 @@ fn row_find_best<const MLS: usize>(
     // still read strictly before `ip` is inserted -- the insert now sits below
     // the walk instead of the walk being pre-materialised above it, which is
     // the same snapshot with none of the copying.
-    let r = tables.rows.row_of(h);
-    let (mut w, rhead, row, rat) = tables.rows.probe_view(r, gtag);
+    let r = tables.rows.row_of_c::<RL>(h);
+    let (mut w, rhead, row, rat) = tables.rows.probe_view::<RL>(r, gtag);
     #[cfg(feature = "profile")]
     {
         use core::sync::atomic::Ordering::Relaxed;
@@ -3620,7 +3637,7 @@ fn row_find_best<const MLS: usize>(
     // compare against a running bar replaces two.
     let mut bar = mls;
     if ip + mls > src_len {
-        tables.lz_insert_rowknown(r, rat, rhead, ip, gtag);
+        tables.lz_insert_rowknown::<RL>(r, rat, rhead, ip, gtag);
         return (0, 0);
     }
     // W6: `.max(1)` folds the empty-slot sentinel INTO the window floor.
@@ -3632,7 +3649,7 @@ fn row_find_best<const MLS: usize>(
     // this by rejecting every candidate in turn. It also makes W7's fused
     // compare sound, by guaranteeing `low <= ip`.
     if ip <= low {
-        tables.lz_insert_rowknown(r, rat, rhead, ip, gtag);
+        tables.lz_insert_rowknown::<RL>(r, rat, rhead, ip, gtag);
         return (0, 0);
     }
     let span = ip - low;
@@ -3652,10 +3669,14 @@ fn row_find_best<const MLS: usize>(
         extra -= 1;
     }
     while w != 0 {
-        // W11's walk, inline: highest set bit is the newest slot.
-        let b = (crate::rowfind::ROW as u32 - 1) - w.leading_zeros();
-        w &= !(1u16 << b);
-        let s = ((b + rhead) & (crate::rowfind::ROW as u32 - 1)) as usize;
+        // W11's walk, inline: highest set bit is the newest slot. `w` only
+        // ever has its low `1 << RL` bits set (see `row_rot`), so the highest
+        // set bit is a slot distance and `s` masks to a slot of THIS row --
+        // which is also what lets the optimiser drop the bounds check on
+        // `row`, a `1 << RL`-element slice.
+        let b = 63 - w.leading_zeros();
+        w &= !(1u64 << b);
+        let s = ((b + rhead) & ((1u32 << RL) - 1)) as usize;
         let m = row[s] as usize;
         // W7: THREE rejects, ONE compare. `m - low` is borrow-free exactly
         // when `m >= low`, and below `span` exactly when `m < ip`; the
@@ -3707,7 +3728,7 @@ fn row_find_best<const MLS: usize>(
     // `tables.rows`) is dead by here, so the mutable borrow is free to start --
     // and every early return above does its own insert, so this path is reached
     // exactly when the walk ran.
-    tables.lz_insert_rowknown(r, rat, rhead, ip, gtag);
+    tables.lz_insert_rowknown::<RL>(r, rat, rhead, ip, gtag);
     if COUNT {
         crate::prof::note_probes(probes);
     }
@@ -4418,7 +4439,13 @@ fn find_lazy_impl<const MLS: usize, const KIND: u8>(
     // BRICK 20: the chain kernel comes in three tag-representation shapes
     // (see `chain_find_best`); the block picks its own here, once.
     let cfb: ChainFn = if use_rows {
-        row_find_best::<MLS>
+        // One row kernel per WIDTH, picked here with the rest of the block's
+        // shape. The table's width is fixed for the frame.
+        match tables.rows.row_log() {
+            6 => row_find_best::<MLS, 6>,
+            5 => row_find_best::<MLS, 5>,
+            _ => row_find_best::<MLS, 4>,
+        }
     } else {
         // BRICK 24: `walk_cont` is the third axis (six kernels).
         match (cp, ca, walk_cont) {
@@ -4693,7 +4720,11 @@ fn find_lazy_impl<const MLS: usize, const KIND: u8>(
                 // frame those invariants are register-resident for the loop's whole life;
                 // the caller pays one call per match, amortised over the match's length.
                 if use_rows {
-                    row_fill_range(&mut tables.rows, src, p, stop, &fill_ctx);
+                    match tables.rows.row_log() {
+                        6 => row_fill_range::<6>(&mut tables.rows, src, p, stop, &fill_ctx),
+                        5 => row_fill_range::<5>(&mut tables.rows, src, p, stop, &fill_ctx),
+                        _ => row_fill_range::<4>(&mut tables.rows, src, p, stop, &fill_ctx),
+                    }
                 } else {
                     if cp {
                         lz_fill_range::<false, true, false, true>(tables, src, p, stop, &fill_ctx);
@@ -5790,14 +5821,83 @@ pub fn set_row_arm(on: bool) {
         core::sync::atomic::Ordering::Relaxed,
     );
 }
-/// 0 = AUTO (size-gated, see `row_auto_ok`), 1 = forced off, 2 = forced on.
-static ROW_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// 0 = AUTO (the shipped policy, see `row_geometry`), 1 = forced off,
+/// 2 = forced on, `0xFF` = not yet resolved against `RZSTD_ROW`.
+static ROW_ARM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0xFF);
+
+/// The row arm, resolved once per process: `RZSTD_ROW=0` forces the hash
+/// chain, `RZSTD_ROW=1` forces rows on every chain strategy, unset keeps the
+/// policy. The hot path is one load and a compare; the env read is cold.
+#[inline(always)]
+fn row_arm() -> u8 {
+    let v = ROW_ARM.load(core::sync::atomic::Ordering::Relaxed);
+    if v != 0xFF {
+        return v;
+    }
+    row_arm_resolve()
+}
+
+#[cold]
+#[inline(never)]
+fn row_arm_resolve() -> u8 {
+    let v = match crate::env_knob_parse::<u8>("RZSTD_ROW") {
+        Some(0) => 1,
+        Some(1) => 2,
+        _ => 0,
+    };
+    ROW_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+    v
+}
+
 #[inline(always)]
 pub(crate) fn row_find_enabled() -> bool {
     // AUTO and forced-on both permit; the ALLOCATION decides for AUTO, and
     // `use_rows` is this AND `!rows.head.is_empty()`, so an unallocated
     // table keeps the chain regardless.
-    ROW_ARM.load(core::sync::atomic::Ordering::Relaxed) != 1
+    row_arm() != 1
+}
+
+/// Row GEOMETRY arms, for the boards that price a width or a table size
+/// against the policy in ONE binary. `u32::MAX` = unresolved, 0 = policy.
+/// `ROW_LOG_ARM`: 4, 5 or 6 forces the row width (`RZSTD_ROW_LOG`).
+/// `ROW_SIZING_ARM`: 1 sizes the table from the chain log, 2 from the hash
+/// log (`RZSTD_ROW_SIZING`).
+static ROW_LOG_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static ROW_SIZING_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Bench hook: force the row geometry (0 in either slot = the policy's value).
+pub fn set_row_geom_arm(row_log: u32, sizing: u32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    ROW_LOG_ARM.store(row_log, Relaxed);
+    ROW_SIZING_ARM.store(sizing, Relaxed);
+}
+
+#[inline]
+fn row_log_arm() -> u32 {
+    use core::sync::atomic::Ordering::Relaxed;
+    let v = ROW_LOG_ARM.load(Relaxed);
+    if v != u32::MAX {
+        return v;
+    }
+    let n = crate::env_knob_parse::<u32>("RZSTD_ROW_LOG")
+        .filter(|v| (crate::rowfind::ROW_LOG_MIN..=crate::rowfind::ROW_LOG_MAX).contains(v))
+        .unwrap_or(0);
+    ROW_LOG_ARM.store(n, Relaxed);
+    n
+}
+
+#[inline]
+fn row_sizing_arm() -> u32 {
+    use core::sync::atomic::Ordering::Relaxed;
+    let v = ROW_SIZING_ARM.load(Relaxed);
+    if v != u32::MAX {
+        return v;
+    }
+    let n = crate::env_knob_parse::<u32>("RZSTD_ROW_SIZING")
+        .filter(|v| (1..=2).contains(v))
+        .unwrap_or(0);
+    ROW_SIZING_ARM.store(n, Relaxed);
+    n
 }
 
 /// The measured AUTO band for the row match finder.
@@ -5830,17 +5930,90 @@ pub(crate) fn row_find_enabled() -> bool {
 const ROW_AUTO_MIN: u64 = 512 << 10;
 const ROW_AUTO_MAX: u64 = 2 << 20;
 
+/// ROW POLICY arm: which frames get rows, and in what shape, when the row arm
+/// is AUTO.
+///
+/// * `0` -- the 2026-09-08 band above: 16 slots, table sized to the chain it
+///   replaces, `Lazy`/`Lazy2` only, known source length in 512 KiB..=2 MiB.
+/// * `1` -- libzstd's shape: EVERY `Greedy`/`Lazy`/`Lazy2` frame whose window
+///   log is above 14, whatever its length (so streaming frames too); row
+///   width from the search log (`clamp(search_log, 4, 6)`), table sized from
+///   the hash log, and a full (stride 1) back-fill.
+///
+/// `u32::MAX` = unresolved; `RZSTD_ROW_POLICY` selects, `set_row_policy_arm`
+/// is the bench hook.
+static ROW_POLICY_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+/// The shipped row policy.
+const ROW_POLICY_DEFAULT: u32 = 0;
+
+/// Bench hook for the row policy (see `ROW_POLICY_ARM`).
+pub fn set_row_policy_arm(v: u32) {
+    ROW_POLICY_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn row_policy() -> u32 {
+    use core::sync::atomic::Ordering::Relaxed;
+    let v = ROW_POLICY_ARM.load(Relaxed);
+    if v != u32::MAX {
+        return v;
+    }
+    let n = crate::env_knob_parse::<u32>("RZSTD_ROW_POLICY")
+        .filter(|v| *v <= 1)
+        .unwrap_or(ROW_POLICY_DEFAULT);
+    ROW_POLICY_ARM.store(n, Relaxed);
+    n
+}
+
 #[inline]
 fn row_auto_ok(params: CompressionParameters, src_len: Option<u64>) -> bool {
-    match ROW_ARM.load(core::sync::atomic::Ordering::Relaxed) {
+    match row_arm() {
         1 => false,
         2 => true,
-        _ => {
-            matches!(params.strategy, Strategy::Lazy | Strategy::Lazy2)
-                && matches!(src_len, Some(n) if (ROW_AUTO_MIN..=ROW_AUTO_MAX).contains(&n))
-        }
+        _ => match row_policy() {
+            1 => {
+                matches!(
+                    params.strategy,
+                    Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
+                ) && params.window_log > 14
+            }
+            _ => {
+                matches!(params.strategy, Strategy::Lazy | Strategy::Lazy2)
+                    && matches!(src_len, Some(n) if (ROW_AUTO_MIN..=ROW_AUTO_MAX).contains(&n))
+            }
+        },
     }
 }
+/// The row finder's GEOMETRY for a frame: `(entries_log, row_log)` -- the
+/// table holds `1 << entries_log` positions in rows of `1 << row_log` slots
+/// -- or `None` for the hash chain. The one place that decides both whether
+/// a frame gets rows and what shape they are; `MatchTables::new_sized` is its
+/// only caller, and the finders read the result back off the table.
+#[inline]
+pub(crate) fn row_geometry(
+    params: CompressionParameters,
+    src_len: Option<u64>,
+) -> Option<(u32, u32)> {
+    if !row_auto_ok(params, src_len) {
+        return None;
+    }
+    let wide = row_policy() == 1;
+    let row_log = match row_log_arm() {
+        0 if wide => params
+            .search_log
+            .clamp(crate::rowfind::ROW_LOG_MIN, crate::rowfind::ROW_LOG_MAX),
+        0 => crate::rowfind::ROW_LOG_MIN,
+        forced => forced,
+    };
+    let entries_log = match row_sizing_arm() {
+        2 => params.hash_log,
+        1 => params.chain_log,
+        _ if wide => params.hash_log,
+        _ => params.chain_log,
+    };
+    Some((entries_log.min(24), row_log))
+}
+
 /// WIDE-CHAIN LATCH census: `[events, positions_rescanned]`. The latch does a
 /// full O(window) chain rebuild when it fires; this is what that costs.
 #[cfg(feature = "profile")]

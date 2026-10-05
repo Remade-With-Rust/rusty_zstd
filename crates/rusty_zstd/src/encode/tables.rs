@@ -456,8 +456,10 @@ impl MatchTables {
             // default build allocates nothing and branches once per insert.
             rows: {
                 let mut r = crate::rowfind::RowTable::default();
-                if use_chain && row_auto_ok(params, src_len) {
-                    r.reset(params.chain_log.min(24));
+                if use_chain {
+                    if let Some((entries_log, row_log)) = row_geometry(params, src_len) {
+                        r.reset(entries_log, row_log);
+                    }
                 }
                 r
             },
@@ -538,6 +540,11 @@ impl MatchTables {
         self.ltags.fill(0);
         self.chain.fill(0);
         self.ctags.fill(0);
+        // Rows are frame state like the rest: a slide that re-bases positions
+        // must not leave the old ones behind. A no-op while the table is
+        // unallocated, which was every streaming frame until rows stopped
+        // depending on a known source length.
+        self.rows.clear();
     }
 
     /// Store `pos + 1` so slot 0 stays "empty" (C window index never uses 0).
@@ -1030,7 +1037,7 @@ impl MatchTables {
     /// insert -- silently lost its inline hint. The `unused attribute` warning
     /// on the duplicate was the only signal, and it names the innocent line.
     #[inline(always)]
-    pub(crate) fn lz_insert_rowknown(
+    pub(crate) fn lz_insert_rowknown<const RL: u32>(
         &mut self,
         r: usize,
         at: usize,
@@ -1039,7 +1046,7 @@ impl MatchTables {
         gtag: u8,
     ) {
         debug_assert!(!self.rows.head.is_empty());
-        self.rows.insert_at(r, at, head, ip as u32, gtag);
+        self.rows.insert_at::<RL>(r, at, head, ip as u32, gtag);
     }
 
     /// T2: binary-tree slot read.
