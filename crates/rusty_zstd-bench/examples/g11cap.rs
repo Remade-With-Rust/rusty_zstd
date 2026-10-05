@@ -13,6 +13,8 @@ fn main(){
     for cap in ["4294967295","65536","8192","2048","512"] {
         std::env::set_var("RZSTD_OPT_FILL","1");
         std::env::set_var("RZSTD_OPT_FILL_MAX",cap);
+        // The knob is cached per process now; make the next compress re-read it.
+        rusty_zstd::reset_env_arms();
         let (mut sz,mut pr)=(0i64,0u64); let mut worst=0i64; let mut wc="";
         for (i,(id,s)) in srcs.iter().enumerate() {
             let _=rusty_zstd::take_bt_probe_stats();
@@ -27,4 +29,5 @@ fn main(){
             100.0*(pr as f64-bp as f64)/bp as f64, sz-bs, 100.0*(sz-bs) as f64/bs as f64);
     }
     std::env::remove_var("RZSTD_OPT_FILL"); std::env::remove_var("RZSTD_OPT_FILL_MAX");
+    rusty_zstd::reset_env_arms();
 }

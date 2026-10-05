@@ -7764,6 +7764,11 @@ pub fn reset_env_arms() {
     PAIR_GAIN_ARM.store(u32::MAX, Ordering::Relaxed);
     PAIR_HI_ARM.store(u32::MAX, Ordering::Relaxed);
     BLOCK_KB_ARM.store(0, Ordering::Relaxed);
+    #[cfg(feature = "std")]
+    {
+        OPT_FILL_MAX_C.store(OPT_FILL_MAX_UNRESOLVED, Ordering::Relaxed);
+        OPT_FILL_S_C.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Arm for the `find_dfast` HLOG specialisation, so it can be A/B'd IN-PROCESS
