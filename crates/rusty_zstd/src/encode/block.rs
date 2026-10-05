@@ -1004,15 +1004,20 @@ pub(crate) fn build_coded_pass(
             of_count[ofc as usize] += 1;
             ml_count[(mlc as usize).min(ml_count.len() - 1)] += 1;
             of_max = of_max.max(ofc);
+            // SEQ-2: the three extra-bit fields leave here as ONE word, already
+            // in stream order (LL lowest, then ML, then the offset), with its
+            // total width beside it. Each field is below `1 << width` by
+            // construction -- a length minus its code's base, an offset value
+            // minus its top bit -- so nothing needs masking again downstream.
+            debug_assert!(llx >> llb == 0 && mlx >> mlb == 0 && ofx >> ofc == 0);
+            let lm = u32::from(llb) + u32::from(mlb);
+            let ex = u64::from(llx) | (u64::from(mlx) << llb) | (u64::from(ofx) << lm);
             coded.push(CodedSeq {
+                ex,
+                ex_bits: (lm + u32::from(ofc)) as u8,
                 llc,
                 mlc,
                 ofc,
-                llx,
-                mlx,
-                ofx,
-                llb,
-                mlb,
             });
         }
 
@@ -1228,6 +1233,14 @@ impl SeqBitWriter<'_> {
         self.nbits = self.nbits.wrapping_add(nb);
     }
 
+    /// Append `nb` bits of a value that is ALREADY below `1 << nb` -- the
+    /// merged extra bits, masked where they were computed.
+    #[inline(always)]
+    fn add_raw(&mut self, value: u64, nb: u32) {
+        self.acc |= value.wrapping_shl(self.nbits);
+        self.nbits = self.nbits.wrapping_add(nb);
+    }
+
     /// Store the container, commit its whole bytes, keep the 0..=7 bit tail.
     /// The one bounds test is the price of writing through a safe slice; it
     /// fails only if the caller's size bound was wrong, and then cleanly.
@@ -1242,6 +1255,29 @@ impl SeqBitWriter<'_> {
         self.nbits &= 7;
         Ok(())
     }
+
+    /// SEQ-2, the rare arm: extra bits that do not fit behind this
+    /// sequence's three FSE steps. Flush first; a field wider than 56 bits
+    /// (it can reach 63) then goes in two pieces, low 32 bits first -- the
+    /// stream is LSB-first, so the split is invisible in the bytes.
+    ///
+    /// By VALUE in and out, and out of line: taking `&mut self` here would
+    /// let the writer's address escape into a call inside the hot loop, which
+    /// is exactly what pinned `BitCStream`'s fields to the stack.
+    #[cold]
+    #[inline(never)]
+    fn add_wide(mut self, mut ex: u64, mut ex_bits: u32) -> Result<Self, Error> {
+        self.flush()?;
+        if ex_bits > 56 {
+            self.add_raw(ex & 0xFFFF_FFFF, 32);
+            self.flush()?;
+            ex >>= 32;
+            ex_bits -= 32;
+        }
+        self.add_raw(ex, ex_bits);
+        self.flush()?;
+        Ok(self)
+    }
 }
 
 /// SEQ-1: the FSE bit-writing loop of the sequence section, in its OWN frame.
@@ -1254,16 +1290,17 @@ impl SeqBitWriter<'_> {
 /// tables hoisted to slices (`FseCTable::seq_enc`) and the stream bounded up
 /// front, the loop holds its state in registers and calls nothing.
 ///
-/// THE FLUSH SCHEDULE. A flush leaves at most 7 bits. Per sequence:
-///   7 + three FSE steps (<= 9 bits each, `table_log` <= 9) + LL extra (<= 16)
-///     = 50  -> flush
-///   7 + ML extra (<= 16) + offset extra (<= 31)
-///     = 54  -> flush
-/// so the container never reaches 64 and no add needs a room test. libzstd
-/// (`ZSTD_encodeSequences_body`, 64-bit) flushes once and guards two more
-/// behind sums of the extra-bit widths; two unconditional flushes keep the
-/// loop free of data-dependent branches entirely. Flush points do not change
-/// the bytes -- the stream is the same bits in the same order.
+/// THE FLUSH SCHEDULE (SEQ-2). A flush leaves at most 7 bits, and three FSE
+/// steps add at most 27 (`table_log` <= 9), so the container holds at most 34
+/// bits when the merged extra bits arrive. They are one field of 0..=63 bits:
+///   * `nbits + ex_bits <= 63`, nearly always: one add, one flush;
+///   * otherwise `add_wide`, out of line.
+///
+/// That one test is on the container's ACTUAL fill, so it fires only when the
+/// bits truly do not fit -- libzstd (`ZSTD_encodeSequences_body`, 64-bit)
+/// guards its two mid-sequence flushes on worst-case sums instead. SEQ-1 had
+/// two unconditional flushes and three masked adds here. Flush points do not
+/// change the bytes -- the stream is the same bits in the same order.
 #[inline(never)]
 pub(crate) fn encode_seq_bits(
     coded: &[CodedSeq],
@@ -1289,10 +1326,8 @@ pub(crate) fn encode_seq_bits(
         acc: 0,
         nbits: 0,
     };
-    // 16 + 16 + 31 = 63 bits into an empty container.
-    w.add(u64::from(last.llx), u32::from(last.llb));
-    w.add(u64::from(last.mlx), u32::from(last.mlb));
-    w.add(u64::from(last.ofx), u32::from(last.ofc));
+    // At most 16 + 16 + 31 = 63 bits, into an empty container.
+    w.add_raw(last.ex, u32::from(last.ex_bits));
     w.flush()?;
 
     for c in rest.iter().rev() {
@@ -1305,10 +1340,12 @@ pub(crate) fn encode_seq_bits(
         let (s, nb) = ll.step(ll_s, c.llc as usize);
         w.add(u64::from(ll_s), nb);
         ll_s = s;
-        w.add(u64::from(c.llx), u32::from(c.llb));
-        w.flush()?;
-        w.add(u64::from(c.mlx), u32::from(c.mlb));
-        w.add(u64::from(c.ofx), u32::from(c.ofc));
+        let ex_bits = u32::from(c.ex_bits);
+        if w.nbits + ex_bits > 63 {
+            w = w.add_wide(c.ex, ex_bits)?;
+            continue;
+        }
+        w.add_raw(c.ex, ex_bits);
         w.flush()?;
     }
 
@@ -1513,14 +1550,19 @@ pub(crate) fn select_seq_table<'a>(
     ))
 }
 
+/// One sequence between the coding pass and the bit-writing loop: 16 bytes.
+///
+/// SEQ-2: this was 20 bytes of five fields the writer added one at a time --
+/// `llx`/`llb`, `mlx`/`mlb`, `ofx` -- each add masking its value again and
+/// shifting it into the container. The three are consecutive in the stream,
+/// so they are one field: `ex`, `ex_bits` wide.
 #[derive(Clone, Copy)]
 pub(crate) struct CodedSeq {
+    /// `llx | mlx << llb | ofx << (llb + mlb)`: the extra bits, in stream order.
+    pub(crate) ex: u64,
+    /// `llb + mlb + ofc`: at most 16 + 16 + 31 = 63.
+    pub(crate) ex_bits: u8,
     pub(crate) llc: u8,
     pub(crate) mlc: u8,
     pub(crate) ofc: u8,
-    pub(crate) llx: u32,
-    pub(crate) mlx: u32,
-    pub(crate) ofx: u32,
-    pub(crate) llb: u8,
-    pub(crate) mlb: u8,
 }

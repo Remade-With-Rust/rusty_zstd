@@ -1444,12 +1444,59 @@ fn skip_off_fast_roundtrip_and_on_skips_noise() {
     );
 }
 
-/// SEQ-1 ORACLE: the sequence bit-writing loop exactly as it stood before
-/// `encode_seq_bits` -- the general `BitCStream`, with its per-add room test
-/// and growable buffer, driven through `FseCTable::encode`. Kept as the
-/// reference the fixed-schedule writer must equal bit for bit.
+/// One sequence as the ORACLE codes it: every field separate, the way
+/// `CodedSeq` carried them before SEQ-2 merged the extra bits.
+#[derive(Clone, Copy)]
+struct OracleSeq {
+    llc: u8,
+    mlc: u8,
+    ofc: u8,
+    llx: u32,
+    mlx: u32,
+    ofx: u32,
+    llb: u8,
+    mlb: u8,
+}
+
+/// SEQ ORACLE, coding pass: each sequence through the linear-scan
+/// `code_from_base` and the DECODER's `resolve_offset` for the repcode
+/// history -- neither of which the encoder's pass uses.
+fn seq_codes_oracle(seqs: &[Seq], reps: &mut [u32; 3]) -> Vec<OracleSeq> {
+    use crate::compressed::{code_from_base, LL_BASE, LL_BITS, ML_BASE, ML_BITS};
+    seqs.iter()
+        .map(|s| {
+            let ov = offset_value_for(s.offset, s.litlen, reps);
+            let resolved = resolve_offset(ov, s.litlen, reps).expect("resolve");
+            assert_eq!(resolved, s.offset);
+            let (llc, llx, llb) = code_from_base(s.litlen, &LL_BASE, &LL_BITS);
+            let (mlc, mlx, mlb) = code_from_base(s.matchlen, &ML_BASE, &ML_BITS);
+            let (ofc, ofx) = if ov <= 1 {
+                (0u8, 0u32)
+            } else {
+                let code = 31 - ov.leading_zeros();
+                (code as u8, ov - (1u32 << code))
+            };
+            OracleSeq {
+                llc,
+                mlc,
+                ofc,
+                llx,
+                mlx,
+                ofx,
+                llb,
+                mlb,
+            }
+        })
+        .collect()
+}
+
+/// SEQ ORACLE, bit-writing loop: exactly as it stood before
+/// `encode_seq_bits` -- the general `BitCStream`, with its per-add room test,
+/// its per-add mask and its growable buffer, driven through
+/// `FseCTable::encode`, six adds per sequence. Kept as the reference the
+/// fixed-schedule writer must equal bit for bit.
 fn seq_bits_oracle(
-    coded: &[CodedSeq],
+    coded: &[OracleSeq],
     ll_t: &FseCTable,
     of_t: &FseCTable,
     ml_t: &FseCTable,
@@ -1529,8 +1576,9 @@ fn oracle_seqs(seed: u64, n: usize, shape: u32) -> Vec<Seq> {
     out
 }
 
-/// SEQ-1: `encode_seq_bits` -- unconditional adds, two fixed flushes per
-/// sequence, a slice sized by `seq_stream_bound` -- must produce the oracle's
+/// SEQ-1/SEQ-2: `build_coded_pass` + `encode_seq_bits` -- merged extra bits,
+/// unconditional adds, one flush per sequence, a slice sized by
+/// `seq_stream_bound` -- must produce the oracle's codes and the oracle's
 /// bytes for every table mode (Predefined, RLE, Compressed, Repeat), and the
 /// bound must be enough room every time.
 #[test]
@@ -1539,6 +1587,10 @@ fn seq_bits_match_bitcstream_oracle() {
     let mut tables = MatchTables::new(params);
     let mut blocks = 0u32;
     let mut modes = [0u32; 4];
+    // Non-final sequences wide enough to need the out-of-line arm behind a
+    // full container (more than 63 - 34 bits), and its two-piece split (more
+    // than 56). Both arms were poisoned once to confirm this test reaches them.
+    let (mut wide, mut split) = (0u32, 0u32);
     for shape in 0..3u32 {
         // The previous block's tables, so the Repeat mode is exercised too.
         let mut prev: [Option<FseCTable>; 3] = [None, None, None];
@@ -1550,7 +1602,29 @@ fn seq_bits_match_bitcstream_oracle() {
             let mut reps = [1u32, 4, 8];
             let (coded, ll_count, of_count, ml_count, of_max) =
                 build_coded_pass(&seqs, &mut reps, &mut tables).expect("coded pass");
+            let mut oracle_reps = [1u32, 4, 8];
+            let oracle = seq_codes_oracle(&seqs, &mut oracle_reps);
+            assert_eq!(reps, oracle_reps, "repcode history, shape {shape} n {n}");
+            assert_eq!(coded.len(), oracle.len());
+            for (i, (c, o)) in coded.iter().zip(&oracle).enumerate() {
+                assert_eq!(
+                    (c.llc, c.mlc, c.ofc),
+                    (o.llc, o.mlc, o.ofc),
+                    "codes, shape {shape} n {n} seq {i}"
+                );
+                let lm = u32::from(o.llb) + u32::from(o.mlb);
+                assert_eq!(u32::from(c.ex_bits), lm + u32::from(o.ofc));
+                assert_eq!(
+                    c.ex,
+                    u64::from(o.llx) | u64::from(o.mlx) << o.llb | u64::from(o.ofx) << lm,
+                    "extra bits, shape {shape} n {n} seq {i}"
+                );
+            }
             let last = *coded.last().expect("non-empty");
+            for c in &coded[..coded.len() - 1] {
+                wide += u32::from(c.ex_bits > 29);
+                split += u32::from(c.ex_bits > 56);
+            }
             let use_low = round % 2 == 1;
             let (ll_mode, ll_t, _) = select_seq_table(
                 &ll_count,
@@ -1591,7 +1665,7 @@ fn seq_bits_match_bitcstream_oracle() {
             for m in [ll_mode, of_mode, ml_mode] {
                 modes[m as usize] += 1;
             }
-            let want = seq_bits_oracle(&coded, &ll_t, &of_t, &ml_t);
+            let want = seq_bits_oracle(&oracle, &ll_t, &of_t, &ml_t);
             let need = seq_stream_bound(&ll_count, &of_count, &ml_count, &ll_t, &of_t, &ml_t);
             // Exactly `need` bytes, pre-filled with a non-zero pattern: the
             // writer must neither want more room nor depend on zeroed scratch.
@@ -1616,9 +1690,11 @@ fn seq_bits_match_bitcstream_oracle() {
         }
     }
     assert_eq!(blocks, 30);
-    // The test is only worth its name if every mode actually ran.
+    // The test is only worth its name if every mode actually ran, and if the
+    // rare wide-extras arm and its split both did.
     assert!(
         modes.iter().all(|&m| m > 0),
         "table modes predefined/rle/compressed/repeat = {modes:?}"
     );
+    assert!(wide > 0 && split > 0, "wide {wide} split {split}");
 }
