@@ -31,11 +31,24 @@ pub(crate) struct DictEntropy {
 }
 
 /// A zstd dictionary (raw bytes or trained with entropy tables).
+///
+/// Compressing many inputs against the SAME `Dictionary` (or clones of it) is
+/// the fast path: from the second call on, the match-table state the
+/// dictionary primes is kept with it and reused instead of being rebuilt from
+/// the dictionary bytes on every call -- libzstd's `ZSTD_CDict`, without a
+/// separate type to manage. Build the `Dictionary` once and keep it; a
+/// `Dictionary` rebuilt from the same bytes for every call starts cold every
+/// time. The output is byte-identical either way.
 #[derive(Clone, Debug)]
 pub struct Dictionary {
     id: u32,
     content: Vec<u8>,
     entropy: Option<DictEntropy>,
+    /// The digested (primed) table states, shared by every clone. See
+    /// `encode::DictDigests` for what is kept and its bound. `std` only: it
+    /// needs a lock, and the working tables that mirror it are thread-local.
+    #[cfg(feature = "std")]
+    digests: alloc::sync::Arc<crate::encode::DictDigests>,
 }
 
 impl Dictionary {
@@ -47,20 +60,12 @@ impl Dictionary {
                 return parse_trained(src);
             }
         }
-        Ok(Self {
-            id: 0,
-            content: src.to_vec(),
-            entropy: None,
-        })
+        Ok(Self::with_parts(0, src.to_vec(), None))
     }
 
     /// Raw-content dictionary (no entropy tables, Dictionary_ID 0).
     pub fn raw(content: impl Into<Vec<u8>>) -> Self {
-        Self {
-            id: 0,
-            content: content.into(),
-            entropy: None,
-        }
+        Self::with_parts(0, content.into(), None)
     }
 
     /// Dictionary_ID (0 for raw content).
@@ -82,7 +87,15 @@ impl Dictionary {
             id,
             content,
             entropy,
+            #[cfg(feature = "std")]
+            digests: Default::default(),
         }
+    }
+
+    /// The digest cache this dictionary (and every clone of it) owns.
+    #[cfg(feature = "std")]
+    pub(crate) fn digests(&self) -> &alloc::sync::Arc<crate::encode::DictDigests> {
+        &self.digests
     }
 }
 

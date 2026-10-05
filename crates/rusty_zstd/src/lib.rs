@@ -346,6 +346,9 @@ pub fn xxh64_pub(d: &[u8]) -> u64 {
 
 #[doc(hidden)]
 #[cfg(feature = "profile")]
+pub use encode::take_digest_census;
+#[doc(hidden)]
+#[cfg(feature = "profile")]
 pub use encode::take_ltag_audit;
 #[doc(hidden)]
 #[cfg(feature = "alloc")]

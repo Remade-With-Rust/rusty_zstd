@@ -538,6 +538,16 @@ fn main() {
         }
     }
     b.end_section("B-dict", verbose);
+    // REACH: how many of those dictionary calls the digest actually served.
+    // Counted, because a digest nothing reaches passes this board untouched.
+    #[cfg(feature = "profile")]
+    {
+        let c = rusty_zstd::take_digest_census();
+        println!(
+            "    digest reach: at rest {}  re-seated {}  built {}  first sight {}  not eligible {}",
+            c[0], c[1], c[2], c[3], c[4]
+        );
+    }
     tick("B done");
 
     // ---- C: streaming ------------------------------------------------------

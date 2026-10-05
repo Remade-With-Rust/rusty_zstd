@@ -1443,3 +1443,131 @@ fn skip_off_fast_roundtrip_and_on_skips_noise() {
         "skip-on should dump at least as many raw blocks"
     );
 }
+
+/// Deterministic text-like bytes: words from a small vocabulary, so a
+/// dictionary cut from one stretch is full of matches for another.
+fn wordy(seed: u64, n: usize) -> Vec<u8> {
+    const WORDS: &[&str] = &[
+        "the",
+        "of",
+        "and",
+        "table",
+        "window",
+        "offset",
+        "literal",
+        "match",
+        "sequence",
+        "dictionary",
+        "frame",
+        "block",
+        "entropy",
+        "state",
+        "symbol",
+        "length",
+        "repeat",
+        "hash",
+        "chain",
+        "prime",
+        "digest",
+        "snapshot",
+        "restore",
+        "message",
+        "payload",
+    ];
+    let mut x = seed | 1;
+    let mut out = Vec::with_capacity(n + 16);
+    while out.len() < n {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.extend_from_slice(WORDS[(x % WORDS.len() as u64) as usize].as_bytes());
+        out.push(if x & 0x300 == 0 { b'\n' } else { b' ' });
+        if x & 0x1C00 == 0 {
+            out.extend_from_slice(&(x >> 20).to_le_bytes()[..3]);
+        }
+    }
+    out.truncate(n);
+    out
+}
+
+/// THE DIGESTED DICTIONARY must serve exactly the bytes the per-call priming
+/// path produces. The oracle is free: a `Dictionary` built fresh for one call
+/// is a FIRST SIGHTING, which always takes the legacy path -- so compressing
+/// against a fresh dictionary and against a long-lived one compares the two
+/// drivers directly, in one process, at every level.
+///
+/// Run in a debug build this also drives the digest's own tripwires on every
+/// call: the build-time "priming does not depend on the message" assert and
+/// the post-restore "tables equal the snapshot" assert.
+#[test]
+fn digested_dictionary_serves_the_legacy_bytes() {
+    use crate::{compress_using_dict, compress_using_dict_with, decompress_using_dict, Dictionary};
+    let data = wordy(0xD1C7, 400_000);
+    let dict_a = &data[..24_000];
+    let dict_b = &data[200_000..203_000];
+    let kept_a = Dictionary::raw(dict_a.to_vec());
+    let kept_b = Dictionary::raw(dict_b.to_vec());
+    let clone_a = kept_a.clone();
+    let sizes = [
+        1usize, 7, 8, 9, 40, 300, 1024, 1025, 4096, 9000, 70_000, 140_000,
+    ];
+    for level in [-3, 1, 2, 3, 4, 5, 7, 9, 12, 13, 16, 19] {
+        for (i, &n) in sizes.iter().cycle().take(30).enumerate() {
+            let at = 30_000 + (i * 7919) % 150_000;
+            let msg = &data[at..at + n];
+            // Alternate the two dictionaries and a clone, so the thread's
+            // working set is re-seated as well as reused at rest.
+            let (bytes, kept) = match i % 5 {
+                0 | 1 => (dict_a, &kept_a),
+                2 => (dict_a, &clone_a),
+                _ => (dict_b, &kept_b),
+            };
+            let want = compress_using_dict(msg, &Dictionary::raw(bytes.to_vec()), level).unwrap();
+            let got = compress_using_dict(msg, kept, level).unwrap();
+            assert_eq!(
+                got, want,
+                "L{level} n={n} i={i}: digest and legacy bytes differ"
+            );
+            assert_eq!(decompress_using_dict(&got, kept).unwrap(), msg);
+            // No checksum, no id: the other shape the public entry point takes.
+            let o = CompressOptions {
+                level,
+                checksum: false,
+            };
+            assert_eq!(
+                compress_using_dict_with(msg, kept, o, false).unwrap(),
+                compress_using_dict_with(msg, &Dictionary::raw(bytes.to_vec()), o, false).unwrap(),
+                "L{level} n={n} i={i} (no checksum)"
+            );
+        }
+    }
+}
+
+/// A REUSED table set must start every frame exactly as a fresh one does.
+/// The oracle is a new thread: its pool is empty, so its `compress` builds
+/// every buffer from scratch. The main thread compresses the same message
+/// after frames chosen to leave the dispatch state as far from its defaults
+/// as content can push it (raw runs, RLE, long repeats, other levels).
+#[test]
+fn pooled_tables_start_every_frame_fresh() {
+    let text = wordy(0xF00D, 300_000);
+    let noise = xorshift(0x5EED, 300_000);
+    let zeros = vec![0u8; 200_000];
+    let dirty: [&[u8]; 3] = [&noise, &zeros, &text];
+    for level in [-1, 1, 2, 3, 4, 5, 7, 9, 13, 16, 19] {
+        for (i, n) in [0usize, 1, 9, 100, 1024, 5000, 40_000]
+            .into_iter()
+            .enumerate()
+        {
+            let msg = text[1000 + i * 31..1000 + i * 31 + n].to_vec();
+            let m2 = msg.clone();
+            let fresh = std::thread::spawn(move || compress(&m2, level).unwrap())
+                .join()
+                .unwrap();
+            // Dirty the pool at this level and at a neighbouring one.
+            let _ = compress(dirty[i % 3], level).unwrap();
+            let _ = compress(dirty[(i + 1) % 3], if level > 3 { 1 } else { 5 }).unwrap();
+            assert_eq!(compress(&msg, level).unwrap(), fresh, "L{level} n={n}");
+        }
+    }
+}

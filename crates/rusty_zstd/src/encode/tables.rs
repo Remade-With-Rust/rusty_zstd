@@ -628,23 +628,43 @@ impl MatchTables {
     }
 
     /// `new_sized`, built over the heap buffers of an EARLIER table set.
-    ///
-    /// This is the ONLY constructor body: `new_sized` is this with empty
-    /// buffers. That is what makes reuse byte-identical by construction rather
-    /// than by audit -- every scalar a frame starts from (`rep_yield`, the
-    /// probe countdowns, the latches, `pack_tags`, ...) is written by the
-    /// struct literal below on both paths, so a field added later is reset
-    /// for a reused set exactly as it is initialised for a fresh one. What
-    /// carries over is allocation CAPACITY and nothing else: the three tables
-    /// are zero-filled to this frame's lengths and every scratch buffer is
-    /// emptied (each of their users clears on take anyway; see the `Clone`
-    /// note above).
     pub(crate) fn new_reusing(
         params: CompressionParameters,
         src_len: Option<u64>,
         bufs: TableBufs,
     ) -> Self {
-        let shape = TableShape::of(params, src_len);
+        Self::build(params, TableShape::of(params, src_len), bufs, true)
+    }
+
+    /// The ONLY constructor body: `new_sized` is this with empty buffers.
+    ///
+    /// That is what makes reuse byte-identical by construction rather than by
+    /// audit -- every scalar a frame starts from (`rep_yield`, the probe
+    /// countdowns, the latches, `pack_tags`, ...) is written by the struct
+    /// literal below on every path, so a field added later is reset for a
+    /// reused set exactly as it is initialised for a fresh one. What carries
+    /// over is allocation CAPACITY and nothing else: every scratch buffer is
+    /// emptied (each of their users clears on take anyway; see the `Clone`
+    /// note above), and with `zero` the three tables are zero-filled to this
+    /// frame's lengths.
+    ///
+    /// `zero == false` is the DIGESTED-DICTIONARY path: the caller hands over
+    /// tables that already hold a primed snapshot at exactly `shape`'s
+    /// lengths, and they are taken as they are.
+    pub(crate) fn build(
+        params: CompressionParameters,
+        shape: TableShape,
+        bufs: TableBufs,
+        zero: bool,
+    ) -> Self {
+        let table = |v: Vec<u32>, n: usize| {
+            if zero {
+                zeroed_table(v, n)
+            } else {
+                debug_assert_eq!(v.len(), n);
+                v
+            }
+        };
         let hash_log = shape.hash_log;
         let hsz = shape.hash;
         let csz = shape.chain;
@@ -699,12 +719,12 @@ impl MatchTables {
         Self {
             rep_yield: 1.0,
             hash_log,
-            hash: zeroed_table(bufs.hash, hsz),
+            hash: table(bufs.hash, hsz),
             wcls: (0, 0),
             null_link: 0,
-            hash_long: zeroed_table(bufs.hash_long, shape.long),
+            hash_long: table(bufs.hash_long, shape.long),
             ltags: Vec::new(),
-            chain: zeroed_table(bufs.chain, shape.chain),
+            chain: table(bufs.chain, shape.chain),
             // Sized to the CHAIN it replaces, and only when the arm is on --
             // an empty `head` is what every hot-path site tests, so the
             // default build allocates nothing and branches once per insert.
