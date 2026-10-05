@@ -1318,6 +1318,25 @@ impl SeqBitWriter<'_> {
 /// guards its two mid-sequence flushes on worst-case sums instead. SEQ-1 had
 /// two unconditional flushes and three masked adds here. Flush points do not
 /// change the bytes -- the stream is the same bits in the same order.
+/// Counted on silesia at L1, L3, L9 and L19 (16 MiB caps): the wide arm ran
+/// for under 0.0005% of every file's sequences (the census's resolution),
+/// where a worst-case test (`ex_bits > 29`) would have fired on up to 0.57%
+/// of them (nci at L19), and on 12 of the 56 that x-ray has at L1.
+///
+/// DECLINED, recorded (SEQ-8): copying the block's three tables side by side
+/// (delta 3 x 64, states 3 x 512: 4.6 KiB of heap) so that every table read
+/// is one base register plus a constant. The loop went 94 -> 89 instructions
+/// and its stack reads 13 -> 7, and `EncodeFseSeq` measured 0.919 (0.876 to
+/// 0.946 in all 11 cells, same harness as SEQ-1..7). But the copy costs ~68 ns
+/// per BLOCK -- measured on the cell with one sequence per block, 150 -> 218
+/// ns -- which puts the break-even near 160 sequences per block. The win is
+/// ~0.4 ns/sequence on 128 KiB blocks, under 1% of an encode; the loss lands
+/// on small payloads, where it is several percent. Not taken.
+///
+/// What still reloads from the stack in this loop is nine invariants -- three
+/// delta pointers, three state-table pointers, three state masks -- against
+/// fifteen registers. An `FseCTable` that kept `delta` and `state_table` in
+/// ONE buffer would get the SEQ-8 loop without the copy.
 #[inline(never)]
 pub(crate) fn encode_seq_bits(
     coded: &[CodedSeq],
