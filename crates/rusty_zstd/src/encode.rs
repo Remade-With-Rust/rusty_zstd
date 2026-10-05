@@ -393,8 +393,10 @@ pub(crate) fn encode_oneshot(
     let mut tables = {
         let _t = crate::prof::scope(crate::prof::Stage::EncodeTables);
         // The one-shot path KNOWS the source length, which is what the row
-        // finder's AUTO band is measured against.
-        MatchTables::new_sized(params, Some(src.len() as u64))
+        // finder's AUTO band is measured against. `OneshotTables` is a
+        // `MatchTables` whose buffers come from, and return to, the thread's
+        // bounded pool (see `ONESHOT_POOL_MAX_BYTES`).
+        OneshotTables::new(params, Some(src.len() as u64))
     };
     // T1: DFast's short-table rejection tag, packed into the slot it already
     // loads. Decided against the real buffer length, so the 24-bit bound is
