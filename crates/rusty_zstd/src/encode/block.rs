@@ -959,9 +959,14 @@ pub(crate) fn build_coded_pass(
         coded.resize(seqs.len(), CodedSeq::EMPTY);
         // The code histograms and the of_needs_comp scan were SEPARATE full
         // passes over `coded`; both fold into this loop.
-        let mut ll_count = [0u32; 36];
+        // SEQ-5: the two length histograms are 64 wide in here, indexed by a
+        // code masked to 6 bits -- the identity on every real code (LL has
+        // 36, ML 53), and a range the optimiser can see, where the code as it
+        // comes out of a table is not. The format-sized arrays the callers
+        // want are copied out below.
+        let mut ll_count = [0u32; 64];
         let mut of_count = [0u32; 32];
-        let mut ml_count = [0u32; 53];
+        let mut ml_count = [0u32; 64];
         // SEQ-3: the repcode history lives in three LOCALS for the pass and is
         // written back once. Behind `&mut [u32; 3]` every test of it was a
         // load and every update a store (or, for the rotate, an overlapping
@@ -975,35 +980,36 @@ pub(crate) fn build_coded_pass(
             // `rep_code_step` for why the branches were the cost here).
             let ov =
                 crate::compressed::rep_code_step(s.offset, s.litlen, &mut r0, &mut r1, &mut r2);
-            let (llc, llx, llb) = ll_code(s.litlen, lut_arm);
-            let (mlc, mlx, mlb) = ml_code(s.matchlen, lut_arm);
+            // SEQ-5: each length arrives coded in one word (one load inside
+            // the LUT range): `code | width << 8 | extra << 16`.
+            let le = crate::compressed::ll_enc(s.litlen, lut_arm);
+            let me = crate::compressed::ml_enc(s.matchlen, lut_arm);
+            let (llc, llb, llx) = (le & 63, (le >> 8) & 31, le >> 16);
+            let (mlc, mlb, mlx) = (me & 63, (me >> 8) & 31, me >> 16);
             // At most 31 by construction (a bit index of a `u32`), which the
             // optimiser can see -- the `ofc > 31` error exit this replaced was
             // already folded away.
             let (ofc, ofx) = crate::compressed::of_code_nb(ov);
-            // WIN: the two clamps are NO-OPS and exist only so LLVM can drop a
-            // bounds check, the same idiom as `rtb[(proba as usize).min(7)]` in
-            // `fse::normalize`. `llc` and `mlc` come out of a LUT, so their range
-            // (0..=35 and 0..=52, the lengths of LL_BASE and ML_BASE) is true by
-            // construction but invisible to the optimiser -- unlike `ofc`, a
-            // bit index, which is exactly why only these two lines carried a
-            // guard branch.
-            ll_count[(llc as usize).min(ll_count.len() - 1)] += 1;
+            // The two length codes were clamped here (`.min(len - 1)`, a
+            // compare and a select each) so LLVM could drop a bounds check on
+            // a value out of a LUT; the 6-bit mask above proves the same
+            // thing for nothing. `ofc` is a bit index and needs no help.
+            ll_count[llc as usize] += 1;
             of_count[ofc as usize] += 1;
-            ml_count[(mlc as usize).min(ml_count.len() - 1)] += 1;
+            ml_count[mlc as usize] += 1;
             // SEQ-2: the three extra-bit fields leave here as ONE word, already
             // in stream order (LL lowest, then ML, then the offset), with its
             // total width beside it. Each field is below `1 << width` by
             // construction -- a length minus its code's base, an offset value
             // minus its top bit -- so nothing needs masking again downstream.
             debug_assert!(llx >> llb == 0 && mlx >> mlb == 0 && ofx >> ofc == 0);
-            let lm = u32::from(llb) + u32::from(mlb);
+            let lm = llb + mlb;
             let ex = u64::from(llx) | (u64::from(mlx) << llb) | (u64::from(ofx) << lm);
             *slot = CodedSeq {
                 ex,
                 ex_bits: (lm + ofc) as u8,
-                llc,
-                mlc,
+                llc: llc as u8,
+                mlc: mlc as u8,
                 ofc: ofc as u8,
             };
         }
@@ -1012,8 +1018,12 @@ pub(crate) fn build_coded_pass(
         // running maximum kept in a stack slot -- load, compare, select, store
         // on every sequence -- for a number the pass has by construction.
         let of_max = of_count.iter().rposition(|&c| c != 0).unwrap_or(0) as u8;
+        let mut ll_out = [0u32; 36];
+        ll_out.copy_from_slice(&ll_count[..36]);
+        let mut ml_out = [0u32; 53];
+        ml_out.copy_from_slice(&ml_count[..53]);
 
-        (coded, ll_count, of_count, ml_count, of_max)
+        (coded, ll_out, of_count, ml_out, of_max)
     };
     Ok(out)
 }
