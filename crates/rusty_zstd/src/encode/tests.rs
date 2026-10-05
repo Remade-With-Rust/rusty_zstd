@@ -1697,6 +1697,8 @@ fn seq_bits_match_bitcstream_oracle() {
         "table modes predefined/rle/compressed/repeat = {modes:?}"
     );
     assert!(wide > 0 && split > 0, "wide {wide} split {split}");
+}
+
 /// Deterministic text-like bytes: words from a small vocabulary, so a
 /// dictionary cut from one stretch is full of matches for another.
 fn wordy(seed: u64, n: usize) -> Vec<u8> {
