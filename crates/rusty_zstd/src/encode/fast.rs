@@ -854,6 +854,9 @@ pub(crate) fn find_fast_impl_inner<
     // Local repeat-offset state, mirroring C's `offset_1`/`offset_2`. A repcode
     // match leaves them unchanged; a normal match shifts them.
     let mut rep1 = reps[0] as usize;
+    // PHASE 2 prize probe (profile only): see `Rep2Probe`.
+    #[cfg(feature = "profile")]
+    let mut r2 = Rep2Probe::new(reps);
     // Shift from the table's OWN clamped hash_log -- never from `params`.
     //
     // BRICK 54: when `HLOG` is specialized (non-zero) this folds to a compile-
@@ -1102,6 +1105,8 @@ pub(crate) fn find_fast_impl_inner<
                     });
                     ip = mstart + ml;
                     anchor = ip;
+                    #[cfg(feature = "profile")]
+                    r2.after(&seqs, src, ip, lowest, ilimit, block_end);
                     if ip > ilimit {
                         break;
                     }
@@ -1186,6 +1191,8 @@ pub(crate) fn find_fast_impl_inner<
                     ml,
                 );
                 anchor = ip;
+                #[cfg(feature = "profile")]
+                r2.after(&seqs, src, ip, lowest, ilimit, block_end);
                 // The non-pipelined loop does this after EVERY emitted match;
                 // this loop did not, so `rep1` stayed frozen at its block-entry
                 // value and every `try_rep1` tested a STALE offset for the whole
@@ -1236,6 +1243,8 @@ pub(crate) fn find_fast_impl_inner<
         // the same multiplier: this return was stamped into every one of the
         // 48+8 copies, and its `push_lits_range` was the `memcpy` call the asm
         // attribution kept finding twice per copy.
+        #[cfg(feature = "profile")]
+        r2.flush();
         fast_pipe_epilogue(
             tables, src, &seqs, &mut lits, anchor, block_end, rep, rep_hits, rep_bytes, rep_probes,
             cand, probes, hits, pipe_pos, ff_made, ff_used, hash_v, tags_v,
@@ -1324,6 +1333,8 @@ pub(crate) fn find_fast_impl_inner<
                 });
                 ip = mstart + ml;
                 anchor = ip;
+                #[cfg(feature = "profile")]
+                r2.after(&seqs, src, ip, lowest, ilimit, block_end);
                 continue;
             }
         }
@@ -1356,6 +1367,8 @@ pub(crate) fn find_fast_impl_inner<
                 ml,
             );
             anchor = ip;
+            #[cfg(feature = "profile")]
+            r2.after(&seqs, src, ip, lowest, ilimit, block_end);
             // Same decision as the pipelined loop -- see GATE 8 above. Guarding
             // only ONE loop would make the heuristic a property of which loop
             // ran, which is exactly the byte-identity break this gate exposed.
@@ -1446,6 +1459,8 @@ pub(crate) fn find_fast_impl_inner<
                         ml,
                     );
                     anchor = ip;
+                    #[cfg(feature = "profile")]
+                    r2.after(&seqs, src, ip, lowest, ilimit, block_end);
                     continue;
                 }
             }
@@ -1462,6 +1477,8 @@ pub(crate) fn find_fast_impl_inner<
     // None of it depends on the const generics except rep and COUNT -- rep is
     // now a runtime bool (per block, free), COUNT is a cfg constant the helper
     // shares. Pure code motion: byte-identical by construction.
+    #[cfg(feature = "profile")]
+    r2.flush();
     fast_finder_epilogue(
         tables,
         src,

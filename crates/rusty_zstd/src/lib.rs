@@ -316,6 +316,8 @@ pub use encode::set_dfast_bext_arm;
 #[cfg(feature = "profile")]
 pub use encode::take_dfast_bext;
 #[cfg(feature = "profile")]
+pub use encode::take_rep2_prize;
+#[cfg(feature = "profile")]
 pub use encode::take_walk_exit;
 #[cfg(feature = "profile")]
 pub use encode::take_wide_latch;

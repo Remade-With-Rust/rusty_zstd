@@ -349,6 +349,123 @@ pub(crate) fn dfast_finder_prologue(
     Ok((seqs, lits, gates))
 }
 
+/// PHASE 2 PRIZE PROBE -- the second repcode, measured before it is built.
+/// Profile only; it reads the emitted sequences and the source, and changes
+/// nothing.
+///
+/// C's fast and dfast loops, right after storing a match, test
+/// `read32(ip) == read32(ip - offset_2)` in a loop and emit zero-literal
+/// repcode matches, swapping the two offsets each time. docs/plans/m7-anatomy
+/// 8.6 found `rep2` matched by none of this crate's finders and asked for the
+/// prize first. This counts it: after EVERY sequence a Fast or DFast block
+/// emits, with the exact two-deep offset history the entropy stage will
+/// derive (`offset_value_for`'s rule: a zero-literal match or a new offset
+/// pushes the old first offset down), would C's test fire at the position the
+/// scan resumes at, and how many bytes would the match cover?
+///
+/// `[0]` sequences seen, `[1]` tests that fire, `[2]` bytes those matches
+/// cover, `[3]`/`[4]` further matches and bytes when C's loop is followed
+/// (swap, re-test), `[5]`/`[6]` fires our own parse ALREADY takes -- the next
+/// sequence it emits is a zero-literal match at that same offset -- and the
+/// bytes of overlap. `[1] - [5]` is the new opportunity.
+#[cfg(feature = "profile")]
+pub static REP2_PRIZE: [crate::census64::AtomicU64; 8] =
+    [const { crate::census64::AtomicU64::new(0) }; 8];
+
+/// Read and clear the PHASE 2 prize probe. See `REP2_PRIZE`.
+#[cfg(feature = "profile")]
+pub fn take_rep2_prize() -> [u64; 8] {
+    let mut o = [0u64; 8];
+    for (i, c) in REP2_PRIZE.iter().enumerate() {
+        o[i] = c.swap(0, core::sync::atomic::Ordering::Relaxed);
+    }
+    o
+}
+
+/// One block's side of `REP2_PRIZE`: block-local accumulators, never an atomic
+/// per sequence.
+#[cfg(feature = "profile")]
+pub(crate) struct Rep2Probe {
+    off1: usize,
+    off2: usize,
+    pend_off: usize,
+    pend_n: usize,
+    acc: [u64; 8],
+}
+
+#[cfg(feature = "profile")]
+impl Rep2Probe {
+    pub(crate) fn new(reps: [u32; 3]) -> Self {
+        Self {
+            off1: reps[0] as usize,
+            off2: reps[1] as usize,
+            pend_off: 0,
+            pend_n: 0,
+            acc: [0; 8],
+        }
+    }
+
+    /// Call after every sequence the finder pushes, with the position the scan
+    /// resumes at.
+    pub(crate) fn after(
+        &mut self,
+        seqs: &[Seq],
+        src: &[u8],
+        ip: usize,
+        lowest: usize,
+        ilimit: usize,
+        block_end: usize,
+    ) {
+        let Some(q) = seqs.last() else { return };
+        let o = q.offset as usize;
+        // Did our own parse take the opportunity the last call predicted?
+        if self.pend_off != 0 {
+            if q.litlen == 0 && o == self.pend_off {
+                self.acc[5] += 1;
+                self.acc[6] += self.pend_n.min(q.matchlen as usize) as u64;
+            }
+            self.pend_off = 0;
+        }
+        // The two-deep history after `q`: reps[0] is always the offset just
+        // used; the old reps[0] becomes reps[1] unless `q` was repcode 1 (same
+        // offset WITH literals).
+        if o != self.off1 || q.litlen == 0 {
+            self.off2 = self.off1;
+        }
+        self.off1 = o;
+        self.acc[0] += 1;
+        let (mut a, mut b, mut p) = (self.off1, self.off2, ip);
+        let mut first = true;
+        while p <= ilimit
+            && b != 0
+            && p >= lowest + b
+            && load_u32le(src, p) == load_u32le(src, p - b)
+        {
+            let n = 4 + count_match(src, p - b + 4, p + 4, block_end);
+            if first {
+                self.acc[1] += 1;
+                self.acc[2] += n as u64;
+                self.pend_off = b;
+                self.pend_n = n;
+                first = false;
+            } else {
+                self.acc[3] += 1;
+                self.acc[4] += n as u64;
+            }
+            core::mem::swap(&mut a, &mut b);
+            p += n;
+        }
+    }
+
+    /// Publish this block's counts.
+    pub(crate) fn flush(&mut self) {
+        for (i, v) in self.acc.iter_mut().enumerate() {
+            REP2_PRIZE[i].fetch_add(*v, core::sync::atomic::Ordering::Relaxed);
+            *v = 0;
+        }
+    }
+}
+
 /// `MatchTables::get_h_tag` for a PACKED frame, in the table's own encoding:
 /// the tag-filtered short slot as `pos + 1`, or 0 for "no candidate". Same
 /// load, same filter, same answer -- `get_h_tag(..)` is `None` exactly when
@@ -531,6 +648,8 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
     // makes an immediate shut safe.
     let use_rep = rep_search_on(tables.rep_yield, params.strategy) || tables.rep_probe == 0;
     let mut rep1 = reps[0] as usize;
+    #[cfg(feature = "profile")]
+    let mut r2 = Rep2Probe::new(reps);
     let mut rep_hits = 0u64;
     // W5: hoisted for the back-extension loop -- see its use.
     let fstart_c = tables.frame_start;
@@ -752,6 +871,8 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
                 });
                 ip = mstart + ml;
                 anchor = ip;
+                #[cfg(feature = "profile")]
+                r2.after(&seqs, src, ip, lowest_rep, ilimit, block_end);
                 // W8: see `spec_dropped`.
                 spec_dropped += u64::from(carried.live);
                 carried.live = false;
@@ -1256,6 +1377,8 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
             }
             ip = end;
             anchor = ip;
+            #[cfg(feature = "profile")]
+            r2.after(&seqs, src, ip, lowest_rep, ilimit, block_end);
             // The two fills rewrite many entries, so anything speculated before
             // them is stale.
             spec_dropped += u64::from(carried.live);
@@ -1271,6 +1394,8 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
     let spec_used = spec_made
         .saturating_sub(spec_dropped)
         .saturating_sub(u64::from(carried.live));
+    #[cfg(feature = "profile")]
+    r2.flush();
     #[cfg(feature = "profile")]
     {
         use core::sync::atomic::Ordering::Relaxed;
