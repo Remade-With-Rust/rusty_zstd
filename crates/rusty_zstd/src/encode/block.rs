@@ -968,45 +968,26 @@ pub(crate) fn build_coded_pass(
         // 8-byte move through memory).
         let [mut r0, mut r1, mut r2] = *reps;
         for (s, slot) in seqs.iter().zip(coded.iter_mut()) {
-            let ov = offset_value_for(s.offset, s.litlen, &[r0, r1, r2]);
-            // BRICK 62: advance the repcodes directly instead of calling the
-            // DECODER's `resolve_offset` and discarding its result.
-            //
-            // `resolve_offset` reconstructs the offset from `ov` through a
-            // branchy match plus a `Result` -- but the encoder already HAS that
-            // offset in `s.offset`, and it is provably the same value:
-            //   * `ov > 3`  => `offset_value_for` produced `s.offset + 3`, so
-            //     `ov - 3 == s.offset` (offsets are window-bounded, so the
-            //     `saturating_add(3)` there never saturates);
-            //   * `ov == 3 && litlen == 0` => that arm is only taken when
-            //     `s.offset == reps[0] - 1`, which is what it reconstructs.
-            // The repcode SHUFFLE below is `resolve_offset`'s verbatim.
-            let is_new = ov > 3 || (ov == 3 && s.litlen == 0);
-            if is_new {
-                r2 = r1;
-                r1 = r0;
-                r0 = s.offset;
-            } else {
-                let which = if s.litlen == 0 { ov + 1 } else { ov };
-                match which {
-                    2 => core::mem::swap(&mut r0, &mut r1),
-                    3 => (r0, r1, r2) = (r2, r0, r1),
-                    _ => {}
-                }
-            }
+            // BRICK 62 advanced the repcodes directly instead of calling the
+            // DECODER's `resolve_offset` and discarding its result -- the
+            // encoder already has the offset. SEQ-4 goes one further: the code
+            // and the history move are one branch-free step (see
+            // `rep_code_step` for why the branches were the cost here).
+            let ov =
+                crate::compressed::rep_code_step(s.offset, s.litlen, &mut r0, &mut r1, &mut r2);
             let (llc, llx, llb) = ll_code(s.litlen, lut_arm);
             let (mlc, mlx, mlb) = ml_code(s.matchlen, lut_arm);
-            let (ofc, ofx) = of_code(ov);
-            if ofc > 31 {
-                return Err(Error::Corruption);
-            }
+            // At most 31 by construction (a bit index of a `u32`), which the
+            // optimiser can see -- the `ofc > 31` error exit this replaced was
+            // already folded away.
+            let (ofc, ofx) = crate::compressed::of_code_nb(ov);
             // WIN: the two clamps are NO-OPS and exist only so LLVM can drop a
             // bounds check, the same idiom as `rtb[(proba as usize).min(7)]` in
             // `fse::normalize`. `llc` and `mlc` come out of a LUT, so their range
             // (0..=35 and 0..=52, the lengths of LL_BASE and ML_BASE) is true by
-            // construction but invisible to the optimiser -- unlike `ofc`, which
-            // the explicit `ofc > 31` check above already makes provable, which is
-            // exactly why only these two lines carried a guard branch.
+            // construction but invisible to the optimiser -- unlike `ofc`, a
+            // bit index, which is exactly why only these two lines carried a
+            // guard branch.
             ll_count[(llc as usize).min(ll_count.len() - 1)] += 1;
             of_count[ofc as usize] += 1;
             ml_count[(mlc as usize).min(ml_count.len() - 1)] += 1;
@@ -1020,10 +1001,10 @@ pub(crate) fn build_coded_pass(
             let ex = u64::from(llx) | (u64::from(mlx) << llb) | (u64::from(ofx) << lm);
             *slot = CodedSeq {
                 ex,
-                ex_bits: (lm + u32::from(ofc)) as u8,
+                ex_bits: (lm + ofc) as u8,
                 llc,
                 mlc,
-                ofc,
+                ofc: ofc as u8,
             };
         }
         *reps = [r0, r1, r2];
