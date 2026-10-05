@@ -349,6 +349,42 @@ pub(crate) fn dfast_finder_prologue(
     Ok((seqs, lits, gates))
 }
 
+/// `MatchTables::get_h_tag` for a PACKED frame, in the table's own encoding:
+/// the tag-filtered short slot as `pos + 1`, or 0 for "no candidate". Same
+/// load, same filter, same answer -- `get_h_tag(..)` is `None` exactly when
+/// this is 0 and `Some(this - 1)` otherwise.
+///
+/// No emptiness test is needed: an empty slot is the all-zero word, whose low
+/// 24 bits are already the "none" value, and a written slot's low 24 bits are
+/// `pos + 1 >= 1` (`pack_tags` requires the frame to fit 24 bits).
+#[inline(always)]
+#[allow(unsafe_code)]
+pub(crate) fn dfast_short_slot_packed(tables: &MatchTables, h: usize, tag: u8) -> u32 {
+    debug_assert!(tables.pack_tags);
+    debug_assert!(h < tables.hash.len());
+    // SAFETY: `h` is this table's own hash index (the shift bounds it).
+    let v = *unsafe { tables.hash.get_unchecked(h) };
+    if (v >> 24) as u8 != tag {
+        return 0;
+    }
+    v & 0x00FF_FFFF
+}
+
+/// `MatchTables::get_hl_tag` for a PACKED frame, in the table's own encoding.
+/// See `dfast_short_slot_packed`; `on` gates the compare only, as there.
+#[inline(always)]
+#[allow(unsafe_code)]
+pub(crate) fn dfast_long_slot_packed(tables: &MatchTables, h: usize, tag: u8, on: bool) -> u32 {
+    debug_assert!(tables.pack_tags);
+    debug_assert!(h < tables.hash_long.len());
+    // SAFETY: `h` is this table's own hash index (the shift bounds it).
+    let v = *unsafe { tables.hash_long.get_unchecked(h) };
+    if on && (v >> 24) as u8 != tag {
+        return 0;
+    }
+    v & 0x00FF_FFFF
+}
+
 /// The dfast STRIDE fill (`RZSTD_DFAST_FILL_S`), outlined -- see the call site
 /// in `find_dfast_impl_inner` for why it left the loop. Body is the former
 /// inline loop verbatim: `put_h_tag`/`put_hl_tag` inlined, same representation.
@@ -739,15 +775,75 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
         // `find_dfast_runtime` drifted until Gate 6 silently broke Gate 4's
         // byte-identity: an issue-order change must not be able to become an
         // algorithm change.
-        let (h4, g4, h8, m4, m8) = if carried.live {
+        // V3 (2026-10-04): in the PACKED body the two candidates stay in the
+        // TABLE's encoding (`pos + 1`, 0 for none) from the slot load to the
+        // match test: `c4`/`c8` here, straight into the carry, straight back
+        // out. The `Option<usize>` form made each candidate a flag AND a value
+        // -- the filter built the flag with `setcc`, the carry re-encoded the
+        // pair to `pos + 1`, and the next position decoded it again.
+        //
+        // The tag-array body keeps the `Option` flow it had (`o4`/`o8`), on the
+        // count: with the raw form its registers re-rolled and samba L3
+        // executed 423.8M -> 443.0M match-find instructions. `PACKED` is this
+        // body's const, so each body carries only its own arm.
+        let (h4, g4, h8, c4, c8, o4, o8) = if carried.live {
             carried.live = false;
-            (
-                carried.h4 as usize,
-                carried.g4,
-                carried.h8 as usize,
-                dec(carried.v4),
-                dec(carried.v8),
-            )
+            if PACKED {
+                (
+                    carried.h4 as usize,
+                    carried.g4,
+                    carried.h8 as usize,
+                    carried.v4,
+                    carried.v8,
+                    None,
+                    None,
+                )
+            } else {
+                (
+                    carried.h4 as usize,
+                    carried.g4,
+                    carried.h8 as usize,
+                    0,
+                    0,
+                    dec(carried.v4),
+                    dec(carried.v8),
+                )
+            }
+        } else if PACKED {
+            let (a, ga, b) = dfast_hash_pair(src, ip, dtag_shift, smask, dlong_shift);
+            let c = dfast_short_slot_packed(tables, a, ga);
+            #[cfg(feature = "profile")]
+            if COUNT && dtag_on && tables.raw_fast(a) != 0 {
+                use core::sync::atomic::Ordering::Relaxed;
+                TAG_REJECT_TOTAL.fetch_add(1, Relaxed);
+                if c == 0 {
+                    let mr = (tables.raw_fast(a) as usize) - 1;
+                    if match_ok(src, mr, ip, window, block_start, mlx_c, frame_start_c)
+                        && count_match(src, mr, ip, block_end) >= mls
+                    {
+                        TAG_FALSE_REJECT.fetch_add(1, Relaxed);
+                    }
+                }
+            }
+            let d = dfast_long_slot_packed(tables, b, ga, lt_on);
+            #[cfg(feature = "profile")]
+            if COUNT && lt_on {
+                use core::sync::atomic::Ordering::Relaxed;
+                let raw = tables.raw_hl(b);
+                if raw != 0 {
+                    LTAG_NONEMPTY.fetch_add(1, Relaxed);
+                    if d == 0 {
+                        LTAG_REJECT.fetch_add(1, Relaxed);
+                        let mr = (raw as usize) - 1;
+                        if match_ok(src, mr, ip, window, block_start, mlx_c, frame_start_c)
+                            && count_match(src, mr, ip, block_end) >= mls
+                        {
+                            LTAG_FALSE.fetch_add(1, Relaxed);
+                        }
+                    }
+                }
+            }
+            (a, ga, b, c, d, None, None)
         } else {
             {
                 let (a, ga, b) = dfast_hash_pair(src, ip, dtag_shift, smask, dlong_shift);
@@ -797,9 +893,10 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
                         }
                     }
                 }
-                (a, ga, b, m, ml8)
+                (a, ga, b, 0, 0, m, ml8)
             }
         };
+        let (m4, m8) = if PACKED { (dec(c4), dec(c8)) } else { (o4, o8) };
         tables.put_h_tag(h4, ip, g4, packed, stag_live);
         tables.put_hl_tag(h8, ip, g4, packed, ltag_live);
         // Issue the NEXT position's two loads NOW, so they are in flight while
@@ -831,36 +928,50 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
             let nip = ip + dstep + ((ip - anchor) >> accel);
             if nip <= ilimit {
                 let (a, ga, b) = dfast_hash_pair(src, nip, dtag_shift, smask, dlong_shift);
-                // The hand-forward has to respect the filter: `put_h_tag` just
-                // wrote `g4` at slot `h4`, so a speculation landing on that slot
-                // sees `ip` only when its own tag matches what is now stored.
-                let va = if a == h4 {
-                    if !dtag_on || ga == g4 {
-                        Some(ip)
-                    } else {
-                        None
-                    }
+                let (va, vb) = if PACKED {
+                    // V3: NO hand-forward. The two stores above precede these
+                    // loads in program order, so a speculation landing on a
+                    // slot this position just wrote reads `(ip + 1) | g4 << 24`
+                    // and the filter compares `ga` with that top byte -- which
+                    // is exactly what the forward computed by hand, at two
+                    // compares per position to decide whether to compute it.
+                    (
+                        dfast_short_slot_packed(tables, a, ga),
+                        dfast_long_slot_packed(tables, b, ga, lt_on),
+                    )
                 } else {
-                    tables.get_h_tag(a, ga, dtag_on, packed)
-                };
-                // The long hand-forward mirrors `get_hl_tag`: the store
-                // above wrote tag `g4` at `h8`, so a speculation landing on
-                // that slot sees `ip` only when its own short tag matches.
-                let vb = if b == h8 {
-                    if !lt_on || ga == g4 {
-                        Some(ip)
+                    // The hand-forward has to respect the filter: `put_h_tag` just
+                    // wrote `g4` at slot `h4`, so a speculation landing on that slot
+                    // sees `ip` only when its own tag matches what is now stored.
+                    let va = if a == h4 {
+                        if !dtag_on || ga == g4 {
+                            Some(ip)
+                        } else {
+                            None
+                        }
                     } else {
-                        None
-                    }
-                } else {
-                    tables.get_hl_tag(b, ga, lt_on, packed)
+                        tables.get_h_tag(a, ga, dtag_on, packed)
+                    };
+                    // The long hand-forward mirrors `get_hl_tag`: the store
+                    // above wrote tag `g4` at `h8`, so a speculation landing on
+                    // that slot sees `ip` only when its own short tag matches.
+                    let vb = if b == h8 {
+                        if !lt_on || ga == g4 {
+                            Some(ip)
+                        } else {
+                            None
+                        }
+                    } else {
+                        tables.get_hl_tag(b, ga, lt_on, packed)
+                    };
+                    (enc(va), enc(vb))
                 };
                 spec_made += 1;
                 carried = Carried {
                     h4: a as u32,
                     h8: b as u32,
-                    v4: enc(va),
-                    v8: enc(vb),
+                    v4: va,
+                    v8: vb,
                     g4: ga,
                     live: true,
                 };
@@ -945,7 +1056,11 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
                 } else {
                     0
                 };
-                tables.get_hl_tag(h8b, g8b, lt_on, packed)
+                if PACKED {
+                    dec(dfast_long_slot_packed(tables, h8b, g8b, lt_on))
+                } else {
+                    tables.get_hl_tag(h8b, g8b, lt_on, packed)
+                }
             };
             if let Some(m8b) = m8b_slot {
                 if COUNT {
