@@ -3552,6 +3552,8 @@ pub(crate) struct ChainCtx<'a> {
     /// the callee spilled the bool on entry. Here it is one field of a
     /// context the callee already dereferences.
     walk_cont: bool,
+    /// Row walk: how many positions past `ip` its next-row hint names.
+    row_pf: usize,
 }
 
 type ChainFn = for<'a> fn(&ChainCtx<'a>, usize, &mut MatchTables) -> (usize, usize);
@@ -3591,6 +3593,7 @@ fn row_find_best<const MLS: usize, const RL: u32>(
         hash_shift32,
         hash_shift64,
         lowest1,
+        row_pf,
         ..
     } = *ctx;
     // W23: `hash_log` is gone from this destructure -- W20/W22 handed the two
@@ -3696,17 +3699,17 @@ fn row_find_best<const MLS: usize, const RL: u32>(
     // Phase 2 -- INSERT. Every candidate is already in hand, so the row can
     // take `ip` now and the row's slot state is dead from here.
     tables.lz_insert_rowknown::<RL>(r, rat, rhead, ip, gtag);
-    if ip + 9 <= src_len {
+    if ip + row_pf + 8 <= src_len {
         // The NEXT search is at `ip + 1` far more often than anywhere else
         // (the no-match step is 1 until a literal run is long, and the lazy
         // look-ahead probes `ip + 1` after a hit). Its row is a random line
-        // in a multi-megabyte table: name it now, one search early.
+        // in a multi-megabyte table: name it now, `row_pf` searches early.
         let (h1, _) = if hash_mode & 2 != 0 {
-            (hash8_shift(src, ip + 1, hash_shift64), 0u8)
+            (hash8_shift(src, ip + row_pf, hash_shift64), 0u8)
         } else if hash_mode & 1 != 0 {
-            hash_wide_link_tag_b(src, ip + 1, hash_shift64, smask, mls)
+            hash_wide_link_tag_b(src, ip + row_pf, hash_shift64, smask, mls)
         } else {
-            hash4_link_tag_w(src, ip + 1, hash_shift32, mls)
+            hash4_link_tag_w(src, ip + row_pf, hash_shift32, mls)
         };
         tables.rows.prefetch_row::<RL>(h1);
     }
@@ -4185,6 +4188,350 @@ fn chain_find_best_inner<const MLS: usize, const CP: bool, const CA: bool, const
     (best_m, best_ml)
 }
 
+/// libzstd `kLazySkippingStep`: once the no-match step passes this, the parse
+/// stops inserting the positions it jumps over.
+const ROW_LAZY_SKIP_STEP: usize = 8;
+
+/// `ZSTD_highbit32` of a value the caller knows is nonzero.
+#[inline(always)]
+fn hb32(x: usize) -> i32 {
+    debug_assert!(x != 0 && x <= u32::MAX as usize);
+    31 - (x as u32).leading_zeros() as i32
+}
+
+/// libzstd's `offBase` price term for the match in hand: `off == 0` is
+/// repcode 1 (`offBase` 1, zero bits), anything else `offset + 3`.
+#[inline(always)]
+fn hb_offbase(off: usize) -> i32 {
+    if off == 0 {
+        0
+    } else {
+        hb32(off + 3)
+    }
+}
+
+/// Bring the row table up to (not including) `to`: libzstd's
+/// `ZSTD_row_update_internal`, long-match skip rule included.
+#[inline(always)]
+fn row_catch_up<const RL: u32>(
+    rows: &mut crate::rowfind::RowTable,
+    src: &[u8],
+    from: usize,
+    to: usize,
+    fc: &FillCtx,
+) {
+    debug_assert!(from < to);
+    if to - from > ROW_SKIP_GAP {
+        row_fill_range::<RL>(rows, src, from, from + ROW_SKIP_HEAD, fc);
+        row_fill_range::<RL>(rows, src, to - ROW_SKIP_TAIL, to, fc);
+    } else {
+        row_fill_range::<RL>(rows, src, from, to, fc);
+    }
+}
+
+/// The lazy parse of a ROW frame: libzstd's `ZSTD_compressBlock_lazy_generic`
+/// for a prefix-only window, statement for statement (`depth` 0 = greedy,
+/// 1 = lazy, 2 = lazy2). See `ROW_PARSE_ARM` for what that changes against
+/// `find_lazy_impl`.
+///
+/// The row table is keyed on the `mls`-byte gram for the whole frame (the
+/// caller checks `chain_wide`), so this function owns its hash: there is no
+/// latch, no walk-continue and no chain state in here at all.
+///
+/// REPCODES. `offset_1` / `offset_2` are the two newest entries of the
+/// format's offset history, tracked exactly: the block encoder turns any
+/// offset equal to a history entry into its repcode, so an offset the search
+/// happens to find at `offset_1` after literals leaves the history alone,
+/// and the update below says so. (libzstd pushes it; its encoder writes that
+/// case as a raw offset.)
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn find_lazy_rows<const RL: u32>(
+    src: &[u8],
+    block_start: usize,
+    block_end: usize,
+    window: usize,
+    params: CompressionParameters,
+    tables: &mut MatchTables,
+    depth: usize,
+    reps: [u32; 3],
+) -> (Vec<Seq>, Vec<u8>) {
+    debug_assert_eq!(RL, tables.rows.row_log());
+    debug_assert!(tables.chain_wide);
+    let mls = params.min_match.clamp(3, 7) as usize;
+    let attempts = search_attempts(params);
+    let (mut seqs, mut lits) = match chain_finder_prologue(src, block_start, block_end, tables, mls)
+    {
+        Ok(t) => t,
+        Err(out) => return out,
+    };
+    // The prologue returned unless `block_start < block_end - 8`.
+    let ilimit = block_end - 8;
+    let prefix_lowest = block_start.saturating_sub(window).max(tables.frame_start);
+    let smask = (1u64 << (8 * mls)) - 1;
+    let hash_log = tables.hash_log;
+    let shift32 = 32u32.saturating_sub(hash_log.min(32));
+    let shift64 = 64u32.saturating_sub(hash_log.min(32));
+    let chain_mask = tables.chain.len().wrapping_sub(1);
+    let row_pf = row_pf_ahead();
+    let ctx = ChainCtx {
+        src,
+        block_start,
+        block_end,
+        window,
+        mls,
+        attempts,
+        hash_log,
+        chain_mask,
+        smask,
+        cp: false,
+        ca: false,
+        wchain: true,
+        wide_hash: false,
+        hash_mode: 1,
+        hash_shift32: shift32,
+        hash_shift64: shift64,
+        lowest1: prefix_lowest.max(1),
+        lowest: prefix_lowest,
+        lowest_w: prefix_lowest + window,
+        rows_live: true,
+        tag_filter: false,
+        walk_cont: false,
+        row_pf,
+    };
+    let fc = FillCtx {
+        stride: 1,
+        shift32,
+        shift64,
+        smask,
+        mls,
+        chain_mask,
+        wide_h: false,
+        wchain: true,
+        cp: false,
+        ca: false,
+    };
+    let lp_copy = lit_width_for(tables);
+    let accel_sh = lazy_step_shift(lazy_accel());
+    // C: `ip += (dictAndPrefixLength == 0)` -- with no history at all the
+    // first position cannot match anything.
+    let mut ip = block_start + usize::from(block_start == prefix_lowest);
+    let mut anchor = block_start;
+    let mut offset_1 = reps[0] as usize;
+    let mut offset_2 = reps[1] as usize;
+    {
+        // C parks an offset that reaches below the prefix for the block.
+        let max_rep = ip - prefix_lowest;
+        if offset_1 > max_rep {
+            offset_1 = 0;
+        }
+        if offset_2 > max_rep {
+            offset_2 = 0;
+        }
+    }
+    // `nextToUpdate`: the first position not yet in the table. It carries
+    // over from the previous block (whose tail was never searched); anything
+    // else -- a fresh table, a reset, a position below the window -- starts
+    // it at this block.
+    let mut ntu = tables.row_ntu;
+    if ntu > block_start {
+        ntu = block_start;
+    }
+    if ntu < prefix_lowest {
+        ntu = prefix_lowest;
+    }
+    let mut lazy_skipping = false;
+    let mut searches = 0u64;
+    let mut rep_hits = 0u64;
+    let rep_skip = row_rep_skip();
+    let rep_take = row_rep_take();
+    let nice = row_nice();
+    // One search: catch the table up to `p`, then probe (which inserts `p`).
+    macro_rules! search {
+        ($p:expr) => {{
+            let p: usize = $p;
+            debug_assert!(p <= ilimit);
+            if ntu < p && !lazy_skipping {
+                row_catch_up::<RL>(&mut tables.rows, src, ntu, p, &fc);
+            }
+            ntu = p + 1;
+            searches += 1;
+            row_find_best::<0, RL>(&ctx, p, tables)
+        }};
+    }
+    'outer: while ip <= ilimit {
+        let mut ml = 0usize;
+        // 0 = the match in hand is repcode 1.
+        let mut off = 0usize;
+        let mut start = ip + 1;
+        'pick: {
+            // Repcode 1 at `ip + 1`.
+            if offset_1 != 0 {
+                if let Some(l) = rep1_len_w(src, ip + 1, ip + 1 - offset_1, block_end, ip < ilimit)
+                {
+                    ml = l;
+                    if depth == 0 || l >= rep_take {
+                        break 'pick;
+                    }
+                }
+            }
+            // First search.
+            {
+                let (m, ml2) = search!(ip);
+                if ml2 > ml {
+                    ml = ml2;
+                    start = ip;
+                    off = ip - m;
+                }
+            }
+            if ml == 0 {
+                // C: "jump faster over incompressible sections".
+                let step = ((ip - anchor) >> accel_sh) + 1;
+                ip += step;
+                lazy_skipping = step > ROW_LAZY_SKIP_STEP;
+                continue 'outer;
+            }
+            // Look for something better one and two positions on.
+            if depth >= 1 && ml < nice {
+                while ip < ilimit {
+                    ip += 1;
+                    if offset_1 != 0 {
+                        if let Some(mr) = rep1_len_w(src, ip, ip - offset_1, block_end, true) {
+                            let gain2 = (mr * 3) as i32;
+                            let gain1 = (ml * 3) as i32 - hb_offbase(off) + 1;
+                            if gain2 > gain1 {
+                                ml = mr;
+                                off = 0;
+                                start = ip;
+                            }
+                        }
+                    }
+                    {
+                        let (m, ml2) = search!(ip);
+                        if ml2 != 0 {
+                            let gain2 = (ml2 * 4) as i32 - hb32(ip - m + 3);
+                            let gain1 = (ml * 4) as i32 - hb_offbase(off) + 4;
+                            if gain2 > gain1 {
+                                ml = ml2;
+                                off = ip - m;
+                                start = ip;
+                                continue;
+                            }
+                        }
+                    }
+                    if depth == 2 && ip < ilimit {
+                        ip += 1;
+                        if offset_1 != 0 {
+                            if let Some(mr) = rep1_len_w(src, ip, ip - offset_1, block_end, true) {
+                                let gain2 = (mr * 4) as i32;
+                                let gain1 = (ml * 4) as i32 - hb_offbase(off) + 1;
+                                if gain2 > gain1 {
+                                    ml = mr;
+                                    off = 0;
+                                    start = ip;
+                                }
+                            }
+                        }
+                        let (m, ml2) = search!(ip);
+                        if ml2 != 0 {
+                            let gain2 = (ml2 * 4) as i32 - hb32(ip - m + 3);
+                            let gain1 = (ml * 4) as i32 - hb_offbase(off) + 7;
+                            if gain2 > gain1 {
+                                ml = ml2;
+                                off = ip - m;
+                                start = ip;
+                                continue;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        debug_assert!(ml >= mls.min(4) && start + ml <= block_end);
+        // The match is chosen, so the next search position is known. Its row
+        // is a random line in a table far larger than the cache: name it now
+        // and let the emit below be its lead time. A pure hint.
+        {
+            // The walk's own hint runs `row_pf` positions ahead, so a jump
+            // leaves the first `row_pf` rows after it unnamed: name them all.
+            let mut nx = start + ml;
+            let nx_end = nx + row_pf;
+            while nx < nx_end && nx <= ilimit {
+                let h1 = hash_wide_link_tag_b(src, nx, shift64, smask, mls).0;
+                tables.rows.prefetch_row::<RL>(h1);
+                nx += 1;
+            }
+        }
+        let emit_off = if off != 0 {
+            // C's "catch up": extend the match backwards over the literals.
+            while start > anchor && start - off > prefix_lowest && back_eq(src, start, start - off)
+            {
+                start -= 1;
+                ml += 1;
+            }
+            // See REPCODES above: after literals, an offset equal to
+            // `offset_1` is written as repcode 1 and moves nothing.
+            if start == anchor || off != offset_1 {
+                offset_2 = offset_1;
+                offset_1 = off;
+            }
+            off
+        } else {
+            rep_hits += 1;
+            offset_1
+        };
+        push_literals(&mut lits, src, anchor, start, lp_copy);
+        seqs.push(Seq {
+            litlen: (start - anchor) as u32,
+            matchlen: ml as u32,
+            offset: emit_off as u32,
+        });
+        ip = start + ml;
+        anchor = ip;
+        lazy_skipping = false;
+        if rep_skip && off == 0 {
+            ntu = ip;
+        }
+        // Repcode 2 straight after a match, no literals: it becomes repcode 1.
+        while ip <= ilimit && offset_2 != 0 {
+            let Some(l) = rep1_len_w(src, ip, ip - offset_2, block_end, true) else {
+                break;
+            };
+            core::mem::swap(&mut offset_1, &mut offset_2);
+            rep_hits += 1;
+            seqs.push(Seq {
+                litlen: 0,
+                matchlen: l as u32,
+                offset: offset_1 as u32,
+            });
+            ip += l;
+            anchor = ip;
+            if rep_skip {
+                ntu = ip;
+            }
+        }
+    }
+    tables.row_ntu = ntu;
+    greedy_finder_epilogue(
+        tables,
+        src,
+        &seqs,
+        &mut lits,
+        anchor,
+        block_start,
+        block_end,
+        rep_hits,
+        false,
+        (0, 0),
+        attempts,
+        searches,
+        0,
+        seqs.len() as u64,
+    );
+    (seqs, lits)
+}
+
 /// Split out for register allocation -- see brick 48 on `find_fast_impl`.
 #[inline(never)]
 fn find_lazy(
@@ -4203,6 +4550,27 @@ fn find_lazy(
     // HLOG and (hash_log, chain_log) specialisations on exactly the argument
     // that `shr %cl` and `shrx` are both one uop on every CPU that HAS BMI2,
     // and those were per-position paths too. Consistency, not a new judgement.
+    if tables.chain_wide && row_find_enabled() && !tables.rows.head.is_empty() && row_parse_c() {
+        macro_rules! go {
+            ($rl:literal) => {
+                find_lazy_rows::<$rl>(
+                    src,
+                    block_start,
+                    block_end,
+                    window,
+                    params,
+                    tables,
+                    depth,
+                    reps,
+                )
+            };
+        }
+        return match tables.rows.row_log() {
+            6 => go!(6),
+            5 => go!(5),
+            _ => go!(4),
+        };
+    }
     find_lazy_sel(
         src,
         block_start,
@@ -4549,6 +4917,7 @@ fn find_lazy_impl<const MLS: usize, const KIND: u8>(
         rows_live: !tables.rows.head.is_empty(),
         tag_filter: cp || ca,
         walk_cont,
+        row_pf: 1,
     };
     // GATE 13, which this finder never received. Every other finder resolves
     // the literal-copy width once per block and emits through `push_literals`;
@@ -4687,6 +5056,28 @@ fn find_lazy_impl<const MLS: usize, const KIND: u8>(
             // and the look-ahead never lowers it. BRICK 37 (P1) folded the emit
             // into the guard above on exactly that identity.
             debug_assert!(best_ml >= mls);
+            // The match is chosen, so the NEXT search position is known:
+            // `best_ip + best_ml`. Its row is a random line in a table far
+            // larger than the cache and nothing has named it -- the walk's
+            // own next-row hint covers `ip + 1`, which is right after a miss
+            // and inside the look-ahead and wrong after every match. Name it
+            // now: the back-extension, the literal copy and the fill below
+            // are its lead time. A pure hint; output cannot change.
+            if KIND == 7 && use_rows {
+                let nx = best_ip + best_ml;
+                if nx <= ilimit {
+                    let h1 = if wchain {
+                        hash_wide_link_tag_b(src, nx, chain_ctx.hash_shift64, smask, mls).0
+                    } else {
+                        hash4_link_tag_w(src, nx, chain_ctx.hash_shift32, mls).0
+                    };
+                    match tables.rows.row_log() {
+                        6 => tables.rows.prefetch_row::<6>(h1),
+                        5 => tables.rows.prefetch_row::<5>(h1),
+                        _ => tables.rows.prefetch_row::<4>(h1),
+                    }
+                }
+            }
             // DEFECT B3 FIX: back-extend the match -- see `find_greedy`.
             let mut s = best_ip;
             let mut mm = best_m;
@@ -5976,6 +6367,153 @@ fn row_wide_start() -> bool {
         .unwrap_or(ROW_WIDE_DEFAULT);
     ROW_WIDE_ARM.store(n, Relaxed);
     n == 1
+}
+
+/// ROW PARSE arm: 1 = a row frame started on the wide key runs libzstd's own
+/// lazy parse (`find_lazy_rows`) instead of the chain ladder's
+/// (`find_lazy_impl` with the row walk behind its pointer). The two differ in
+/// four places, all of them libzstd's:
+///   * a repcode-1 hit at `ip + 1` is a CANDIDATE for the look-ahead, not an
+///     immediate emit (depth >= 1);
+///   * the look-ahead SLIDES -- a better match at `ip + 1` restarts it there
+///     -- and prices a later match by `4*ml - log2(offset)` with the +4 / +7
+///     handicaps, plus a repcode probe at each look-ahead position;
+///   * after every match, repcode 2 is tried at once with no literals;
+///   * the table is brought up to date LAZILY, at the next search
+///     (`nextToUpdate`), under the long-match skip rule.
+///
+/// `u32::MAX` = unresolved; `RZSTD_ROW_PARSE`.
+static ROW_PARSE_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+/// The shipped row parse.
+const ROW_PARSE_DEFAULT: u32 = 0;
+
+/// Bench hook for the row parse (see `ROW_PARSE_ARM`).
+pub fn set_row_parse_arm(v: u32) {
+    ROW_PARSE_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn row_parse_c() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let v = ROW_PARSE_ARM.load(Relaxed);
+    if v != u32::MAX {
+        return v == 1;
+    }
+    let n = crate::env_knob_parse::<u32>("RZSTD_ROW_PARSE")
+        .filter(|v| *v <= 1)
+        .unwrap_or(ROW_PARSE_DEFAULT);
+    ROW_PARSE_ARM.store(n, Relaxed);
+    n == 1
+}
+
+/// ROW REP-FILL arm: 1 = `find_lazy_rows` does NOT insert the positions a
+/// REPCODE match covers (libzstd inserts every position the parse passes).
+/// `u32::MAX` = unresolved; `RZSTD_ROW_REPSKIP`.
+static ROW_REPSKIP_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+/// The shipped rep-fill rule.
+const ROW_REPSKIP_DEFAULT: u32 = 0;
+
+/// Bench hook for the rep-fill rule (see `ROW_REPSKIP_ARM`).
+pub fn set_row_repskip_arm(v: u32) {
+    ROW_REPSKIP_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn row_rep_skip() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let v = ROW_REPSKIP_ARM.load(Relaxed);
+    if v != u32::MAX {
+        return v == 1;
+    }
+    let n = crate::env_knob_parse::<u32>("RZSTD_ROW_REPSKIP")
+        .filter(|v| *v <= 1)
+        .unwrap_or(ROW_REPSKIP_DEFAULT);
+    ROW_REPSKIP_ARM.store(n, Relaxed);
+    n == 1
+}
+
+/// ROW REP-TAKE arm: a repcode-1 hit at `ip + 1` at least this long is
+/// emitted at once, without the search at `ip` or the look-ahead (libzstd
+/// does both whatever the length). 0 = never. `u32::MAX` = unresolved;
+/// `RZSTD_ROW_REPTAKE`.
+static ROW_REPTAKE_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+/// The shipped rep-take length.
+const ROW_REPTAKE_DEFAULT: u32 = 0;
+
+/// Bench hook for the rep-take length (see `ROW_REPTAKE_ARM`).
+pub fn set_row_reptake_arm(v: u32) {
+    ROW_REPTAKE_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn row_rep_take() -> usize {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut v = ROW_REPTAKE_ARM.load(Relaxed);
+    if v == u32::MAX {
+        v = crate::env_knob_parse::<u32>("RZSTD_ROW_REPTAKE")
+            .filter(|v| *v < u32::MAX)
+            .unwrap_or(ROW_REPTAKE_DEFAULT);
+        ROW_REPTAKE_ARM.store(v, Relaxed);
+    }
+    if v == 0 {
+        usize::MAX
+    } else {
+        v as usize
+    }
+}
+
+/// ROW NICE-LENGTH arm: a first-search match at least this long skips the
+/// look-ahead (libzstd's lazy parse always looks). 0 = never. `u32::MAX` =
+/// unresolved; `RZSTD_ROW_NICE`.
+static ROW_NICE_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+/// The shipped nice length.
+const ROW_NICE_DEFAULT: u32 = 0;
+
+/// Bench hook for the nice length (see `ROW_NICE_ARM`).
+pub fn set_row_nice_arm(v: u32) {
+    ROW_NICE_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn row_nice() -> usize {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut v = ROW_NICE_ARM.load(Relaxed);
+    if v == u32::MAX {
+        v = crate::env_knob_parse::<u32>("RZSTD_ROW_NICE")
+            .filter(|v| *v < u32::MAX)
+            .unwrap_or(ROW_NICE_DEFAULT);
+        ROW_NICE_ARM.store(v, Relaxed);
+    }
+    if v == 0 {
+        usize::MAX
+    } else {
+        v as usize
+    }
+}
+
+/// ROW HINT DISTANCE arm: how many positions ahead of the one being searched
+/// `find_lazy_rows` names a row (libzstd's hash cache runs 8 ahead).
+/// `u32::MAX` = unresolved; `RZSTD_ROW_PF`, 1..=16.
+static ROW_PF_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+/// The shipped hint distance.
+const ROW_PF_DEFAULT: u32 = 1;
+
+/// Bench hook for the row hint distance (see `ROW_PF_ARM`).
+pub fn set_row_pf_arm(v: u32) {
+    ROW_PF_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn row_pf_ahead() -> usize {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut v = ROW_PF_ARM.load(Relaxed);
+    if v == u32::MAX {
+        v = crate::env_knob_parse::<u32>("RZSTD_ROW_PF").unwrap_or(ROW_PF_DEFAULT);
+        ROW_PF_ARM.store(v, Relaxed);
+    }
+    v.clamp(1, 16) as usize
 }
 
 /// ROW FILL SKIP arm: 1 = a match longer than `ROW_SKIP_GAP` inserts only its

@@ -107,6 +107,10 @@ pub(crate) struct MatchTables {
     pub(crate) bits_scratch: Vec<u8>,
     /// See `set_wide_chain_arm`.
     pub(crate) chain_wide: bool,
+    /// Row frames under `find_lazy_rows`: the first position not yet inserted
+    /// into the row table -- libzstd's `nextToUpdate`. `usize::MAX` = no
+    /// carry (fresh or reset table); the parser then starts at its block.
+    pub(crate) row_ntu: usize,
     /// Blocks whose finder has actually RUN and written back its signals.
     ///
     /// GATE 1 @ L1 needs this because `rep_yield` starts OPTIMISTIC at 1.0 so
@@ -344,6 +348,7 @@ impl Clone for MatchTables {
             coded_scratch: Vec::new(),
             bits_scratch: Vec::new(),
             chain_wide: self.chain_wide,
+            row_ntu: usize::MAX,
             blocks_done: self.blocks_done,
             seq_scratch: Vec::new(),
             lit_scratch: Vec::new(),
@@ -442,7 +447,7 @@ impl MatchTables {
         // construction. It pays where tables are built often rather than once:
         // per-entry CRDT blobs (a table set per small payload) and streaming,
         // where `reset()` memsets the whole set on every window slide.
-        Self {
+        let mut t = Self {
             rep_yield: 1.0,
             hash_log,
             hash: vec![0; hsz],
@@ -481,6 +486,7 @@ impl MatchTables {
             chain_pack: false,
             ctags: Vec::new(),
             chain_wide: false,
+            row_ntu: usize::MAX,
             coded_scratch: Vec::new(),
             bits_scratch: Vec::new(),
             blocks_done: 0,
@@ -521,7 +527,12 @@ impl MatchTables {
             pack_tags: false,
             fast_hash_legacy: false,
             tag_yield: 1.0,
-        }
+        };
+        // A row frame's key is a FRAME constant, so it is decided where the
+        // rows are: every construction path (one-shot, streaming, priming)
+        // then agrees on it without each having to remember to.
+        t.chain_wide = !t.rows.head.is_empty() && row_wide_start();
+        t
     }
 
     pub(crate) fn reset(&mut self) {
@@ -545,6 +556,7 @@ impl MatchTables {
         // unallocated, which was every streaming frame until rows stopped
         // depending on a known source length.
         self.rows.clear();
+        self.row_ntu = usize::MAX;
     }
 
     /// Store `pos + 1` so slot 0 stays "empty" (C window index never uses 0).
