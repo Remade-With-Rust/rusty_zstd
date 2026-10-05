@@ -1388,6 +1388,21 @@ pub(crate) fn ncount_seq_table(
     max_log: u8,
     use_low_prob: bool,
 ) -> Result<(Vec<u8>, FseCTable), Error> {
+    let (hdr, norm, table_log) = ncount_seq_norm(counts, last_sym, max_log, use_low_prob)?;
+    let ct = FseCTable::from_norm(&norm, table_log)?;
+    fse::give_norm_buf(norm);
+    Ok((hdr, ct))
+}
+
+/// SEQ-7: `ncount_seq_table` up to, but not including, the table build -- the
+/// NCount header, the normalised counts and their log. See `select_seq_table`.
+#[inline(always)]
+pub(crate) fn ncount_seq_norm(
+    counts: &[u32],
+    last_sym: usize,
+    max_log: u8,
+    use_low_prob: bool,
+) -> Result<(Vec<u8>, Vec<i16>, u8), Error> {
     // libzstd ZSTD_buildCTable: last sequence is FSE_initCState2 only, so drop
     // it from the normalized counts when it still leaves a usable distribution.
     //
@@ -1405,7 +1420,7 @@ pub(crate) fn ncount_seq_table(
         if last_sym < n && buf[last_sym] > 1 {
             buf[last_sym] -= 1;
         }
-        return fse::ncount_and_ctable(&buf[..n], max_log, use_low_prob);
+        return fse::ncount_and_norm(&buf[..n], max_log, use_low_prob);
     }
     // Not reachable for the three sequence tables; kept so a future caller with
     // a wider alphabet cannot silently truncate.
@@ -1413,7 +1428,7 @@ pub(crate) fn ncount_seq_table(
     if last_sym < buf.len() && buf[last_sym] > 1 {
         buf[last_sym] -= 1;
     }
-    fse::ncount_and_ctable(&buf, max_log, use_low_prob)
+    fse::ncount_and_norm(&buf, max_log, use_low_prob)
 }
 
 /// ALLOC-5 (N11): a seq table that may be BORROWED.
@@ -1517,9 +1532,27 @@ pub(crate) fn select_seq_table<'a>(
     }
 
     if total >= 8 {
-        if let Ok((hdr, ct)) = ncount_seq_table(counts, last_sym, max_log, use_low_prob) {
-            let c = ct.bit_cost(counts) + (hdr.len() as u64) * 8;
-            if c < best_cost || force_compressed {
+        // SEQ-7: PRICE the Compressed candidate before BUILDING it.
+        //
+        // This built the whole `FseCTable` -- symbol spread, state table,
+        // delta table, two pool round trips -- only to ask it `bit_cost`, and
+        // then dropped it whenever Repeat or Predefined had already won:
+        // 14-61% of calls on silesia at L1-L9, by file. The price needs only
+        // the normalised counts (`fse::norm_bit_cost` is `bit_cost` read off
+        // them, and a test holds the two equal), so the build now happens for
+        // the winner alone. The decision and its inputs are unchanged.
+        if let Ok((hdr, norm, table_log)) = ncount_seq_norm(counts, last_sym, max_log, use_low_prob)
+        {
+            let c = fse::norm_bit_cost(&norm, table_log, counts) + (hdr.len() as u64) * 8;
+            // A candidate whose build fails was never a candidate -- the same
+            // outcome as when the build came first.
+            let built = if c < best_cost || force_compressed {
+                FseCTable::from_norm(&norm, table_log).ok()
+            } else {
+                None
+            };
+            fse::give_norm_buf(norm);
+            if let Some(ct) = built {
                 best_mode = 2;
                 best_table = Some(SeqTable::Own(ct));
                 best_hdr = hdr;
