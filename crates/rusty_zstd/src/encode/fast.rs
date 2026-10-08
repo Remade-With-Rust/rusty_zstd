@@ -1775,6 +1775,19 @@ fn pair_probe<const SHAPE: u8>(
 ///   * The loop shared a body (and a register allocation) with the pipelined
 ///     loop and the runtime-shape arms; here the invariants sit in one
 ///     `PairScan` and the running state in locals.
+///
+/// REFUTED (2026-10-08), recorded so they are not retried. Executed
+/// instructions, callgrind, L1, whole file, against this body:
+///   * A LEAN INNER LOOP for the positions where both slots come back empty
+///     (no repcode probe): swap, load, pair store, advance, leaving with the
+///     keys on the first candidate. Inline: dickens +0.7%, xml +0.6%,
+///     mozilla -0.9% -- LLVM reloads the shift, mask, table base, anchor and
+///     limit from the stack at the loop head just the same, because the rest
+///     of the scan keeps them live across it. Outlined as its own leaf (with a
+///     BMI2 twin): the leaf is tight (~32 instructions per two positions) but
+///     it exits every ~3.6 iterations on dickens, and the call, the hand-back
+///     of the keys and the caller's re-spills cost more than it saved --
+///     dickens +8.1%, mozilla +2.4%.
 #[inline(always)]
 pub(crate) fn fast_pair_scan<const BMI2: bool, const SHAPE: u8>(
     k: &PairScan,
