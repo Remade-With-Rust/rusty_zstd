@@ -447,6 +447,7 @@ pub(crate) fn encode_oneshot(
     // the wide key -- smallmsg-class content (first-find dominated, prefers
     // its literal+rep economy) never latches. Frame init only resets it.
     tables.chain_wide = row_wide_start() && !tables.rows.head.is_empty();
+    tables.row_htag = row_htag_for(params.strategy, &tables);
     // Array route where the 24-bit proof fails (>= 16 MiB): link tags in
     // `ctags`, head tags in `tags` (same hash index). Priced by `linkbig`.
     if matches!(
@@ -2441,7 +2442,11 @@ pub(crate) fn prime_tables(
                 } else {
                     (1u64 << (8 * mls)) - 1
                 };
-                let (hh, gt) = if tables.chain_wide {
+                // A hash-tag row frame primes its rows in its own tag (the
+                // chain this also writes is never walked in a row frame).
+                let (hh, gt) = if tables.row_htag {
+                    row_key_htag(src, p, 64u32.saturating_sub(hash_log.min(32)), smask)
+                } else if tables.chain_wide {
                     hash_wide_link_tag_b(src, p, 64u32.saturating_sub(hash_log.min(32)), smask, mls)
                 } else {
                     hash4_link_tag_b(src, p, 32u32.saturating_sub(hash_log.min(32)), mls)
@@ -2664,8 +2669,8 @@ fn find_sequences_strategy_sel(
             if row_find_enabled() && !tables.rows.head.is_empty() {
                 if tables.chain_wide && row_parse_c() {
                     macro_rules! go {
-                        ($rl:literal) => {
-                            find_greedy_rows::<$rl>(
+                        ($rl:literal, $ht:literal) => {
+                            find_greedy_rows::<$rl, $ht>(
                                 src,
                                 block_start,
                                 block_end,
@@ -2676,10 +2681,13 @@ fn find_sequences_strategy_sel(
                             )
                         };
                     }
-                    return match tables.rows.row_log() {
-                        6 => go!(6),
-                        5 => go!(5),
-                        _ => go!(4),
+                    return match (tables.rows.row_log(), tables.row_htag) {
+                        (6, true) => go!(6, true),
+                        (5, true) => go!(5, true),
+                        (_, true) => go!(4, true),
+                        (6, false) => go!(6, false),
+                        (5, false) => go!(5, false),
+                        (_, false) => go!(4, false),
                     };
                 }
                 find_lazy(src, block_start, block_end, window, params, tables, 0, reps)
@@ -7398,6 +7406,58 @@ fn row_greedy() -> bool {
         .unwrap_or(ROW_GREEDY_DEFAULT);
     ROW_GREEDY_ARM.store(n, Relaxed);
     n == 1
+}
+
+/// GREEDY ROW TAG arm: 1 = a Greedy row frame tags its rows with eight HASH
+/// bits (`row_key_htag`, libzstd's tag) instead of the gram's last byte.
+/// `u32::MAX` = unresolved; `RZSTD_ROW_GREEDY_HTAG`.
+///
+/// The byte tag (BRICK 100, chosen on the CHAIN, whose bucket mates already
+/// share the 4-byte key) says nothing about which of the `1 << row_log`
+/// buckets folded into a row a slot came from. On binary content most row
+/// candidates were cross-bucket: at L5 / 256 KiB, 87% of mozilla's examined
+/// candidates and 71% of x-ray's failed the first compare (`take_row_bucket`),
+/// each a random `src` load. Eight hash bits reject 255 in 256 of those.
+///
+/// Measured 2026-10-08, L5, six silesia files, pinned floor, time vs the
+/// chain (byte tag -> hash tag): 256 KiB 1.081 -> 0.939 (x-ray 1.536 ->
+/// 1.078, mozilla 1.192 -> 0.895); 4 MiB 0.859 -> 0.814 (x-ray 1.045 ->
+/// 0.860). Size, 18 corpora: 64 KiB -0.002%, 256 KiB identical (L5 there
+/// searches every slot of its 32-slot rows, so the tag only skips work),
+/// 1 MiB +0.039% (samba +0.37%), 4 MiB +0.007%.
+static ROW_GREEDY_HTAG_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+/// The shipped greedy row tag.
+const ROW_GREEDY_HTAG_DEFAULT: u32 = 1;
+
+/// Bench hook for the greedy row tag (see `ROW_GREEDY_HTAG_ARM`).
+pub fn set_row_greedy_htag_arm(v: u32) {
+    ROW_GREEDY_HTAG_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn row_greedy_htag() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let v = ROW_GREEDY_HTAG_ARM.load(Relaxed);
+    if v != u32::MAX {
+        return v == 1;
+    }
+    let n = crate::env_knob_parse::<u32>("RZSTD_ROW_GREEDY_HTAG")
+        .filter(|v| *v <= 1)
+        .unwrap_or(ROW_GREEDY_HTAG_DEFAULT);
+    ROW_GREEDY_HTAG_ARM.store(n, Relaxed);
+    n == 1
+}
+
+/// Whether a frame's rows carry hash tags: a Greedy frame on wide-key rows
+/// with the C parse (i.e. one `find_greedy_rows` serves) and the arm on.
+/// Decided where `chain_wide` is, so every producer of the frame agrees.
+pub(crate) fn row_htag_for(strategy: Strategy, tables: &MatchTables) -> bool {
+    strategy == Strategy::Greedy
+        && tables.chain_wide
+        && !tables.rows.head.is_empty()
+        && row_parse_c()
+        && row_greedy_htag()
 }
 
 /// GREEDY ROW STEP arm: the no-match step shift of `find_greedy_rows`

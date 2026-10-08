@@ -26,13 +26,25 @@ fn row_key(src: &[u8], p: usize, shift64: u32, smask: u64) -> usize {
     ((load_u64le(src, p) & smask).wrapping_mul(FAST_HASH_PRIME64) >> shift64) as usize
 }
 
+/// The row key AND a HASH tag from one multiply: the eight product bits just
+/// below the key's (libzstd's `hash & ZSTD_ROW_HASH_TAG_MASK` over a hash
+/// eight bits wider than the row index). The key is bit-identical to
+/// `row_key`. `shift64 >= 40` (the hash log is at most 24), so `- 8` cannot
+/// wrap.
+#[inline(always)]
+pub(crate) fn row_key_htag(src: &[u8], p: usize, shift64: u32, smask: u64) -> (usize, u8) {
+    let w =
+        ((load_u64le(src, p) & smask).wrapping_mul(FAST_HASH_PRIME64) >> (shift64 - 8)) as usize;
+    (w >> 8, w as u8)
+}
+
 /// See the module comment. With `ROW_GREEDY_ACCEL_ARM` set to the shared
 /// step and `ROW_GREEDY_POS0_ARM` off, output is identical to
 /// `find_lazy_rows::<RL>` at depth 0 on the same table (GOLD over 18 corpora
 /// at four caps); the shipped values of both differ, see their notes.
 #[inline(never)]
 #[allow(unsafe_code)]
-pub(crate) fn find_greedy_rows<const RL: u32>(
+pub(crate) fn find_greedy_rows<const RL: u32, const HT: bool>(
     src: &[u8],
     block_start: usize,
     block_end: usize,
@@ -43,6 +55,7 @@ pub(crate) fn find_greedy_rows<const RL: u32>(
 ) -> (Vec<Seq>, Vec<u8>) {
     debug_assert_eq!(RL, tables.rows.row_log());
     debug_assert!(tables.chain_wide);
+    debug_assert_eq!(HT, tables.row_htag);
     let mls = params.min_match.clamp(3, 7) as usize;
     let attempts = search_attempts(params);
     let (mut seqs, mut lits) = match chain_finder_prologue(src, block_start, block_end, tables, mls)
@@ -136,17 +149,31 @@ pub(crate) fn find_greedy_rows<const RL: u32>(
             }
         }};
     }
-    // Insert `q` (hash `h`) at its row's head.
-    macro_rules! insert {
-        ($q:expr, $h:expr) => {{
+    // `(row key, tag)` of `q`: the hash tag (`HT`, `ROW_GREEDY_HTAG_ARM`)
+    // or the gram's last byte (`link_tag`, what every other row producer
+    // writes).
+    macro_rules! key {
+        ($q:expr) => {{
             let q: usize = $q;
-            let r = ($h >> RL) & rmask;
+            if HT {
+                row_key_htag(src, q, shift64, smask)
+            } else {
+                (row_key(src, q, shift64, smask), link_tag(src, q, mls))
+            }
+        }};
+    }
+    // Insert `q` (key and tag `kt`) at its row's head.
+    macro_rules! insert {
+        ($q:expr, $kt:expr) => {{
+            let q: usize = $q;
+            let (h, t): (usize, u8) = $kt;
+            let r = (h >> RL) & rmask;
             unsafe {
                 let s = u32::from(*headp.add(r));
                 debug_assert!(s <= slot_mask);
                 let at = (r << RL) + s as usize;
                 *posp.add(at) = q as u32;
-                *tagp.add(at) = link_tag(src, q, mls);
+                *tagp.add(at) = t;
                 *headp.add(r) = ((s + 1) & slot_mask) as u8;
             }
         }};
@@ -161,11 +188,11 @@ pub(crate) fn find_greedy_rows<const RL: u32>(
             let pf_end = to.min((ilimit + 1).saturating_sub(HC));
             while q < pf_end {
                 prefetch_row!(row_key(src, q + HC, shift64, smask));
-                insert!(q, row_key(src, q, shift64, smask));
+                insert!(q, key!(q));
                 q += 1;
             }
             while q < to {
-                insert!(q, row_key(src, q, shift64, smask));
+                insert!(q, key!(q));
                 q += 1;
             }
         }};
@@ -193,10 +220,9 @@ pub(crate) fn find_greedy_rows<const RL: u32>(
                 }
                 name_ahead!(p);
             }
-            let h = row_key(src, p, shift64, smask);
+            let (h, gtag) = key!(p);
             ntu = p + 1;
             searches += 1;
-            let gtag = link_tag(src, p, mls);
             let r = (h >> RL) & rmask;
             let at = r << RL;
             // SAFETY: see the table note above.
@@ -240,7 +266,7 @@ pub(crate) fn find_greedy_rows<const RL: u32>(
                     cand[n & N_MASK].write(m);
                     n += 1;
                 }
-                insert!(p, h);
+                insert!(p, (h, gtag));
                 #[cfg(feature = "profile")]
                 {
                     crate::prof::note_probes(n as u64);
@@ -270,7 +296,7 @@ pub(crate) fn find_greedy_rows<const RL: u32>(
                     }
                 }
             } else {
-                insert!(p, h);
+                insert!(p, (h, gtag));
             }
             (best_m, best_ml)
         }};

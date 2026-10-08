@@ -107,6 +107,11 @@ pub(crate) struct MatchTables {
     pub(crate) bits_scratch: Vec<u8>,
     /// See `set_wide_chain_arm`.
     pub(crate) chain_wide: bool,
+    /// A Greedy row frame whose row tags are HASH bits (`row_key_htag`)
+    /// rather than the gram's last byte: every row producer of the frame --
+    /// `find_greedy_rows` and the primer -- must agree. See
+    /// `ROW_GREEDY_HTAG_ARM`.
+    pub(crate) row_htag: bool,
     /// Row frames under `find_lazy_rows`: the first position not yet inserted
     /// into the row table -- libzstd's `nextToUpdate`. `usize::MAX` = no
     /// carry (fresh or reset table); the parser then starts at its block.
@@ -348,6 +353,7 @@ impl Clone for MatchTables {
             coded_scratch: Vec::new(),
             bits_scratch: Vec::new(),
             chain_wide: self.chain_wide,
+            row_htag: self.row_htag,
             row_ntu: usize::MAX,
             blocks_done: self.blocks_done,
             seq_scratch: Vec::new(),
@@ -774,6 +780,7 @@ impl MatchTables {
             chain_pack: false,
             ctags: Vec::new(),
             chain_wide: false,
+            row_htag: false,
             row_ntu: usize::MAX,
             coded_scratch: emptied(bufs.coded),
             bits_scratch: emptied(bufs.bits),
@@ -820,6 +827,7 @@ impl MatchTables {
         // rows are: every construction path (one-shot, streaming, priming)
         // then agrees on it without each having to remember to.
         t.chain_wide = !t.rows.head.is_empty() && row_wide_start();
+        t.row_htag = row_htag_for(_params.strategy, &t);
         t
     }
 
