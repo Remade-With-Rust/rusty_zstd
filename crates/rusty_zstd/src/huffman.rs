@@ -1990,9 +1990,23 @@ fn huffman_nbits(freq: &[u32; 256]) -> Result<[u8; 256], Error> {
 
     // ONE stable sort, ascending by count, ties left in symbol order -- which is
     // precisely the order the old first iteration produced.
+    //
+    // As an UNSTABLE sort of `count << 8 | i`: the low byte is the leaf's own
+    // position (at most 256 leaves here, one per present symbol), so no two
+    // keys tie, and ascending keys are ascending counts with ties in position
+    // order -- exactly the stable sort's permutation. The stable
+    // `sort_by_key`, reaching each count through `nodes.get(i)`, ran ~47K
+    // instructions per table (callgrind, mozilla L1: 17.4M in the sort
+    // routines for 371 tables).
     let mut leaves = crate::scratch::lease(&SC_LEAVES);
-    leaves.extend(0..nodes.len());
-    leaves.sort_by_key(|&i| nodes.get(i).map_or(0, |n| n.count));
+    let mut keys = [0u64; 256];
+    let nl = nodes.len().min(256);
+    debug_assert!(nodes.len() <= 256);
+    for ((k, n), i) in keys.iter_mut().zip(nodes.iter()).zip(0u64..) {
+        *k = (n.count << 8) | i;
+    }
+    keys[..nl].sort_unstable();
+    leaves.extend(keys[..nl].iter().map(|&k| (k & 0xFF) as usize));
     let mut internal = crate::scratch::lease(&SC_INTERNAL);
     let (mut li, mut ii) = (0usize, 0usize);
 
