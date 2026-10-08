@@ -7505,6 +7505,27 @@ pub(crate) fn row_fused_strategy(params: CompressionParameters) -> bool {
     }
 }
 
+/// The chain table a row frame that `find_greedy_rows` parses is given:
+/// 64 entries instead of `1 << chain_log`. Nothing in such a frame walks a
+/// chain -- the finder reads only the row table, and every chain write (the
+/// primer's, through `lz_insert`) is masked by the table's own length -- so
+/// the full table was a per-frame zero-fill of dead memory (1 MiB at L5).
+/// Byte-identical (GOLD at L5 / L6, 128 KiB and 1 MiB caps); time vs the
+/// full table, six silesia files, pinned floor, four rounds: L5 0.947 at
+/// 128 KiB, 0.985 at 1 MiB; L6 0.990 at 1 MiB.
+///
+/// The HASH table is just as dead in these frames (the finder never reads
+/// it) and twice the size, but it is written unchecked from ~70 sites
+/// indexed by the full hash log; shrinking it needs that audit first.
+pub(crate) const ROW_FRAME_CHAIN: usize = 64;
+
+/// Whether a row frame of these parameters leaves its chain table dead (see
+/// `ROW_FRAME_CHAIN`): the fused parse serves it.
+#[inline]
+pub(crate) fn row_chain_dead(params: CompressionParameters) -> bool {
+    row_fused_strategy(params) && row_parse_c() && row_wide_start()
+}
+
 /// ROW L6 arm: whether row policy 1 gives `Lazy` frames with a search log
 /// below 4 (L6) rows, parsed by `find_greedy_rows` at depth 1, when the
 /// source is unknown or at least `ROW_L6_MIN_SRC`. 0 = the hash chain.

@@ -419,6 +419,11 @@ impl TableShape {
         let hash_log = params.hash_log.clamp(6, 24);
         let hsz = 1usize << hash_log;
         let use_chain = !matches!(params.strategy, Strategy::Fast | Strategy::DFast);
+        let rows = if use_chain {
+            row_geometry(params, src_len)
+        } else {
+            None
+        };
         Self {
             hash_log,
             hash: hsz,
@@ -427,16 +432,14 @@ impl TableShape {
             } else {
                 0
             },
-            chain: if use_chain {
-                1usize << params.chain_log.min(24)
-            } else {
+            chain: if !use_chain {
                 0
-            },
-            rows: if use_chain {
-                row_geometry(params, src_len)
+            } else if rows.is_some() && row_chain_dead(params) {
+                ROW_FRAME_CHAIN
             } else {
-                None
+                1usize << params.chain_log.min(24)
             },
+            rows,
         }
     }
 
