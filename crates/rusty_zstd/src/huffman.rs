@@ -1702,7 +1702,15 @@ impl HuffCTable {
     /// `encode_stream_unrolled_matches_scalar` gates it against the per-byte
     /// `add_bits` oracle at every `max_nbits` from 1 to 11.
     #[inline(always)]
-    fn encode_rev_into(&self, src: &[u8], buf: Vec<u8>) -> Vec<u8> {
+    fn encode_rev_into(&self, src: &[u8], mut buf: Vec<u8>) -> Vec<u8> {
+        buf.clear();
+        self.encode_rev_append(src, &mut buf);
+        buf
+    }
+
+    /// `encode_rev_into`, appending the stream to `buf`; returns its length.
+    #[inline(always)]
+    fn encode_rev_append(&self, src: &[u8], buf: &mut Vec<u8>) -> usize {
         // C's unroll table for 64-bit targets. `K * max + 7` must leave the
         // live bits clear of the low-byte noise: when it cannot, the group's
         // last symbol is masked (`LAST_FAST = false`), as in C.
@@ -1714,6 +1722,47 @@ impl HuffCTable {
             7 => self.emit_celt::<8, false>(src, buf),
             _ => self.emit_celt::<9, true>(src, buf),
         }
+    }
+
+    /// One literal stream appended to `dst`, by the same arm dispatch as
+    /// `encode_stream_into` -- same arms, same order, same bytes. Returns the
+    /// stream's length. The scalar arm (`RZSTD_HUFF_FAST=0`) stages through
+    /// its own buffer.
+    fn encode_stream_append(&self, src: &[u8], dst: &mut Vec<u8>) -> Result<usize, Error> {
+        if src.is_empty() {
+            return Err(Error::Corruption);
+        }
+        if crate::encode::huff_fast_enabled() {
+            #[cfg(all(target_arch = "x86_64", feature = "std"))]
+            if crate::simd::has_bmi2() {
+                crate::kreach::hit(crate::kreach::K_HUF_ENC);
+                // SAFETY: guarded by runtime CPUID; the body is identical.
+                #[allow(unsafe_code)]
+                return Ok(unsafe { self.encode_stream_append_bmi2(src, dst) });
+            }
+            crate::kreach::miss(crate::kreach::K_HUF_ENC);
+            Ok(self.encode_stream_append_plain(src, dst))
+        } else {
+            crate::kreach::miss(crate::kreach::K_HUF_ENC);
+            let s = self.encode_stream_scalar_into(src, Vec::new())?;
+            dst.extend_from_slice(&s);
+            Ok(s.len())
+        }
+    }
+
+    /// The BMI2 twin of `encode_stream_append_plain`.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[target_feature(enable = "bmi2,lzcnt")]
+    #[allow(unsafe_code)]
+    #[inline(never)]
+    unsafe fn encode_stream_append_bmi2(&self, src: &[u8], dst: &mut Vec<u8>) -> usize {
+        self.encode_rev_append(src, dst)
+    }
+
+    /// The BASELINE arm of `encode_stream_append`.
+    #[inline(never)]
+    fn encode_stream_append_plain(&self, src: &[u8], dst: &mut Vec<u8>) -> usize {
+        self.encode_rev_append(src, dst)
     }
 
     /// See `encode_rev_into`. Two containers, as in C: each round codes `K`
@@ -1730,13 +1779,14 @@ impl HuffCTable {
     fn emit_celt<const K: usize, const LAST_FAST: bool>(
         &self,
         src: &[u8],
-        mut buf: Vec<u8>,
-    ) -> Vec<u8> {
+        buf: &mut Vec<u8>,
+    ) -> usize {
         let len = src.len();
         let max = usize::from(self.max_nbits.clamp(1, MAX_BITS));
-        buf.clear();
+        let base = buf.len();
         buf.reserve(((len * max) >> 3) + 16);
-        let out = buf.as_mut_ptr();
+        // SAFETY: `base <= len()`; the stream is written from `base` on.
+        let out = unsafe { buf.as_mut_ptr().add(base) };
         let ct = &self.celt;
         let sp = src.as_ptr();
         // `nb` <= 11 < 16, so only the low four bits of an element are noise.
@@ -1754,7 +1804,7 @@ impl HuffCTable {
             debug_assert!(nbits <= 64);
             // `nbits == 0` shifts by 64 & 63 = 0 and commits nothing.
             let v = c0.wrapping_shr((64 - nbits) as u32);
-            debug_assert!(*op + 8 <= buf.capacity());
+            debug_assert!(base + *op + 8 <= buf.capacity());
             // SAFETY: see the function note -- 8 bytes at `op` are reserved.
             unsafe { core::ptr::write_unaligned(out.add(*op).cast::<u64>(), v.to_le()) };
             *op += (nbits >> 3) as usize;
@@ -1802,10 +1852,10 @@ impl HuffCTable {
         add(&mut c0, &mut p0, (1u64 << 63) | 1, false);
         flush(c0, &mut p0, &mut op);
         let total = op + usize::from(p0 & 0xFF != 0);
-        debug_assert!(total <= buf.capacity());
-        // SAFETY: every byte below `total` was written by a flush above.
-        unsafe { buf.set_len(total) };
-        buf
+        debug_assert!(base + total <= buf.capacity());
+        // SAFETY: every byte in `base..base + total` was written by a flush above.
+        unsafe { buf.set_len(base + total) };
+        total
     }
 }
 
@@ -2786,31 +2836,6 @@ fn pack_huff_section(
     pack_huff_section_into(lit_type, n_streams, regen, tree, body, Vec::new())
 }
 
-/// Append the packed section to `dst` and return its byte length.
-///
-/// The header needs `csize`, and `csize` is `tree.len() + body.len()` -- both
-/// known here, because the body has already been encoded. So there is nothing
-/// circular about writing this straight into the frame; the only reason the
-/// `_into` twin below stages into its own buffer is that CANDIDATES compete on
-/// size and a loser has to be discardable. The caller resolves that by
-/// appending the candidate that usually wins and truncating on the rare loss.
-fn pack_huff_section_append(
-    dst: &mut Vec<u8>,
-    lit_type: u8,
-    n_streams: u32,
-    regen: u32,
-    tree: &[u8],
-    body: &[u8],
-) -> Result<usize, Error> {
-    let csize = (tree.len() + body.len()) as u32;
-    let mut h = [0u8; 5];
-    let hn = lit_huff_header_bytes(lit_type, n_streams, regen, csize, &mut h)?;
-    dst.extend_from_slice(&h[..hn]);
-    dst.extend_from_slice(tree);
-    dst.extend_from_slice(body);
-    Ok(hn + tree.len() + body.len())
-}
-
 fn pack_huff_section_into(
     lit_type: u8,
     n_streams: u32,
@@ -3170,9 +3195,25 @@ pub(crate) fn encode_literals_section(
 /// `try_huff_section`, appending onto `dst` instead of returning a `Vec`.
 ///
 /// Returns the number of bytes appended, or `None` (having appended nothing) if
-/// the encode failed. The body still needs its own buffer -- it is what the
-/// header's `csize` is measured from -- but the SECTION no longer does, which
-/// is the copy this removes.
+/// the encode failed.
+///
+/// THE STREAMS ARE CODED IN PLACE. This used to code each stream into a
+/// pooled buffer, concatenate the four (with their jump table) into a body
+/// buffer, and append the body after the header and tree -- every coded
+/// literal byte written once and copied twice (callgrind, mozilla L1: 23.6M
+/// executed in `memcpy` from `encode_4_streams_into` and this function).
+/// libzstd codes into `dst` directly. Here the header's slot is reserved at
+/// the size class `regen` alone selects, the tree and a zeroed jump table
+/// follow, and each stream is coded onto the end of `dst`. The header is
+/// written last, once `csize` is known; its class is the larger of the two
+/// lengths', so it can only GROW past the reservation (`csize > regen`, a
+/// section that loses to raw anyway), and then the body moves up to make room.
+///
+/// Same bytes, same `Some`/`None` on every input: the stream bytes are the
+/// stream bytes, the layout is the one `encode_4_streams_into` and
+/// `pack_huff_section_append` built, and the three failures -- an empty
+/// piece, a stream over 65535 bytes, a header that cannot express `csize` --
+/// are the three they returned, tested in their order.
 fn try_huff_section_append(
     dst: &mut Vec<u8>,
     lit_type: u8,
@@ -3182,16 +3223,68 @@ fn try_huff_section_append(
     ct: &HuffCTable,
     lits: &[u8],
 ) -> Option<usize> {
-    let buf = body_pool_take();
-    let body = if n_streams == 1 {
-        ct.encode_stream_into(lits, buf).ok()?
-    } else {
-        encode_4_streams_into(ct, lits, buf).ok()?
+    let mark = dst.len();
+    let mut h = [0u8; 5];
+    // The class `regen` alone selects: `csize = 0` can never raise it, and a
+    // header that fails here fails for every `csize`.
+    let hn_guess = lit_huff_header_bytes(lit_type, n_streams, regen, 0, &mut h).ok()?;
+    dst.extend_from_slice(&h[..hn_guess]);
+    dst.extend_from_slice(tree);
+    let body_start = dst.len();
+    let fail = |dst: &mut Vec<u8>| {
+        dst.truncate(mark);
+        None
     };
-    crate::copies::add(crate::copies::C_HUFF_EMIT, body.len());
-    let r = pack_huff_section_append(dst, lit_type, n_streams, regen, tree, &body).ok();
-    body_pool_give(body);
-    r
+    if n_streams == 1 {
+        if ct.encode_stream_append(lits, dst).is_err() {
+            return fail(dst);
+        }
+    } else {
+        let jt = dst.len();
+        dst.extend_from_slice(&[0u8; 6]);
+        let chunk = lits.len().div_ceil(4);
+        let mut sizes = [0u16; 3];
+        let mut off = 0usize;
+        for i in 0..4 {
+            let end = if i == 3 {
+                lits.len()
+            } else {
+                (off + chunk).min(lits.len())
+            };
+            let piece = &lits[off..end];
+            if piece.is_empty() {
+                return fail(dst);
+            }
+            let Ok(n) = ct.encode_stream_append(piece, dst) else {
+                return fail(dst);
+            };
+            if n > 65535 {
+                return fail(dst);
+            }
+            if let Some(s) = sizes.get_mut(i) {
+                *s = n as u16;
+            }
+            off = end;
+        }
+        for (i, s) in sizes.iter().enumerate() {
+            dst[jt + 2 * i..jt + 2 * i + 2].copy_from_slice(&s.to_le_bytes());
+        }
+    }
+    let body_len = dst.len() - body_start;
+    crate::copies::add(crate::copies::C_HUFF_EMIT, body_len);
+    let csize = (tree.len() + body_len) as u32;
+    let Ok(hn) = lit_huff_header_bytes(lit_type, n_streams, regen, csize, &mut h) else {
+        return fail(dst);
+    };
+    debug_assert!(hn >= hn_guess);
+    if hn > hn_guess {
+        // Rare: `csize > regen` moved the header to a larger class.
+        let old_len = dst.len();
+        dst.resize(old_len + (hn - hn_guess), 0);
+        dst.copy_within(mark + hn_guess..old_len, mark + hn);
+    }
+    dst[mark..mark + hn].copy_from_slice(&h[..hn]);
+    Some(hn + tree.len() + body_len)
 }
 
 fn try_huff_section(
@@ -3979,6 +4072,74 @@ mod tests {
         let (sec, _) = encode_literals_section(&src, None).expect("section");
         assert_eq!(sec[0] & 3, 2);
         assert_eq!(sec[0] >> 2 & 3, 0, "1-stream size format 0");
+    }
+
+    /// `try_huff_section_append` codes the streams in place; `try_huff_section`
+    /// still builds the body apart and packs it. Same bytes and the same
+    /// `Some`/`None`, including the sections whose `csize` outgrows `regen`'s
+    /// header class (the in-place writer moves the body up for those) and a
+    /// table that does not cover the literals.
+    #[test]
+    fn in_place_section_matches_staged_section() {
+        let mut x = 0x0123_4567_89AB_CDEF_u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut grew = 0;
+        for &n in &[
+            8usize, 255, 256, 600, 1000, 1023, 1024, 1100, 4000, 16_383, 16_384, 70_000,
+        ] {
+            for skew in [0u32, 1, 3] {
+                let lits: Vec<u8> = (0..n)
+                    .map(|_| {
+                        let mut v = next() as u8;
+                        for _ in 0..skew {
+                            v = v.min(next() as u8);
+                        }
+                        v
+                    })
+                    .collect();
+                // A table built on OTHER data: on flat literals it codes longer
+                // than raw (`csize > regen`), and it may miss symbols outright.
+                let mut other: Vec<u8> = (0..4096).map(|i| (i % 7) as u8 * 30).collect();
+                other.extend((0..=255u8).cycle().take(512));
+                let own = build_ctable(&lits).ok();
+                let foreign = build_ctable(&other).ok();
+                for ct in [own.as_ref(), foreign.as_ref()].into_iter().flatten() {
+                    let tree = write_tree(ct).unwrap_or_default();
+                    for streams in [1u32, 4] {
+                        let staged = try_huff_section(2, streams, n as u32, &tree, ct, &lits);
+                        let mut dst = vec![0xAAu8; 3];
+                        let got = try_huff_section_append(
+                            &mut dst, 2, streams, n as u32, &tree, ct, &lits,
+                        );
+                        match (&staged, got) {
+                            (Some(s), Some(len)) => {
+                                assert_eq!(len, s.len(), "n={n} skew={skew} streams={streams}");
+                                assert_eq!(
+                                    &dst[3..],
+                                    &s[..],
+                                    "n={n} skew={skew} streams={streams}"
+                                );
+                                if s.len() > n + 5 {
+                                    grew += 1;
+                                }
+                            }
+                            (None, None) => assert_eq!(dst.len(), 3, "left bytes behind"),
+                            _ => panic!(
+                                "n={n} skew={skew} streams={streams}: {:?} vs {:?}",
+                                staged.map(|s| s.len()),
+                                got
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        assert!(grew > 0, "no section outgrew its regen class");
     }
 
     #[test]
