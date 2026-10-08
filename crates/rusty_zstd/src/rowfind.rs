@@ -196,14 +196,45 @@ pub(crate) fn row_tag_mask<const RL: u32>(tags: &[u8], want: u8) -> RowMask {
     unsafe { row_tag_mask_raw::<RL>(tags.as_ptr(), want) }
 }
 
+/// 16 row positions on one cache line. The storage unit of `RowTable::pos`:
+/// a `Vec` of these is 64-byte aligned, so a row starts on a line boundary.
+#[cfg(feature = "alloc")]
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub(crate) struct PosLine([u32; 16]);
+
+/// 64 row tags on one cache line. The storage unit of `RowTable::tags`.
+#[cfg(feature = "alloc")]
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub(crate) struct TagLine([u8; 64]);
+
 /// The row table: `1 << row_log` positions per row with their tags contiguous.
+///
+/// ## Line-aligned storage (2026-10-08)
+///
+/// `pos` and `tags` were plain `Vec<u32>` / `Vec<u8>`, whose bases the
+/// allocator places 16 bytes past a line (glibc's `mmap` chunk header; the
+/// Windows heap is no better), so EVERY row straddled one more cache line than
+/// it spans: a 16-slot row's 64 position bytes touched 2 lines instead of 1,
+/// a 64-slot row's 256 bytes 5 instead of 4. libzstd asserts its rows are
+/// line-aligned (`ZSTD_row_prefetch`). Storage is now a `Vec` of
+/// 64-byte-aligned lines; the element layout is unchanged, so the output is
+/// too.
+///
+/// Measured: callgrind's cache simulation with a 2 MiB last level (an L2
+/// stand-in), L9, last-level misses: dickens 17.4M -> 14.6M, x-ray 23.2M ->
+/// 21.1M (libzstd 1.5.7: 12.9M / 17.8M). Wall clock on six silesia files at
+/// L9 and L12, pinned: within this box's +-10% noise -- the adjacent-line
+/// prefetcher was already hiding most of each straddle. Kept for the
+/// deterministic miss count, not for a timed win.
 #[cfg(feature = "alloc")]
 #[derive(Default, Clone)]
 pub(crate) struct RowTable {
-    /// `rows << row_log` positions.
-    pub pos: alloc::vec::Vec<u32>,
-    /// `rows << row_log` tags, so each row's tags are contiguous.
-    pub tags: alloc::vec::Vec<u8>,
+    /// `rows << row_log` positions, 16 to a line.
+    pos: alloc::vec::Vec<PosLine>,
+    /// `rows << row_log` tags, so each row's tags are contiguous, 64 to a line.
+    tags: alloc::vec::Vec<TagLine>,
     /// Next slot to write, per row. Wraps at the row width, so a row always
     /// holds the most recent `1 << row_log` positions for its buckets.
     pub head: alloc::vec::Vec<u8>,
@@ -223,14 +254,50 @@ impl RowTable {
         let row_log = row_log.clamp(ROW_LOG_MIN, ROW_LOG_MAX);
         let entries = 1usize << entries_log.clamp(ROW_LOG_MAX, 24);
         let rows = entries >> row_log;
+        // `entries >= 64`: a whole number of lines of either kind.
         self.pos.clear();
-        self.pos.resize(rows << row_log, 0);
+        self.pos.resize(entries / 16, PosLine([0; 16]));
         self.tags.clear();
-        self.tags.resize(rows << row_log, 0);
+        self.tags.resize(entries / 64, TagLine([0; 64]));
         self.head.clear();
         self.head.resize(rows, 0);
         self.row_mask = rows - 1;
         self.row_log = row_log;
+    }
+
+    /// Slots in the table (`rows << row_log`); 0 while unallocated.
+    #[inline(always)]
+    fn slots(&self) -> usize {
+        self.pos.len() * 16
+    }
+
+    /// Base of the position array, as `u32` elements.
+    #[inline(always)]
+    fn pos_ptr(&self) -> *const u32 {
+        self.pos.as_ptr() as *const u32
+    }
+
+    /// Base of the tag array, as bytes.
+    #[inline(always)]
+    fn tags_ptr(&self) -> *const u8 {
+        self.tags.as_ptr() as *const u8
+    }
+
+    /// Store `ip` / `tag` at slot `at` and advance row `r`'s head from `s`.
+    ///
+    /// # Safety
+    /// `r < head.len()`, `at < slots()` and `s < 1 << rl`.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    unsafe fn put(&mut self, r: usize, at: usize, s: usize, rl: u32, ip: u32, tag: u8) {
+        debug_assert!(r < self.head.len() && at < self.slots() && s < (1 << rl));
+        // SAFETY: the caller's bounds; `PosLine` / `TagLine` are `repr(C)`
+        // arrays, so the line vectors are `slots()` contiguous `u32` / `u8`.
+        unsafe {
+            *(self.pos.as_mut_ptr() as *mut u32).add(at) = ip;
+            *(self.tags.as_mut_ptr() as *mut u8).add(at) = tag;
+            *self.head.get_unchecked_mut(r) = ((s + 1) & ((1usize << rl) - 1)) as u8;
+        }
     }
 
     /// Touch the lines a probe of hash bucket `h`'s row will read: its tags,
@@ -246,21 +313,28 @@ impl RowTable {
         // position bytes all exist. The `_known` hint drops the per-address
         // `< len` guard the checked hint re-tested -- seven compares and
         // branches per probe at 64 slots (2026-10-08 callgrind).
-        debug_assert!(r < self.head.len() && at + (1usize << RL) <= self.tags.len());
+        debug_assert!(r < self.head.len() && at + (1usize << RL) <= self.slots());
         crate::simd::prefetch_read_known(&self.head, r);
-        // Tags: `1 << RL` bytes. The tables are not line-aligned, so a row
-        // can straddle a boundary: name its last byte as well as its first.
-        crate::simd::prefetch_read_known(&self.tags, at);
-        crate::simd::prefetch_read_known(&self.tags, at + (1usize << RL) - 1);
-        // Positions: 4 bytes per slot, i.e. 64 / 128 / 256 bytes.
+        // Tags: `1 << RL <= 64` bytes at a multiple of `1 << RL` from a
+        // line-aligned base -- inside ONE line.
+        let tags: &[u8] = {
+            #[allow(unsafe_code)]
+            // SAFETY: the tag lines are `slots()` initialised bytes (see
+            // `put`); the view is used for address arithmetic by a prefetch
+            // only.
+            unsafe {
+                core::slice::from_raw_parts(self.tags_ptr(), self.slots())
+            }
+        };
+        crate::simd::prefetch_read_known(tags, at);
+        // Positions: 4 bytes per slot, i.e. 1 / 2 / 4 whole lines.
         let pos: &[u8] = {
-            // View the `u32` positions as bytes for the hint only.
             #[allow(unsafe_code)]
             // SAFETY: a `[u32]` is valid to view as `4 * len` initialised
             // bytes; the slice is used for address arithmetic by a prefetch
             // and never read through.
             unsafe {
-                core::slice::from_raw_parts(self.pos.as_ptr() as *const u8, self.pos.len() * 4)
+                core::slice::from_raw_parts(self.pos_ptr() as *const u8, self.slots() * 4)
             }
         };
         let mut off = 0usize;
@@ -268,13 +342,12 @@ impl RowTable {
             crate::simd::prefetch_read_known(pos, (at << 2) + off);
             off += 64;
         }
-        crate::simd::prefetch_read_known(pos, (at << 2) + (4usize << RL) - 1);
     }
 
     /// Forget every position, keeping the allocation and the geometry.
     pub fn clear(&mut self) {
-        self.pos.fill(0);
-        self.tags.fill(0);
+        self.pos.fill(PosLine([0; 16]));
+        self.tags.fill(TagLine([0; 64]));
         self.head.fill(0);
     }
 
@@ -319,15 +392,11 @@ impl RowTable {
         debug_assert_eq!(RL, self.row_log);
         let r = (h >> RL) & rmask;
         debug_assert!(r < self.head.len());
-        // SAFETY: identical to `insert` -- `r <= row_mask == head.len() - 1`,
-        // and `pos`/`tags` are `head.len() << RL` long, `s < 1 << RL`.
+        // SAFETY: `r <= row_mask == head.len() - 1`, and the table holds
+        // `head.len() << RL` slots, `s < 1 << RL`.
         unsafe {
             let s = *self.head.get_unchecked(r) as usize;
-            debug_assert!(s < (1 << RL));
-            let at = (r << RL) + s;
-            *self.pos.get_unchecked_mut(at) = ip;
-            *self.tags.get_unchecked_mut(at) = tag;
-            *self.head.get_unchecked_mut(r) = ((s + 1) & ((1 << RL) - 1)) as u8;
+            self.put(r, (r << RL) + s, s, RL, ip, tag);
         }
     }
 
@@ -339,23 +408,22 @@ impl RowTable {
     pub fn insert(&mut self, r: usize, ip: u32, tag: u8) {
         debug_assert!(r < self.head.len());
         let rl = self.row_log;
-        // SAFETY: `r < head.len()` and `pos`/`tags` are `head.len() << rl`
-        // long, so `(r << rl) + s` with `s < 1 << rl` is in bounds for both.
+        // SAFETY: `r < head.len()` and the table holds `head.len() << rl`
+        // slots, so `(r << rl) + s` with `s < 1 << rl` is in bounds.
         unsafe {
             let s = *self.head.get_unchecked(r) as usize;
-            debug_assert!(s < (1 << rl));
-            let at = (r << rl) + s;
-            *self.pos.get_unchecked_mut(at) = ip;
-            *self.tags.get_unchecked_mut(at) = tag;
-            *self.head.get_unchecked_mut(r) = ((s + 1) & ((1usize << rl) - 1)) as u8;
+            self.put(r, (r << rl) + s, s, rl, ip, tag);
         }
     }
 
     /// The tags of row `r`.
     #[cfg(test)]
+    #[allow(unsafe_code)]
     pub fn tag_row(&self, r: usize) -> &[u8] {
         let n = 1usize << self.row_log;
-        &self.tags[r * n..(r + 1) * n]
+        assert!((r + 1) * n <= self.slots());
+        // SAFETY: bounds asserted; the tag lines are contiguous bytes.
+        unsafe { core::slice::from_raw_parts(self.tags_ptr().add(r * n), n) }
     }
 
     /// W16 -- the row's ENTIRE walk state in one call.
@@ -373,14 +441,14 @@ impl RowTable {
     pub fn probe_view<const RL: u32>(&self, r: usize, want: u8) -> (RowMask, u32, &[u32], usize) {
         debug_assert!(r < self.head.len());
         debug_assert_eq!(RL, self.row_log);
-        // SAFETY: `r < head.len()`; `tags` and `pos` are both
-        // `head.len() << RL` long, so both `1 << RL`-element windows at `at`
-        // are in bounds.
+        // SAFETY: `r < head.len()`; the table holds `head.len() << RL` tags
+        // and positions, so both `1 << RL`-element windows at `at` are in
+        // bounds.
         let at = r << RL;
         let (mask, row, head) = unsafe {
             (
-                row_tag_mask_raw::<RL>(self.tags.as_ptr().add(at), want),
-                core::slice::from_raw_parts(self.pos.as_ptr().add(at), 1usize << RL),
+                row_tag_mask_raw::<RL>(self.tags_ptr().add(at), want),
+                core::slice::from_raw_parts(self.pos_ptr().add(at), 1usize << RL),
                 u32::from(*self.head.get_unchecked(r)),
             )
         };
@@ -420,14 +488,9 @@ impl RowTable {
         debug_assert_eq!(at, r << RL);
         debug_assert_eq!(head, u32::from(self.head[r]));
         debug_assert!(head < (1 << RL));
-        // SAFETY: `at + head < (r + 1) << RL <= pos.len() == tags.len()`, and
+        // SAFETY: `at + head < (r + 1) << RL <= slots()`, and
         // `r < head.len()`.
-        unsafe {
-            let slot = at + head as usize;
-            *self.pos.get_unchecked_mut(slot) = ip;
-            *self.tags.get_unchecked_mut(slot) = tag;
-            *self.head.get_unchecked_mut(r) = ((head + 1) & ((1u32 << RL) - 1)) as u8;
-        }
+        unsafe { self.put(r, at + head as usize, head as usize, RL, ip, tag) }
     }
 
     /// Candidate positions of row `r`, MOST RECENT FIRST.
@@ -437,9 +500,13 @@ impl RowTable {
     /// to code. Walking the row in slot order instead of insertion order
     /// inflates offsets.
     #[cfg(test)]
+    #[allow(unsafe_code)]
     pub fn candidates(&self, r: usize, mut mask: RowMask, out: &mut [u32; ROW_MAX]) -> usize {
         let n = 1usize << self.row_log;
         let head = self.head[r] as usize;
+        assert!((r + 1) * n <= self.slots());
+        // SAFETY: bounds asserted; the position lines are contiguous `u32`s.
+        let row = unsafe { core::slice::from_raw_parts(self.pos_ptr().add(r * n), n) };
         let mut cnt = 0usize;
         // Walk slots newest-first: head-1, head-2, ... wrapping.
         for k in 1..=n {
@@ -449,7 +516,7 @@ impl RowTable {
             let s = (head + n - k) & (n - 1);
             if mask & (1 << s) != 0 {
                 mask &= !(1u64 << s);
-                out[cnt] = self.pos[r * n + s];
+                out[cnt] = row[s];
                 cnt += 1;
             }
         }
