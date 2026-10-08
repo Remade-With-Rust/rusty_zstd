@@ -2,9 +2,10 @@
 //! (`ZSTD_compressBlock_lazy_generic` at depth 0 over `ZSTD_RowFindBestMatch`)
 //! as ONE function.
 //!
-//! `find_lazy_rows` at depth 0 makes the same decisions, and this finder is
+//! `find_lazy_rows` at depth 0 makes the same decisions, and this finder was
 //! held to them: same candidates, same order, same accept rule, same repcode
-//! bookkeeping. What differs is the SHAPE, and it is libzstd's:
+//! bookkeeping (two shipped arms now differ on purpose: the no-match step and
+//! the window floor). What differs is the SHAPE, and it is libzstd's:
 //!
 //! * the search is inlined here -- `row_find_best` is an outlined fn-pointer
 //!   kernel that re-reads a 24-field `ChainCtx` on every call;
@@ -25,8 +26,10 @@ fn row_key(src: &[u8], p: usize, shift64: u32, smask: u64) -> usize {
     ((load_u64le(src, p) & smask).wrapping_mul(FAST_HASH_PRIME64) >> shift64) as usize
 }
 
-/// See the module comment. Output is identical to `find_lazy_rows::<RL>`
-/// at depth 0 on the same table.
+/// See the module comment. With `ROW_GREEDY_ACCEL_ARM` set to the shared
+/// step and `ROW_GREEDY_POS0_ARM` off, output is identical to
+/// `find_lazy_rows::<RL>` at depth 0 on the same table (GOLD over 18 corpora
+/// at four caps); the shipped values of both differ, see their notes.
 #[inline(never)]
 #[allow(unsafe_code)]
 pub(crate) fn find_greedy_rows<const RL: u32>(
@@ -51,11 +54,15 @@ pub(crate) fn find_greedy_rows<const RL: u32>(
     let ilimit = block_end - 8;
     debug_assert!(block_end <= src.len());
     let prefix_lowest = block_start.saturating_sub(window).max(tables.frame_start);
-    let lowest1 = prefix_lowest.max(1);
+    let lowest1 = if row_greedy_pos0() {
+        prefix_lowest
+    } else {
+        prefix_lowest.max(1)
+    };
     let smask = (1u64 << (8 * mls)) - 1;
     let shift64 = 64u32.saturating_sub(tables.hash_log.min(32));
     let lp_copy = lit_width_for(tables);
-    let accel_sh = lazy_step_shift(lazy_accel());
+    let accel_sh = lazy_step_shift(row_greedy_accel());
     let rep_skip = row_rep_skip();
     // C: `ip += (dictAndPrefixLength == 0)`.
     let mut ip = block_start + usize::from(block_start == prefix_lowest);

@@ -7357,6 +7357,114 @@ fn row_rep_skip() -> bool {
     n == 1
 }
 
+/// ROW GREEDY arm: whether row policy 1 gives `Greedy` frames rows (and so
+/// `find_greedy_rows`). 0 = the hash chain, 1 = rows. `u32::MAX` =
+/// unresolved; `RZSTD_ROW_GREEDY`.
+///
+/// Measured 2026-10-08 at L5 with the step and floor arms below at their
+/// shipped values, against the chain:
+///
+/// ```text
+///   18 corpora, total size   64K -0.41%  256K -1.80%  1M -1.76%  4M -1.78%
+///   six silesia files, 4 MiB caps, pinned floor, geomean time
+///     chain 1.000   rows 0.861   libzstd 1.5.7 0.923
+///     dickens 0.892  mozilla 0.658  nci 0.964  samba 0.886  x-ray 1.025
+///     xml 0.791
+/// ```
+///
+/// Two corpora get bigger: `smallmsg-8m` +1.54% at 1 MiB / +3.64% at 4 MiB
+/// and `jsonlog-16m` +0.28% / +1.46%. Both are the record-periodic class the
+/// chain's depth wins, and libzstd's own row greedy is there too
+/// (`smallmsg-8m` at 4 MiB: libzstd 1,417,564, rows 1,419,630, chain
+/// 1,369,768) -- the L7-L12 flip ended at the same parity.
+static ROW_GREEDY_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+/// The shipped greedy policy.
+const ROW_GREEDY_DEFAULT: u32 = 1;
+
+/// Bench hook for the greedy row policy (see `ROW_GREEDY_ARM`).
+pub fn set_row_greedy_arm(v: u32) {
+    ROW_GREEDY_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn row_greedy() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let v = ROW_GREEDY_ARM.load(Relaxed);
+    if v != u32::MAX {
+        return v == 1;
+    }
+    let n = crate::env_knob_parse::<u32>("RZSTD_ROW_GREEDY")
+        .filter(|v| *v <= 1)
+        .unwrap_or(ROW_GREEDY_DEFAULT);
+    ROW_GREEDY_ARM.store(n, Relaxed);
+    n == 1
+}
+
+/// GREEDY ROW STEP arm: the no-match step shift of `find_greedy_rows`
+/// (`((ip - anchor) >> shift) + 1`), apart from `RZSTD_LAZY_ACCEL`, which
+/// the chain finders and `find_lazy_rows` share. 0 = the shared knob.
+/// `u32::MAX` = unresolved; `RZSTD_ROW_GREEDY_ACCEL`.
+///
+/// Ships at libzstd's `kSearchStrength`, 8, where the shared knob is 12 (its
+/// sweep was taken on the chain). On rows it is SMALLER as well as faster:
+/// L5 total 6,547,090 -> 6,546,724 bytes at 1 MiB and 26,054,903 ->
+/// 26,053,793 at 4 MiB (64 KiB / 256 KiB +4 / +101). The speed is binary
+/// content: mozilla's searches at 1 MiB go 537,180 -> 244,879 (libzstd
+/// 247,203) and its time 1.085 -> 0.658 of the chain.
+static ROW_GREEDY_ACCEL_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+/// The shipped greedy row step shift.
+const ROW_GREEDY_ACCEL_DEFAULT: u32 = 8;
+
+/// Bench hook for the greedy row step (see `ROW_GREEDY_ACCEL_ARM`).
+pub fn set_row_greedy_accel_arm(v: u32) {
+    ROW_GREEDY_ACCEL_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn row_greedy_accel() -> usize {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut v = ROW_GREEDY_ACCEL_ARM.load(Relaxed);
+    if v == u32::MAX {
+        v = crate::env_knob_parse::<u32>("RZSTD_ROW_GREEDY_ACCEL")
+            .filter(|v| *v < 64)
+            .unwrap_or(ROW_GREEDY_ACCEL_DEFAULT);
+        ROW_GREEDY_ACCEL_ARM.store(v, Relaxed);
+    }
+    if v == 0 {
+        lazy_accel()
+    } else {
+        v as usize
+    }
+}
+
+/// GREEDY ROW FLOOR arm: 1 = `find_greedy_rows` admits position 0 as a
+/// candidate (the window floor is the frame start, not 1). `u32::MAX` =
+/// unresolved; `RZSTD_ROW_GREEDY_POS0`.
+static ROW_GREEDY_POS0_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+/// The shipped greedy row floor.
+const ROW_GREEDY_POS0_DEFAULT: u32 = 1;
+
+/// Bench hook for the greedy row floor (see `ROW_GREEDY_POS0_ARM`).
+pub fn set_row_greedy_pos0_arm(v: u32) {
+    ROW_GREEDY_POS0_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn row_greedy_pos0() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let v = ROW_GREEDY_POS0_ARM.load(Relaxed);
+    if v != u32::MAX {
+        return v == 1;
+    }
+    let n = crate::env_knob_parse::<u32>("RZSTD_ROW_GREEDY_POS0")
+        .filter(|v| *v <= 1)
+        .unwrap_or(ROW_GREEDY_POS0_DEFAULT);
+    ROW_GREEDY_POS0_ARM.store(n, Relaxed);
+    n == 1
+}
+
 /// ROW REP-TAKE arm: a repcode-1 hit at `ip + 1` at least this long is
 /// emitted at once, without the search at `ip` or the look-ahead (libzstd
 /// does both whatever the length). 0 = never. `u32::MAX` = unresolved;
@@ -7559,14 +7667,14 @@ const ROW_AUTO_MAX: u64 = 2 << 20;
 ///   the search log (`clamp(search_log, 4, 6)`), table sized from the hash
 ///   log, and a full (stride 1) back-fill.
 ///
-///   `Greedy` is NOT in it yet. Routed through the lazy finder at depth 0
-///   (see `find_sequences_strategy_sel`) it is -1.0% to -1.5% total size at
-///   256 KiB / 1 MiB and -4% on text, but `versions-16m` goes 8,278 -> 15,106
-///   bytes at 1 MiB (+82%): the loss starts where the second 512 KiB version
-///   begins, is identical under every row width / table size / fill stride,
-///   and `Lazy` (depth 1) on the same tables does not have it -- so it is the
-///   depth-0 parse, not the rows. Open; the forced arm (`RZSTD_ROW=1`) still
-///   reaches it.
+///   `Greedy` frames (window log above 14) get rows too, through
+///   `find_greedy_rows` (`ROW_GREEDY_ARM`, 2026-10-08). The `versions-16m`
+///   loss that kept them out (8,282 -> 14,683 bytes at 1 MiB) was not the
+///   depth-0 parse: the window floor was clamped to 1 so that position 0
+///   could be the empty-slot sentinel, and the second 512 KiB version's true
+///   match is position 0. Admitting it (`ROW_GREEDY_POS0_ARM`) gives back
+///   8,282 exactly; an empty slot then costs one compare against position 0
+///   only when the probe's tag is 0.
 ///
 /// `u32::MAX` = unresolved; `RZSTD_ROW_POLICY` selects, `set_row_policy_arm`
 /// is the bench hook.
@@ -7600,9 +7708,12 @@ fn row_auto_ok(params: CompressionParameters, src_len: Option<u64>) -> bool {
         2 => true,
         _ => match row_policy() {
             1 => {
-                matches!(params.strategy, Strategy::Lazy | Strategy::Lazy2)
-                    && params.window_log > 14
-                    && params.search_log >= 4
+                params.window_log > 14
+                    && match params.strategy {
+                        Strategy::Lazy | Strategy::Lazy2 => params.search_log >= 4,
+                        Strategy::Greedy => row_greedy(),
+                        _ => false,
+                    }
             }
             _ => {
                 matches!(params.strategy, Strategy::Lazy | Strategy::Lazy2)
