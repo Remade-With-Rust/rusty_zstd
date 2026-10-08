@@ -7248,7 +7248,7 @@ pub(crate) fn row_find_enabled() -> bool {
 /// `u32::MAX` = unresolved; `RZSTD_ROW_WIDE`.
 static ROW_WIDE_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 /// The shipped row key.
-const ROW_WIDE_DEFAULT: u32 = 0;
+const ROW_WIDE_DEFAULT: u32 = 1;
 
 /// Bench hook for the row key (see `ROW_WIDE_ARM`).
 pub fn set_row_wide_arm(v: u32) {
@@ -7285,7 +7285,7 @@ fn row_wide_start() -> bool {
 /// `u32::MAX` = unresolved; `RZSTD_ROW_PARSE`.
 static ROW_PARSE_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 /// The shipped row parse.
-const ROW_PARSE_DEFAULT: u32 = 0;
+const ROW_PARSE_DEFAULT: u32 = 1;
 
 /// Bench hook for the row parse (see `ROW_PARSE_ARM`).
 pub fn set_row_parse_arm(v: u32) {
@@ -7312,7 +7312,7 @@ fn row_parse_c() -> bool {
 static ROW_REPSKIP_ARM: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
 /// The shipped rep-fill rule.
-const ROW_REPSKIP_DEFAULT: u32 = 0;
+const ROW_REPSKIP_DEFAULT: u32 = 1;
 
 /// Bench hook for the rep-fill rule (see `ROW_REPSKIP_ARM`).
 pub fn set_row_repskip_arm(v: u32) {
@@ -7528,7 +7528,10 @@ const ROW_AUTO_MAX: u64 = 2 << 20;
 /// * `0` -- the 2026-09-08 band above: 16 slots, table sized to the chain it
 ///   replaces, `Lazy`/`Lazy2` only, known source length in 512 KiB..=2 MiB.
 /// * `1` -- libzstd's shape: EVERY `Lazy`/`Lazy2` frame whose window log is
-///   above 14, whatever its length (so streaming frames too); row width from
+///   above 14 and whose search log is at least 4 (L7 and up; L6's search log
+///   is 3, and rows there measured 1.12-1.19x SLOWER than the chain on six
+///   silesia files, 2026-10-04), whatever its length (so streaming frames
+///   too); row width from
 ///   the search log (`clamp(search_log, 4, 6)`), table sized from the hash
 ///   log, and a full (stride 1) back-fill.
 ///
@@ -7545,7 +7548,7 @@ const ROW_AUTO_MAX: u64 = 2 << 20;
 /// is the bench hook.
 static ROW_POLICY_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 /// The shipped row policy.
-const ROW_POLICY_DEFAULT: u32 = 0;
+const ROW_POLICY_DEFAULT: u32 = 1;
 
 /// Bench hook for the row policy (see `ROW_POLICY_ARM`).
 pub fn set_row_policy_arm(v: u32) {
@@ -7575,6 +7578,7 @@ fn row_auto_ok(params: CompressionParameters, src_len: Option<u64>) -> bool {
             1 => {
                 matches!(params.strategy, Strategy::Lazy | Strategy::Lazy2)
                     && params.window_log > 14
+                    && params.search_log >= 4
             }
             _ => {
                 matches!(params.strategy, Strategy::Lazy | Strategy::Lazy2)
