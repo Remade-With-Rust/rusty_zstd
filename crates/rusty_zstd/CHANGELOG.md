@@ -7,38 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.6](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.2.5...rusty_zstd-v0.2.6) - 2026-10-04
+## [0.3.0](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.2.5...rusty_zstd-v0.3.0) - 2026-10-08
 
-Compressed output is byte-identical to 0.2.5 at every level: everything new
-below ships behind arms that default off.
+**Encode is 1.8x faster.** On the standing board (dickens, samba, x-ray,
+mozilla, nci and xml at L1/3/5/7/9/12, whole files, one core, best of five
+alternating rounds) encode time against 0.2.5 is:
+
+| L1 | L3 | L5 | L7 | L9 | L12 | geomean |
+|---|---|---|---|---|---|---|
+| 0.61x | 0.72x | 0.68x | 0.61x | 0.54x | 0.31x | **0.56x** |
+
+**Compressed output changes at L4-L12** -- smaller, and still plain zstd
+frames: libzstd 1.5.7 decodes them byte-for-byte. L1-L3 and L13 and up are
+byte-identical to 0.2.5. Decoding is unchanged.
+
+### Changed -- output
+
+- *(rowfind)* L5-L12 move from the hash chain to libzstd's ROW match finder
+  with its lazy parse: 16/32/64-slot rows by search log, 8-bit hash tags,
+  the 8-ahead hash cache, rows that fill downward. L6 runs it for sources of
+  1 MiB or more; L4 runs it where the level table makes L4 greedy (16-256
+  KiB sources).
+- Size, 18 corpora capped at 4 MiB, against 0.2.5: L5 -1.8%, L7 -2.8%, L9
+  -2.9%, L12 -2.9% (reymont and dickens -9..-11%, nci and xml -9..-12%,
+  versions -37%). One corpus grows: `smallmsg-8m`, +2.0..+3.6% at L5-L12
+  (record-periodic messages; libzstd's own row greedy lands in the same
+  place). Positions a repcode match covers are not indexed, a departure from
+  libzstd measured on `versions-16m` (-74% at 1 MiB).
+
+### Changed -- speed, byte-identical
+
+- *(fast, dfast)* L1-L4: the Fast pair and pipelined routes run in their own
+  scan loops with one multiply per key; DFast keeps candidates in the table's
+  encoding and reuses the speculation's long candidate.
+- *(huf)* literals are emitted in libzstd's shape (7 instructions per literal,
+  from 16), coded straight into the output, with a length limiter that no
+  longer rescans the alphabet per step.
+- *(seq)* the sequence coder writes one merged extra-bits field per sequence
+  from a fixed flush schedule, with branch-free repcode steps.
+- *(dict)* a dictionary is primed once per (dictionary, parameters) and
+  restored per call, instead of re-primed every call.
+- *(alloc)* the CLI and bench binaries move to rusty_alloc 2.2.5 (from 2.0.5);
+  measured neutral (0.98-1.00x). The optional `rusty-alloc` feature still
+  installs 1.1.6 through `rusty_alloc_default` 0.1.2.
+- *(encode)* `encode.rs` split into modules.
 
 ### Added
 
-- *(rowfind)* the row match finder takes a row width (16 / 32 / 64 slots),
-  a table size and a policy as parameters (`RZSTD_ROW_LOG`,
-  `RZSTD_ROW_SIZING`, `RZSTD_ROW_POLICY`)
-- *(rowfind)* libzstd's lazy parse for row frames (`RZSTD_ROW_PARSE`), with
-  a wide row key (`RZSTD_ROW_WIDE`), the long-match fill skip
-  (`RZSTD_ROW_SKIP`) and a rule that leaves repcode-covered positions out of
-  the table (`RZSTD_ROW_REPSKIP`). Together, against the shipped hash chain:
-  0.87x time / -3.5% size at L7, 0.73x / -4.1% at L9, 0.56x / -3.7% at L12
-  (six silesia files); not yet the default
-- bench hooks `set_row_geom_arm`, `set_row_policy_arm`, `set_row_wide_arm`,
-  `set_row_skip_arm`, `set_row_parse_arm`, `set_row_repskip_arm`,
-  `set_row_reptake_arm`, `set_row_nice_arm`, `set_row_pf_arm`
-
-### Changed
-
-- *(rowfind)* the row walk gathers every candidate and prefetches its source
-  line before the first compare, and names the next search's row as soon as
-  a match is chosen: 11-14% faster on row frames, same output
-- *(alloc)* the CLI and bench binaries move to rusty_alloc 2.2.5 (from 2.0.5)
-  through the `rzstd-alloc` seam; measured neutral to slightly faster (whole-
-  file compress 0.98-1.00x at L1-L12, decompress 0.98x, small messages
-  0.98-1.01x) with fewer page faults at L12. The optional `rusty-alloc`
-  feature still installs 1.1.6 via `rusty_alloc_default` 0.1.2
-- *(encode)* `encode.rs` split into seven modules; the asm board is identical
-  in all thirty-two columns (#18)
+- `RZSTD_ROW*` environment arms and `set_row_*_arm` bench hooks for every
+  row-finder decision above (hidden, no semver promise); `RZSTD_ROW=0`
+  returns L5-L12 to the hash chain.
 
 ## [0.2.5](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.2.4...rusty_zstd-v0.2.5) - 2026-09-09
 

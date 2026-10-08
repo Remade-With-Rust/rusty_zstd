@@ -6,6 +6,30 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Released -- 0.3.0 (2026-10-08): encode 1.8x faster; L4-L12 output changes
+
+The encoder-veins campaign, against 0.2.5 on the standing board (dickens,
+samba, x-ray, mozilla, nci, xml; whole files; one core; best of five
+alternating rounds): encode time 0.61x at L1, 0.72x at L3, 0.68x at L5, 0.61x
+at L7, 0.54x at L9, 0.31x at L12 -- 0.56x by geometric mean. A first,
+independent three-round board read 0.574x.
+
+- L1-L3 and L13+: byte-identical to 0.2.5. The speed there is the Fast/DFast
+  scan loops, Huffman literals emitted in libzstd's shape, the sequence coder's
+  fixed flush schedule, and a dictionary primed once per (dictionary, params).
+- L4-L12: the ROW match finder with libzstd's greedy and lazy parses,
+  bitstream-changing and smaller (-1.8% at L5, -2.8..-2.9% at L7-L12 over 18
+  corpora at 4 MiB); `smallmsg-8m` grows 2.0-3.6%. libzstd 1.5.7 decodes every
+  sampled frame byte-for-byte; every bytegate cell round-trips.
+- Final bytegate GOLD (64 KiB / 256 KiB / 1 MiB / 4 MiB): 1E56F4482D6E7987 /
+  0CCF7D0F52E43EA7 / 1DBC41CF8A105847 / 17F2CDBC6F7757A5.
+- Against C 1.5.7, in the codec alone: 0.91-1.27x of C's encode speed at L1,
+  0.74-0.99x at L3, 0.91-1.08x at L9, 1.20-1.49x at L19. The README's CLI
+  table (whole program, default flags) is re-measured for this release.
+
+Per-commit numbers, refutations and their sites: `git log` on the merge of
+`veins/integrate`, and `crates/rusty_zstd/CHANGELOG.md`.
+
 ### Changed -- `encode.rs` split into modules, with the asm board as the gate
 
 `encode.rs` was **17,912 lines**. It is now **7,646**, with seven siblings,

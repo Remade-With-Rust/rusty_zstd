@@ -34,10 +34,10 @@ cargo add rusty_zstd
 
 ```toml
 [dependencies]
-rusty_zstd = "0.1"
+rusty_zstd = "0.3"
 
 # …or for embedded / wasm targets with no `std`:
-rusty_zstd = { version = "0.1", default-features = false, features = ["alloc"] }
+rusty_zstd = { version = "0.3", default-features = false, features = ["alloc"] }
 ```
 
 The minimum supported configuration is `no_std + alloc` — every entry point
@@ -137,42 +137,36 @@ removed in any release.
 ## Performance
 
 Both CLIs at their real defaults — `zstd -<lvl> <files>` against
-`rzstd -<lvl> <files>`, no flags beyond the level, each arm decoding the
-other's output (cross-checked every run).
+`rzstd -<lvl> <files>`, no flags beyond the level, one invocation per run over
+19 corpus files capped at 8 MiB each (143.9 MB), 10 alternating runs per arm,
+pinned to one core, each arm decoding the other's output as the cross-check.
+Ratios are C's time over ours: **above 1× we are faster.**
 
 | level | encode vs C | decode vs C | size vs C |
 |---|---:|---:|---:|
-| L1 | 0.56–0.61× | **2.58–2.82×** | +2.00% |
-| L3 (default) | 0.73–0.75× | **2.20–3.12×** | +2.11% |
-| L9 | 0.34–0.38× | **2.32–2.85×** | +2.45% |
-| L19 | **1.22–1.40×** | **2.64–2.76×** | +3.82% |
+| L1 | **1.31–1.58×** | **1.42–1.78×** | +2.00% |
+| L3 (default) | 0.90–1.35× | **1.25–1.69×** | +1.76% |
+| L9 | **1.06–1.37×** | **1.07–4.44×** | +0.29% |
+| L19 | **1.18–1.43×** | **1.41–1.90×** | +3.82% |
 
-The two columns come from different runs. **Size** was re-measured for 0.2.3
-over the full 19-file corpus, 355,593,492 bytes — deterministic, reproduces
-bit-for-bit. **Speed** is carried over from the 0.2.0 run, which used the same
-files in a capped 143.9 MB staging, and was not re-measured: this host has been
-under sustained load, and a fresh number would be a worse estimate than the one
-it replaced.
+Measured for 0.3.0 against the official zstd 1.5.7 binary. Speed cells are
+min–max over paired samples on a non-quiescent host. **Size** is the full,
+uncapped corpus (355,593,492 bytes) and is deterministic.
 
-**Read the decode column carefully — it is not a codec claim.** These are
-whole-program numbers (read + codec + write), and decode is dominated by each
-CLI's file-*writing* strategy. Decoding 24 MiB to files: C 398 ms, us 93 ms; the
-same decode to *stdout*, with the write removed: C 171 ms, us 194 ms. Measured
-in-process on the codec alone, C leads decode. Judge end-user experience from
-this table; judge codec work from
+**These are whole-program numbers (read + codec + write), and C's CLI is slow
+at writing files on this host — the decode column is mostly that.** In the
+codec alone (in-process, no checksum, no I/O, against `zstd -b
+--single-thread` on six silesia files) our encode runs at 0.91–1.27× of C's
+speed at L1, 0.74–0.99× at L3, 0.91–1.08× at L9 and 1.20–1.49× at L19. Judge
+end-user experience from the table; judge codec work from
 [`docs/plans/m7-anatomy.md`](https://github.com/Remade-With-Rust/rusty_zstd/blob/main/docs/plans/m7-anatomy.md).
 
-Speed cells are min–max over independent samples (N=10 per arm per phase) on a
-non-quiescent host, so they are ranges rather than point estimates. The size
-column is deterministic and exact. Encode trails C at L1–L9 and leads at L19;
-closing the mid-level gap is the open work.
-
-**0.2.3 moved the size column deliberately, in both directions.** DFast back
-extension took L3 −1.28% and L4 −1.15%, a pure win on the default level with no
-corpus regressing. Tightening the chain walk's first-find bar traded +0.35% to
-+1.39% size for +5.2% to +38.1% encode throughput at L5–L12 — the one
-deliberate size-for-speed trade in this encoder. Setting
-`RZSTD_WALK_FIRST_MAX=0.70` restores the previous bitstream exactly at L7/L9.
+**0.3.0 made encode 1.8× faster than 0.2.5** (geometric mean over six silesia
+files at L1/3/5/7/9/12: 0.61× / 0.72× / 0.68× / 0.61× / 0.54× / 0.31× of the
+0.2.5 time). L1–L3 output is byte-identical to 0.2.5; L4–L12 move to
+libzstd's row match finder and emit smaller output (−1.8% to −2.9% over 18
+corpora), with one corpus (`smallmsg-8m`) growing 2–3.6%. Details in the
+[changelog](https://github.com/Remade-With-Rust/rusty_zstd/blob/main/crates/rusty_zstd/CHANGELOG.md).
 
 ## Correctness
 

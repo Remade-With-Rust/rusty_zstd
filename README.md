@@ -67,77 +67,60 @@ reference**, ships the whole product surface rather than a decoder, and lands
 ### Performance — default deployment, measured and honestly reported
 
 **Both CLIs at their real defaults.** `zstd -<lvl> <files>` against
-`rzstd -<lvl> <files>`, no flags beyond the level, one invocation each so
-startup is paid once. 19 files, 143.9 MB. This is the only true
-default-vs-default comparison available: `zstd -b` **cannot** include a
-checksum — `-b --check` is accepted and ignored — yet both projects default to
-checksum **ON**, so a `-b` table compares two configurations neither project
-ships. Each arm gets its own staged copy of the inputs, and each decodes the
-other's output; the cross-check passed on every run below.
+`rzstd -<lvl> <files>`, no flags beyond the level (both default to one thread
+and a content checksum), one invocation per run over the 19-file corpus capped
+at 8 MiB per file — 143,865,706 bytes. Each arm has its own staged copy;
+encode and decode are each timed 10 times per level with the arms alternating,
+every process pinned to one core at high priority, and each CLI decodes the
+other's output against the original as the work-parity check (0 mismatches at
+every level). Ratios are C's time over ours: **above 1× we are faster.**
 
 | level | encode vs C | decode vs C | size vs C |
 |---|---:|---:|---:|
-| **L1** | 0.56–0.61× | **2.58–2.82×** | **+2.00%** |
-| **L3** (default) | 0.73–0.75× | **2.20–3.12×** | **+2.11%** |
-| **L9** | 0.34–0.38× | **2.32–2.85×** | **+2.45%** |
-| **L19** | **1.22–1.40×** | **2.64–2.76×** | **+3.82%** |
+| **L1** | **1.31–1.58×** | **1.42–1.78×** | +2.00% |
+| **L3** (default) | 0.90–1.35× | **1.25–1.69×** | +1.76% |
+| **L9** | **1.06–1.37×** | **1.07–4.44×** | **+0.29%** |
+| **L19** | **1.18–1.43×** | **1.41–1.90×** | +3.82% |
 
-<sub>**The two columns come from different runs, and mixing them would be
-sloppy, so here is exactly which is which.** The **size** column was
-re-measured for 0.2.3 over the **full 19-file corpus, 355,593,492 bytes**,
-both CLIs at their defaults: at L1 we emit 116,548,162 bytes against C's
-114,259,341. It is deterministic and reproduces bit-for-bit. The **speed**
-ranges are carried over from the 0.2.0 measurement, which ran the same 19
-files in a *capped* staging totalling 143.9 MB, and were **not** re-measured
-here — this host has been under sustained load all campaign, and a speed
-number taken today would be a worse estimate than the one it replaced, not a
-better one.</sub>
+<sub>Measured for **0.3.0** on 2026-10-08 against the official zstd 1.5.7
+Windows binary. Speed cells are min–max over the 10 paired samples, because
+this host is not quiescent and a single number would be one draw from that
+spread. **Size** is the full, uncapped 19-file corpus (355,593,492 bytes), both
+CLIs at their defaults: at L1 we emit 116,548,162 bytes against C's
+114,259,341. It is deterministic and reproduces bit-for-bit.</sub>
 
-<sub>**Speed cells are ranges, not point estimates, and that is deliberate.**
-Min–max over independent samples at N=10 per arm per phase, on a host that was
-not quiescent. The same measurement at N=3 read L1 decode as 2.66× on one
-sample and 1.57× on the next, and even at N=10 the L3 encode cell moved 0.63×
-to 0.93× *between batches*. Anything quoted here as a single number would be
-one draw from that spread.</sub>
+**The CLI table is whole-program — read, codec and write — and that flatters
+us.** On this host C's CLI is slow at writing files, and the decode column in
+particular is mostly that. The codec alone, both sides in-process with no
+checksum and no I/O (our encoder against the official binary's own `zstd -b
+--single-thread`, six silesia files capped at 8 MiB, pinned, best of
+alternating rounds), our encode speed relative to C's:
 
-<sub>**0.2.3 moved the size column on purpose, in both directions.** DFast
-back-extension took **L3 −1.28%** and L4 −1.15% — a pure win on the default
-level's ladder, no corpus regressing. Tightening the chain walk's first-find
-bar traded **+0.35% to +1.39% size for +5.2% to +38.1% encode throughput** at
-L5–L12; it is the one deliberate size-for-speed trade in this encoder, and
-`RZSTD_WALK_FIRST_MAX=0.70` restores the previous bitstream exactly at L7/L9.
-The L1 and L19 rows are bit-identical to 0.2.2 — neither change touches those
-ladders, so their movement above is corpus, not code.</sub>
+| level | dickens | samba | x-ray | mozilla | nci | xml |
+|---|---:|---:|---:|---:|---:|---:|
+| L1 | 0.91× | 0.94× | **1.27×** | 0.92× | 0.93× | 0.94× |
+| L3 | 0.86× | 0.95× | 0.74× | 0.99× | 0.88× | 0.92× |
+| L9 | **1.01×** | 0.96× | 0.95× | 0.91× | **1.08×** | **1.03×** |
+| L19 | **1.30×** | **1.20×** | **1.21×** | **1.41×** | **1.49×** | **1.28×** |
 
-<sub>**READ THIS BEFORE OPTIMISING FROM IT — the decode figure is not a codec
-claim.** These are whole-program numbers: read + codec + write. On this host
-decode is dominated by each CLI's file-**writing** strategy, not by the codec.
-Decoding the same 24 MiB to files took C 398 ms and us 93 ms; the same decode
-to **stdout**, with the write removed, took C 171 ms and us 194 ms. The
-advantage is the write path, and with it removed C is ahead. Measured
-in-process on the codec alone — checksum off on both arms, as `zstd -b` runs —
-C leads **both** phases: by ~1.6× at L1/L3 and by ~2.1–2.8× at L9. The
-in-process encode figures (0.54× / 0.63× / 0.36× at L1/L3/L9) agree closely
-with the CLI encode column above, and two instruments that disagree about
-decode while agreeing about encode is what establishes the encode gap as a
-real codec property rather than an artifact of either harness.
-**Judge end-user experience from this table; judge codec work from**
-[`docs/plans/m7-anatomy.md`](docs/plans/m7-anatomy.md).</sub>
+So in the codec, C still leads at L1 (by ~6–9%) and L3 (by 1–26%); the two are
+level at L9; we lead at L19. **Judge end-user experience from the first table,
+codec work from the second.**
 
-<sub>**The speed columns moved between releases and that is NOT attributable to
-this project's changes.** Every level's throughput read higher in the 0.2.0
-measurement than in 0.1.0's — including L9, whose compressed bytes are
-*bit-identical* between the two, so its code path did not change. When an
-unchanged path speeds up, the lift is the host, not the codec. The SIZE column
-carries no such caveat: it is deterministic, and its 0.1.0 → 0.2.0 movement at
-L1 and L3 is exactly the fill-density change described in the changelog.</sub>
+**0.3.0 is where the encoder caught up.** Against 0.2.5 on the standing board
+(the six files above at L1/3/5/7/9/12, whole files, one core, best of five
+alternating rounds), encode time is 0.61× at L1, 0.72× at L3, 0.68× at L5,
+0.61× at L7, 0.54× at L9 and 0.31× at L12 — **0.56× by geometric mean, 1.8×
+faster.** L1–L3 output is byte-identical to 0.2.5. L4–L12 move to libzstd's
+row match finder and its lazy parse, and the output there gets **smaller**
+(−1.8% at L5, −2.8% to −2.9% at L7–L12 over 18 corpora at 4 MiB), with one
+corpus growing (`smallmsg-8m`, +2–3.6%). See
+[`crates/rusty_zstd/CHANGELOG.md`](crates/rusty_zstd/CHANGELOG.md).
 
-<sub>**No claim is made that the optimization campaign made this faster.**
-Every brick in it shipped on strictly-less-work plus byte-identity, never on a
-wall-clock delta, and the boards say so explicitly. The per-file spread is the
-story and these files differ enormously — **never average them**. Method,
-per-corpus stage shares, and the instrument's own repair history:
-[`docs/plans/m7-anatomy.md`](docs/plans/m7-anatomy.md) and
+<sub>The previous table (0.2.0 speed, 0.2.3 size) read encode 0.56–0.61× at
+L1, 0.73–0.75× at L3 and 0.34–0.38× at L9 against C, measured the same way on a
+loaded host and never re-measured since. Method history and the per-corpus
+stage shares: [`docs/plans/m7-anatomy.md`](docs/plans/m7-anatomy.md) and
 [`docs/plans/m7-benchmark-repair.md`](docs/plans/m7-benchmark-repair.md).</sub>
 
 ## What is this?
@@ -211,10 +194,10 @@ cargo add rusty_zstd
 
 ```toml
 [dependencies]
-rusty_zstd = "0.2"
+rusty_zstd = "0.3"
 
 # …or for embedded / wasm targets with no `std`:
-rusty_zstd = { version = "0.2", default-features = false, features = ["alloc"] }
+rusty_zstd = { version = "0.3", default-features = false, features = ["alloc"] }
 ```
 
 The minimum supported configuration is `no_std + alloc` — every entry point
@@ -391,14 +374,15 @@ scalar twins run and the output is identical.
 - [x] **M6 — CLI completeness.** Multi-threading (`-T#`, `--jobsize`,
       `--overlap-log`), `-l` / `-b` / `-r`, env vars, and the `unzstd` /
       `zstdcat` / `zstdmt` aliases — all dual-gated against C
-- [x] **M7 (in progress) — the performance campaign.** At default settings we
-      emit **+0.9%** (L1) to **+2.2%** (L3) more than C, and the CLI decodes
-      **faster** than C end-to-end — but that is the write path, not the codec
-      (see Performance above). The codec speed gap, ~1.6× on both phases, is
-      the open work, and it is concentrated in the **mid-level match finders**
-      (L5–L12): the opt-class finders at L19 already reach C's encode rate
-- [ ] Mission §7's exit bars: compress within **1.25×** of C at L1/L3 and
-      decompress within **1.11×**, which the current board does not yet clear
+- [x] **M7 (in progress) — the performance campaign.** 0.3.0 made encode
+      1.8× faster than 0.2.5. In the codec alone we are level with C at L9 and
+      ahead at L19; C still leads at L1 (~6–9%) and L3 (1–26%). At default
+      settings we emit +0.3% (L9) to +3.8% (L19) more than C. The CLI beats
+      C's end to end at every level measured (see Performance above), partly
+      on its write path
+- [ ] Mission §7's exit bars: compress within **1.25×** of C at L1/L3 (L1
+      clears it in the codec; L3 does not yet on x-ray, 1.36×) and decompress
+      within **1.11×** in the codec, which has not been re-measured for 0.3.0
 - [ ] Legacy frame decode (v0.1–v0.7), behind the `legacy` feature
 - [ ] The optional C ABI `cdylib`, so existing C callers can relink
 
