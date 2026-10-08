@@ -1049,6 +1049,80 @@ pub(crate) fn find_fast_impl_inner<
         tags_live,
         ends: f_ends,
     };
+    // The two shapes that carry the traffic run the pipelined route in their
+    // own scan too -- see `fast_pipe_scan`.
+    if pipe_rt && !pair && ip <= ilimit && (SHAPE == 1 || SHAPE == 2) {
+        if COUNT {
+            FF_PIPE_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        let ks = PairScan {
+            src,
+            block_end,
+            ilimit,
+            window,
+            lowest,
+            accept_ml,
+            pair_bar: 0,
+            mask: f_mask,
+            shift: f_shift,
+            step0,
+            accel,
+            rep,
+            maintain_rep1,
+            lp_copy,
+        };
+        let mut t = PairTally {
+            ip,
+            anchor,
+            rep1,
+            ..PairTally::default()
+        };
+        #[cfg(feature = "profile")]
+        {
+            fast_pipe_scan::<BMI2, SHAPE>(
+                &ks,
+                &ectx,
+                &mut hash_v,
+                &mut tags_v,
+                &mut seqs,
+                &mut lits,
+                &mut t,
+                &mut r2,
+            );
+            r2.flush();
+        }
+        #[cfg(not(feature = "profile"))]
+        fast_pipe_scan::<BMI2, SHAPE>(
+            &ks,
+            &ectx,
+            &mut hash_v,
+            &mut tags_v,
+            &mut seqs,
+            &mut lits,
+            &mut t,
+        );
+        fast_pipe_epilogue(
+            tables,
+            src,
+            &seqs,
+            &mut lits,
+            t.anchor,
+            block_end,
+            rep,
+            t.rep_hits,
+            t.rep_bytes,
+            t.rep_probes,
+            t.cand,
+            t.probes,
+            t.hits,
+            t.pipe_pos,
+            t.ff_made,
+            t.ff_used,
+            hash_v,
+            tags_v,
+        );
+        return (seqs, lits);
+    }
     if pipe_rt && !pair && ip <= ilimit {
         if COUNT {
             FF_PIPE_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1612,6 +1686,10 @@ pub(crate) struct PairTally {
     pub(crate) hits: u64,
     pub(crate) mm_total: u64,
     pub(crate) mm_miss: u64,
+    /// The pipelined scan's census (`fast_pipe_scan`; profile only).
+    pub(crate) pipe_pos: u64,
+    pub(crate) ff_made: u64,
+    pub(crate) ff_used: u64,
 }
 
 /// The slot key of position `p` for body `SHAPE`: `(bucket, tag word)`.
@@ -1959,6 +2037,144 @@ pub(crate) fn fast_pair_scan<const BMI2: bool, const SHAPE: u8>(
     }
     if ip == ilimit {
         step!(false);
+    }
+    t.ip = ip;
+    t.anchor = anchor;
+    t.rep1 = rep1;
+    t.cand = cand;
+}
+
+/// THE PIPELINED ROUTE'S SCAN (routes 0 and 1: no pair search; brick 39's
+/// 2-way software pipeline), for the same two bodies as `fast_pair_scan`.
+///
+/// Position for position the work of the pipelined loop in
+/// `find_fast_impl_inner` -- the store at `ip`, the repcode probe, the next
+/// position's key and slot issued before the current candidate is tested,
+/// the emit -- so byte-identical by construction. One simplification is an
+/// identity: the old loop forwarded the slot it had just stored by hand when
+/// the next key landed on it (`h == h0`), and a plain load after the store
+/// reads exactly that (packed: `(ip + 1) | g0 << 24`, which decodes to
+/// `ip + 1` iff the tags agree; tag array: `ip + 1` under `g0`), as the
+/// DFast speculation already found (V3). And the emitter is inline, as in
+/// `fast_pair_scan`.
+#[inline(always)]
+pub(crate) fn fast_pipe_scan<const BMI2: bool, const SHAPE: u8>(
+    k: &PairScan,
+    ectx: &FastEmitCtx,
+    hash: &mut [u32],
+    tags: &mut [u8],
+    seqs: &mut Vec<Seq>,
+    lits: &mut Vec<u8>,
+    t: &mut PairTally,
+    #[cfg(feature = "profile")] r2: &mut Rep2Probe,
+) {
+    const COUNT: bool = cfg!(feature = "profile");
+    debug_assert!(SHAPE == 1 || SHAPE == 2);
+    let _ = BMI2;
+    let src = k.src;
+    let ilimit = k.ilimit;
+    let mut ip = t.ip;
+    let mut anchor = t.anchor;
+    let mut rep1 = t.rep1;
+    let mut cand = t.cand;
+    debug_assert!(ip <= ilimit);
+    let (mut h0, mut g0) = pair_key::<SHAPE>(k, ip);
+    let mut m0 = pair_load::<SHAPE>(hash, tags, h0, g0);
+    loop {
+        if COUNT {
+            t.pipe_pos += 1;
+            t.probes += 1;
+            let raw = fast_slot_raw(hash, SHAPE == 1, h0);
+            if m0 == 0 && raw != 0 {
+                if fast_probe(
+                    &mut (0, 0),
+                    src,
+                    raw,
+                    ip,
+                    k.window,
+                    k.lowest,
+                    k.accept_ml,
+                    k.block_end,
+                )
+                .is_some()
+                {
+                    TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        pair_store::<SHAPE>(hash, tags, h0, ip, g0);
+        if k.rep {
+            if COUNT {
+                t.rep_probes += 1;
+            }
+            if let Some(ml) = try_rep1(src, ip, rep1, k.lowest, k.block_end, ilimit) {
+                t.rep_hits += 1;
+                t.rep_bytes += ml as u64;
+                if COUNT {
+                    t.hits += 1;
+                }
+                let mstart = ip + 1;
+                crate::prof::note_huff_path(11);
+                push_literals(lits, src, anchor, mstart, k.lp_copy);
+                crate::prof::note_huff_path(13);
+                seqs.push(Seq {
+                    litlen: (mstart - anchor) as u32,
+                    matchlen: ml as u32,
+                    offset: rep1 as u32,
+                });
+                ip = mstart + ml;
+                anchor = ip;
+                #[cfg(feature = "profile")]
+                r2.after(seqs, src, ip, k.lowest, ilimit, k.block_end);
+                if ip > ilimit {
+                    break;
+                }
+                (h0, g0) = pair_key::<SHAPE>(k, ip);
+                m0 = pair_load::<SHAPE>(hash, tags, h0, g0);
+                continue;
+            }
+        }
+        // Next position, and its slot load issued NOW (brick 39).
+        let nip = ip + k.step0 + ((ip - anchor) >> k.accel);
+        if COUNT && nip <= ilimit {
+            t.ff_made += 1;
+        }
+        let (h1, g1, m1) = if nip <= ilimit {
+            let (h, g) = pair_key::<SHAPE>(k, nip);
+            (h, g, pair_load::<SHAPE>(hash, tags, h, g))
+        } else {
+            (0, 0, 0)
+        };
+        if let Some((m, ml)) = pair_probe::<SHAPE>(k, &mut cand, m0, ip) {
+            if COUNT {
+                t.hits += 1;
+            }
+            let found = ip;
+            ip = emit_fast_seq_body(ectx, hash, tags, seqs, lits, anchor, found, m, ml);
+            anchor = ip;
+            #[cfg(feature = "profile")]
+            r2.after(seqs, src, ip, k.lowest, ilimit, k.block_end);
+            if k.maintain_rep1 {
+                rep1 = found - m;
+            }
+            if ip > ilimit {
+                break;
+            }
+            (h0, g0) = pair_key::<SHAPE>(k, ip);
+            m0 = pair_load::<SHAPE>(hash, tags, h0, g0);
+            continue;
+        }
+        if nip > ilimit {
+            break;
+        }
+        if COUNT {
+            t.ff_used += 1;
+        }
+        ip = nip;
+        h0 = h1;
+        g0 = g1;
+        m0 = m1;
     }
     t.ip = ip;
     t.anchor = anchor;
