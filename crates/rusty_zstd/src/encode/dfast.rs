@@ -284,7 +284,19 @@ pub(crate) fn dfast_finder_prologue(
     } else {
         1
     };
+    // The pipeline runs on the PACKED body only. On the tag-array body (frames
+    // of 16 MiB and over, and streaming) its speculation carries the
+    // hand-forward the packed body dropped (V3) and costs more than the
+    // overlap returns. Measured 2026-10-08, byte-identical (issue order
+    // only): executed whole-program instructions samba / mozilla / nci L3
+    // 0.988 / 0.978 / 0.994, L4 0.988 / 0.980 / 0.994; clock (encab, ABBA,
+    // pinned, floor of thread CPU cycles; two sessions) mozilla L3 0.972 and
+    // 0.965, L4 0.951; samba L3 0.993 and 0.980, L4 0.971; nci L3 0.963 and
+    // 0.994, L4 0.977, against controls on the untouched packed body of
+    // 0.968..1.025. Turning it off on the PACKED body too was neutral there
+    // (dickens 1.007, x-ray 1.006, xml 1.006 at L3), so that body keeps it.
     let dpipe = dfast_pipe_enabled()
+        && tables.pack_tags
         && (tables.dfast_probe == 0 || tables.dfast_spec_yield >= dfast_spec_min());
     let lt_on = long_tag_enabled() && (tables.pack_tags || !tables.ltags.is_empty());
     let gates = DfastGates {
