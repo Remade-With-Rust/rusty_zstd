@@ -44,7 +44,7 @@ pub(crate) fn row_key_htag(src: &[u8], p: usize, shift64: u32, smask: u64) -> (u
 /// at four caps); the shipped values of both differ, see their notes.
 #[inline(never)]
 #[allow(unsafe_code)]
-pub(crate) fn find_greedy_rows<const RL: u32, const HT: bool>(
+pub(crate) fn find_greedy_rows<const RL: u32, const HT: bool, const D: usize>(
     src: &[u8],
     block_start: usize,
     block_end: usize,
@@ -56,6 +56,10 @@ pub(crate) fn find_greedy_rows<const RL: u32, const HT: bool>(
     debug_assert_eq!(RL, tables.rows.row_log());
     debug_assert!(tables.chain_wide);
     debug_assert_eq!(HT, tables.row_htag);
+    // Depth 0 (Greedy) and depth 1 (Lazy at search log 3, L6) only.
+    debug_assert!(D <= 1);
+    let rep_take = row_rep_take();
+    let nice = row_nice();
     let mls = params.min_match.clamp(3, 7) as usize;
     let attempts = search_attempts(params);
     let (mut seqs, mut lits) = match chain_finder_prologue(src, block_start, block_end, tables, mls)
@@ -129,6 +133,17 @@ pub(crate) fn find_greedy_rows<const RL: u32, const HT: bool>(
             unsafe {
                 crate::simd::prefetch_raw(tagp.add(at) as *const u8);
                 let pb = posp.add(at) as *const u8;
+                // The table is not line-aligned, so a row can straddle a
+                // boundary: name its last byte too.
+                //
+                // REFUTED 2026-10-08: line-aligning `pos` and `tags` (one line
+                // of slack, every access from the first 64-byte boundary) so
+                // a 16-slot row is one line instead of two three times in
+                // four. Byte-identical, and SLOWER: L5 0.995, L6 1.016, L7
+                // 1.049, L9 1.084 of the unaligned table (six silesia files
+                // at 4 MiB, pinned floor, four rounds). Not chased further;
+                // one suspect is both tables then sharing their low 12
+                // address bits row for row (4K aliasing).
                 let mut off = 0usize;
                 while off < (4usize << RL) {
                     crate::simd::prefetch_raw(pb.add(off));
@@ -179,9 +194,16 @@ pub(crate) fn find_greedy_rows<const RL: u32, const HT: bool>(
         }};
     }
     // Insert `from .. to` -- libzstd's update with its long-match skip
-    // (`row_catch_up`'s rule). Every inserted position names the row
-    // `HC` positions on, libzstd's hash-cache distance; the loop is split
-    // so the bulk runs without the `ilimit` test.
+    // (`row_catch_up`'s rule). Every inserted position names the row `HC`
+    // positions on, libzstd's hash-cache distance; the loop is split so the
+    // bulk runs without the `ilimit` test.
+    //
+    // REFUTED 2026-10-08: naming only the last `HC` rows of a fill (the ones
+    // the next search reads), on the argument that an insert only reads its
+    // row's 1-byte head. Fewer instructions (nci L6 / 1 MiB 58.8M -> 54.9M)
+    // and SLOWER: L5 1.024x, L6 1.004x of this form (six silesia files at
+    // 4 MiB, pinned floor, four rounds; dickens / samba / x-ray / mozilla
+    // +3..5%). The inserts' row lines are worth naming.
     macro_rules! fill_run {
         ($from:expr, $to:expr) => {{
             let (mut q, to): (usize, usize) = ($from, $to);
@@ -308,12 +330,14 @@ pub(crate) fn find_greedy_rows<const RL: u32, const HT: bool>(
         let mut off = 0usize;
         let mut start = ip + 1;
         'pick: {
-            // Repcode 1 at `ip + 1`, taken at once (depth 0).
+            // Repcode 1 at `ip + 1`, taken at once at depth 0.
             if offset_1 != 0 {
                 if let Some(l) = rep1_len_w(src, ip + 1, ip + 1 - offset_1, block_end, ip < ilimit)
                 {
                     ml = l;
-                    break 'pick;
+                    if D == 0 || l >= rep_take {
+                        break 'pick;
+                    }
                 }
             }
             let (m, ml2) = search!(ip);
@@ -328,6 +352,42 @@ pub(crate) fn find_greedy_rows<const RL: u32, const HT: bool>(
                 ip += step;
                 lazy_skipping = step > ROW_LAZY_SKIP_STEP;
                 continue 'outer;
+            }
+            // Depth 1: look for something better one position on, with
+            // libzstd's gains (`find_lazy_rows`, statement for statement).
+            if D >= 1 && ml < nice {
+                while ip < ilimit {
+                    ip += 1;
+                    if offset_1 != 0 {
+                        if let Some(mr) = rep1_len_w(src, ip, ip - offset_1, block_end, true) {
+                            let gain2 = (mr * 3) as i32;
+                            let gain1 = (ml * 3) as i32 - hb_offbase(off) + 1;
+                            if gain2 > gain1 {
+                                ml = mr;
+                                off = 0;
+                                start = ip;
+                            }
+                        }
+                    }
+                    // REFUTED 2026-10-08: searching here with a floor of
+                    // `ml - 6` (nothing shorter can pass the gain test, so the
+                    // output is identical) to start the prefilter there.
+                    // nci at L6 / 1 MiB went 54.92M -> 55.22M instructions:
+                    // the lookahead's candidates fail at the first word, not
+                    // in the count.
+                    let (m, ml2) = search!(ip);
+                    if ml2 != 0 {
+                        let gain2 = (ml2 * 4) as i32 - hb32(ip - m + 3);
+                        let gain1 = (ml * 4) as i32 - hb_offbase(off) + 4;
+                        if gain2 > gain1 {
+                            ml = ml2;
+                            off = ip - m;
+                            start = ip;
+                            continue;
+                        }
+                    }
+                    break;
+                }
             }
         }
         debug_assert!(ml >= mls.min(4) && start + ml <= block_end);

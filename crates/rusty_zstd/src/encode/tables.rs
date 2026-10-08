@@ -827,7 +827,7 @@ impl MatchTables {
         // rows are: every construction path (one-shot, streaming, priming)
         // then agrees on it without each having to remember to.
         t.chain_wide = !t.rows.head.is_empty() && row_wide_start();
-        t.row_htag = row_htag_for(_params.strategy, &t);
+        t.row_htag = row_htag_for(_params, &t);
         t
     }
 

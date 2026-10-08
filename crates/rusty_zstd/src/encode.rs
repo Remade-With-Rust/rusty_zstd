@@ -447,7 +447,7 @@ pub(crate) fn encode_oneshot(
     // the wide key -- smallmsg-class content (first-find dominated, prefers
     // its literal+rep economy) never latches. Frame init only resets it.
     tables.chain_wide = row_wide_start() && !tables.rows.head.is_empty();
-    tables.row_htag = row_htag_for(params.strategy, &tables);
+    tables.row_htag = row_htag_for(params, &tables);
     // Array route where the 24-bit proof fails (>= 16 MiB): link tags in
     // `ctags`, head tags in `tags` (same hash index). Priced by `linkbig`.
     if matches!(
@@ -2670,7 +2670,7 @@ fn find_sequences_strategy_sel(
                 if tables.chain_wide && row_parse_c() {
                     macro_rules! go {
                         ($rl:literal, $ht:literal) => {
-                            find_greedy_rows::<$rl, $ht>(
+                            find_greedy_rows::<$rl, $ht, 0>(
                                 src,
                                 block_start,
                                 block_end,
@@ -2695,7 +2695,39 @@ fn find_sequences_strategy_sel(
                 find_greedy(src, block_start, block_end, window, params, tables, reps)
             }
         }
-        Strategy::Lazy => find_lazy(src, block_start, block_end, window, params, tables, 1, reps),
+        Strategy::Lazy => {
+            // L6 (search log 3) on rows: the fused parse at depth 1. Deeper
+            // lazy frames (L7+) stay on `find_lazy_rows` through `find_lazy`.
+            if row_fused_strategy(params)
+                && row_find_enabled()
+                && !tables.rows.head.is_empty()
+                && tables.chain_wide
+                && row_parse_c()
+            {
+                macro_rules! go {
+                    ($rl:literal, $ht:literal) => {
+                        find_greedy_rows::<$rl, $ht, 1>(
+                            src,
+                            block_start,
+                            block_end,
+                            window,
+                            params,
+                            tables,
+                            reps,
+                        )
+                    };
+                }
+                return match (tables.rows.row_log(), tables.row_htag) {
+                    (6, true) => go!(6, true),
+                    (5, true) => go!(5, true),
+                    (_, true) => go!(4, true),
+                    (6, false) => go!(6, false),
+                    (5, false) => go!(5, false),
+                    (_, false) => go!(4, false),
+                };
+            }
+            find_lazy(src, block_start, block_end, window, params, tables, 1, reps)
+        }
         Strategy::Lazy2 => find_lazy(src, block_start, block_end, window, params, tables, 2, reps),
         Strategy::BtLazy2 => {
             find_bt_lazy(src, block_start, block_end, window, params, tables, 2, reps)
@@ -7366,7 +7398,8 @@ fn row_rep_skip() -> bool {
 }
 
 /// ROW GREEDY arm: whether row policy 1 gives `Greedy` frames rows (and so
-/// `find_greedy_rows`). 0 = the hash chain, 1 = rows. `u32::MAX` =
+/// `find_greedy_rows`) when the source is unknown or at least
+/// `ROW_GREEDY_MIN_SRC`. 0 = the hash chain, 1 = rows. `u32::MAX` =
 /// unresolved; `RZSTD_ROW_GREEDY`.
 ///
 /// Measured 2026-10-08 at L5 with the step and floor arms below at their
@@ -7452,12 +7485,77 @@ fn row_greedy_htag() -> bool {
 /// Whether a frame's rows carry hash tags: a Greedy frame on wide-key rows
 /// with the C parse (i.e. one `find_greedy_rows` serves) and the arm on.
 /// Decided where `chain_wide` is, so every producer of the frame agrees.
-pub(crate) fn row_htag_for(strategy: Strategy, tables: &MatchTables) -> bool {
-    strategy == Strategy::Greedy
+pub(crate) fn row_htag_for(params: CompressionParameters, tables: &MatchTables) -> bool {
+    row_fused_strategy(params)
         && tables.chain_wide
         && !tables.rows.head.is_empty()
         && row_parse_c()
         && row_greedy_htag()
+}
+
+/// The frames `find_greedy_rows` parses when they have rows: `Greedy`
+/// (depth 0) and `Lazy` at a search log below 4 (depth 1; L6). Deeper lazy
+/// frames are `find_lazy_rows`'.
+#[inline]
+pub(crate) fn row_fused_strategy(params: CompressionParameters) -> bool {
+    match params.strategy {
+        Strategy::Greedy => true,
+        Strategy::Lazy => params.search_log < 4,
+        _ => false,
+    }
+}
+
+/// ROW L6 arm: whether row policy 1 gives `Lazy` frames with a search log
+/// below 4 (L6) rows, parsed by `find_greedy_rows` at depth 1, when the
+/// source is unknown or at least `ROW_L6_MIN_SRC`. 0 = the hash chain.
+/// `u32::MAX` = unresolved; `RZSTD_ROW_L6`.
+///
+/// Held to `find_lazy_rows` at depth 1 first: with the step, floor and tag
+/// arms at the shared values its output is identical (GOLD over 18 corpora
+/// at L6 and four caps, forced rows). Measured 2026-10-08 with the shipped
+/// arms, L6 vs the chain:
+///
+/// ```text
+///   cap     time (six silesia files, pinned floor, geomean)   size (18)
+///   64K     1.238                                             -0.97%
+///   256K    1.086                                             -2.81%
+///   512K    1.056                                             -2.26% (six)
+///   1M      0.931  (mozilla 0.600, samba 0.832, nci 1.378)    -2.80%
+///   4M      0.942  (x-ray 0.847, nci 1.303)                   -2.70%
+/// ```
+///
+/// Below a megabyte the chain is faster (its tables are cache-resident
+/// there, which is what rows buy back on big inputs), so the policy keeps
+/// it. Worst corpus at 4 MiB: smallmsg-8m +1.68%. nci and xml stay slower
+/// on rows at every size: long repeats put eight live candidates in every
+/// row and the lookahead searches twice per match.
+static ROW_L6_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+/// The shipped L6 policy.
+const ROW_L6_DEFAULT: u32 = 1;
+/// The smallest known source an L6 frame takes rows for (see `ROW_L6_ARM`).
+const ROW_L6_MIN_SRC: u64 = 1 << 20;
+/// The smallest known source a Greedy frame takes rows for: at L5, rows
+/// were 1.047x the chain's time at 64 KiB (-0.49% size) and 0.987x at
+/// 128 KiB (six silesia files, pinned floor, 2026-10-08).
+const ROW_GREEDY_MIN_SRC: u64 = 128 << 10;
+
+/// Bench hook for the L6 row policy (see `ROW_L6_ARM`).
+pub fn set_row_l6_arm(v: u32) {
+    ROW_L6_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn row_l6() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let v = ROW_L6_ARM.load(Relaxed);
+    if v != u32::MAX {
+        return v == 1;
+    }
+    let n = crate::env_knob_parse::<u32>("RZSTD_ROW_L6")
+        .filter(|v| *v <= 1)
+        .unwrap_or(ROW_L6_DEFAULT);
+    ROW_L6_ARM.store(n, Relaxed);
+    n == 1
 }
 
 /// GREEDY ROW STEP arm: the no-match step shift of `find_greedy_rows`
@@ -7770,8 +7868,11 @@ fn row_auto_ok(params: CompressionParameters, src_len: Option<u64>) -> bool {
             1 => {
                 params.window_log > 14
                     && match params.strategy {
-                        Strategy::Lazy | Strategy::Lazy2 => params.search_log >= 4,
-                        Strategy::Greedy => row_greedy(),
+                        Strategy::Lazy | Strategy::Lazy2 if params.search_log >= 4 => true,
+                        Strategy::Lazy => row_l6() && src_len.is_none_or(|n| n >= ROW_L6_MIN_SRC),
+                        Strategy::Greedy => {
+                            row_greedy() && src_len.is_none_or(|n| n >= ROW_GREEDY_MIN_SRC)
+                        }
                         _ => false,
                     }
             }
