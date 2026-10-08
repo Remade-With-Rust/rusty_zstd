@@ -235,17 +235,23 @@ impl RowTable {
 
     /// Touch the lines a probe of hash bucket `h`'s row will read: its tags,
     /// its positions and its head byte. A pure hint -- see
-    /// `simd::prefetch_read`; nothing is read and nothing can change.
+    /// `simd::prefetch_read_known`; nothing is read and nothing can change.
     #[inline(always)]
     pub fn prefetch_row<const RL: u32>(&self, h: usize) {
         debug_assert_eq!(RL, self.row_log);
         let r = (h >> RL) & self.row_mask;
         let at = r << RL;
-        crate::simd::prefetch_read(&self.head, r);
+        // Every address below is inside its table: `r <= row_mask`, so
+        // `head[r]`, `tags[at .. at + (1 << RL)]` and the row's `4 << RL`
+        // position bytes all exist. The `_known` hint drops the per-address
+        // `< len` guard the checked hint re-tested -- seven compares and
+        // branches per probe at 64 slots (2026-10-08 callgrind).
+        debug_assert!(r < self.head.len() && at + (1usize << RL) <= self.tags.len());
+        crate::simd::prefetch_read_known(&self.head, r);
         // Tags: `1 << RL` bytes. The tables are not line-aligned, so a row
         // can straddle a boundary: name its last byte as well as its first.
-        crate::simd::prefetch_read(&self.tags, at);
-        crate::simd::prefetch_read(&self.tags, at + (1usize << RL) - 1);
+        crate::simd::prefetch_read_known(&self.tags, at);
+        crate::simd::prefetch_read_known(&self.tags, at + (1usize << RL) - 1);
         // Positions: 4 bytes per slot, i.e. 64 / 128 / 256 bytes.
         let pos: &[u8] = {
             // View the `u32` positions as bytes for the hint only.
@@ -259,10 +265,10 @@ impl RowTable {
         };
         let mut off = 0usize;
         while off < (4usize << RL) {
-            crate::simd::prefetch_read(pos, (at << 2) + off);
+            crate::simd::prefetch_read_known(pos, (at << 2) + off);
             off += 64;
         }
-        crate::simd::prefetch_read(pos, (at << 2) + (4usize << RL) - 1);
+        crate::simd::prefetch_read_known(pos, (at << 2) + (4usize << RL) - 1);
     }
 
     /// Forget every position, keeping the allocation and the geometry.

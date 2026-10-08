@@ -4565,16 +4565,31 @@ fn row_find_best<const MLS: usize, const RL: u32>(
     // down per candidate: the walk visits set bits from the high end, so "the
     // newest `attempts` candidates" is "clear the lowest set bits until
     // popcount == attempts", and `w &= w - 1` clears exactly the lowest.
-    let mut extra = (w.count_ones() as usize).saturating_sub(attempts);
-    while extra != 0 {
-        w &= w - 1;
-        extra -= 1;
+    //
+    // Only when the budget CAN bind: a row has `1 << RL` slots, and the
+    // shipped policy sizes rows from the search log, so at L7-L12 the budget
+    // equals the width and this never trims. Baseline x86_64 has no POPCNT,
+    // so the unguarded count was ~20 instructions of bit arithmetic per probe
+    // (2026-10-08 callgrind, every probe at L9 and L12).
+    if attempts < (1usize << RL) {
+        let mut extra = (w.count_ones() as usize).saturating_sub(attempts);
+        while extra != 0 {
+            w &= w - 1;
+            extra -= 1;
+        }
     }
     // Phase 1 -- GATHER. At most `1 << RL <= 64` candidates; only the prefix
     // `cand[..n]` is ever read, so the buffer is left uninitialised rather
     // than zeroed on every searched position.
+    //
+    // A WRITE CURSOR instead of an index (2026-10-08): `cand[n & 63]` kept `n`
+    // in a stack slot (load, mask, store, increment, store back per accepted
+    // candidate), and the checked prefetch's own `at < len` guard re-tested what
+    // the window test below has just proven. Callgrind on dickens L12: the
+    // accepted-candidate tail went from 13 instructions to 4.
     let mut cand = [core::mem::MaybeUninit::<u32>::uninit(); 1 << crate::rowfind::ROW_LOG_MAX];
-    let mut n = 0usize;
+    let c0 = cand.as_mut_ptr() as *mut u32;
+    let mut cur = c0;
     while w != 0 {
         // Highest set bit is the newest slot. `w` only ever has its low
         // `1 << RL` bits set (see `row_rot`), so `s` masks to a slot of THIS
@@ -4590,12 +4605,21 @@ fn row_find_best<const MLS: usize, const RL: u32>(
         if (m as usize).wrapping_sub(low) >= span {
             continue;
         }
-        crate::simd::prefetch_read(src, m as usize);
-        // `n < 1 << RL` here: each iteration clears one of at most
-        // `1 << RL` set bits before it can reach this store.
-        cand[n & ((1 << crate::rowfind::ROW_LOG_MAX) - 1)].write(m);
-        n += 1;
+        // `m < ip < src.len()` by the test above.
+        crate::simd::prefetch_read_known(src, m as usize);
+        // SAFETY: each iteration clears one of at most `1 << RL <= 64` set
+        // bits before it can reach this store, so at most 64 stores land in
+        // the 64-element `cand`, and `cur` ends at most one past its end.
+        #[allow(unsafe_code)]
+        unsafe {
+            cur.write(m);
+            cur = cur.add(1);
+        }
     }
+    // SAFETY: `cur` was advanced from `c0` inside the same array.
+    #[allow(unsafe_code)]
+    let n = unsafe { cur.offset_from(c0) } as usize;
+    debug_assert!(n <= 1 << RL);
     // Phase 2 -- INSERT. Every candidate is already in hand, so the row can
     // take `ip` now and the row's slot state is dead from here.
     tables.lz_insert_rowknown::<RL>(r, rat, rhead, ip, gtag);
@@ -4685,9 +4709,7 @@ fn row_find_best<const MLS: usize, const RL: u32>(
     debug_assert!(mls <= 8 && ip + 8 <= block_end && block_end <= src_len);
     // SAFETY (both loops): `i < n`, and phase 1 wrote exactly `cand[0..n]`.
     #[allow(unsafe_code)]
-    let cand_at = |i: usize| unsafe {
-        cand[i & ((1 << crate::rowfind::ROW_LOG_MAX) - 1)].assume_init() as usize
-    };
+    let cand_at = |i: usize| unsafe { *c0.add(i) as usize };
     let ipw = load_u64le(src, ip);
     let mut best_m = 0usize;
     let mut best_ml = 0usize;
