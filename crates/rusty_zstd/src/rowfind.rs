@@ -367,8 +367,20 @@ impl RowTable {
                 core::slice::from_raw_parts(self.pos_ptr() as *const u8, self.slots() * 4)
             }
         };
+        // At most the FIRST TWO position lines, as libzstd names (`relRow`
+        // and `relRow + 16`; "prefetching more of the hash table does not
+        // appear to be beneficial"). A 64-slot row is four lines, and since
+        // the hash cache names a row for EVERY inserted position, the other
+        // two were bandwidth and fill buffers the row may never repay: on a
+        // literal-heavy probe only a few slots are read. Measured 2026-10-08,
+        // pinned, best of 4 alternating rounds, MB/s all four -> first two
+        // lines: L12 x-ray 27.1 -> 30.4, nci 79.0 -> 85.5, samba 48.0 ->
+        // 51.2, xml 73.1 -> 77.6, mozilla 37.8 -> 40.2, dickens 21.2 -> 22.4;
+        // L11 (also 64 slots) 4 of 6 files up 3-10%, the others within noise.
+        // ONE line was no better than two at L10 (32 slots) or L12. 16-slot
+        // rows are one line either way.
         let mut off = 0usize;
-        while off < (4usize << RL) {
+        while off < (4usize << RL).min(128) {
             crate::simd::prefetch_read_known(pos, (at << 2) + off);
             off += 64;
         }
