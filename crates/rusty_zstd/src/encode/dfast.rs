@@ -284,7 +284,19 @@ pub(crate) fn dfast_finder_prologue(
     } else {
         1
     };
+    // The pipeline runs on the PACKED body only. On the tag-array body (frames
+    // of 16 MiB and over, and streaming) its speculation carries the
+    // hand-forward the packed body dropped (V3) and costs more than the
+    // overlap returns. Measured 2026-10-08, byte-identical (issue order
+    // only): executed whole-program instructions samba / mozilla / nci L3
+    // 0.988 / 0.978 / 0.994, L4 0.988 / 0.980 / 0.994; clock (encab, ABBA,
+    // pinned, floor of thread CPU cycles; two sessions) mozilla L3 0.972 and
+    // 0.965, L4 0.951; samba L3 0.993 and 0.980, L4 0.971; nci L3 0.963 and
+    // 0.994, L4 0.977, against controls on the untouched packed body of
+    // 0.968..1.025. Turning it off on the PACKED body too was neutral there
+    // (dickens 1.007, x-ray 1.006, xml 1.006 at L3), so that body keeps it.
     let dpipe = dfast_pipe_enabled()
+        && tables.pack_tags
         && (tables.dfast_probe == 0 || tables.dfast_spec_yield >= dfast_spec_min());
     let lt_on = long_tag_enabled() && (tables.pack_tags || !tables.ltags.is_empty());
     let gates = DfastGates {
@@ -848,6 +860,27 @@ pub(crate) fn find_dfast_impl_inner<const HLOG: u32, const PACKED: bool>(
     // whose live set (spec tuple, two tables, rep, nl, band counters) is
     // already past sixteen GPRs. Fast won because it took TWO vecs into a
     // smaller live set. Do not redo without first shrinking the live set.
+    //
+    // REFUTED AGAIN (2026-10-08), with the live set shrunk -- the treatment
+    // that cut Fast's pair route 20% (`fast_pair_scan`). Executed
+    // instructions are callgrind, whole file; clock is encab, 4 rounds ABBA
+    // of whole processes on one pinned core, floor of thread CPU cycles.
+    //   * A dedicated scan: the four tables as slices, one copy per pipeline
+    //     arm (`dpipe` a const), the after-match fill inline, packed slots
+    //     decoded with one xor. Executed L3: dickens -1.2%, samba -5.3%,
+    //     x-ray -6.9%, mozilla -6.0%, nci -5.6%, xml 0. Clock L3 new/old:
+    //     dickens 1.016, samba 1.006, x-ray 0.975, mozilla 1.001, nci 1.023,
+    //     xml 1.064 (L4 xml 1.085). Fewer instructions, no faster: this loop
+    //     is load-latency bound, and the order the loads issue in matters
+    //     more than the count. Reverted.
+    //   * On top of it, carrying the next-long probe's key of `ip + 1` into
+    //     the next position (pipeline off; C's loop hands `hl1` on this way):
+    //     match-find executed +1.8..+5.6% against the scan without it -- the
+    //     carried key lives in stack slots.
+    //   * The scan copies as separate symbols: dickens -3.0%, x-ray +6.0%.
+    //   * The HLOG axis back, `hash_log` 17 and 18 as consts (W11 refuted its
+    //     removal on STATIC counts): match-find executed +1.1..+4.2% on all six
+    //     corpora at L3 and L4. Immediates did not buy back the registers.
     while ip <= ilimit {
         #[cfg(feature = "profile")]
         if COUNT {

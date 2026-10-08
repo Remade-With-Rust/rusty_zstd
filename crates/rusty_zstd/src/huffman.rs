@@ -1434,14 +1434,16 @@ impl Drop for HuffCTable {
 pub(crate) struct HuffCTable {
     /// Per-symbol: low 16 = code, bits 16..24 = nbits (0 = missing).
     entry: [u32; 256],
+    /// The same codes as C's `HUF_CElt`: the code LEFT-aligned in the top
+    /// `nbits` bits, `nbits` itself in the low byte, 0 = missing. One load
+    /// feeds all three operations of a symbol -- see `emit_celt`.
+    celt: [u64; 256],
     /// Decode twin kept as the test oracle (`ct.table.decode_stream`).
     #[allow(dead_code)]
     table: HuffmanTable,
     weights_wo_last: Vec<u8>,
-    /// Longest code in this table (`tableLog`). Fixed unroll width is `floor((64-7)/max)`.
+    /// Longest code in this table (`tableLog`); picks `emit_celt`'s unroll.
     max_nbits: u8,
-    /// Freq-weighted mean nbits × 10. Fill-vs-5 dispatch; 110 if empty.
-    mean_nbits_x10: u8,
 }
 
 #[cfg(feature = "alloc")]
@@ -1668,9 +1670,7 @@ impl HuffCTable {
         if src.is_empty() {
             return Err(Error::Corruption);
         }
-        let mut bits = crate::bit::BitCStream::from_vec(buf, src.len() + 8);
-        self.encode_rev_into(&mut bits, src);
-        Ok(bits.close())
+        Ok(self.encode_rev_into(src, buf))
     }
 
     /// ALLOC-2, unrolled twin -- the BASELINE arm. See `encode_stream_scalar_into`.
@@ -1679,143 +1679,183 @@ impl HuffCTable {
         self.encode_stream_unrolled_body(src, buf)
     }
 
+    /// The literal emit loop, in C's shape (`HUF_compress1X_usingCTable_internal_body_loop`,
+    /// libzstd 1.5.7): an MSB-first container fed straight from `celt`.
+    ///
+    /// Per symbol the work is one byte load, one `celt` load and three ALU ops
+    /// -- `c >>= nb` (`shrx` reads only the low six bits, so the whole element
+    /// is the count), `c |= elt` (the code sits in the top `nb` bits; `nb`
+    /// itself lands in the low four bits as noise below the live bits) and
+    /// `pos += elt` (only the low byte of `pos` is read). The LSB-first
+    /// `add_bits_huff` this replaces split the packed `entry` into code and
+    /// length first: movzwl, shr, shlx, or, add -- and its `fill` arm kept the
+    /// container in the `BitCStream` in MEMORY, two stores per symbol.
+    ///
+    /// Measured (callgrind, Linux build, whole file, anchors identical), this
+    /// function: x-ray L1 135.1M -> 59.3M (libzstd 1.5.7's
+    /// `HUF_compress1X_usingCTable_internal_bmi2`: 59.4M), mozilla L1 256.1M
+    /// -> 114.4M, dickens L1 63.5M -> 28.4M. 16 instructions per literal -> 7.
+    ///
+    /// BYTE-IDENTICAL by construction: the bit sequence is the same codes in
+    /// the same order (last literal first) and a flush only decides WHEN
+    /// whole bytes leave the container, never what they hold.
+    /// `encode_stream_unrolled_matches_scalar` gates it against the per-byte
+    /// `add_bits` oracle at every `max_nbits` from 1 to 11.
     #[inline(always)]
-    fn encode_rev_into(&self, bits: &mut crate::bit::BitCStream, src: &[u8]) {
-        crate::prof::note_huff_path(if self.use_fill() {
-            0
-        } else {
-            match self.max_nbits {
-                0..=3 => 1,
-                4 => 2,
-                5 => 3,
-                6 => 4,
-                7 => 5,
-                8 => 6,
-                9 => 7,
-                _ => 8,
-            }
-        });
-        crate::prof::note_huff_path(9 + self.max_nbits.min(10));
-        if self.use_fill() {
-            self.emit_fill(bits, src);
-            return;
-        }
+    fn encode_rev_into(&self, src: &[u8], mut buf: Vec<u8>) -> Vec<u8> {
+        buf.clear();
+        self.encode_rev_append(src, &mut buf);
+        buf
+    }
+
+    /// `encode_rev_into`, appending the stream to `buf`; returns its length.
+    #[inline(always)]
+    fn encode_rev_append(&self, src: &[u8], buf: &mut Vec<u8>) -> usize {
+        // C's unroll table for 64-bit targets. `K * max + 7` must leave the
+        // live bits clear of the low-byte noise: when it cannot, the group's
+        // last symbol is masked (`LAST_FAST = false`), as in C.
         match self.max_nbits {
-            0..=3 => self.emit_k::<16>(bits, src),
-            4 => self.emit_k::<14>(bits, src),
-            5 => self.emit_k::<11>(bits, src),
-            6 => self.emit_k::<9>(bits, src),
-            7 => self.emit_k::<8>(bits, src),
-            8 => self.emit_k::<7>(bits, src),
-            9 => self.emit_k::<6>(bits, src),
-            _ => self.emit_k5(bits, src),
+            11 => self.emit_celt::<5, false>(src, buf),
+            10 => self.emit_celt::<5, true>(src, buf),
+            9 => self.emit_celt::<6, false>(src, buf),
+            8 => self.emit_celt::<7, false>(src, buf),
+            7 => self.emit_celt::<8, false>(src, buf),
+            _ => self.emit_celt::<9, true>(src, buf),
         }
     }
 
-    /// Fill when expected symbols/word beat the max-nbits K by >2 (pays the fit check).
-    /// Hard cap mean ≤ 7.0 from the Silesia census: sao is 7.5 / one table (brick 31 sign-flip).
-    #[inline(always)]
-    fn use_fill(&self) -> bool {
-        if self.mean_nbits_x10 > 70 {
-            return false;
+    /// One literal stream appended to `dst`, by the same arm dispatch as
+    /// `encode_stream_into` -- same arms, same order, same bytes. Returns the
+    /// stream's length. The scalar arm (`RZSTD_HUFF_FAST=0`) stages through
+    /// its own buffer.
+    fn encode_stream_append(&self, src: &[u8], dst: &mut Vec<u8>) -> Result<usize, Error> {
+        if src.is_empty() {
+            return Err(Error::Corruption);
         }
-        let mean_x10 = u32::from(self.mean_nbits_x10.max(1));
-        let k = k_from_max(self.max_nbits);
-        600 / mean_x10 > k + 2
+        if crate::encode::huff_fast_enabled() {
+            #[cfg(all(target_arch = "x86_64", feature = "std"))]
+            if crate::simd::has_bmi2() {
+                crate::kreach::hit(crate::kreach::K_HUF_ENC);
+                // SAFETY: guarded by runtime CPUID; the body is identical.
+                #[allow(unsafe_code)]
+                return Ok(unsafe { self.encode_stream_append_bmi2(src, dst) });
+            }
+            crate::kreach::miss(crate::kreach::K_HUF_ENC);
+            Ok(self.encode_stream_append_plain(src, dst))
+        } else {
+            crate::kreach::miss(crate::kreach::K_HUF_ENC);
+            let s = self.encode_stream_scalar_into(src, Vec::new())?;
+            dst.extend_from_slice(&s);
+            Ok(s.len())
+        }
     }
 
-    /// SAFETY throughout: `i` starts at `src.len()` and every access is preceded
-    /// by `i -= 1` under a `while i >= K` guard, so `i < src.len()` at each read.
-    /// This is brick 69's argument -- `emit_fill` next door has used it since --
-    /// and `emit_k5`/`emit_k` were simply never given it. Per LITERAL.
+    /// The BMI2 twin of `encode_stream_append_plain`.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[target_feature(enable = "bmi2,lzcnt")]
+    #[allow(unsafe_code)]
+    #[inline(never)]
+    unsafe fn encode_stream_append_bmi2(&self, src: &[u8], dst: &mut Vec<u8>) -> usize {
+        self.encode_rev_append(src, dst)
+    }
+
+    /// The BASELINE arm of `encode_stream_append`.
+    #[inline(never)]
+    fn encode_stream_append_plain(&self, src: &[u8], dst: &mut Vec<u8>) -> usize {
+        self.encode_rev_append(src, dst)
+    }
+
+    /// See `encode_rev_into`. Two containers, as in C: each round codes `K`
+    /// symbols into `c0`, flushes, codes the next `K` into a zeroed `c1`
+    /// (no dependency on the flush) and merges.
+    ///
+    /// SAFETY of the unchecked accesses: `n` starts at `src.len()` and every
+    /// read is `src[n - u]` with `1 <= u <= K <= n` (the loop keeps `n` a
+    /// multiple of `K` once the remainder is coded), and every store is an
+    /// 8-byte write at `op`, which never passes the committed length plus 8
+    /// bytes; the reservation covers `ceil((len * max_nbits + 1) / 8) + 8`.
     #[allow(unsafe_code)]
     #[inline(always)]
-    fn emit_k5(&self, bits: &mut crate::bit::BitCStream, src: &[u8]) {
-        let mut i = src.len();
-        while i >= 5 {
-            bits.flush();
-            for _ in 0..5 {
-                i -= 1;
-                debug_assert!(i < src.len());
-                self.huff_sym(bits, unsafe { *src.get_unchecked(i) });
-            }
+    fn emit_celt<const K: usize, const LAST_FAST: bool>(
+        &self,
+        src: &[u8],
+        buf: &mut Vec<u8>,
+    ) -> usize {
+        let len = src.len();
+        let max = usize::from(self.max_nbits.clamp(1, MAX_BITS));
+        let base = buf.len();
+        buf.reserve(((len * max) >> 3) + 16);
+        // SAFETY: `base <= len()`; the stream is written from `base` on.
+        let out = unsafe { buf.as_mut_ptr().add(base) };
+        let ct = &self.celt;
+        let sp = src.as_ptr();
+        // `nb` <= 11 < 16, so only the low four bits of an element are noise.
+        const VALUE: u64 = !0xFF;
+        #[inline(always)]
+        fn add(c: &mut u64, p: &mut u64, e: u64, fast: bool) {
+            *c = (*c >> (e & 63)) | if fast { e } else { e & VALUE };
+            *p = p.wrapping_add(e);
         }
-        self.emit_tail(bits, src, i);
-    }
-
-    /// SAFETY: identical to `emit_k5` and `emit_fill` -- `i` only decreases from
-    /// `src.len()` and every read follows an `i -= 1` under `while i >= K`.
-    #[inline(always)]
-    #[allow(unsafe_code)]
-    fn emit_k<const K: usize>(&self, bits: &mut crate::bit::BitCStream, src: &[u8]) {
-        let mut i = src.len();
-        while i >= K {
-            bits.flush();
-            let mut n = 0usize;
-            while n < K {
-                i -= 1;
-                debug_assert!(i < src.len());
-                self.huff_sym(bits, unsafe { *src.get_unchecked(i) });
-                n += 1;
+        let mut op = 0usize;
+        let (mut c0, mut p0) = (0u64, 0u64);
+        // Only the low byte of `p0` is meaningful; it never exceeds 64 here.
+        let flush = |c0: u64, p0: &mut u64, op: &mut usize| {
+            let nbits = *p0 & 0xFF;
+            debug_assert!(nbits <= 64);
+            // `nbits == 0` shifts by 64 & 63 = 0 and commits nothing.
+            let v = c0.wrapping_shr((64 - nbits) as u32);
+            debug_assert!(base + *op + 8 <= buf.capacity());
+            // SAFETY: see the function note -- 8 bytes at `op` are reserved.
+            unsafe { core::ptr::write_unaligned(out.add(*op).cast::<u64>(), v.to_le()) };
+            *op += (nbits >> 3) as usize;
+            *p0 &= 7;
+        };
+        let sym = |i: usize| -> u64 {
+            debug_assert!(i < len);
+            // SAFETY: `i < len` (see the function note); `u8` indexes `[u64; 256]`.
+            unsafe { *ct.get_unchecked(usize::from(*sp.add(i))) }
+        };
+        let mut n = len;
+        let rem = n % K;
+        if rem > 0 {
+            for _ in 0..rem {
+                n -= 1;
+                add(&mut c0, &mut p0, sym(n), false);
             }
+            flush(c0, &mut p0, &mut op);
         }
-        self.emit_tail(bits, src, i);
-    }
-
-    /// Pack the max-nbits K with no container check, then fill extras.
-    /// After `flush`, leftover is ≤7 so `K*max + 7 < 64` is guaranteed.
-    #[allow(unsafe_code)]
-    #[inline(always)]
-    fn emit_fill(&self, bits: &mut crate::bit::BitCStream, src: &[u8]) {
-        let k = k_from_max(self.max_nbits) as usize;
-        let mut i = src.len();
-        while i >= k {
-            bits.flush();
-            let mut n = 0usize;
-            while n < k {
-                i -= 1;
-                // SAFETY: `i` starts at `src.len()` and only decreases; the
-                // `while i >= k` guard means at least `k` symbols remain, so
-                // after `i -= 1` we have `i < src.len()`. See brick 69.
-                self.huff_sym(bits, unsafe { *src.get_unchecked(i) });
-                n += 1;
+        if n % (2 * K) != 0 {
+            for u in 1..K {
+                add(&mut c0, &mut p0, sym(n - u), true);
             }
-            while i > 0 {
-                // SAFETY: guarded by `i > 0`, and `i <= src.len()` always.
-                let e = self.entry[unsafe { *src.get_unchecked(i - 1) } as usize];
-                let nb = e >> 16;
-                debug_assert!(nb != 0, "CTable missing symbol {}", src[i - 1]);
-                if !bits.huff_fits(nb) {
-                    break;
-                }
-                i -= 1;
-                bits.add_bits_huff(u64::from(e & 0xFFFF), nb);
+            add(&mut c0, &mut p0, sym(n - K), LAST_FAST);
+            flush(c0, &mut p0, &mut op);
+            n -= K;
+        }
+        while n > 0 {
+            for u in 1..K {
+                add(&mut c0, &mut p0, sym(n - u), true);
             }
+            add(&mut c0, &mut p0, sym(n - K), LAST_FAST);
+            flush(c0, &mut p0, &mut op);
+            let (mut c1, mut p1) = (0u64, 0u64);
+            for u in 1..K {
+                add(&mut c1, &mut p1, sym(n - K - u), true);
+            }
+            add(&mut c1, &mut p1, sym(n - 2 * K), LAST_FAST);
+            c0 = (c0 >> (p1 & 0xFF)) | c1;
+            p0 = p0.wrapping_add(p1);
+            flush(c0, &mut p0, &mut op);
+            n -= 2 * K;
         }
-        self.emit_tail(bits, src, i);
-    }
-
-    #[allow(unsafe_code)]
-    fn emit_tail(&self, bits: &mut crate::bit::BitCStream, src: &[u8], mut i: usize) {
-        while i > 0 {
-            i -= 1;
-            // SAFETY: guarded by `i > 0` before the decrement, so `i` is a valid
-            // index; `i` only ever decreases from an initial `<= src.len()`.
-            let b = unsafe { *src.get_unchecked(i) };
-            let e = self.entry[b as usize];
-            let nb = e >> 16;
-            debug_assert!(nb != 0, "CTable missing symbol {b}");
-            bits.add_bits(u64::from(e & 0xFFFF), nb);
-        }
-    }
-
-    /// Caller (`covers` on treeless, `build_ctable` on new) guarantees nbits.
-    #[inline(always)]
-    fn huff_sym(&self, bits: &mut crate::bit::BitCStream, b: u8) {
-        let e = self.entry[b as usize];
-        let nb = e >> 16;
-        debug_assert!(nb != 0, "CTable missing symbol {b}");
-        bits.add_bits_huff(u64::from(e & 0xFFFF), nb);
+        // The end mark: one bit of value 1, masked like C's `HUF_endMark`.
+        add(&mut c0, &mut p0, (1u64 << 63) | 1, false);
+        flush(c0, &mut p0, &mut op);
+        let total = op + usize::from(p0 & 0xFF != 0);
+        debug_assert!(base + total <= buf.capacity());
+        // SAFETY: every byte in `base..base + total` was written by a flush above.
+        unsafe { buf.set_len(base + total) };
+        total
     }
 }
 
@@ -1950,9 +1990,23 @@ fn huffman_nbits(freq: &[u32; 256]) -> Result<[u8; 256], Error> {
 
     // ONE stable sort, ascending by count, ties left in symbol order -- which is
     // precisely the order the old first iteration produced.
+    //
+    // As an UNSTABLE sort of `count << 8 | i`: the low byte is the leaf's own
+    // position (at most 256 leaves here, one per present symbol), so no two
+    // keys tie, and ascending keys are ascending counts with ties in position
+    // order -- exactly the stable sort's permutation. The stable
+    // `sort_by_key`, reaching each count through `nodes.get(i)`, ran ~47K
+    // instructions per table (callgrind, mozilla L1: 17.4M in the sort
+    // routines for 371 tables).
     let mut leaves = crate::scratch::lease(&SC_LEAVES);
-    leaves.extend(0..nodes.len());
-    leaves.sort_by_key(|&i| nodes.get(i).map_or(0, |n| n.count));
+    let mut keys = [0u64; 256];
+    let nl = nodes.len().min(256);
+    debug_assert!(nodes.len() <= 256);
+    for ((k, n), i) in keys.iter_mut().zip(nodes.iter()).zip(0u64..) {
+        *k = (n.count << 8) | i;
+    }
+    keys[..nl].sort_unstable();
+    leaves.extend(keys[..nl].iter().map(|&k| (k & 0xFF) as usize));
     let mut internal = crate::scratch::lease(&SC_INTERNAL);
     let (mut li, mut ii) = (0usize, 0usize);
 
@@ -2034,8 +2088,80 @@ pub fn take_e12_scan() -> [u64; 3] {
 // shrank `write_sequences` from 12,413 to 2,216 instructions.
 #[inline(never)]
 fn limit_nbits(nbits: &mut [u8; 256], present: &[u8], max_bits: u8) {
+    // ONE STEP AT A TIME, AS BEFORE -- ONLY THE SEARCH CHANGED. Each step of
+    // the two repair loops asked "which present symbol has the shortest
+    // (longest) code, first in symbol order on a tie?" by scanning all of
+    // `present`: O(alphabet) per step, and a deep tree takes hundreds of steps
+    // a block. Callgrind, mozilla L1: 102.7M instructions in this function,
+    // 4.2% of the whole encode, against 15.4M for libzstd's entire
+    // `HUF_buildCTable_wksp`.
+    //
+    // The same question is answered by one bit set per code length: the
+    // shortest (longest) non-empty length, then its lowest set bit -- the
+    // first such symbol in `present` order, because `present` is ascending.
+    // Same choice, same order of steps, so the same `nbits`, by construction;
+    // `limit_nbits_matches_scan` gates it against the scan, kept as the oracle.
     #[cfg(feature = "profile")]
     E12_SCAN[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    debug_assert!((1..=15).contains(&max_bits));
+    let mb = usize::from(max_bits.min(15));
+    let max = i32::from(max_bits);
+    let mut kraft = 0i32;
+    // `lv[nb]` = the present symbols whose code is `nb` bits long.
+    let mut lv = [[0u64; 4]; 16];
+    for &s in present {
+        let s = usize::from(s);
+        if nbits[s] > max_bits || nbits[s] == 0 {
+            nbits[s] = max_bits;
+        }
+        kraft += 1 << (max - i32::from(nbits[s]));
+        lv[usize::from(nbits[s])][s >> 6] |= 1u64 << (s & 63);
+    }
+    fn lowest(set: &[u64; 4]) -> Option<usize> {
+        set.iter()
+            .position(|&w| w != 0)
+            .map(|i| i * 64 + set[i].trailing_zeros() as usize)
+    }
+    let target = 1 << max;
+    while kraft > target {
+        #[cfg(feature = "profile")]
+        {
+            E12_SCAN[1].fetch_add(present.len() as u64, core::sync::atomic::Ordering::Relaxed);
+            E12_SCAN[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        // Shortest code below the cap.
+        let Some((nb, s)) = (1..mb).find_map(|nb| lowest(&lv[nb]).map(|s| (nb, s))) else {
+            break;
+        };
+        kraft -= 1 << (max - nb as i32 - 1);
+        lv[nb][s >> 6] &= !(1u64 << (s & 63));
+        lv[nb + 1][s >> 6] |= 1u64 << (s & 63);
+        nbits[s] += 1;
+    }
+    while kraft < target {
+        #[cfg(feature = "profile")]
+        {
+            E12_SCAN[1].fetch_add(present.len() as u64, core::sync::atomic::Ordering::Relaxed);
+            E12_SCAN[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        // Longest code above one bit.
+        let Some((nb, s)) = (2..=mb)
+            .rev()
+            .find_map(|nb| lowest(&lv[nb]).map(|s| (nb, s)))
+        else {
+            break;
+        };
+        kraft += 1 << (max - nb as i32);
+        lv[nb][s >> 6] &= !(1u64 << (s & 63));
+        lv[nb - 1][s >> 6] |= 1u64 << (s & 63);
+        nbits[s] -= 1;
+    }
+}
+
+/// The scan `limit_nbits` replaced: the definition of its choice, and its
+/// oracle.
+#[cfg(all(feature = "alloc", test))]
+fn limit_nbits_scan(nbits: &mut [u8; 256], present: &[u8], max_bits: u8) {
     let max = i32::from(max_bits);
     let mut kraft = 0i32;
     for &s in present {
@@ -2046,11 +2172,6 @@ fn limit_nbits(nbits: &mut [u8; 256], present: &[u8], max_bits: u8) {
     }
     let target = 1 << max;
     while kraft > target {
-        #[cfg(feature = "profile")]
-        {
-            E12_SCAN[1].fetch_add(present.len() as u64, core::sync::atomic::Ordering::Relaxed);
-            E12_SCAN[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
         let mut best: Option<usize> = None;
         let mut best_nb = 0u8;
         for &s in present {
@@ -2067,11 +2188,6 @@ fn limit_nbits(nbits: &mut [u8; 256], present: &[u8], max_bits: u8) {
         nbits[s] += 1;
     }
     while kraft < target {
-        #[cfg(feature = "profile")]
-        {
-            E12_SCAN[1].fetch_add(present.len() as u64, core::sync::atomic::Ordering::Relaxed);
-            E12_SCAN[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
         let mut best: Option<usize> = None;
         let mut best_nb = 0u8;
         for &s in present {
@@ -2259,7 +2375,7 @@ pub(crate) fn build_ctable_from_freq(freq: &[u32; 256]) -> Result<HuffCTable, Er
     ctable_from_nbits(&nbits, Some(freq))
 }
 
-#[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", test))]
 fn huff_mean_nbits_x10(nbits: &[u8; 256], freq: Option<&[u32; 256]>) -> u8 {
     let mut acc = 0u64;
     let mut n = 0u64;
@@ -2284,22 +2400,6 @@ fn huff_mean_nbits_x10(nbits: &[u8; 256], freq: Option<&[u32; 256]>) -> u8 {
         return 110;
     }
     ((acc * 10 + n / 2) / n) as u8
-}
-
-/// Largest K with `K * max_nbits + 7 leftover < 64`. 16/8/5 are the 4×4/8×8/16×16 rungs.
-#[cfg(feature = "alloc")]
-#[inline(always)]
-fn k_from_max(max_nbits: u8) -> u32 {
-    match max_nbits {
-        0..=3 => 16,
-        4 => 14,
-        5 => 11,
-        6 => 9,
-        7 => 8,
-        8 => 7,
-        9 => 6,
-        _ => 5,
-    }
 }
 
 #[cfg(all(feature = "alloc", test))]
@@ -2337,15 +2437,26 @@ fn finish_ctable(
     freq: Option<&[u32; 256]>,
 ) -> HuffCTable {
     let max_nbits = nbits.iter().copied().max().unwrap_or(0);
-    let mean_nbits_x10 = huff_mean_nbits_x10(nbits, freq);
+    // The freq-weighted mean chose the old `fill` emitter; `emit_celt` has no
+    // such arm, so only the nbits census still reads it.
     #[cfg(test)]
-    nbits_census::note(max_nbits, mean_nbits_x10);
+    nbits_census::note(max_nbits, huff_mean_nbits_x10(nbits, freq));
+    #[cfg(not(test))]
+    let _ = freq;
+    let mut celt = [0u64; 256];
+    for (c, &e) in celt.iter_mut().zip(entry.iter()) {
+        let nb = e >> 16;
+        if nb != 0 {
+            debug_assert!(nb <= u32::from(MAX_BITS) && (e & 0xFFFF) >> nb == 0);
+            *c = (u64::from(e & 0xFFFF) << (64 - nb)) | u64::from(nb);
+        }
+    }
     HuffCTable {
         entry,
+        celt,
         table,
         weights_wo_last,
         max_nbits,
-        mean_nbits_x10,
     }
 }
 
@@ -2739,31 +2850,6 @@ fn pack_huff_section(
     pack_huff_section_into(lit_type, n_streams, regen, tree, body, Vec::new())
 }
 
-/// Append the packed section to `dst` and return its byte length.
-///
-/// The header needs `csize`, and `csize` is `tree.len() + body.len()` -- both
-/// known here, because the body has already been encoded. So there is nothing
-/// circular about writing this straight into the frame; the only reason the
-/// `_into` twin below stages into its own buffer is that CANDIDATES compete on
-/// size and a loser has to be discardable. The caller resolves that by
-/// appending the candidate that usually wins and truncating on the rare loss.
-fn pack_huff_section_append(
-    dst: &mut Vec<u8>,
-    lit_type: u8,
-    n_streams: u32,
-    regen: u32,
-    tree: &[u8],
-    body: &[u8],
-) -> Result<usize, Error> {
-    let csize = (tree.len() + body.len()) as u32;
-    let mut h = [0u8; 5];
-    let hn = lit_huff_header_bytes(lit_type, n_streams, regen, csize, &mut h)?;
-    dst.extend_from_slice(&h[..hn]);
-    dst.extend_from_slice(tree);
-    dst.extend_from_slice(body);
-    Ok(hn + tree.len() + body.len())
-}
-
 fn pack_huff_section_into(
     lit_type: u8,
     n_streams: u32,
@@ -3123,9 +3209,25 @@ pub(crate) fn encode_literals_section(
 /// `try_huff_section`, appending onto `dst` instead of returning a `Vec`.
 ///
 /// Returns the number of bytes appended, or `None` (having appended nothing) if
-/// the encode failed. The body still needs its own buffer -- it is what the
-/// header's `csize` is measured from -- but the SECTION no longer does, which
-/// is the copy this removes.
+/// the encode failed.
+///
+/// THE STREAMS ARE CODED IN PLACE. This used to code each stream into a
+/// pooled buffer, concatenate the four (with their jump table) into a body
+/// buffer, and append the body after the header and tree -- every coded
+/// literal byte written once and copied twice (callgrind, mozilla L1: 23.6M
+/// executed in `memcpy` from `encode_4_streams_into` and this function).
+/// libzstd codes into `dst` directly. Here the header's slot is reserved at
+/// the size class `regen` alone selects, the tree and a zeroed jump table
+/// follow, and each stream is coded onto the end of `dst`. The header is
+/// written last, once `csize` is known; its class is the larger of the two
+/// lengths', so it can only GROW past the reservation (`csize > regen`, a
+/// section that loses to raw anyway), and then the body moves up to make room.
+///
+/// Same bytes, same `Some`/`None` on every input: the stream bytes are the
+/// stream bytes, the layout is the one `encode_4_streams_into` and
+/// `pack_huff_section_append` built, and the three failures -- an empty
+/// piece, a stream over 65535 bytes, a header that cannot express `csize` --
+/// are the three they returned, tested in their order.
 fn try_huff_section_append(
     dst: &mut Vec<u8>,
     lit_type: u8,
@@ -3135,16 +3237,68 @@ fn try_huff_section_append(
     ct: &HuffCTable,
     lits: &[u8],
 ) -> Option<usize> {
-    let buf = body_pool_take();
-    let body = if n_streams == 1 {
-        ct.encode_stream_into(lits, buf).ok()?
-    } else {
-        encode_4_streams_into(ct, lits, buf).ok()?
+    let mark = dst.len();
+    let mut h = [0u8; 5];
+    // The class `regen` alone selects: `csize = 0` can never raise it, and a
+    // header that fails here fails for every `csize`.
+    let hn_guess = lit_huff_header_bytes(lit_type, n_streams, regen, 0, &mut h).ok()?;
+    dst.extend_from_slice(&h[..hn_guess]);
+    dst.extend_from_slice(tree);
+    let body_start = dst.len();
+    let fail = |dst: &mut Vec<u8>| {
+        dst.truncate(mark);
+        None
     };
-    crate::copies::add(crate::copies::C_HUFF_EMIT, body.len());
-    let r = pack_huff_section_append(dst, lit_type, n_streams, regen, tree, &body).ok();
-    body_pool_give(body);
-    r
+    if n_streams == 1 {
+        if ct.encode_stream_append(lits, dst).is_err() {
+            return fail(dst);
+        }
+    } else {
+        let jt = dst.len();
+        dst.extend_from_slice(&[0u8; 6]);
+        let chunk = lits.len().div_ceil(4);
+        let mut sizes = [0u16; 3];
+        let mut off = 0usize;
+        for i in 0..4 {
+            let end = if i == 3 {
+                lits.len()
+            } else {
+                (off + chunk).min(lits.len())
+            };
+            let piece = &lits[off..end];
+            if piece.is_empty() {
+                return fail(dst);
+            }
+            let Ok(n) = ct.encode_stream_append(piece, dst) else {
+                return fail(dst);
+            };
+            if n > 65535 {
+                return fail(dst);
+            }
+            if let Some(s) = sizes.get_mut(i) {
+                *s = n as u16;
+            }
+            off = end;
+        }
+        for (i, s) in sizes.iter().enumerate() {
+            dst[jt + 2 * i..jt + 2 * i + 2].copy_from_slice(&s.to_le_bytes());
+        }
+    }
+    let body_len = dst.len() - body_start;
+    crate::copies::add(crate::copies::C_HUFF_EMIT, body_len);
+    let csize = (tree.len() + body_len) as u32;
+    let Ok(hn) = lit_huff_header_bytes(lit_type, n_streams, regen, csize, &mut h) else {
+        return fail(dst);
+    };
+    debug_assert!(hn >= hn_guess);
+    if hn > hn_guess {
+        // Rare: `csize > regen` moved the header to a larger class.
+        let old_len = dst.len();
+        dst.resize(old_len + (hn - hn_guess), 0);
+        dst.copy_within(mark + hn_guess..old_len, mark + hn);
+    }
+    dst[mark..mark + hn].copy_from_slice(&h[..hn]);
+    Some(hn + tree.len() + body_len)
 }
 
 fn try_huff_section(
@@ -3625,49 +3779,106 @@ mod tests {
         let b = ct2.encode_stream_scalar(&noise).expect("scalar");
         assert_eq!(a, b, "noise");
 
-        // Peaked alphabet → short max_nbits (K16) or fill. Must stay byte-identical.
+        // Peaked alphabet: a short max_nbits. Must stay byte-identical.
         let mut peaked = vec![b'a'; 4096];
         peaked.extend_from_slice(b"bc");
         let ct3 = build_ctable(&peaked).expect("peaked table");
         let a = ct3.encode_stream(&peaked).expect("fast");
         let b = ct3.encode_stream_scalar(&peaked).expect("scalar");
         assert_eq!(a, b, "peaked");
-        assert!(
-            ct3.max_nbits <= 3 || ct3.use_fill(),
-            "peaked max={} mean_x10={} should take K16 or fill",
-            ct3.max_nbits,
-            ct3.mean_nbits_x10
-        );
     }
 
+    /// `emit_celt` has one unroll per `max_nbits` (C's table, two of them with
+    /// the group's last symbol masked). Every arm, every length class around
+    /// its `K` and `2K` boundaries, against the per-byte `add_bits` oracle.
     #[test]
-    fn huff_pack_dispatch_separates_peaked_from_flat() {
-        let mut peaked = vec![b'a'; 8192];
-        peaked.extend_from_slice(b"bcdefgh");
-        let ct = build_ctable(&peaked).expect("peaked");
-        assert!(
-            ct.use_fill() || ct.max_nbits <= 7,
-            "peaked should fill or take a wide K max={} mean_x10={}",
-            ct.max_nbits,
-            ct.mean_nbits_x10
-        );
-
-        let mut flat = vec![0u8; 8192];
-        for (i, b) in flat.iter_mut().enumerate() {
-            *b = (i % 251) as u8;
+    fn emit_celt_every_max_nbits_matches_scalar() {
+        let mut seen = [false; 12];
+        let mut x = 0x9E37_79B9_7F4A_7C15_u64;
+        for alpha in 2usize..=256 {
+            // Geometric-ish weights over `alpha` symbols: long tails reach
+            // max_nbits 11, small alphabets stay short.
+            for skew in [1u64, 2, 3, 5, 8] {
+                let mut src = Vec::with_capacity(3000);
+                while src.len() < 3000 {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let mut s = (x % alpha as u64) as usize;
+                    for _ in 0..skew {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        s = s.min((x % alpha as u64) as usize);
+                    }
+                    src.push(s as u8);
+                }
+                let Ok(ct) = build_ctable(&src) else {
+                    continue;
+                };
+                let mx = usize::from(ct.max_nbits);
+                if mx < seen.len() && seen[mx] && alpha % 17 != 0 {
+                    continue;
+                }
+                if mx < seen.len() {
+                    seen[mx] = true;
+                }
+                for n in (1..=40).chain([63, 64, 65, 127, 128, 129, 999, 1000, 3000]) {
+                    let s = &src[..n.min(src.len())];
+                    let a = ct.encode_stream(s).expect("fast");
+                    let b = ct.encode_stream_scalar(s).expect("scalar");
+                    assert_eq!(a, b, "max_nbits={mx} n={n} alpha={alpha} skew={skew}");
+                }
+            }
         }
-        let ct_f = build_ctable(&flat).expect("flat");
-        // Sao-like: long mean → fixed K, not fill (the brick-31 sign-flip).
-        assert!(
-            !ct_f.use_fill(),
-            "flat/long-code must not fill max={} mean_x10={}",
-            ct_f.max_nbits,
-            ct_f.mean_nbits_x10
-        );
-        assert_eq!(k_from_max(9), 6);
-        assert_eq!(k_from_max(11), 5);
-        assert_eq!(k_from_max(7), 8);
-        assert_eq!(k_from_max(3), 16);
+        for (mx, &hit) in seen.iter().enumerate().skip(1) {
+            assert!(hit, "no table reached max_nbits={mx}");
+        }
+    }
+
+    /// `limit_nbits` (bit sets) against the scan it replaced, on code
+    /// lengths from deep real trees and from arbitrary length vectors.
+    #[test]
+    fn limit_nbits_matches_scan() {
+        let mut x = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for case in 0..4000 {
+            let alpha = 2 + (next() % 255) as usize;
+            let mut present: Vec<u8> = (0..=255u8)
+                .filter(|_| next() % 256 < alpha as u64)
+                .collect();
+            if present.len() < 2 {
+                present = vec![3, 200];
+            }
+            let mut nb = [0u8; 256];
+            for &s in &present {
+                // Mostly tree-like depths, sometimes 0 or past the cap.
+                nb[s as usize] = match next() % 16 {
+                    0 => 0,
+                    1 => 12 + (next() % 20) as u8,
+                    _ => 1 + (next() % (1 + case % 30) as u64) as u8,
+                };
+            }
+            let max = [11u8, 11, 11, 9, 6, 4][case % 6];
+            let (mut a, mut b) = (nb, nb);
+            limit_nbits(&mut a, &present, max);
+            limit_nbits_scan(&mut b, &present, max);
+            assert_eq!(a, b, "case {case}");
+        }
+        // Real trees: geometric frequencies give depths far past 11.
+        for n in [3usize, 17, 64, 200, 256] {
+            let mut freq = [0u32; 256];
+            for (i, f) in freq.iter_mut().take(n).enumerate() {
+                *f = 1 + (1u32 << (i % 31)) / (1 + i as u32);
+            }
+            let a = huffman_nbits(&freq).expect("tree");
+            assert!(a.iter().all(|&v| v <= MAX_BITS));
+        }
     }
 
     #[test]
@@ -3875,6 +4086,74 @@ mod tests {
         let (sec, _) = encode_literals_section(&src, None).expect("section");
         assert_eq!(sec[0] & 3, 2);
         assert_eq!(sec[0] >> 2 & 3, 0, "1-stream size format 0");
+    }
+
+    /// `try_huff_section_append` codes the streams in place; `try_huff_section`
+    /// still builds the body apart and packs it. Same bytes and the same
+    /// `Some`/`None`, including the sections whose `csize` outgrows `regen`'s
+    /// header class (the in-place writer moves the body up for those) and a
+    /// table that does not cover the literals.
+    #[test]
+    fn in_place_section_matches_staged_section() {
+        let mut x = 0x0123_4567_89AB_CDEF_u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut grew = 0;
+        for &n in &[
+            8usize, 255, 256, 600, 1000, 1023, 1024, 1100, 4000, 16_383, 16_384, 70_000,
+        ] {
+            for skew in [0u32, 1, 3] {
+                let lits: Vec<u8> = (0..n)
+                    .map(|_| {
+                        let mut v = next() as u8;
+                        for _ in 0..skew {
+                            v = v.min(next() as u8);
+                        }
+                        v
+                    })
+                    .collect();
+                // A table built on OTHER data: on flat literals it codes longer
+                // than raw (`csize > regen`), and it may miss symbols outright.
+                let mut other: Vec<u8> = (0..4096).map(|i| (i % 7) as u8 * 30).collect();
+                other.extend((0..=255u8).cycle().take(512));
+                let own = build_ctable(&lits).ok();
+                let foreign = build_ctable(&other).ok();
+                for ct in [own.as_ref(), foreign.as_ref()].into_iter().flatten() {
+                    let tree = write_tree(ct).unwrap_or_default();
+                    for streams in [1u32, 4] {
+                        let staged = try_huff_section(2, streams, n as u32, &tree, ct, &lits);
+                        let mut dst = vec![0xAAu8; 3];
+                        let got = try_huff_section_append(
+                            &mut dst, 2, streams, n as u32, &tree, ct, &lits,
+                        );
+                        match (&staged, got) {
+                            (Some(s), Some(len)) => {
+                                assert_eq!(len, s.len(), "n={n} skew={skew} streams={streams}");
+                                assert_eq!(
+                                    &dst[3..],
+                                    &s[..],
+                                    "n={n} skew={skew} streams={streams}"
+                                );
+                                if s.len() > n + 5 {
+                                    grew += 1;
+                                }
+                            }
+                            (None, None) => assert_eq!(dst.len(), 3, "left bytes behind"),
+                            _ => panic!(
+                                "n={n} skew={skew} streams={streams}: {:?} vs {:?}",
+                                staged.map(|s| s.len()),
+                                got
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        assert!(grew > 0, "no section outgrew its regen class");
     }
 
     #[test]

@@ -1049,6 +1049,80 @@ pub(crate) fn find_fast_impl_inner<
         tags_live,
         ends: f_ends,
     };
+    // The two shapes that carry the traffic run the pipelined route in their
+    // own scan too -- see `fast_pipe_scan`.
+    if pipe_rt && !pair && ip <= ilimit && (SHAPE == 1 || SHAPE == 2) {
+        if COUNT {
+            FF_PIPE_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        let ks = PairScan {
+            src,
+            block_end,
+            ilimit,
+            window,
+            lowest,
+            accept_ml,
+            pair_bar: 0,
+            mask: f_mask,
+            shift: f_shift,
+            step0,
+            accel,
+            rep,
+            maintain_rep1,
+            lp_copy,
+        };
+        let mut t = PairTally {
+            ip,
+            anchor,
+            rep1,
+            ..PairTally::default()
+        };
+        #[cfg(feature = "profile")]
+        {
+            fast_pipe_scan::<BMI2, SHAPE>(
+                &ks,
+                &ectx,
+                &mut hash_v,
+                &mut tags_v,
+                &mut seqs,
+                &mut lits,
+                &mut t,
+                &mut r2,
+            );
+            r2.flush();
+        }
+        #[cfg(not(feature = "profile"))]
+        fast_pipe_scan::<BMI2, SHAPE>(
+            &ks,
+            &ectx,
+            &mut hash_v,
+            &mut tags_v,
+            &mut seqs,
+            &mut lits,
+            &mut t,
+        );
+        fast_pipe_epilogue(
+            tables,
+            src,
+            &seqs,
+            &mut lits,
+            t.anchor,
+            block_end,
+            rep,
+            t.rep_hits,
+            t.rep_bytes,
+            t.rep_probes,
+            t.cand,
+            t.probes,
+            t.hits,
+            t.pipe_pos,
+            t.ff_made,
+            t.ff_used,
+            hash_v,
+            tags_v,
+        );
+        return (seqs, lits);
+    }
     if pipe_rt && !pair && ip <= ilimit {
         if COUNT {
             FF_PIPE_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1248,6 +1322,79 @@ pub(crate) fn find_fast_impl_inner<
         fast_pipe_epilogue(
             tables, src, &seqs, &mut lits, anchor, block_end, rep, rep_hits, rep_bytes, rep_probes,
             cand, probes, hits, pipe_pos, ff_made, ff_used, hash_v, tags_v,
+        );
+        return (seqs, lits);
+    }
+    // The two shapes that carry the traffic run the pair route in their own
+    // scan -- see `fast_pair_scan`. Every other shape keeps the loop below.
+    if pair && (SHAPE == 1 || SHAPE == 2) {
+        let ks = PairScan {
+            src,
+            block_end,
+            ilimit,
+            window,
+            lowest,
+            accept_ml,
+            pair_bar: if veto_block { ff_anchor_ml() } else { 0 },
+            mask: f_mask,
+            shift: f_shift,
+            step0,
+            accel,
+            rep,
+            maintain_rep1,
+            lp_copy,
+        };
+        let mut t = PairTally {
+            ip,
+            anchor,
+            rep1,
+            ..PairTally::default()
+        };
+        #[cfg(feature = "profile")]
+        {
+            fast_pair_scan::<BMI2, SHAPE>(
+                &ks,
+                &ectx,
+                &mut hash_v,
+                &mut tags_v,
+                &mut seqs,
+                &mut lits,
+                &mut t,
+                &mut r2,
+            );
+            r2.flush();
+        }
+        #[cfg(not(feature = "profile"))]
+        fast_pair_scan::<BMI2, SHAPE>(
+            &ks,
+            &ectx,
+            &mut hash_v,
+            &mut tags_v,
+            &mut seqs,
+            &mut lits,
+            &mut t,
+        );
+        fast_finder_epilogue(
+            tables,
+            src,
+            &seqs,
+            &mut lits,
+            t.anchor,
+            block_end,
+            rep,
+            t.rep_hits,
+            t.rep_bytes,
+            t.rep_probes,
+            pair,
+            t.pair_bytes,
+            t.pair_probes,
+            t.cand,
+            t.probes,
+            t.hits,
+            t.mm_total,
+            t.mm_miss,
+            hash_v,
+            tags_v,
         );
         return (seqs, lits);
     }
@@ -1504,6 +1651,537 @@ pub(crate) fn find_fast_impl_inner<
     (seqs, lits)
 }
 
+/// Per-block invariants of the pair route's scan -- see `fast_pair_scan`.
+pub(crate) struct PairScan<'a> {
+    pub(crate) src: &'a [u8],
+    pub(crate) block_end: usize,
+    pub(crate) ilimit: usize,
+    pub(crate) window: usize,
+    pub(crate) lowest: usize,
+    pub(crate) accept_ml: usize,
+    /// The pair candidate's extra bar: `ff_anchor_ml()` on a veto block, else 0.
+    pub(crate) pair_bar: usize,
+    pub(crate) mask: u64,
+    pub(crate) shift: u32,
+    pub(crate) step0: usize,
+    pub(crate) accel: u32,
+    pub(crate) rep: bool,
+    pub(crate) maintain_rep1: bool,
+    pub(crate) lp_copy: usize,
+}
+
+/// The scan's running state and the per-block counts its epilogue reads.
+#[derive(Default)]
+pub(crate) struct PairTally {
+    pub(crate) ip: usize,
+    pub(crate) anchor: usize,
+    pub(crate) rep1: usize,
+    pub(crate) rep_hits: u64,
+    pub(crate) rep_bytes: u64,
+    pub(crate) rep_probes: u64,
+    pub(crate) pair_bytes: u64,
+    pub(crate) pair_probes: u64,
+    pub(crate) cand: (u64, u64),
+    pub(crate) probes: u64,
+    pub(crate) hits: u64,
+    pub(crate) mm_total: u64,
+    pub(crate) mm_miss: u64,
+    /// The pipelined scan's census (`fast_pipe_scan`; profile only).
+    pub(crate) pipe_pos: u64,
+    pub(crate) ff_made: u64,
+    pub(crate) ff_used: u64,
+}
+
+/// The slot key of position `p` for body `SHAPE`: `(bucket, tag word)`.
+///
+/// SHAPE 1 (wide key, packed tags): the tag word is the tag already seated in
+/// the slot's top byte, `tag << 24`, so a slot decodes with one xor.
+/// SHAPE 2 (legacy 4-byte key, tag array): the tag byte.
+/// Both are `fast_hash_tag::<true>` exactly; SAFE because every caller has
+/// `p <= ilimit`, i.e. `p + 8 <= block_end`.
+#[inline(always)]
+fn pair_key<const SHAPE: u8>(k: &PairScan, p: usize) -> (usize, u32) {
+    let (h, g) = fast_hash_tag::<true>(k.src, p, SHAPE == 1, k.mask, k.shift);
+    if SHAPE == 1 {
+        (h, u32::from(g) << 24)
+    } else {
+        (h, u32::from(g))
+    }
+}
+
+/// A packed slot word against a tag word: the candidate (`pos + 1`) or 0.
+/// `e ^ tw` is the position exactly when the top bytes agree; any other top
+/// byte leaves it above 24 bits. An empty slot (`e == 0`) gives `tw`, which is
+/// above 24 bits unless the tag is 0, and then it is 0 -- "no candidate"
+/// either way. That is `fast_slot_load`'s packed arm (empty, tag mismatch,
+/// `e & 0xFF_FFFF`) in one xor and one compare.
+#[inline(always)]
+fn pair_decode(e: u32, tw: u32) -> u32 {
+    let x = e ^ tw;
+    if x > 0x00FF_FFFF {
+        0
+    } else {
+        x
+    }
+}
+
+/// `fast_slot_swap` for body `SHAPE`: store `p`, return the old candidate.
+#[inline(always)]
+#[allow(unsafe_code)]
+fn pair_swap<const SHAPE: u8>(
+    hash: &mut [u32],
+    tags: &mut [u8],
+    h: usize,
+    p: usize,
+    tw: u32,
+) -> u32 {
+    debug_assert!(h < hash.len());
+    debug_assert!(SHAPE == 1 || tags.len() == hash.len());
+    // SAFETY: `h` is a hash shifted down to `hash_log` bits and the table holds
+    // `1 << hash_log` slots (brick 50); the tag array, where it is used, is
+    // allocated at exactly `hash.len()`.
+    unsafe {
+        let slot = hash.get_unchecked_mut(h);
+        let e = *slot;
+        if SHAPE == 1 {
+            *slot = ((p as u32).wrapping_add(1) & 0x00FF_FFFF) | tw;
+            pair_decode(e, tw)
+        } else {
+            *slot = (p as u32).wrapping_add(1);
+            let t = tags.get_unchecked_mut(h);
+            let old = *t;
+            *t = tw as u8;
+            if e == 0 || u32::from(old) != tw {
+                0
+            } else {
+                e
+            }
+        }
+    }
+}
+
+/// `fast_slot_load` for body `SHAPE`.
+#[inline(always)]
+#[allow(unsafe_code)]
+fn pair_load<const SHAPE: u8>(hash: &[u32], tags: &[u8], h: usize, tw: u32) -> u32 {
+    debug_assert!(h < hash.len());
+    // SAFETY: as `pair_swap`.
+    unsafe {
+        let e = *hash.get_unchecked(h);
+        if SHAPE == 1 {
+            pair_decode(e, tw)
+        } else {
+            debug_assert!(tags.len() == hash.len());
+            if e == 0 || u32::from(*tags.get_unchecked(h)) != tw {
+                0
+            } else {
+                e
+            }
+        }
+    }
+}
+
+/// `fast_slot_store` for body `SHAPE`.
+#[inline(always)]
+#[allow(unsafe_code)]
+fn pair_store<const SHAPE: u8>(hash: &mut [u32], tags: &mut [u8], h: usize, p: usize, tw: u32) {
+    debug_assert!(h < hash.len());
+    // SAFETY: as `pair_swap`.
+    unsafe {
+        if SHAPE == 1 {
+            *hash.get_unchecked_mut(h) = ((p as u32).wrapping_add(1) & 0x00FF_FFFF) | tw;
+        } else {
+            debug_assert!(tags.len() == hash.len());
+            *tags.get_unchecked_mut(h) = tw as u8;
+            *hash.get_unchecked_mut(h) = (p as u32).wrapping_add(1);
+        }
+    }
+}
+
+/// The candidate probe for body `SHAPE` (`fast_probe_wide` / `fast_probe`).
+#[inline(always)]
+fn pair_probe<const SHAPE: u8>(
+    k: &PairScan,
+    cand: &mut (u64, u64),
+    slot: u32,
+    at: usize,
+) -> Option<(usize, usize)> {
+    if SHAPE == 1 {
+        fast_probe_wide::<true>(
+            cand,
+            k.src,
+            slot,
+            at,
+            k.window,
+            k.lowest,
+            k.accept_ml,
+            k.mask,
+            k.block_end,
+        )
+    } else {
+        fast_probe(
+            cand,
+            k.src,
+            slot,
+            at,
+            k.window,
+            k.lowest,
+            k.accept_ml,
+            k.block_end,
+        )
+    }
+}
+
+/// THE PAIR ROUTE'S SCAN, for the two bodies that carry the traffic (SHAPE 1:
+/// every L1/L2 block of a frame under 16 MiB that Gate 6 routes to the pair
+/// search; SHAPE 2: the same on a frame of 16 MiB and over).
+///
+/// The same work, position for position, as the non-pipelined loop of
+/// `find_fast_impl_inner` with `pair` true -- same probes in the same order,
+/// same stores, same emits -- so byte-identical by construction. What
+/// changed is how the loop carries it. Counted on the path that runs
+/// (callgrind, dickens L1, SHAPE 1): the shared loop executed ~84
+/// instructions per two-position iteration against libzstd's ~15 per
+/// position, and most of the difference was carriage, not work:
+///
+///   * `pair && ip < ilimit` was rebuilt, spilled and re-tested from the stack
+///     every iteration to drive an `Option` (`pair_pre`). `pair` is true here
+///     and `ip < ilimit` fails only at `ip == ilimit`, so that one position is
+///     peeled off the end and the loop body carries no flag at all.
+///   * A packed slot decoded through `e == 0`, a tag compare, a mask and two
+///     cmovs; `pair_decode` is one xor and one compare.
+///   * The loop shared a body (and a register allocation) with the pipelined
+///     loop and the runtime-shape arms; here the invariants sit in one
+///     `PairScan` and the running state in locals.
+///
+/// REFUTED (2026-10-08), recorded so they are not retried. Executed
+/// instructions, callgrind, L1, whole file, against this body:
+///   * A LEAN INNER LOOP for the positions where both slots come back empty
+///     (no repcode probe): swap, load, pair store, advance, leaving with the
+///     keys on the first candidate. Inline: dickens +0.7%, xml +0.6%,
+///     mozilla -0.9% -- LLVM reloads the shift, mask, table base, anchor and
+///     limit from the stack at the loop head just the same, because the rest
+///     of the scan keeps them live across it. Outlined as its own leaf (with a
+///     BMI2 twin): the leaf is tight (~32 instructions per two positions) but
+///     it exits every ~3.6 iterations on dickens, and the call, the hand-back
+///     of the keys and the caller's re-spills cost more than it saved --
+///     dickens +8.1%, mozilla +2.4%.
+#[inline(always)]
+pub(crate) fn fast_pair_scan<const BMI2: bool, const SHAPE: u8>(
+    k: &PairScan,
+    ectx: &FastEmitCtx,
+    hash: &mut [u32],
+    tags: &mut [u8],
+    seqs: &mut Vec<Seq>,
+    lits: &mut Vec<u8>,
+    t: &mut PairTally,
+    #[cfg(feature = "profile")] r2: &mut Rep2Probe,
+) {
+    const COUNT: bool = cfg!(feature = "profile");
+    debug_assert!(SHAPE == 1 || SHAPE == 2);
+    let src = k.src;
+    let ilimit = k.ilimit;
+    let mut ip = t.ip;
+    let mut anchor = t.anchor;
+    let mut rep1 = t.rep1;
+    let mut cand = t.cand;
+    // One position; `$pair` = whether `ip + 1` is probed too (`ip < ilimit`).
+    macro_rules! step {
+        ($pair:expr) => {{
+            if COUNT {
+                t.mm_total += 1;
+                t.probes += 1;
+            }
+            let (h0, g0) = pair_key::<SHAPE>(k, ip);
+            let m0 = pair_swap::<SHAPE>(hash, tags, h0, ip, g0);
+            if COUNT {
+                // Mirrors the shared loop's tag-reject census, which reads
+                // the slot AFTER the swap stored `ip`.
+                let raw = fast_slot_raw(hash, SHAPE == 1, h0);
+                if m0 == 0 && raw != 0 {
+                    if fast_probe(
+                        &mut (0, 0),
+                        src,
+                        raw,
+                        ip,
+                        k.window,
+                        k.lowest,
+                        k.accept_ml,
+                        k.block_end,
+                    )
+                    .is_some()
+                    {
+                        TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            // The pair probe's load is issued here, beside the main probe's
+            // and after its store -- the order the shared loop uses.
+            let (h1, g1, m1) = if $pair {
+                let (h1, g1) = pair_key::<SHAPE>(k, ip + 1);
+                (h1, g1, pair_load::<SHAPE>(hash, tags, h1, g1))
+            } else {
+                (0, 0, 0)
+            };
+            'pos: {
+                if k.rep {
+                    if COUNT {
+                        t.rep_probes += 1;
+                    }
+                    if let Some(ml) = try_rep1(src, ip, rep1, k.lowest, k.block_end, ilimit) {
+                        t.rep_hits += 1;
+                        t.rep_bytes += ml as u64;
+                        if COUNT {
+                            t.hits += 1;
+                        }
+                        let mstart = ip + 1;
+                        crate::prof::note_huff_path(11);
+                        push_literals(lits, src, anchor, mstart, k.lp_copy);
+                        crate::prof::note_huff_path(13);
+                        seqs.push(Seq {
+                            litlen: (mstart - anchor) as u32,
+                            matchlen: ml as u32,
+                            offset: rep1 as u32,
+                        });
+                        ip = mstart + ml;
+                        anchor = ip;
+                        #[cfg(feature = "profile")]
+                        r2.after(seqs, src, ip, k.lowest, ilimit, k.block_end);
+                        break 'pos;
+                    }
+                }
+                if let Some((m, ml)) = pair_probe::<SHAPE>(k, &mut cand, m0, ip) {
+                    if COUNT {
+                        t.hits += 1;
+                    }
+                    let found = ip;
+                    ip = emit_fast_seq_body(ectx, hash, tags, seqs, lits, anchor, found, m, ml);
+                    anchor = ip;
+                    #[cfg(feature = "profile")]
+                    r2.after(seqs, src, ip, k.lowest, ilimit, k.block_end);
+                    if k.maintain_rep1 {
+                        rep1 = found - m;
+                    }
+                    break 'pos;
+                }
+                if $pair {
+                    let ip1 = ip + 1;
+                    if COUNT {
+                        t.probes += 1;
+                    }
+                    t.pair_probes += 1;
+                    if COUNT {
+                        use core::sync::atomic::Ordering::Relaxed;
+                        if m0 == 0 {
+                            PAIR_M0_EMPTY.fetch_add(1, Relaxed);
+                        } else {
+                            PAIR_M0_LIVE.fetch_add(1, Relaxed);
+                        }
+                        PAIR_PROBES.fetch_add(1, Relaxed);
+                        let raw = fast_slot_raw(hash, SHAPE == 1, h1);
+                        if m1 == 0 && raw != 0 {
+                            if fast_probe(
+                                &mut (0, 0),
+                                src,
+                                raw,
+                                ip1,
+                                k.window,
+                                k.lowest,
+                                k.accept_ml,
+                                k.block_end,
+                            )
+                            .is_some()
+                            {
+                                TAG_FALSE_REJECT.fetch_add(1, Relaxed);
+                            }
+                            TAG_REJECT_TOTAL.fetch_add(1, Relaxed);
+                        }
+                    }
+                    pair_store::<SHAPE>(hash, tags, h1, ip1, g1);
+                    if let Some((m, ml)) = pair_probe::<SHAPE>(k, &mut cand, m1, ip1) {
+                        if ml >= k.pair_bar {
+                            if COUNT {
+                                use core::sync::atomic::Ordering::Relaxed;
+                                if m0 == 0 {
+                                    PAIR_HIT_EMPTY.fetch_add(1, Relaxed);
+                                    PAIR_BYTES_EMPTY.fetch_add(ml as u64, Relaxed);
+                                } else {
+                                    PAIR_HIT_LIVE.fetch_add(1, Relaxed);
+                                    PAIR_BYTES_LIVE.fetch_add(ml as u64, Relaxed);
+                                }
+                                PAIR_HITS.fetch_add(1, Relaxed);
+                                PAIR_BYTES.fetch_add(ml as u64, Relaxed);
+                                t.hits += 1;
+                            }
+                            t.pair_bytes += ml as u64;
+                            ip = emit_fast_seq_body(
+                                ectx, hash, tags, seqs, lits, anchor, ip1, m, ml,
+                            );
+                            anchor = ip;
+                            #[cfg(feature = "profile")]
+                            r2.after(seqs, src, ip, k.lowest, ilimit, k.block_end);
+                            break 'pos;
+                        }
+                    }
+                }
+                if COUNT {
+                    t.mm_miss += 1;
+                }
+                ip += k.step0 + ((ip - anchor) >> k.accel);
+            }
+        }};
+    }
+    while ip < ilimit {
+        step!(true);
+    }
+    if ip == ilimit {
+        step!(false);
+    }
+    t.ip = ip;
+    t.anchor = anchor;
+    t.rep1 = rep1;
+    t.cand = cand;
+}
+
+/// THE PIPELINED ROUTE'S SCAN (routes 0 and 1: no pair search; brick 39's
+/// 2-way software pipeline), for the same two bodies as `fast_pair_scan`.
+///
+/// Position for position the work of the pipelined loop in
+/// `find_fast_impl_inner` -- the store at `ip`, the repcode probe, the next
+/// position's key and slot issued before the current candidate is tested,
+/// the emit -- so byte-identical by construction. One simplification is an
+/// identity: the old loop forwarded the slot it had just stored by hand when
+/// the next key landed on it (`h == h0`), and a plain load after the store
+/// reads exactly that (packed: `(ip + 1) | g0 << 24`, which decodes to
+/// `ip + 1` iff the tags agree; tag array: `ip + 1` under `g0`), as the
+/// DFast speculation already found (V3). And the emitter is inline, as in
+/// `fast_pair_scan`.
+#[inline(always)]
+pub(crate) fn fast_pipe_scan<const BMI2: bool, const SHAPE: u8>(
+    k: &PairScan,
+    ectx: &FastEmitCtx,
+    hash: &mut [u32],
+    tags: &mut [u8],
+    seqs: &mut Vec<Seq>,
+    lits: &mut Vec<u8>,
+    t: &mut PairTally,
+    #[cfg(feature = "profile")] r2: &mut Rep2Probe,
+) {
+    const COUNT: bool = cfg!(feature = "profile");
+    debug_assert!(SHAPE == 1 || SHAPE == 2);
+    let _ = BMI2;
+    let src = k.src;
+    let ilimit = k.ilimit;
+    let mut ip = t.ip;
+    let mut anchor = t.anchor;
+    let mut rep1 = t.rep1;
+    let mut cand = t.cand;
+    debug_assert!(ip <= ilimit);
+    let (mut h0, mut g0) = pair_key::<SHAPE>(k, ip);
+    let mut m0 = pair_load::<SHAPE>(hash, tags, h0, g0);
+    loop {
+        if COUNT {
+            t.pipe_pos += 1;
+            t.probes += 1;
+            let raw = fast_slot_raw(hash, SHAPE == 1, h0);
+            if m0 == 0 && raw != 0 {
+                if fast_probe(
+                    &mut (0, 0),
+                    src,
+                    raw,
+                    ip,
+                    k.window,
+                    k.lowest,
+                    k.accept_ml,
+                    k.block_end,
+                )
+                .is_some()
+                {
+                    TAG_FALSE_REJECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                TAG_REJECT_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        pair_store::<SHAPE>(hash, tags, h0, ip, g0);
+        if k.rep {
+            if COUNT {
+                t.rep_probes += 1;
+            }
+            if let Some(ml) = try_rep1(src, ip, rep1, k.lowest, k.block_end, ilimit) {
+                t.rep_hits += 1;
+                t.rep_bytes += ml as u64;
+                if COUNT {
+                    t.hits += 1;
+                }
+                let mstart = ip + 1;
+                crate::prof::note_huff_path(11);
+                push_literals(lits, src, anchor, mstart, k.lp_copy);
+                crate::prof::note_huff_path(13);
+                seqs.push(Seq {
+                    litlen: (mstart - anchor) as u32,
+                    matchlen: ml as u32,
+                    offset: rep1 as u32,
+                });
+                ip = mstart + ml;
+                anchor = ip;
+                #[cfg(feature = "profile")]
+                r2.after(seqs, src, ip, k.lowest, ilimit, k.block_end);
+                if ip > ilimit {
+                    break;
+                }
+                (h0, g0) = pair_key::<SHAPE>(k, ip);
+                m0 = pair_load::<SHAPE>(hash, tags, h0, g0);
+                continue;
+            }
+        }
+        // Next position, and its slot load issued NOW (brick 39).
+        let nip = ip + k.step0 + ((ip - anchor) >> k.accel);
+        if COUNT && nip <= ilimit {
+            t.ff_made += 1;
+        }
+        let (h1, g1, m1) = if nip <= ilimit {
+            let (h, g) = pair_key::<SHAPE>(k, nip);
+            (h, g, pair_load::<SHAPE>(hash, tags, h, g))
+        } else {
+            (0, 0, 0)
+        };
+        if let Some((m, ml)) = pair_probe::<SHAPE>(k, &mut cand, m0, ip) {
+            if COUNT {
+                t.hits += 1;
+            }
+            let found = ip;
+            ip = emit_fast_seq_body(ectx, hash, tags, seqs, lits, anchor, found, m, ml);
+            anchor = ip;
+            #[cfg(feature = "profile")]
+            r2.after(seqs, src, ip, k.lowest, ilimit, k.block_end);
+            if k.maintain_rep1 {
+                rep1 = found - m;
+            }
+            if ip > ilimit {
+                break;
+            }
+            (h0, g0) = pair_key::<SHAPE>(k, ip);
+            m0 = pair_load::<SHAPE>(hash, tags, h0, g0);
+            continue;
+        }
+        if nip > ilimit {
+            break;
+        }
+        if COUNT {
+            t.ff_used += 1;
+        }
+        ip = nip;
+        h0 = h1;
+        g0 = g1;
+        m0 = m1;
+    }
+    t.ip = ip;
+    t.anchor = anchor;
+    t.rep1 = rep1;
+    t.cand = cand;
+}
+
 /// The pipelined arm's per-block tail of `find_fast_impl_inner` -- the second
 /// of its two exits, factored out of the 48x (+8) family exactly like
 /// `fast_finder_epilogue` (the main tail). Runs once per block.
@@ -1749,7 +2427,12 @@ pub(crate) fn fast_probe_wide<const SAFE: bool>(
         return None;
     }
     let m = (match_slot as usize) - 1;
-    if m < lowest || m >= ip || ip - m > window {
+    // `m >= ip || ip - m > window` as ONE unsigned compare: `ip - m - 1`
+    // wraps past `window` exactly when `m >= ip`, and is `>= window` exactly
+    // when `ip - m > window` otherwise. Needs `window < 2^63` (it is at most
+    // 2^31). One compare and branch fewer per candidate.
+    debug_assert!(window < usize::MAX / 2);
+    if m < lowest || ip.wrapping_sub(m).wrapping_sub(1) >= window {
         return None;
     }
     let a = if SAFE {
@@ -1825,7 +2508,9 @@ pub(crate) fn fast_probe(
         return None;
     }
     let m = (match_slot as usize) - 1;
-    if m < lowest || m >= ip || ip - m > window {
+    // One compare for `m >= ip || ip - m > window` -- see `fast_probe_wide`.
+    debug_assert!(window < usize::MAX / 2);
+    if m < lowest || ip.wrapping_sub(m).wrapping_sub(1) >= window {
         return None;
     }
     // FUSED FIRST-WORD HEAD: with 8-byte room under block_end, ONE u64 pair

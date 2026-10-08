@@ -343,21 +343,6 @@ impl BitCStream {
         self.bit_pos += nb_bits;
     }
 
-    /// Huffman fast path: `1 <= nb_bits <= 11` and `bit_pos + nb_bits < 64`.
-    #[inline(always)]
-    pub(crate) fn add_bits_huff(&mut self, code: u64, nb_bits: u32) {
-        debug_assert!(nb_bits > 0 && nb_bits <= 11);
-        debug_assert!(self.bit_pos + nb_bits < 64);
-        self.container |= code << self.bit_pos;
-        self.bit_pos += nb_bits;
-    }
-
-    /// Remaining container room for one Huffman code (fill dispatch).
-    #[inline(always)]
-    pub(crate) fn huff_fits(&self, nb_bits: u32) -> bool {
-        self.bit_pos + nb_bits < 64
-    }
-
     #[inline(always)]
     /// BRICK 68: FIXED-WIDTH flush.
     ///

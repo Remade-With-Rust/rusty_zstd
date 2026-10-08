@@ -3307,6 +3307,10 @@ fn fill_dfast_after_match(
     // the two anchors needs an `la == sa` test, and MEASURED +31 instructions
     // -- the branch costs more than the hash it saves on a path LLVM had as
     // straight-line code. Recorded so it is not retried.
+    // Re-measured on EXECUTED instructions (2026-10-08; whole program,
+    // callgrind, L3, inlined both ways): dickens +1.5%, x-ray +1.0%, xml
+    // +1.1%, samba -2.0%. Left `#[inline]`, the shared form outlines the
+    // helper and costs dickens +9.1%. The verdict stands.
     if do_a {
         if sa <= ilimit {
             let (h, g) = hash4_tag_mls(src, sa, hash_shift, smask);
