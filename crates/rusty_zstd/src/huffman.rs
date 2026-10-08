@@ -2024,8 +2024,80 @@ pub fn take_e12_scan() -> [u64; 3] {
 // shrank `write_sequences` from 12,413 to 2,216 instructions.
 #[inline(never)]
 fn limit_nbits(nbits: &mut [u8; 256], present: &[u8], max_bits: u8) {
+    // ONE STEP AT A TIME, AS BEFORE -- ONLY THE SEARCH CHANGED. Each step of
+    // the two repair loops asked "which present symbol has the shortest
+    // (longest) code, first in symbol order on a tie?" by scanning all of
+    // `present`: O(alphabet) per step, and a deep tree takes hundreds of steps
+    // a block. Callgrind, mozilla L1: 102.7M instructions in this function,
+    // 4.2% of the whole encode, against 15.4M for libzstd's entire
+    // `HUF_buildCTable_wksp`.
+    //
+    // The same question is answered by one bit set per code length: the
+    // shortest (longest) non-empty length, then its lowest set bit -- the
+    // first such symbol in `present` order, because `present` is ascending.
+    // Same choice, same order of steps, so the same `nbits`, by construction;
+    // `limit_nbits_matches_scan` gates it against the scan, kept as the oracle.
     #[cfg(feature = "profile")]
     E12_SCAN[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    debug_assert!((1..=15).contains(&max_bits));
+    let mb = usize::from(max_bits.min(15));
+    let max = i32::from(max_bits);
+    let mut kraft = 0i32;
+    // `lv[nb]` = the present symbols whose code is `nb` bits long.
+    let mut lv = [[0u64; 4]; 16];
+    for &s in present {
+        let s = usize::from(s);
+        if nbits[s] > max_bits || nbits[s] == 0 {
+            nbits[s] = max_bits;
+        }
+        kraft += 1 << (max - i32::from(nbits[s]));
+        lv[usize::from(nbits[s])][s >> 6] |= 1u64 << (s & 63);
+    }
+    fn lowest(set: &[u64; 4]) -> Option<usize> {
+        set.iter()
+            .position(|&w| w != 0)
+            .map(|i| i * 64 + set[i].trailing_zeros() as usize)
+    }
+    let target = 1 << max;
+    while kraft > target {
+        #[cfg(feature = "profile")]
+        {
+            E12_SCAN[1].fetch_add(present.len() as u64, core::sync::atomic::Ordering::Relaxed);
+            E12_SCAN[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        // Shortest code below the cap.
+        let Some((nb, s)) = (1..mb).find_map(|nb| lowest(&lv[nb]).map(|s| (nb, s))) else {
+            break;
+        };
+        kraft -= 1 << (max - nb as i32 - 1);
+        lv[nb][s >> 6] &= !(1u64 << (s & 63));
+        lv[nb + 1][s >> 6] |= 1u64 << (s & 63);
+        nbits[s] += 1;
+    }
+    while kraft < target {
+        #[cfg(feature = "profile")]
+        {
+            E12_SCAN[1].fetch_add(present.len() as u64, core::sync::atomic::Ordering::Relaxed);
+            E12_SCAN[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        // Longest code above one bit.
+        let Some((nb, s)) = (2..=mb)
+            .rev()
+            .find_map(|nb| lowest(&lv[nb]).map(|s| (nb, s)))
+        else {
+            break;
+        };
+        kraft += 1 << (max - nb as i32);
+        lv[nb][s >> 6] &= !(1u64 << (s & 63));
+        lv[nb - 1][s >> 6] |= 1u64 << (s & 63);
+        nbits[s] -= 1;
+    }
+}
+
+/// The scan `limit_nbits` replaced: the definition of its choice, and its
+/// oracle.
+#[cfg(all(feature = "alloc", test))]
+fn limit_nbits_scan(nbits: &mut [u8; 256], present: &[u8], max_bits: u8) {
     let max = i32::from(max_bits);
     let mut kraft = 0i32;
     for &s in present {
@@ -2036,11 +2108,6 @@ fn limit_nbits(nbits: &mut [u8; 256], present: &[u8], max_bits: u8) {
     }
     let target = 1 << max;
     while kraft > target {
-        #[cfg(feature = "profile")]
-        {
-            E12_SCAN[1].fetch_add(present.len() as u64, core::sync::atomic::Ordering::Relaxed);
-            E12_SCAN[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
         let mut best: Option<usize> = None;
         let mut best_nb = 0u8;
         for &s in present {
@@ -2057,11 +2124,6 @@ fn limit_nbits(nbits: &mut [u8; 256], present: &[u8], max_bits: u8) {
         nbits[s] += 1;
     }
     while kraft < target {
-        #[cfg(feature = "profile")]
-        {
-            E12_SCAN[1].fetch_add(present.len() as u64, core::sync::atomic::Ordering::Relaxed);
-            E12_SCAN[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
         let mut best: Option<usize> = None;
         let mut best_nb = 0u8;
         for &s in present {
@@ -3664,6 +3726,51 @@ mod tests {
         }
         for (mx, &hit) in seen.iter().enumerate().skip(1) {
             assert!(hit, "no table reached max_nbits={mx}");
+        }
+    }
+
+    /// `limit_nbits` (bit sets) against the scan it replaced, on code
+    /// lengths from deep real trees and from arbitrary length vectors.
+    #[test]
+    fn limit_nbits_matches_scan() {
+        let mut x = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for case in 0..4000 {
+            let alpha = 2 + (next() % 255) as usize;
+            let mut present: Vec<u8> = (0..=255u8)
+                .filter(|_| next() % 256 < alpha as u64)
+                .collect();
+            if present.len() < 2 {
+                present = vec![3, 200];
+            }
+            let mut nb = [0u8; 256];
+            for &s in &present {
+                // Mostly tree-like depths, sometimes 0 or past the cap.
+                nb[s as usize] = match next() % 16 {
+                    0 => 0,
+                    1 => 12 + (next() % 20) as u8,
+                    _ => 1 + (next() % (1 + case % 30) as u64) as u8,
+                };
+            }
+            let max = [11u8, 11, 11, 9, 6, 4][case % 6];
+            let (mut a, mut b) = (nb, nb);
+            limit_nbits(&mut a, &present, max);
+            limit_nbits_scan(&mut b, &present, max);
+            assert_eq!(a, b, "case {case}");
+        }
+        // Real trees: geometric frequencies give depths far past 11.
+        for n in [3usize, 17, 64, 200, 256] {
+            let mut freq = [0u32; 256];
+            for (i, f) in freq.iter_mut().take(n).enumerate() {
+                *f = 1 + (1u32 << (i % 31)) / (1 + i as u32);
+            }
+            let a = huffman_nbits(&freq).expect("tree");
+            assert!(a.iter().all(|&v| v <= MAX_BITS));
         }
     }
 
