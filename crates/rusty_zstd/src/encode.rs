@@ -4593,9 +4593,9 @@ fn row_find_body<const MLS: usize, const RL: u32, const PF: bool>(
     }
     let span = ip - low;
     // W15: the attempt budget is applied to the MASK, once, instead of counted
-    // down per candidate: the walk visits set bits from the high end, so "the
-    // newest `attempts` candidates" is "clear the lowest set bits until
-    // popcount == attempts", and `w &= w - 1` clears exactly the lowest.
+    // down per candidate: the walk visits set bits from the LOW end (newest
+    // on bit 0, see `row_rot`), so "the newest `attempts` candidates" is
+    // "clear the highest set bits until popcount == attempts".
     //
     // Only when the budget CAN bind: a row has `1 << RL` slots, and the
     // shipped policy sizes rows from the search log, so at L7-L12 the budget
@@ -4605,7 +4605,7 @@ fn row_find_body<const MLS: usize, const RL: u32, const PF: bool>(
     if attempts < (1usize << RL) {
         let mut extra = (w.count_ones() as usize).saturating_sub(attempts);
         while extra != 0 {
-            w &= w - 1;
+            w &= !(1u64 << (63 - w.leading_zeros()));
             extra -= 1;
         }
     }
@@ -4622,12 +4622,14 @@ fn row_find_body<const MLS: usize, const RL: u32, const PF: bool>(
     let c0 = cand.as_mut_ptr() as *mut u32;
     let mut cur = c0;
     while w != 0 {
-        // Highest set bit is the newest slot. `w` only ever has its low
+        // Lowest set bit is the newest slot. `w` only ever has its low
         // `1 << RL` bits set (see `row_rot`), so `s` masks to a slot of THIS
         // row -- which is also what lets the optimiser drop the bounds check
-        // on `row`, a `1 << RL`-element slice.
-        let b = 63 - w.leading_zeros();
-        w &= !(1u64 << b);
+        // on `row`, a `1 << RL`-element slice. `w &= w - 1` does not wait
+        // for the bit scan: the loop carries one `lea` + `and`, where
+        // `bsr` + `btr` carried four cycles (see `row_rot`).
+        let b = w.trailing_zeros();
+        w &= w - 1;
         let s = ((b + rhead) & ((1u32 << RL) - 1)) as usize;
         let m = row[s];
         // W7: THREE rejects, ONE compare. `m - low` is borrow-free exactly

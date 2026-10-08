@@ -86,7 +86,24 @@ pub fn take_row_walk() -> [u64; 3] {
 }
 
 /// Rotate an `N`-bit candidate mask right by `head` (`N = 1 << RL`,
-/// `head < N`), so that bit `N - 1` is the newest slot and bit 0 the oldest.
+/// `head < N`), so that bit 0 is the newest slot and bit `N - 1` the oldest.
+///
+/// NEWEST ON BIT 0 (2026-10-08). The row used to fill UPWARD, newest on the
+/// top bit, so the walk took candidates with `bsr` and cleared them with
+/// `btr` -- and `btr` needs `bsr`'s result, so every iteration carried a
+/// `bsr` latency (3 cycles) plus the clear on the loop's dependency chain.
+/// libzstd fills its rows DOWNWARD (`ZSTD_row_nextIndex`) for exactly this:
+/// newest on bit 0, `ctz` off the chain, `m &= m - 1` the only carried op.
+/// Rows now fill downward too. Same ages, same newest-first order, same
+/// candidates: the slot permutation is invisible to the output.
+///
+/// Callgrind cannot see this (same instruction count); the clock can.
+/// Pinned, best of 4 alternating rounds, MB/s before -> after: L12 dickens
+/// 14.6 -> 20.3, samba 32.4 -> 45.8, mozilla 24.5 -> 33.8, nci 55.8 -> 75.3,
+/// xml 52.1 -> 70.2, x-ray 22.8 -> 24.5; L9 dickens 34.6 -> 42.3, samba 72.9
+/// -> 85.3, mozilla 54.5 -> 62.6, nci 119.4 -> 134.9, xml 105.3 -> 116.9,
+/// x-ray 39.4 -> 44.6. The win scales with candidates per probe (41 on
+/// dickens at L12, 12 at L9), which is the length of the carried chain.
 #[inline(always)]
 pub(crate) fn row_rot<const RL: u32>(mask: RowMask, head: u32) -> RowMask {
     debug_assert!((ROW_LOG_MIN..=ROW_LOG_MAX).contains(&RL) && head < (1 << RL));
@@ -283,20 +300,25 @@ impl RowTable {
         self.tags.as_ptr() as *const u8
     }
 
-    /// Store `ip` / `tag` at slot `at` and advance row `r`'s head from `s`.
+    /// Store `ip` / `tag` in row `r` (first slot `row_at`, current head
+    /// `head`), one slot BELOW the head, and make that slot the head: rows
+    /// fill downward, so the head is always the newest slot (see `row_rot`).
     ///
     /// # Safety
-    /// `r < head.len()`, `at < slots()` and `s < 1 << rl`.
+    /// `r < head.len()`, `row_at == r << rl` and `head < 1 << rl`.
     #[inline(always)]
     #[allow(unsafe_code)]
-    unsafe fn put(&mut self, r: usize, at: usize, s: usize, rl: u32, ip: u32, tag: u8) {
-        debug_assert!(r < self.head.len() && at < self.slots() && s < (1 << rl));
+    unsafe fn put(&mut self, r: usize, row_at: usize, head: usize, rl: u32, ip: u32, tag: u8) {
+        debug_assert!(r < self.head.len() && row_at == r << rl && head < (1 << rl));
+        let s = head.wrapping_sub(1) & ((1usize << rl) - 1);
+        let at = row_at + s;
+        debug_assert!(at < self.slots());
         // SAFETY: the caller's bounds; `PosLine` / `TagLine` are `repr(C)`
         // arrays, so the line vectors are `slots()` contiguous `u32` / `u8`.
         unsafe {
             *(self.pos.as_mut_ptr() as *mut u32).add(at) = ip;
             *(self.tags.as_mut_ptr() as *mut u8).add(at) = tag;
-            *self.head.get_unchecked_mut(r) = ((s + 1) & ((1usize << rl) - 1)) as u8;
+            *self.head.get_unchecked_mut(r) = s as u8;
         }
     }
 
@@ -395,8 +417,8 @@ impl RowTable {
         // SAFETY: `r <= row_mask == head.len() - 1`, and the table holds
         // `head.len() << RL` slots, `s < 1 << RL`.
         unsafe {
-            let s = *self.head.get_unchecked(r) as usize;
-            self.put(r, (r << RL) + s, s, RL, ip, tag);
+            let head = *self.head.get_unchecked(r) as usize;
+            self.put(r, r << RL, head, RL, ip, tag);
         }
     }
 
@@ -411,8 +433,8 @@ impl RowTable {
         // SAFETY: `r < head.len()` and the table holds `head.len() << rl`
         // slots, so `(r << rl) + s` with `s < 1 << rl` is in bounds.
         unsafe {
-            let s = *self.head.get_unchecked(r) as usize;
-            self.put(r, (r << rl) + s, s, rl, ip, tag);
+            let head = *self.head.get_unchecked(r) as usize;
+            self.put(r, r << rl, head, rl, ip, tag);
         }
     }
 
@@ -464,7 +486,7 @@ impl RowTable {
             let oldi = if w0 == 0 {
                 1u64
             } else {
-                u64::from((n - w0.trailing_zeros() + 1).min(n))
+                u64::from((64 - w0.leading_zeros() + 1).min(n))
             };
             ROW_WALK[0].fetch_add(1, Relaxed);
             ROW_WALK[1].fetch_add(oldi, Relaxed);
@@ -488,9 +510,8 @@ impl RowTable {
         debug_assert_eq!(at, r << RL);
         debug_assert_eq!(head, u32::from(self.head[r]));
         debug_assert!(head < (1 << RL));
-        // SAFETY: `at + head < (r + 1) << RL <= slots()`, and
-        // `r < head.len()`.
-        unsafe { self.put(r, at + head as usize, head as usize, RL, ip, tag) }
+        // SAFETY: `at == r << RL`, `head < 1 << RL` and `r < head.len()`.
+        unsafe { self.put(r, at, head as usize, RL, ip, tag) }
     }
 
     /// Candidate positions of row `r`, MOST RECENT FIRST.
@@ -508,12 +529,12 @@ impl RowTable {
         // SAFETY: bounds asserted; the position lines are contiguous `u32`s.
         let row = unsafe { core::slice::from_raw_parts(self.pos_ptr().add(r * n), n) };
         let mut cnt = 0usize;
-        // Walk slots newest-first: head-1, head-2, ... wrapping.
-        for k in 1..=n {
+        // Walk slots newest-first: head, head+1, ... wrapping.
+        for k in 0..n {
             if mask == 0 {
                 break;
             }
-            let s = (head + n - k) & (n - 1);
+            let s = (head + k) & (n - 1);
             if mask & (1 << s) != 0 {
                 mask &= !(1u64 << s);
                 out[cnt] = row[s];
@@ -582,10 +603,11 @@ mod tests {
     fn rot_check<const RL: u32>() {
         let n = 1u32 << RL;
         for head in 0..n {
-            // The newest slot is `head - 1` (mod n); the oldest is `head`.
-            let newest = (head + n - 1) & (n - 1);
+            // Rows fill downward: the newest slot is `head`, the oldest
+            // `head - 1` (mod n).
+            let oldest = (head + n - 1) & (n - 1);
             assert_eq!(
-                row_rot::<RL>(1 << newest, head),
+                row_rot::<RL>(1 << oldest, head),
                 1 << (n - 1),
                 "n {n} head {head}"
             );
@@ -593,9 +615,9 @@ mod tests {
         }
     }
 
-    /// The rotation puts the NEWEST slot on the top bit for every head.
+    /// The rotation puts the NEWEST slot on bit 0 for every head.
     #[test]
-    fn rot_puts_newest_on_top() {
+    fn rot_puts_newest_on_bit0() {
         rot_check::<4>();
         rot_check::<5>();
         rot_check::<6>();
@@ -624,10 +646,10 @@ mod tests {
         assert_eq!(cnt, n);
         assert_eq!(out[0], 200);
         assert!(!out[..cnt].contains(&100), "oldest not evicted");
-        // The monomorphised probe agrees with the test walk: top bit = newest.
+        // The monomorphised probe agrees with the test walk: bit 0 = newest.
         let (w, head, row, at) = t.probe_view::<RL>(r, 0x42);
         assert_eq!(at, r << RL);
-        let b = 63 - w.leading_zeros();
+        let b = w.trailing_zeros();
         let s = ((b + head) & ((1u32 << RL) - 1)) as usize;
         assert_eq!(row[s], 200);
     }
