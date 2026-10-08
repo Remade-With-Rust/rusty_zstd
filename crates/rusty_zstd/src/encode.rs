@@ -4633,51 +4633,108 @@ fn row_find_best<const MLS: usize, const RL: u32>(
     //     +2.0% to +3.2% total at 4 MiB, xml +39%, and jsonlog / smallmsg get
     //     WORSE (+14% / +7%), so "the nearest match wins" is not their
     //     mechanism either.
-    let mut best_m = 0usize;
-    let mut best_ml = 0usize;
-    // W7's acceptance bar: `best_ml` is 0 or already >= mls, so one compare
-    // against a running bar replaces two.
-    let mut bar = mls;
-    let mut i = 0usize;
-    while i < n {
-        // SAFETY: `i < n`, and phase 1 wrote exactly `cand[0..n]`.
-        #[allow(unsafe_code)]
-        let m =
-            unsafe { cand[i & ((1 << crate::rowfind::ROW_LOG_MAX) - 1)].assume_init() } as usize;
-        i += 1;
-        #[cfg(feature = "profile")]
-        {
-            use core::sync::atomic::Ordering::Relaxed;
-            ROW_BUCKET[0].fetch_add(1, Relaxed);
-            if m + 8 <= src_len {
-                let hm = if hash_mode & 2 != 0 && m + 8 <= src_len {
-                    hash8_shift(src, m, hash_shift64)
-                } else if hash_mode & 1 != 0 {
-                    hash_wide_link_tag_b(src, m, hash_shift64, smask, mls).0
-                } else {
-                    hash4_link_tag_b(src, m, hash_shift32, mls).0
-                };
-                if hm == h {
-                    ROW_BUCKET[1].fetch_add(1, Relaxed);
-                }
-            }
-            if mls_eq(src, m, ip, mls, smask) {
-                ROW_BUCKET[2].fetch_add(1, Relaxed);
-            }
-        }
-        if let Some(x) = mls_xor(src, m, ip, mls, smask) {
-            // C's `match[ml] == ip[ml]` prefilter, same as the chain walk.
-            if best_ml == 0 || pre_eq(src, m, ip, best_ml) {
-                // BRICK 11: see `mls_xor`.
-                let ml = fused_ml(x, src, m, ip, block_end);
-                if ml >= bar {
-                    best_ml = ml;
-                    best_m = m;
-                    bar = ml + 1;
-                    if ip + best_ml >= block_end {
-                        break;
+    //
+    // TWO LOOPS, ONE RULE (2026-10-08). The rule is unchanged: a candidate is
+    // taken when its common prefix with `ip` is at least `mls` and longer
+    // than the best so far. What changed is the FILTER that rejects the rest,
+    // which is where this loop spends its time -- on dickens at L12, 132.6M
+    // of 135.7M examined candidates were rejected, at 19 instructions each:
+    // an 8-byte `mls_xor` (with the `ip` word RE-LOADED per candidate),
+    // a `best_ml == 0` test, then the one-byte `pre_eq`. libzstd rejects the
+    // same candidate with ONE 4-byte compare, `MEM_read32(match + ml - 3) ==
+    // MEM_read32(ip + ml - 3)`, against a word it holds across the loop.
+    //
+    // * 3a, nothing in hand: the first candidate whose first `mls` bytes
+    //   match is taken outright -- its prefix is `>= mls` by the mask, which
+    //   is the whole bar.
+    // * 3b, `best_ml >= mls` in hand: beating it needs bytes
+    //   `0..=best_ml` equal, so the 4 bytes ENDING at `best_ml` are a
+    //   necessary test (and `best_ml >= mls >= 3` keeps them inside the
+    //   prefix). A survivor gets its exact length from offset 0, and
+    //   `ml > best_ml > mls - 1` already implies the `mls` test.
+    //
+    // Same candidates, same order, same accept set: byte-identical (bytegate
+    // GOLD unchanged at all four caps). Bounds: every load here ends at
+    // index `ip + best_ml` or `m + best_ml < ip + best_ml`, and the loop
+    // stops once `ip + best_ml >= block_end`.
+    macro_rules! census {
+        ($m:expr) => {
+            #[cfg(feature = "profile")]
+            {
+                use core::sync::atomic::Ordering::Relaxed;
+                let m: usize = $m;
+                ROW_BUCKET[0].fetch_add(1, Relaxed);
+                if m + 8 <= src_len {
+                    let hm = if hash_mode & 2 != 0 && m + 8 <= src_len {
+                        hash8_shift(src, m, hash_shift64)
+                    } else if hash_mode & 1 != 0 {
+                        hash_wide_link_tag_b(src, m, hash_shift64, smask, mls).0
+                    } else {
+                        hash4_link_tag_b(src, m, hash_shift32, mls).0
+                    };
+                    if hm == h {
+                        ROW_BUCKET[1].fetch_add(1, Relaxed);
                     }
                 }
+                if mls_eq(src, m, ip, mls, smask) {
+                    ROW_BUCKET[2].fetch_add(1, Relaxed);
+                }
+            }
+        };
+    }
+    debug_assert!(mls <= 8 && ip + 8 <= block_end && block_end <= src_len);
+    // SAFETY (both loops): `i < n`, and phase 1 wrote exactly `cand[0..n]`.
+    #[allow(unsafe_code)]
+    let cand_at = |i: usize| unsafe {
+        cand[i & ((1 << crate::rowfind::ROW_LOG_MAX) - 1)].assume_init() as usize
+    };
+    let ipw = load_u64le(src, ip);
+    let mut best_m = 0usize;
+    let mut best_ml = 0usize;
+    let mut i = 0usize;
+    // 3a.
+    while i < n {
+        let m = cand_at(i);
+        i += 1;
+        census!(m);
+        let x = load_u64le(src, m) ^ ipw;
+        if x & smask == 0 {
+            // BRICK 11's fused length: the xor already answers 0..=7.
+            best_ml = if x != 0 {
+                (x.trailing_zeros() as usize) >> 3
+            } else {
+                8 + count_match_fast(src, m + 8, ip + 8, block_end)
+            };
+            best_m = m;
+            break;
+        }
+    }
+    // 3b.
+    if best_ml != 0 && ip + best_ml < block_end {
+        debug_assert!(best_ml >= mls && mls >= 3);
+        let mut off = best_ml - 3;
+        let mut want = load_u32le(src, ip + off);
+        while i < n {
+            let m = cand_at(i);
+            i += 1;
+            census!(m);
+            if load_u32le(src, m + off) != want {
+                continue;
+            }
+            let x = load_u64le(src, m) ^ ipw;
+            let ml = if x != 0 {
+                (x.trailing_zeros() as usize) >> 3
+            } else {
+                8 + count_match_fast(src, m + 8, ip + 8, block_end)
+            };
+            if ml > best_ml {
+                best_ml = ml;
+                best_m = m;
+                if ip + best_ml >= block_end {
+                    break;
+                }
+                off = best_ml - 3;
+                want = load_u32le(src, ip + off);
             }
         }
     }
