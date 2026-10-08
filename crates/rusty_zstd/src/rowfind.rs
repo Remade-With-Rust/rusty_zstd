@@ -262,6 +262,16 @@ pub(crate) struct RowTable {
     tags: alloc::vec::Vec<TagLine>,
     /// Next slot to write, per row. Wraps at the row width, so a row always
     /// holds the most recent `1 << row_log` positions for its buckets.
+    ///
+    /// REFUTED 2026-10-08, do not retry blindly: moving the head INTO the tag
+    /// row (rows below 64 slots doubled to 32 / 64 bytes, head after the
+    /// tags -- libzstd's one-line probe without giving up a slot). Same
+    /// output, but SLOWER: pinned, best of 4 alternating rounds, L9 mozilla
+    /// 67.0 -> 60.4 MB/s, xml 117.3 -> 110.5, samba 87.5 -> 83.0; L10
+    /// dickens 27.1 -> 25.0, mozilla 47.8 -> 43.9; L7 within noise to -4%.
+    /// This array is 128 KiB at L9-L12 and lives in L2; the doubled tag
+    /// table costs more cache than the extra line saves. (Not naming this
+    /// line in `prefetch_row` IS costly: L9 -3% to -10%.)
     pub head: alloc::vec::Vec<u8>,
     /// W1: `rows - 1`, cached. `row_of` ran on every position and derived this
     /// from `head.len()` -- a Vec field load feeding the address computation of
