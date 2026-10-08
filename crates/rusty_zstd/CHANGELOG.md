@@ -32,6 +32,11 @@ below ships behind arms that default off.
 - *(rowfind)* the row walk gathers every candidate and prefetches its source
   line before the first compare, and names the next search's row as soon as
   a match is chosen: 11-14% faster on row frames, same output
+- *(alloc)* the CLI and bench binaries move to rusty_alloc 2.2.5 (from 2.0.5)
+  through the `rzstd-alloc` seam; measured neutral to slightly faster (whole-
+  file compress 0.98-1.00x at L1-L12, decompress 0.98x, small messages
+  0.98-1.01x) with fewer page faults at L12. The optional `rusty-alloc`
+  feature still installs 1.1.6 via `rusty_alloc_default` 0.1.2
 - *(encode)* `encode.rs` split into seven modules; the asm board is identical
   in all thirty-two columns (#18)
 

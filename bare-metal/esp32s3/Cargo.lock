@@ -1224,9 +1224,9 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rusty_alloc"
-version = "2.0.5"
+version = "2.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d59f4e6793d58ca76f11c5138939761fbabb6978b1fe404e1c097fa6bd45e706"
+checksum = "c12ed1752127ac2fabc5bc5aed934055f4be5f093885d830a66686bff4cd7668"
 dependencies = [
  "libc",
  "windows-sys 0.60.2",
@@ -1234,16 +1234,16 @@ dependencies = [
 
 [[package]]
 name = "rusty_alloc-api"
-version = "2.0.5"
+version = "2.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66795d559e48d97cc9e5df15471c98ffd6a95870110fec8ca49ad22318e546c0"
+checksum = "a68d299fc4818e1b26164556504f28240de294ea709c519ec465add9238f30f7"
 dependencies = [
  "rusty_alloc",
 ]
 
 [[package]]
 name = "rusty_zstd"
-version = "0.2.5"
+version = "0.2.6"
 
 [[package]]
 name = "ryu"
