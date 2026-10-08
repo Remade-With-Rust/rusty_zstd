@@ -245,6 +245,14 @@ pub(crate) struct TagLine([u8; 64]);
 /// L9 and L12, pinned: within this box's +-10% noise -- the adjacent-line
 /// prefetcher was already hiding most of each straddle. Kept for the
 /// deterministic miss count, not for a timed win.
+///
+/// RE-MEASURED after the hash cache, downward rows and hash tags (same day):
+/// the aligned table against one deliberately skewed by 16 bytes (the old
+/// layout), pinned, best of 4 alternating rounds -- aligned faster in 15 of
+/// 18 cells, by 1-4% (L7 samba 115.2 vs 110.6 MB/s, L9 x-ray 54.2 vs 51.3,
+/// L12 x-ray 27.7 vs 26.6); the three others within 2%. `veins/greedy`
+/// measured aligned tables SLOWER at L7/L9 on its own code (1.049 / 1.084);
+/// not reproduced on this one.
 #[cfg(feature = "alloc")]
 #[derive(Default, Clone)]
 pub(crate) struct RowTable {

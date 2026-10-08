@@ -5501,6 +5501,11 @@ fn find_lazy_rows<const RL: u32, const HT: bool>(
         ca: false,
     };
     let lp_copy = lit_width_for(tables);
+    // REFUTED 2026-10-08 for this parse: libzstd's no-match step shift is 8
+    // (`kSearchStrength`), ours 12. At 8: no time change at L9 or L12 on six
+    // silesia files (pinned, within noise) for +0.02% size (1 MiB, 18
+    // corpora; mozilla +0.19%). The faster skip pays on Greedy (veins/greedy),
+    // where the search is cheaper relative to the step.
     let accel_sh = lazy_step_shift(lazy_accel());
     // C: `ip += (dictAndPrefixLength == 0)` -- with no history at all the
     // first position cannot match anything.
