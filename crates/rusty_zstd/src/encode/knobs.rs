@@ -1074,7 +1074,13 @@ pub(crate) fn fast_hash_tag<const SAFE: bool>(
         } & mask;
         let hv = v.wrapping_mul(FAST_HASH_PRIME64);
         // BRICK 52: the byte under the bucket (the top bits ARE the bucket).
-        ((hv >> shift) as usize, ((hv << 8) >> shift) as u8)
+        // Written `(hv << 8) >> shift`, LLVM folded the `<< 8` into the
+        // multiplier and emitted a SECOND `imul` (by `P << 8`) plus its own
+        // `movabs` per hash site. `hv >> (shift - 8)` truncated to a byte is
+        // the same eight bits [shift - 8, shift); `shift = 64 - hash_log >= 40`
+        // (`tables.hash_log` is clamped to 6..=24), so `shift - 8` cannot wrap.
+        debug_assert!(shift >= 8);
+        ((hv >> shift) as usize, (hv >> (shift - 8)) as u8)
     } else {
         let hv = load_u32le(src, pos).wrapping_mul(HASH4_PRIME);
         ((hv >> shift) as usize, (hv ^ (hv >> 15)) as u8)
