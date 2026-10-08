@@ -56,6 +56,25 @@ pub(crate) fn prefetch_read(slice: &[u8], at: usize) {
     }
 }
 
+/// `prefetch_read` for a pointer the caller already holds into a live
+/// table. A pure hint: `_mm_prefetch` never dereferences architecturally, so
+/// it cannot fault or change a value whatever `p` is; callers still pass
+/// in-bounds pointers (they form them with `add` inside the table).
+#[inline(always)]
+pub(crate) fn prefetch_raw(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: a prefetch has no architectural effect (see above).
+        unsafe {
+            core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = p;
+    }
+}
+
 /// Unaligned little-endian `u32`. Caller: `i + 4 <= src.len()`.
 #[inline(always)]
 pub(crate) fn load_u32_le(src: &[u8], i: usize) -> u32 {

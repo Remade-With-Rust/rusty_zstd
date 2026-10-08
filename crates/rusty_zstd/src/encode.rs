@@ -2654,14 +2654,34 @@ fn find_sequences_strategy_sel(
     match params.strategy {
         Strategy::DFast => find_dfast(src, block_start, block_end, window, params, tables, reps),
         Strategy::Greedy => {
-            // ROWS AT THE GREEDY LEVEL go through the lazy finder at depth 0.
-            // `find_greedy_impl` carries its own hand-copied CHAIN walk and
-            // only ever mirrored inserts into the rows; `find_lazy_impl` is
-            // the finder the row kernel is wired into, and with `depth == 0`
-            // its look-ahead loop (`for d in 1..=depth`) never runs, which is
-            // greedy. Reached only when the frame was allocated with rows
-            // (`row_geometry`), so chain frames are untouched.
+            // ROWS AT THE GREEDY LEVEL. With the C-shaped parse on a wide-key
+            // row frame (the shipped row arms) it is `find_greedy_rows`, the
+            // fused depth-0 parse; any other row frame (the parse or key arms
+            // forced back) goes through the lazy finder at depth 0, whose
+            // look-ahead never runs at that depth. Reached only when the frame
+            // was allocated with rows (`row_geometry`), so chain frames are
+            // untouched.
             if row_find_enabled() && !tables.rows.head.is_empty() {
+                if tables.chain_wide && row_parse_c() {
+                    macro_rules! go {
+                        ($rl:literal) => {
+                            find_greedy_rows::<$rl>(
+                                src,
+                                block_start,
+                                block_end,
+                                window,
+                                params,
+                                tables,
+                                reps,
+                            )
+                        };
+                    }
+                    return match tables.rows.row_log() {
+                        6 => go!(6),
+                        5 => go!(5),
+                        _ => go!(4),
+                    };
+                }
                 find_lazy(src, block_start, block_end, window, params, tables, 0, reps)
             } else {
                 find_greedy(src, block_start, block_end, window, params, tables, reps)
@@ -2993,6 +3013,10 @@ fn rep_yield_min() -> f32 {
 /// The Fast ladder (L1-L2, and the Gate 1 dispatch): one hash table, one probe. Lives in `encode/fast.rs`.
 mod fast;
 pub(crate) use fast::*;
+
+/// The greedy parse of a ROW frame (L5), libzstd's `greedy_row`. Lives in `encode/rowgreedy.rs`.
+mod rowgreedy;
+pub(crate) use rowgreedy::*;
 
 /// The tuning ARMS and census COUNTERS: bench hooks, env knobs, instruments. Lives in `encode/knobs.rs`.
 mod knobs;
