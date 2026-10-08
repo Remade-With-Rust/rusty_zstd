@@ -1,8 +1,17 @@
 ### In The Wild with 1,612 Active Installs
-> **In the wild** — [RAG Converter](https://ragconverter.com) uses `rusty_zstd` for compression.
+> [MATA Network](https://mata.network) uses `rusty_zstd` as their unified compression tool
+> deploying across Windows, PC, MAC, Linux, Android, iPhone, WASM, and ESP-32 for Home devices.
+> This diverse ecosystem is battle testing our code base in every environment for performance,
+> and security.
+>
+> [SpaceDB](https://mata.network/remade-with-rust) uses `rusty_zstd` as their core compression
+> for distributed cloud applications, across many device types.
+> 
+> [RAG Converter](https://ragconverter.com) uses `rusty_zstd` for compression.
 > It makes personal and work files AI-readable without them leaving the machine:
 > the whole conversion runs as WebAssembly in the browser tab, with nothing
 > uploaded and nothing to install.
+> 
 
 # rusty_zstd
 
