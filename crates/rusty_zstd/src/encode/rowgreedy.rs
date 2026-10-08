@@ -108,16 +108,15 @@ pub(crate) fn find_greedy_rows<const RL: u32, const HT: bool, const D: usize>(
 
     // The row table, by base pointer. SAFETY (every access below): a row
     // index is `(h >> RL) & rmask` with `rmask == head.len() - 1`, so it is
-    // `< head.len()`; `pos` and `tags` are `head.len() << RL` long and a slot
-    // is `(r << RL) + s` with `s < 1 << RL`. Nothing in this function resizes
-    // the table, and `tables` is not otherwise touched until the epilogue.
+    // `< head.len()`; the table holds `head.len() << RL` positions and tags
+    // and a slot is `(r << RL) + s` with `s < 1 << RL`. Nothing in this
+    // function resizes the table, and `tables` is not otherwise touched until
+    // the epilogue.
     let rmask = tables.rows.mask();
     debug_assert_eq!(rmask + 1, tables.rows.head.len());
-    debug_assert_eq!(tables.rows.pos.len(), tables.rows.head.len() << RL);
-    debug_assert_eq!(tables.rows.tags.len(), tables.rows.head.len() << RL);
-    let posp = tables.rows.pos.as_mut_ptr();
-    let tagp = tables.rows.tags.as_mut_ptr();
-    let headp = tables.rows.head.as_mut_ptr();
+    let (posp, tagp, headp, slots) = tables.rows.raw_parts_mut();
+    debug_assert_eq!(slots, tables.rows.head.len() << RL);
+    let _ = slots;
     const N_MASK: usize = (1usize << crate::rowfind::ROW_LOG_MAX) - 1;
     let slot_mask: u32 = (1u32 << RL) - 1;
 
@@ -133,23 +132,22 @@ pub(crate) fn find_greedy_rows<const RL: u32, const HT: bool, const D: usize>(
             unsafe {
                 crate::simd::prefetch_raw(tagp.add(at) as *const u8);
                 let pb = posp.add(at) as *const u8;
-                // The table is not line-aligned, so a row can straddle a
-                // boundary: name its last byte too.
+                // The table is LINE-ALIGNED (`rowfind::RowTable`, from the
+                // L9-L12 work merged 2026-10-08), so a row never straddles a
+                // line and its lines are exactly `4 << RL` bytes from `pb`.
                 //
-                // REFUTED 2026-10-08: line-aligning `pos` and `tags` (one line
-                // of slack, every access from the first 64-byte boundary) so
-                // a 16-slot row is one line instead of two three times in
-                // four. Byte-identical, and SLOWER: L5 0.995, L6 1.016, L7
-                // 1.049, L9 1.084 of the unaligned table (six silesia files
-                // at 4 MiB, pinned floor, four rounds). Not chased further;
-                // one suspect is both tables then sharing their low 12
-                // address bits row for row (4K aliasing).
+                // ALIGNMENT, TWO VERDICTS: on this function's own code, before
+                // the merge, an aligned table measured SLOWER (L5 0.995, L6
+                // 1.016, L7 1.049, L9 1.084 of the unaligned one; six silesia
+                // files at 4 MiB, pinned floor, four rounds), while the L9-L12
+                // parse measured it FASTER in 15 of 18 cells (1-4%). The
+                // merged table is aligned for both; see the merge commit for
+                // the L5/L6 re-time.
                 let mut off = 0usize;
                 while off < (4usize << RL) {
                     crate::simd::prefetch_raw(pb.add(off));
                     off += 64;
                 }
-                crate::simd::prefetch_raw(pb.add((4usize << RL) - 1));
             }
         }};
     }
@@ -177,19 +175,20 @@ pub(crate) fn find_greedy_rows<const RL: u32, const HT: bool, const D: usize>(
             }
         }};
     }
-    // Insert `q` (key and tag `kt`) at its row's head.
+    // Insert `q` (key and tag `kt`) one slot BELOW its row's head and make
+    // that slot the head: rows fill downward, so the head is the newest slot
+    // (`RowTable::put`, `row_rot`).
     macro_rules! insert {
         ($q:expr, $kt:expr) => {{
             let q: usize = $q;
             let (h, t): (usize, u8) = $kt;
             let r = (h >> RL) & rmask;
             unsafe {
-                let s = u32::from(*headp.add(r));
-                debug_assert!(s <= slot_mask);
+                let s = u32::from(*headp.add(r)).wrapping_sub(1) & slot_mask;
                 let at = (r << RL) + s as usize;
                 *posp.add(at) = q as u32;
                 *tagp.add(at) = t;
-                *headp.add(r) = ((s + 1) & slot_mask) as u8;
+                *headp.add(r) = s as u8;
             }
         }};
     }
@@ -275,8 +274,10 @@ pub(crate) fn find_greedy_rows<const RL: u32, const HT: bool, const D: usize>(
                 let mut left = attempts;
                 while w != 0 && left != 0 {
                     left -= 1;
-                    let b = 63 - w.leading_zeros();
-                    w &= !(1u64 << b);
+                    // Newest on bit 0 (`row_rot`): `tzcnt` off the carried
+                    // chain, `w &= w - 1` the only carried op.
+                    let b = w.trailing_zeros();
+                    w &= w - 1;
                     let s = ((b + rhead) & slot_mask) as usize;
                     // SAFETY: `s < 1 << RL`, a slot of row `r`.
                     let m = unsafe { *posp.add(at + s) };

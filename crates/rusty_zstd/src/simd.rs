@@ -4,40 +4,36 @@
 //! mismatch (early exit). CRT `memcmp` of a whole equal run is a call, then a
 //! second scan to find the index. AVX2/NEON `pcmpeqb` + mask tzcnt is one pass.
 
-/// Hint the CPU to start loading `slice[at]` into L1.
+/// Hint the CPU to start loading `slice[at]` into L1, for a caller that has
+/// ALREADY proven `at < slice.len()`.
 ///
-/// UNUSED. Bricks 42 (decoder match source) and 43 (encoder candidate) both
-/// tried it and both measured WORSE -- see `m7-encoder-whys.md`. The reason is
-/// the same in both: the target is already cache-resident, so there is no miss
-/// to hide and the hint is pure instruction overhead. Kept because the
-/// primitive is correct -- so it lives in the TEST build only, where "kept
-/// because it is correct" costs nothing. It used to be `#[allow(dead_code)]`
-/// in the shipping build, with that attribute sitting in the MIDDLE of this
-/// doc comment. That is the same drift that put `#[cfg(feature = "std")]` on
-/// `params::CPARAM_CLAMP_ARM` while both its users stayed ungated and broke
-/// the whole `no_std + alloc` build; an attribute wedged between doc lines is
-/// a hazard, not a style choice.
+/// Used by the ROW match finder only: every candidate's source line, and the
+/// next probe's row. Bricks 42 (decoder match source) and 43 (encoder chain
+/// candidate) both tried a prefetch and both measured WORSE -- see
+/// `m7-encoder-whys.md` -- because their targets were already cache-resident.
+/// The row walk is the opposite case: a row hands back up to 64 candidates at
+/// random offsets before the first compare, so the misses can overlap.
 ///
-/// A pure HINT: it cannot fault, cannot change any value, and an out-of-range
-/// `at` simply does nothing. So any code path using it is byte-identical by
-/// construction -- no oracle needed, only a benchmark.
+/// A pure HINT: it cannot fault and cannot change any value, so any code path
+/// using it is byte-identical by construction -- no oracle needed, only a
+/// benchmark.
 ///
-/// The match copy in `decode_sequences` reads from a random earlier offset,
-/// which is the decoder's one unpredictable load. C ships a whole separate
-/// path for this (`ZSTD_decompressSequencesLong` + `ZSTD_DECODESEQUENCE_PREFETCH`).
+/// No `at < len` guard (2026-10-08). The checked form re-tested what the
+/// row walk's window test (`low <= m < ip`) had just proven, at a compare, a
+/// branch and a spilled `len` per candidate: 341M of 7,628M instructions on
+/// dickens at L12 (callgrind). The checked form had no other caller left and
+/// is gone; `debug_assert!` keeps the proof honest in test builds.
 #[inline(always)]
-pub(crate) fn prefetch_read(slice: &[u8], at: usize) {
-    if at >= slice.len() {
-        return;
-    }
+pub(crate) fn prefetch_read_known(slice: &[u8], at: usize) {
+    debug_assert!(at < slice.len());
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: `at < slice.len()`, so the pointer is in-bounds of a live
-        // allocation. `_mm_prefetch` only touches the cache hierarchy; it
-        // never dereferences architecturally and has no observable effect.
+        // SAFETY: `_mm_prefetch` never dereferences architecturally and
+        // cannot fault; `wrapping_add` keeps the address arithmetic defined
+        // even if the caller's proof were wrong.
         unsafe {
             core::arch::x86_64::_mm_prefetch(
-                slice.as_ptr().add(at) as *const i8,
+                slice.as_ptr().wrapping_add(at) as *const i8,
                 core::arch::x86_64::_MM_HINT_T0,
             );
         }
@@ -45,14 +41,11 @@ pub(crate) fn prefetch_read(slice: &[u8], at: usize) {
     // aarch64: NO-OP ON PURPOSE. `core::arch::aarch64::_prefetch` and its
     // `_PREFETCH_*` constants are still unstable (rust-lang #117217), so this
     // arm did not compile on stable -- `cargo check --target
-    // aarch64-unknown-linux-gnu` failed on the whole crate because of a
-    // function nothing calls. Since a prefetch is a pure hint and both bricks
-    // that tried it measured WORSE, dropping to a no-op costs nothing and
-    // gives the NEON twin below a target that actually builds. Restore it with
-    // `asm!("prfm pldl1keep, [{}]")` if a use ever justifies it.
+    // aarch64-unknown-linux-gnu` failed on the whole crate. Restore it with
+    // `asm!("prfm pldl1keep, [{}]")` if an aarch64 measurement justifies it.
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = at;
+        let _ = (slice, at);
     }
 }
 

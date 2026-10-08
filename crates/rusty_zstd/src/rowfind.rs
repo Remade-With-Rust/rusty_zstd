@@ -86,7 +86,24 @@ pub fn take_row_walk() -> [u64; 3] {
 }
 
 /// Rotate an `N`-bit candidate mask right by `head` (`N = 1 << RL`,
-/// `head < N`), so that bit `N - 1` is the newest slot and bit 0 the oldest.
+/// `head < N`), so that bit 0 is the newest slot and bit `N - 1` the oldest.
+///
+/// NEWEST ON BIT 0 (2026-10-08). The row used to fill UPWARD, newest on the
+/// top bit, so the walk took candidates with `bsr` and cleared them with
+/// `btr` -- and `btr` needs `bsr`'s result, so every iteration carried a
+/// `bsr` latency (3 cycles) plus the clear on the loop's dependency chain.
+/// libzstd fills its rows DOWNWARD (`ZSTD_row_nextIndex`) for exactly this:
+/// newest on bit 0, `ctz` off the chain, `m &= m - 1` the only carried op.
+/// Rows now fill downward too. Same ages, same newest-first order, same
+/// candidates: the slot permutation is invisible to the output.
+///
+/// Callgrind cannot see this (same instruction count); the clock can.
+/// Pinned, best of 4 alternating rounds, MB/s before -> after: L12 dickens
+/// 14.6 -> 20.3, samba 32.4 -> 45.8, mozilla 24.5 -> 33.8, nci 55.8 -> 75.3,
+/// xml 52.1 -> 70.2, x-ray 22.8 -> 24.5; L9 dickens 34.6 -> 42.3, samba 72.9
+/// -> 85.3, mozilla 54.5 -> 62.6, nci 119.4 -> 134.9, xml 105.3 -> 116.9,
+/// x-ray 39.4 -> 44.6. The win scales with candidates per probe (41 on
+/// dickens at L12, 12 at L9), which is the length of the carried chain.
 #[inline(always)]
 pub(crate) fn row_rot<const RL: u32>(mask: RowMask, head: u32) -> RowMask {
     debug_assert!((ROW_LOG_MIN..=ROW_LOG_MAX).contains(&RL) && head < (1 << RL));
@@ -196,16 +213,65 @@ pub(crate) fn row_tag_mask<const RL: u32>(tags: &[u8], want: u8) -> RowMask {
     unsafe { row_tag_mask_raw::<RL>(tags.as_ptr(), want) }
 }
 
+/// 16 row positions on one cache line. The storage unit of `RowTable::pos`:
+/// a `Vec` of these is 64-byte aligned, so a row starts on a line boundary.
+#[cfg(feature = "alloc")]
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub(crate) struct PosLine([u32; 16]);
+
+/// 64 row tags on one cache line. The storage unit of `RowTable::tags`.
+#[cfg(feature = "alloc")]
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub(crate) struct TagLine([u8; 64]);
+
 /// The row table: `1 << row_log` positions per row with their tags contiguous.
+///
+/// ## Line-aligned storage (2026-10-08)
+///
+/// `pos` and `tags` were plain `Vec<u32>` / `Vec<u8>`, whose bases the
+/// allocator places 16 bytes past a line (glibc's `mmap` chunk header; the
+/// Windows heap is no better), so EVERY row straddled one more cache line than
+/// it spans: a 16-slot row's 64 position bytes touched 2 lines instead of 1,
+/// a 64-slot row's 256 bytes 5 instead of 4. libzstd asserts its rows are
+/// line-aligned (`ZSTD_row_prefetch`). Storage is now a `Vec` of
+/// 64-byte-aligned lines; the element layout is unchanged, so the output is
+/// too.
+///
+/// Measured: callgrind's cache simulation with a 2 MiB last level (an L2
+/// stand-in), L9, last-level misses: dickens 17.4M -> 14.6M, x-ray 23.2M ->
+/// 21.1M (libzstd 1.5.7: 12.9M / 17.8M). Wall clock on six silesia files at
+/// L9 and L12, pinned: within this box's +-10% noise -- the adjacent-line
+/// prefetcher was already hiding most of each straddle. Kept for the
+/// deterministic miss count, not for a timed win.
+///
+/// RE-MEASURED after the hash cache, downward rows and hash tags (same day):
+/// the aligned table against one deliberately skewed by 16 bytes (the old
+/// layout), pinned, best of 4 alternating rounds -- aligned faster in 15 of
+/// 18 cells, by 1-4% (L7 samba 115.2 vs 110.6 MB/s, L9 x-ray 54.2 vs 51.3,
+/// L12 x-ray 27.7 vs 26.6); the three others within 2%. `veins/greedy`
+/// measured aligned tables SLOWER at L7/L9 on its own code (1.049 / 1.084);
+/// not reproduced on this one.
 #[cfg(feature = "alloc")]
 #[derive(Default, Clone)]
 pub(crate) struct RowTable {
-    /// `rows << row_log` positions.
-    pub pos: alloc::vec::Vec<u32>,
-    /// `rows << row_log` tags, so each row's tags are contiguous.
-    pub tags: alloc::vec::Vec<u8>,
+    /// `rows << row_log` positions, 16 to a line.
+    pos: alloc::vec::Vec<PosLine>,
+    /// `rows << row_log` tags, so each row's tags are contiguous, 64 to a line.
+    tags: alloc::vec::Vec<TagLine>,
     /// Next slot to write, per row. Wraps at the row width, so a row always
     /// holds the most recent `1 << row_log` positions for its buckets.
+    ///
+    /// REFUTED 2026-10-08, do not retry blindly: moving the head INTO the tag
+    /// row (rows below 64 slots doubled to 32 / 64 bytes, head after the
+    /// tags -- libzstd's one-line probe without giving up a slot). Same
+    /// output, but SLOWER: pinned, best of 4 alternating rounds, L9 mozilla
+    /// 67.0 -> 60.4 MB/s, xml 117.3 -> 110.5, samba 87.5 -> 83.0; L10
+    /// dickens 27.1 -> 25.0, mozilla 47.8 -> 43.9; L7 within noise to -4%.
+    /// This array is 128 KiB at L9-L12 and lives in L2; the doubled tag
+    /// table costs more cache than the extra line saves. (Not naming this
+    /// line in `prefetch_row` IS costly: L9 -3% to -10%.)
     pub head: alloc::vec::Vec<u8>,
     /// W1: `rows - 1`, cached. `row_of` ran on every position and derived this
     /// from `head.len()` -- a Vec field load feeding the address computation of
@@ -223,52 +289,134 @@ impl RowTable {
         let row_log = row_log.clamp(ROW_LOG_MIN, ROW_LOG_MAX);
         let entries = 1usize << entries_log.clamp(ROW_LOG_MAX, 24);
         let rows = entries >> row_log;
+        // `entries >= 64`: a whole number of lines of either kind.
         self.pos.clear();
-        self.pos.resize(rows << row_log, 0);
+        self.pos.resize(entries / 16, PosLine([0; 16]));
         self.tags.clear();
-        self.tags.resize(rows << row_log, 0);
+        self.tags.resize(entries / 64, TagLine([0; 64]));
         self.head.clear();
         self.head.resize(rows, 0);
         self.row_mask = rows - 1;
         self.row_log = row_log;
     }
 
+    /// Slots in the table (`rows << row_log`); 0 while unallocated.
+    #[inline(always)]
+    fn slots(&self) -> usize {
+        self.pos.len() * 16
+    }
+
+    /// The table's three bases for a kernel that keeps them in registers for
+    /// a whole block (`find_greedy_rows`): `(positions, tags, heads, slots)`.
+    /// Positions and tags are `slots` contiguous elements; heads is
+    /// `slots >> row_log`. The caller writes rows the way `put` does --
+    /// DOWNWARD, the head always the newest slot -- or `row_rot`'s newest-on-
+    /// bit-0 order breaks for every other reader of the table.
+    #[inline(always)]
+    pub(crate) fn raw_parts_mut(&mut self) -> (*mut u32, *mut u8, *mut u8, usize) {
+        let slots = self.slots();
+        (
+            self.pos.as_mut_ptr() as *mut u32,
+            self.tags.as_mut_ptr() as *mut u8,
+            self.head.as_mut_ptr(),
+            slots,
+        )
+    }
+
+    /// Base of the position array, as `u32` elements.
+    #[inline(always)]
+    fn pos_ptr(&self) -> *const u32 {
+        self.pos.as_ptr() as *const u32
+    }
+
+    /// Base of the tag array, as bytes.
+    #[inline(always)]
+    fn tags_ptr(&self) -> *const u8 {
+        self.tags.as_ptr() as *const u8
+    }
+
+    /// Store `ip` / `tag` in row `r` (first slot `row_at`, current head
+    /// `head`), one slot BELOW the head, and make that slot the head: rows
+    /// fill downward, so the head is always the newest slot (see `row_rot`).
+    ///
+    /// # Safety
+    /// `r < head.len()`, `row_at == r << rl` and `head < 1 << rl`.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    unsafe fn put(&mut self, r: usize, row_at: usize, head: usize, rl: u32, ip: u32, tag: u8) {
+        debug_assert!(r < self.head.len() && row_at == r << rl && head < (1 << rl));
+        let s = head.wrapping_sub(1) & ((1usize << rl) - 1);
+        let at = row_at + s;
+        debug_assert!(at < self.slots());
+        // SAFETY: the caller's bounds; `PosLine` / `TagLine` are `repr(C)`
+        // arrays, so the line vectors are `slots()` contiguous `u32` / `u8`.
+        unsafe {
+            *(self.pos.as_mut_ptr() as *mut u32).add(at) = ip;
+            *(self.tags.as_mut_ptr() as *mut u8).add(at) = tag;
+            *self.head.get_unchecked_mut(r) = s as u8;
+        }
+    }
+
     /// Touch the lines a probe of hash bucket `h`'s row will read: its tags,
     /// its positions and its head byte. A pure hint -- see
-    /// `simd::prefetch_read`; nothing is read and nothing can change.
+    /// `simd::prefetch_read_known`; nothing is read and nothing can change.
     #[inline(always)]
     pub fn prefetch_row<const RL: u32>(&self, h: usize) {
         debug_assert_eq!(RL, self.row_log);
         let r = (h >> RL) & self.row_mask;
         let at = r << RL;
-        crate::simd::prefetch_read(&self.head, r);
-        // Tags: `1 << RL` bytes. The tables are not line-aligned, so a row
-        // can straddle a boundary: name its last byte as well as its first.
-        crate::simd::prefetch_read(&self.tags, at);
-        crate::simd::prefetch_read(&self.tags, at + (1usize << RL) - 1);
-        // Positions: 4 bytes per slot, i.e. 64 / 128 / 256 bytes.
+        // Every address below is inside its table: `r <= row_mask`, so
+        // `head[r]`, `tags[at .. at + (1 << RL)]` and the row's `4 << RL`
+        // position bytes all exist. The `_known` hint drops the per-address
+        // `< len` guard the checked hint re-tested -- seven compares and
+        // branches per probe at 64 slots (2026-10-08 callgrind).
+        debug_assert!(r < self.head.len() && at + (1usize << RL) <= self.slots());
+        crate::simd::prefetch_read_known(&self.head, r);
+        // Tags: `1 << RL <= 64` bytes at a multiple of `1 << RL` from a
+        // line-aligned base -- inside ONE line.
+        let tags: &[u8] = {
+            #[allow(unsafe_code)]
+            // SAFETY: the tag lines are `slots()` initialised bytes (see
+            // `put`); the view is used for address arithmetic by a prefetch
+            // only.
+            unsafe {
+                core::slice::from_raw_parts(self.tags_ptr(), self.slots())
+            }
+        };
+        crate::simd::prefetch_read_known(tags, at);
+        // Positions: 4 bytes per slot, i.e. 1 / 2 / 4 whole lines.
         let pos: &[u8] = {
-            // View the `u32` positions as bytes for the hint only.
             #[allow(unsafe_code)]
             // SAFETY: a `[u32]` is valid to view as `4 * len` initialised
             // bytes; the slice is used for address arithmetic by a prefetch
             // and never read through.
             unsafe {
-                core::slice::from_raw_parts(self.pos.as_ptr() as *const u8, self.pos.len() * 4)
+                core::slice::from_raw_parts(self.pos_ptr() as *const u8, self.slots() * 4)
             }
         };
+        // At most the FIRST TWO position lines, as libzstd names (`relRow`
+        // and `relRow + 16`; "prefetching more of the hash table does not
+        // appear to be beneficial"). A 64-slot row is four lines, and since
+        // the hash cache names a row for EVERY inserted position, the other
+        // two were bandwidth and fill buffers the row may never repay: on a
+        // literal-heavy probe only a few slots are read. Measured 2026-10-08,
+        // pinned, best of 4 alternating rounds, MB/s all four -> first two
+        // lines: L12 x-ray 27.1 -> 30.4, nci 79.0 -> 85.5, samba 48.0 ->
+        // 51.2, xml 73.1 -> 77.6, mozilla 37.8 -> 40.2, dickens 21.2 -> 22.4;
+        // L11 (also 64 slots) 4 of 6 files up 3-10%, the others within noise.
+        // ONE line was no better than two at L10 (32 slots) or L12. 16-slot
+        // rows are one line either way.
         let mut off = 0usize;
-        while off < (4usize << RL) {
-            crate::simd::prefetch_read(pos, (at << 2) + off);
+        while off < (4usize << RL).min(128) {
+            crate::simd::prefetch_read_known(pos, (at << 2) + off);
             off += 64;
         }
-        crate::simd::prefetch_read(pos, (at << 2) + (4usize << RL) - 1);
     }
 
     /// Forget every position, keeping the allocation and the geometry.
     pub fn clear(&mut self) {
-        self.pos.fill(0);
-        self.tags.fill(0);
+        self.pos.fill(PosLine([0; 16]));
+        self.tags.fill(TagLine([0; 64]));
         self.head.fill(0);
     }
 
@@ -313,15 +461,11 @@ impl RowTable {
         debug_assert_eq!(RL, self.row_log);
         let r = (h >> RL) & rmask;
         debug_assert!(r < self.head.len());
-        // SAFETY: identical to `insert` -- `r <= row_mask == head.len() - 1`,
-        // and `pos`/`tags` are `head.len() << RL` long, `s < 1 << RL`.
+        // SAFETY: `r <= row_mask == head.len() - 1`, and the table holds
+        // `head.len() << RL` slots, `s < 1 << RL`.
         unsafe {
-            let s = *self.head.get_unchecked(r) as usize;
-            debug_assert!(s < (1 << RL));
-            let at = (r << RL) + s;
-            *self.pos.get_unchecked_mut(at) = ip;
-            *self.tags.get_unchecked_mut(at) = tag;
-            *self.head.get_unchecked_mut(r) = ((s + 1) & ((1 << RL) - 1)) as u8;
+            let head = *self.head.get_unchecked(r) as usize;
+            self.put(r, r << RL, head, RL, ip, tag);
         }
     }
 
@@ -333,23 +477,22 @@ impl RowTable {
     pub fn insert(&mut self, r: usize, ip: u32, tag: u8) {
         debug_assert!(r < self.head.len());
         let rl = self.row_log;
-        // SAFETY: `r < head.len()` and `pos`/`tags` are `head.len() << rl`
-        // long, so `(r << rl) + s` with `s < 1 << rl` is in bounds for both.
+        // SAFETY: `r < head.len()` and the table holds `head.len() << rl`
+        // slots, so `(r << rl) + s` with `s < 1 << rl` is in bounds.
         unsafe {
-            let s = *self.head.get_unchecked(r) as usize;
-            debug_assert!(s < (1 << rl));
-            let at = (r << rl) + s;
-            *self.pos.get_unchecked_mut(at) = ip;
-            *self.tags.get_unchecked_mut(at) = tag;
-            *self.head.get_unchecked_mut(r) = ((s + 1) & ((1usize << rl) - 1)) as u8;
+            let head = *self.head.get_unchecked(r) as usize;
+            self.put(r, r << rl, head, rl, ip, tag);
         }
     }
 
     /// The tags of row `r`.
     #[cfg(test)]
+    #[allow(unsafe_code)]
     pub fn tag_row(&self, r: usize) -> &[u8] {
         let n = 1usize << self.row_log;
-        &self.tags[r * n..(r + 1) * n]
+        assert!((r + 1) * n <= self.slots());
+        // SAFETY: bounds asserted; the tag lines are contiguous bytes.
+        unsafe { core::slice::from_raw_parts(self.tags_ptr().add(r * n), n) }
     }
 
     /// W16 -- the row's ENTIRE walk state in one call.
@@ -367,14 +510,14 @@ impl RowTable {
     pub fn probe_view<const RL: u32>(&self, r: usize, want: u8) -> (RowMask, u32, &[u32], usize) {
         debug_assert!(r < self.head.len());
         debug_assert_eq!(RL, self.row_log);
-        // SAFETY: `r < head.len()`; `tags` and `pos` are both
-        // `head.len() << RL` long, so both `1 << RL`-element windows at `at`
-        // are in bounds.
+        // SAFETY: `r < head.len()`; the table holds `head.len() << RL` tags
+        // and positions, so both `1 << RL`-element windows at `at` are in
+        // bounds.
         let at = r << RL;
         let (mask, row, head) = unsafe {
             (
-                row_tag_mask_raw::<RL>(self.tags.as_ptr().add(at), want),
-                core::slice::from_raw_parts(self.pos.as_ptr().add(at), 1usize << RL),
+                row_tag_mask_raw::<RL>(self.tags_ptr().add(at), want),
+                core::slice::from_raw_parts(self.pos_ptr().add(at), 1usize << RL),
                 u32::from(*self.head.get_unchecked(r)),
             )
         };
@@ -390,7 +533,7 @@ impl RowTable {
             let oldi = if w0 == 0 {
                 1u64
             } else {
-                u64::from((n - w0.trailing_zeros() + 1).min(n))
+                u64::from((64 - w0.leading_zeros() + 1).min(n))
             };
             ROW_WALK[0].fetch_add(1, Relaxed);
             ROW_WALK[1].fetch_add(oldi, Relaxed);
@@ -414,14 +557,8 @@ impl RowTable {
         debug_assert_eq!(at, r << RL);
         debug_assert_eq!(head, u32::from(self.head[r]));
         debug_assert!(head < (1 << RL));
-        // SAFETY: `at + head < (r + 1) << RL <= pos.len() == tags.len()`, and
-        // `r < head.len()`.
-        unsafe {
-            let slot = at + head as usize;
-            *self.pos.get_unchecked_mut(slot) = ip;
-            *self.tags.get_unchecked_mut(slot) = tag;
-            *self.head.get_unchecked_mut(r) = ((head + 1) & ((1u32 << RL) - 1)) as u8;
-        }
+        // SAFETY: `at == r << RL`, `head < 1 << RL` and `r < head.len()`.
+        unsafe { self.put(r, at, head as usize, RL, ip, tag) }
     }
 
     /// Candidate positions of row `r`, MOST RECENT FIRST.
@@ -431,19 +568,23 @@ impl RowTable {
     /// to code. Walking the row in slot order instead of insertion order
     /// inflates offsets.
     #[cfg(test)]
+    #[allow(unsafe_code)]
     pub fn candidates(&self, r: usize, mut mask: RowMask, out: &mut [u32; ROW_MAX]) -> usize {
         let n = 1usize << self.row_log;
         let head = self.head[r] as usize;
+        assert!((r + 1) * n <= self.slots());
+        // SAFETY: bounds asserted; the position lines are contiguous `u32`s.
+        let row = unsafe { core::slice::from_raw_parts(self.pos_ptr().add(r * n), n) };
         let mut cnt = 0usize;
-        // Walk slots newest-first: head-1, head-2, ... wrapping.
-        for k in 1..=n {
+        // Walk slots newest-first: head, head+1, ... wrapping.
+        for k in 0..n {
             if mask == 0 {
                 break;
             }
-            let s = (head + n - k) & (n - 1);
+            let s = (head + k) & (n - 1);
             if mask & (1 << s) != 0 {
                 mask &= !(1u64 << s);
-                out[cnt] = self.pos[r * n + s];
+                out[cnt] = row[s];
                 cnt += 1;
             }
         }
@@ -509,10 +650,11 @@ mod tests {
     fn rot_check<const RL: u32>() {
         let n = 1u32 << RL;
         for head in 0..n {
-            // The newest slot is `head - 1` (mod n); the oldest is `head`.
-            let newest = (head + n - 1) & (n - 1);
+            // Rows fill downward: the newest slot is `head`, the oldest
+            // `head - 1` (mod n).
+            let oldest = (head + n - 1) & (n - 1);
             assert_eq!(
-                row_rot::<RL>(1 << newest, head),
+                row_rot::<RL>(1 << oldest, head),
                 1 << (n - 1),
                 "n {n} head {head}"
             );
@@ -520,9 +662,9 @@ mod tests {
         }
     }
 
-    /// The rotation puts the NEWEST slot on the top bit for every head.
+    /// The rotation puts the NEWEST slot on bit 0 for every head.
     #[test]
-    fn rot_puts_newest_on_top() {
+    fn rot_puts_newest_on_bit0() {
         rot_check::<4>();
         rot_check::<5>();
         rot_check::<6>();
@@ -551,10 +693,10 @@ mod tests {
         assert_eq!(cnt, n);
         assert_eq!(out[0], 200);
         assert!(!out[..cnt].contains(&100), "oldest not evicted");
-        // The monomorphised probe agrees with the test walk: top bit = newest.
+        // The monomorphised probe agrees with the test walk: bit 0 = newest.
         let (w, head, row, at) = t.probe_view::<RL>(r, 0x42);
         assert_eq!(at, r << RL);
-        let b = 63 - w.leading_zeros();
+        let b = w.trailing_zeros();
         let s = ((b + head) & ((1u32 << RL) - 1)) as usize;
         assert_eq!(row[s], 200);
     }

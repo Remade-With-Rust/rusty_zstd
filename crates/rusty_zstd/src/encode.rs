@@ -996,6 +996,7 @@ impl Digest {
             t.pack_tags = key.rep.pack_tags;
             t.chain_pack = key.rep.chain_pack;
             t.chain_wide = false;
+            t.row_htag = false;
             let window = 1usize << key.params.window_log.min(31);
             prime_tables(&mut t, hist, tail.len(), window, key.params);
             t
@@ -1433,6 +1434,7 @@ fn encode_with_digest(
         t.pack_tags = key.rep.pack_tags;
         t.chain_pack = key.rep.chain_pack;
         t.chain_wide = false;
+        t.row_htag = false;
         t.null_link = work.digest.null_link;
         t
     };
@@ -4546,6 +4548,50 @@ fn row_find_best<const MLS: usize, const RL: u32>(
     ip: usize,
     tables: &mut MatchTables,
 ) -> (usize, usize) {
+    let mls = if MLS == 0 { ctx.mls } else { MLS };
+    let src = ctx.src;
+    // W20/W22/W24: one mode byte, and all three shifts arrive resolved.
+    // Arm order is exactly the original `wide_hash && fits`, then `wchain`,
+    // then the 4-byte key -- including the case where a wide-hash block near
+    // the buffer end falls through to the wide-chain arm.
+    let (h, gtag) = if ctx.hash_mode & 2 != 0 && ip + 8 <= src.len() {
+        (hash8_shift(src, ip, ctx.hash_shift64), 0u8)
+    } else if ctx.hash_mode & 1 != 0 {
+        hash_wide_link_tag_b(src, ip, ctx.hash_shift64, ctx.smask, mls)
+    } else {
+        hash4_link_tag_w(src, ip, ctx.hash_shift32, mls)
+    };
+    row_find_body::<MLS, RL, true>(ctx, ip, h, gtag, tables)
+}
+
+/// `row_find_best` for `find_lazy_rows`, whose hash cache (`RowHashCache`)
+/// hands in the hash and tag of `ip` and names the rows ahead itself, so
+/// this instance carries no hash and no next-row hint. Outlined for the
+/// same reason `row_find_best` is: inlining the walk into the parser
+/// measured 7-45% SLOWER (2026-10-04). RE-TESTED 2026-10-08 on the leaner
+/// walk (cursor gather, two-loop compare, hash cache, downward rows): still
+/// 0-6% slower at L9 and L12 on six silesia files, pinned. Stays outlined.
+#[inline(never)]
+fn row_find_cached<const RL: u32>(
+    ctx: &ChainCtx,
+    ip: usize,
+    h: usize,
+    gtag: u8,
+    tables: &mut MatchTables,
+) -> (usize, usize) {
+    row_find_body::<0, RL, false>(ctx, ip, h, gtag, tables)
+}
+
+/// The row walk itself, for a probe at `ip` whose bucket hash `h` and tag
+/// `gtag` are already known. `PF`: name the row `row_pf` positions ahead.
+#[inline(always)]
+fn row_find_body<const MLS: usize, const RL: u32, const PF: bool>(
+    ctx: &ChainCtx,
+    ip: usize,
+    h: usize,
+    gtag: u8,
+    tables: &mut MatchTables,
+) -> (usize, usize) {
     let ChainCtx {
         src,
         block_end,
@@ -4569,17 +4615,6 @@ fn row_find_best<const MLS: usize, const RL: u32>(
     // W9: `src.len()` is a slice field re-read; both uses below want the same
     // per-call value.
     let src_len = src.len();
-    // W20/W22/W24: one mode byte, and all three shifts arrive resolved.
-    // Arm order is exactly the original `wide_hash && fits`, then `wchain`,
-    // then the 4-byte key -- including the case where a wide-hash block near
-    // the buffer end falls through to the wide-chain arm.
-    let (h, gtag) = if hash_mode & 2 != 0 && ip + 8 <= src_len {
-        (hash8_shift(src, ip, hash_shift64), 0u8)
-    } else if hash_mode & 1 != 0 {
-        hash_wide_link_tag_b(src, ip, hash_shift64, smask, mls)
-    } else {
-        hash4_link_tag_w(src, ip, hash_shift32, mls)
-    };
     // GATHER, INSERT, COMPARE -- libzstd's `matchBuffer` shape (2026-10-04).
     //
     // W11 walked the mask and compared each candidate as it came, to save
@@ -4626,26 +4661,43 @@ fn row_find_best<const MLS: usize, const RL: u32>(
     }
     let span = ip - low;
     // W15: the attempt budget is applied to the MASK, once, instead of counted
-    // down per candidate: the walk visits set bits from the high end, so "the
-    // newest `attempts` candidates" is "clear the lowest set bits until
-    // popcount == attempts", and `w &= w - 1` clears exactly the lowest.
-    let mut extra = (w.count_ones() as usize).saturating_sub(attempts);
-    while extra != 0 {
-        w &= w - 1;
-        extra -= 1;
+    // down per candidate: the walk visits set bits from the LOW end (newest
+    // on bit 0, see `row_rot`), so "the newest `attempts` candidates" is
+    // "clear the highest set bits until popcount == attempts".
+    //
+    // Only when the budget CAN bind: a row has `1 << RL` slots, and the
+    // shipped policy sizes rows from the search log, so at L7-L12 the budget
+    // equals the width and this never trims. Baseline x86_64 has no POPCNT,
+    // so the unguarded count was ~20 instructions of bit arithmetic per probe
+    // (2026-10-08 callgrind, every probe at L9 and L12).
+    if attempts < (1usize << RL) {
+        let mut extra = (w.count_ones() as usize).saturating_sub(attempts);
+        while extra != 0 {
+            w &= !(1u64 << (63 - w.leading_zeros()));
+            extra -= 1;
+        }
     }
     // Phase 1 -- GATHER. At most `1 << RL <= 64` candidates; only the prefix
     // `cand[..n]` is ever read, so the buffer is left uninitialised rather
     // than zeroed on every searched position.
+    //
+    // A WRITE CURSOR instead of an index (2026-10-08): `cand[n & 63]` kept `n`
+    // in a stack slot (load, mask, store, increment, store back per accepted
+    // candidate), and the checked prefetch's own `at < len` guard re-tested what
+    // the window test below has just proven. Callgrind on dickens L12: the
+    // accepted-candidate tail went from 13 instructions to 4.
     let mut cand = [core::mem::MaybeUninit::<u32>::uninit(); 1 << crate::rowfind::ROW_LOG_MAX];
-    let mut n = 0usize;
+    let c0 = cand.as_mut_ptr() as *mut u32;
+    let mut cur = c0;
     while w != 0 {
-        // Highest set bit is the newest slot. `w` only ever has its low
+        // Lowest set bit is the newest slot. `w` only ever has its low
         // `1 << RL` bits set (see `row_rot`), so `s` masks to a slot of THIS
         // row -- which is also what lets the optimiser drop the bounds check
-        // on `row`, a `1 << RL`-element slice.
-        let b = 63 - w.leading_zeros();
-        w &= !(1u64 << b);
+        // on `row`, a `1 << RL`-element slice. `w &= w - 1` does not wait
+        // for the bit scan: the loop carries one `lea` + `and`, where
+        // `bsr` + `btr` carried four cycles (see `row_rot`).
+        let b = w.trailing_zeros();
+        w &= w - 1;
         let s = ((b + rhead) & ((1u32 << RL) - 1)) as usize;
         let m = row[s];
         // W7: THREE rejects, ONE compare. `m - low` is borrow-free exactly
@@ -4654,16 +4706,25 @@ fn row_find_best<const MLS: usize, const RL: u32>(
         if (m as usize).wrapping_sub(low) >= span {
             continue;
         }
-        crate::simd::prefetch_read(src, m as usize);
-        // `n < 1 << RL` here: each iteration clears one of at most
-        // `1 << RL` set bits before it can reach this store.
-        cand[n & ((1 << crate::rowfind::ROW_LOG_MAX) - 1)].write(m);
-        n += 1;
+        // `m < ip < src.len()` by the test above.
+        crate::simd::prefetch_read_known(src, m as usize);
+        // SAFETY: each iteration clears one of at most `1 << RL <= 64` set
+        // bits before it can reach this store, so at most 64 stores land in
+        // the 64-element `cand`, and `cur` ends at most one past its end.
+        #[allow(unsafe_code)]
+        unsafe {
+            cur.write(m);
+            cur = cur.add(1);
+        }
     }
+    // SAFETY: `cur` was advanced from `c0` inside the same array.
+    #[allow(unsafe_code)]
+    let n = unsafe { cur.offset_from(c0) } as usize;
+    debug_assert!(n <= 1 << RL);
     // Phase 2 -- INSERT. Every candidate is already in hand, so the row can
     // take `ip` now and the row's slot state is dead from here.
     tables.lz_insert_rowknown::<RL>(r, rat, rhead, ip, gtag);
-    if ip + row_pf + 8 <= src_len {
+    if PF && ip + row_pf + 8 <= src_len {
         // The NEXT search is at `ip + 1` far more often than anywhere else
         // (the no-match step is 1 until a literal run is long, and the lazy
         // look-ahead probes `ip + 1` after a hit). Its row is a random line
@@ -4697,51 +4758,106 @@ fn row_find_best<const MLS: usize, const RL: u32>(
     //     +2.0% to +3.2% total at 4 MiB, xml +39%, and jsonlog / smallmsg get
     //     WORSE (+14% / +7%), so "the nearest match wins" is not their
     //     mechanism either.
-    let mut best_m = 0usize;
-    let mut best_ml = 0usize;
-    // W7's acceptance bar: `best_ml` is 0 or already >= mls, so one compare
-    // against a running bar replaces two.
-    let mut bar = mls;
-    let mut i = 0usize;
-    while i < n {
-        // SAFETY: `i < n`, and phase 1 wrote exactly `cand[0..n]`.
-        #[allow(unsafe_code)]
-        let m =
-            unsafe { cand[i & ((1 << crate::rowfind::ROW_LOG_MAX) - 1)].assume_init() } as usize;
-        i += 1;
-        #[cfg(feature = "profile")]
-        {
-            use core::sync::atomic::Ordering::Relaxed;
-            ROW_BUCKET[0].fetch_add(1, Relaxed);
-            if m + 8 <= src_len {
-                let hm = if hash_mode & 2 != 0 && m + 8 <= src_len {
-                    hash8_shift(src, m, hash_shift64)
-                } else if hash_mode & 1 != 0 {
-                    hash_wide_link_tag_b(src, m, hash_shift64, smask, mls).0
-                } else {
-                    hash4_link_tag_b(src, m, hash_shift32, mls).0
-                };
-                if hm == h {
-                    ROW_BUCKET[1].fetch_add(1, Relaxed);
-                }
-            }
-            if mls_eq(src, m, ip, mls, smask) {
-                ROW_BUCKET[2].fetch_add(1, Relaxed);
-            }
-        }
-        if let Some(x) = mls_xor(src, m, ip, mls, smask) {
-            // C's `match[ml] == ip[ml]` prefilter, same as the chain walk.
-            if best_ml == 0 || pre_eq(src, m, ip, best_ml) {
-                // BRICK 11: see `mls_xor`.
-                let ml = fused_ml(x, src, m, ip, block_end);
-                if ml >= bar {
-                    best_ml = ml;
-                    best_m = m;
-                    bar = ml + 1;
-                    if ip + best_ml >= block_end {
-                        break;
+    //
+    // TWO LOOPS, ONE RULE (2026-10-08). The rule is unchanged: a candidate is
+    // taken when its common prefix with `ip` is at least `mls` and longer
+    // than the best so far. What changed is the FILTER that rejects the rest,
+    // which is where this loop spends its time -- on dickens at L12, 132.6M
+    // of 135.7M examined candidates were rejected, at 19 instructions each:
+    // an 8-byte `mls_xor` (with the `ip` word RE-LOADED per candidate),
+    // a `best_ml == 0` test, then the one-byte `pre_eq`. libzstd rejects the
+    // same candidate with ONE 4-byte compare, `MEM_read32(match + ml - 3) ==
+    // MEM_read32(ip + ml - 3)`, against a word it holds across the loop.
+    //
+    // * 3a, nothing in hand: the first candidate whose first `mls` bytes
+    //   match is taken outright -- its prefix is `>= mls` by the mask, which
+    //   is the whole bar.
+    // * 3b, `best_ml >= mls` in hand: beating it needs bytes
+    //   `0..=best_ml` equal, so the 4 bytes ENDING at `best_ml` are a
+    //   necessary test (and `best_ml >= mls >= 3` keeps them inside the
+    //   prefix). A survivor gets its exact length from offset 0, and
+    //   `ml > best_ml > mls - 1` already implies the `mls` test.
+    //
+    // Same candidates, same order, same accept set: byte-identical (bytegate
+    // GOLD unchanged at all four caps). Bounds: every load here ends at
+    // index `ip + best_ml` or `m + best_ml < ip + best_ml`, and the loop
+    // stops once `ip + best_ml >= block_end`.
+    macro_rules! census {
+        ($m:expr) => {
+            #[cfg(feature = "profile")]
+            {
+                use core::sync::atomic::Ordering::Relaxed;
+                let m: usize = $m;
+                ROW_BUCKET[0].fetch_add(1, Relaxed);
+                if m + 8 <= src_len {
+                    let hm = if hash_mode & 2 != 0 && m + 8 <= src_len {
+                        hash8_shift(src, m, hash_shift64)
+                    } else if hash_mode & 1 != 0 {
+                        hash_wide_link_tag_b(src, m, hash_shift64, smask, mls).0
+                    } else {
+                        hash4_link_tag_b(src, m, hash_shift32, mls).0
+                    };
+                    if hm == h {
+                        ROW_BUCKET[1].fetch_add(1, Relaxed);
                     }
                 }
+                if mls_eq(src, m, ip, mls, smask) {
+                    ROW_BUCKET[2].fetch_add(1, Relaxed);
+                }
+            }
+        };
+    }
+    debug_assert!(mls <= 8 && ip + 8 <= block_end && block_end <= src_len);
+    // SAFETY (both loops): `i < n`, and phase 1 wrote exactly `cand[0..n]`.
+    #[allow(unsafe_code)]
+    let cand_at = |i: usize| unsafe { *c0.add(i) as usize };
+    let ipw = load_u64le(src, ip);
+    let mut best_m = 0usize;
+    let mut best_ml = 0usize;
+    let mut i = 0usize;
+    // 3a.
+    while i < n {
+        let m = cand_at(i);
+        i += 1;
+        census!(m);
+        let x = load_u64le(src, m) ^ ipw;
+        if x & smask == 0 {
+            // BRICK 11's fused length: the xor already answers 0..=7.
+            best_ml = if x != 0 {
+                (x.trailing_zeros() as usize) >> 3
+            } else {
+                8 + count_match_fast(src, m + 8, ip + 8, block_end)
+            };
+            best_m = m;
+            break;
+        }
+    }
+    // 3b.
+    if best_ml != 0 && ip + best_ml < block_end {
+        debug_assert!(best_ml >= mls && mls >= 3);
+        let mut off = best_ml - 3;
+        let mut want = load_u32le(src, ip + off);
+        while i < n {
+            let m = cand_at(i);
+            i += 1;
+            census!(m);
+            if load_u32le(src, m + off) != want {
+                continue;
+            }
+            let x = load_u64le(src, m) ^ ipw;
+            let ml = if x != 0 {
+                (x.trailing_zeros() as usize) >> 3
+            } else {
+                8 + count_match_fast(src, m + 8, ip + 8, block_end)
+            };
+            if ml > best_ml {
+                best_ml = ml;
+                best_m = m;
+                if ip + best_ml >= block_end {
+                    break;
+                }
+                off = best_ml - 3;
+                want = load_u32le(src, ip + off);
             }
         }
     }
@@ -5174,22 +5290,176 @@ fn hb_offbase(off: usize) -> i32 {
     }
 }
 
+/// The row parse's key and tag for position `q`: `row_key_htag` in a
+/// `row_htag` frame, else the wide key with the gram's last byte.
+#[inline(always)]
+fn row_lazy_key<const HT: bool>(src: &[u8], q: usize, fc: &FillCtx) -> (usize, u8) {
+    if HT {
+        row_key_htag(src, q, fc.shift64, fc.smask)
+    } else {
+        hash_wide_link_tag_b(src, q, fc.shift64, fc.smask, fc.mls)
+    }
+}
+
+/// LAZY ROW TAG arm: 1 = a `find_lazy_rows` frame tags its rows with eight
+/// HASH bits (`row_key_htag`, libzstd's tag) instead of the gram's last
+/// byte. `u32::MAX` = unresolved; `RZSTD_ROW_LAZY_HTAG`.
+///
+/// The byte tag (BRICK 100, chosen on the CHAIN, whose bucket mates already
+/// share the key) cannot tell apart the `1 << row_log` buckets a row folds
+/// together, so on narrow-alphabet content most of the walk's early loads
+/// were false: on x-ray at L9, 1.77M of the 4.25M candidates loaded before
+/// the first accept failed the gram compare, each a random `src` load.
+///
+/// BYTE-IDENTICAL at L7-L12, unlike the Greedy frames' same switch on
+/// `veins/greedy`: the tag only decides which NON-matching grams reach the
+/// compare (a matching gram has the same key and tag under any function of
+/// the gram), and nothing else can see them, because the attempt budget
+/// equals the row width there and never trims (`row_find_body`). Bytegate
+/// GOLD unchanged.
+///
+/// Measured 2026-10-08, pinned, best of 4 alternating rounds, MB/s byte tag
+/// -> hash tag: L9 x-ray 47.4 -> 57.0, mozilla 61.9 -> 74.1, nci 131.9 ->
+/// 147.0, xml 115.3 -> 124.9, samba 87.0 -> 93.4, dickens 43.5 -> 46.3; L12
+/// x-ray 26.0 -> 27.3, mozilla 36.1 -> 37.1, xml 70.0 -> 72.1, the rest
+/// within noise (41 true candidates per probe on text dwarf the false ones).
+/// A cheaper-looking alternative, XOR-ing the `row_log` hash bits the row
+/// index drops into the byte tag inside `RowTable`, got about two thirds of
+/// the L9 gain (x-ray 42.9 -> 50.3, mozilla 58.6 -> 68.5); not kept.
+static ROW_LAZY_HTAG_ARM: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+/// The shipped lazy row tag.
+const ROW_LAZY_HTAG_DEFAULT: u32 = 1;
+
+/// Bench hook for the lazy row tag (see `ROW_LAZY_HTAG_ARM`).
+pub fn set_row_lazy_htag_arm(v: u32) {
+    ROW_LAZY_HTAG_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn row_lazy_htag() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let v = ROW_LAZY_HTAG_ARM.load(Relaxed);
+    if v != u32::MAX {
+        return v == 1;
+    }
+    let n = crate::env_knob_parse::<u32>("RZSTD_ROW_LAZY_HTAG")
+        .filter(|v| *v <= 1)
+        .unwrap_or(ROW_LAZY_HTAG_DEFAULT);
+    ROW_LAZY_HTAG_ARM.store(n, Relaxed);
+    n == 1
+}
+
+/// How far ahead `RowHashCache` hashes, and names rows: libzstd's
+/// `ZSTD_ROW_HASH_CACHE_SIZE`.
+const ROW_HC: usize = 8;
+
+/// libzstd's row HASH CACHE (`ZSTD_row_nextCachedHash`), keyed by position.
+///
+/// Every position the row parse inserts or probes is hashed `ROW_HC`
+/// positions EARLY, and its row named then, so by the time the insert or the
+/// probe arrives the row's lines are in flight or in cache. Before this the
+/// parse named one row ahead of a probe (`row_pf`, 1) and none ahead of an
+/// insert, so the back-fill over a match stored into cold rows one after
+/// another, and a run of literal probes waited on each row in turn.
+///
+/// Slot `q & 7` holds `(h << 8) | tag` for position `at[q & 7]`. A position
+/// that was not hashed ahead -- the first `ROW_HC` after a jump (a skipped
+/// repcode match, a skipped long-match middle, the end of lazy skipping) --
+/// misses and is hashed on the spot, so the cache can never hand back a
+/// stale value. Same hash, same tag, same insert order: the output is
+/// unchanged.
+///
+/// Measured 2026-10-08, pinned, best of 4 alternating rounds, MB/s before ->
+/// after: L9 x-ray 30.0 -> 43.4, mozilla 50.6 -> 59.4, dickens 33.6 -> 38.1,
+/// samba 74.7 -> 80.6, xml 111.6 -> 114.8, nci 136.2 -> 130.6 (noise is
+/// +-10% here); L12 x-ray 16.6 -> 24.2, mozilla 24.0 -> 26.6, dickens 14.1 ->
+/// 15.4, samba 33.9 -> 35.2, nci and xml within noise. Raising the old
+/// one-ahead hint to 8 (`RZSTD_ROW_PF=8`, no cache) bought most of the
+/// x-ray gain too, but not the back-fill's. Cost: +5.5% instructions
+/// (callgrind, dickens L9 2,380M -> 2,516M) -- the hash moved, the hints
+/// are new.
+struct RowHashCache {
+    v: [u32; ROW_HC],
+    at: [usize; ROW_HC],
+}
+
+impl RowHashCache {
+    fn new() -> Self {
+        Self {
+            v: [0; ROW_HC],
+            at: [usize::MAX; ROW_HC],
+        }
+    }
+
+    /// Hash and tag of `q` (`q + 8 <= src.len()`), and hash `q + ROW_HC`.
+    #[inline(always)]
+    fn take<const RL: u32, const HT: bool>(
+        &mut self,
+        rows: &crate::rowfind::RowTable,
+        src: &[u8],
+        q: usize,
+        fc: &FillCtx,
+    ) -> (usize, u8) {
+        let s = q & (ROW_HC - 1);
+        let (h, t) = if self.at[s] == q {
+            let v = self.v[s];
+            ((v >> 8) as usize, v as u8)
+        } else {
+            row_lazy_key::<HT>(src, q, fc)
+        };
+        let q8 = q + ROW_HC;
+        if q8 + 8 <= src.len() {
+            let (h8, t8) = row_lazy_key::<HT>(src, q8, fc);
+            // `h8 < 1 << hash_log <= 1 << 24`, so it packs above the tag.
+            debug_assert!(h8 < 1 << 24);
+            self.v[s] = ((h8 as u32) << 8) | u32::from(t8);
+            self.at[s] = q8;
+            rows.prefetch_row::<RL>(h8);
+        }
+        (h, t)
+    }
+}
+
+/// `row_fill_range` through the hash cache -- the row parse's back-fill.
+/// Outlined like `row_fill_range` (BRICK 10).
+#[inline(never)]
+fn row_fill_cached<const RL: u32, const HT: bool>(
+    rows: &mut crate::rowfind::RowTable,
+    src: &[u8],
+    mut p: usize,
+    stop: usize,
+    fc: &FillCtx,
+    hc: &mut RowHashCache,
+) {
+    debug_assert!(fc.stride == 1 && fc.wchain && !fc.wide_h);
+    let rmask = rows.mask();
+    while p < stop {
+        #[cfg(feature = "profile")]
+        LF_INSERTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let (hh, gt) = hc.take::<RL, HT>(rows, src, p, fc);
+        rows.insert_h::<RL>(hh, rmask, p as u32, gt);
+        p += 1;
+    }
+}
+
 /// Bring the row table up to (not including) `to`: libzstd's
 /// `ZSTD_row_update_internal`, long-match skip rule included.
 #[inline(always)]
-fn row_catch_up<const RL: u32>(
+fn row_catch_up<const RL: u32, const HT: bool>(
     rows: &mut crate::rowfind::RowTable,
     src: &[u8],
     from: usize,
     to: usize,
     fc: &FillCtx,
+    hc: &mut RowHashCache,
 ) {
     debug_assert!(from < to);
     if to - from > ROW_SKIP_GAP {
-        row_fill_range::<RL>(rows, src, from, from + ROW_SKIP_HEAD, fc);
-        row_fill_range::<RL>(rows, src, to - ROW_SKIP_TAIL, to, fc);
+        row_fill_cached::<RL, HT>(rows, src, from, from + ROW_SKIP_HEAD, fc, hc);
+        row_fill_cached::<RL, HT>(rows, src, to - ROW_SKIP_TAIL, to, fc, hc);
     } else {
-        row_fill_range::<RL>(rows, src, from, to, fc);
+        row_fill_cached::<RL, HT>(rows, src, from, to, fc, hc);
     }
 }
 
@@ -5210,7 +5480,7 @@ fn row_catch_up<const RL: u32>(
 /// case as a raw offset.)
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn find_lazy_rows<const RL: u32>(
+fn find_lazy_rows<const RL: u32, const HT: bool>(
     src: &[u8],
     block_start: usize,
     block_end: usize,
@@ -5222,6 +5492,7 @@ fn find_lazy_rows<const RL: u32>(
 ) -> (Vec<Seq>, Vec<u8>) {
     debug_assert_eq!(RL, tables.rows.row_log());
     debug_assert!(tables.chain_wide);
+    debug_assert_eq!(HT, tables.row_htag);
     let mls = params.min_match.clamp(3, 7) as usize;
     let attempts = search_attempts(params);
     let (mut seqs, mut lits) = match chain_finder_prologue(src, block_start, block_end, tables, mls)
@@ -5276,6 +5547,11 @@ fn find_lazy_rows<const RL: u32>(
         ca: false,
     };
     let lp_copy = lit_width_for(tables);
+    // REFUTED 2026-10-08 for this parse: libzstd's no-match step shift is 8
+    // (`kSearchStrength`), ours 12. At 8: no time change at L9 or L12 on six
+    // silesia files (pinned, within noise) for +0.02% size (1 MiB, 18
+    // corpora; mozilla +0.19%). The faster skip pays on Greedy (veins/greedy),
+    // where the search is cheaper relative to the step.
     let accel_sh = lazy_step_shift(lazy_accel());
     // C: `ip += (dictAndPrefixLength == 0)` -- with no history at all the
     // first position cannot match anything.
@@ -5310,17 +5586,26 @@ fn find_lazy_rows<const RL: u32>(
     let rep_skip = row_rep_skip();
     let rep_take = row_rep_take();
     let nice = row_nice();
+    let mut hc = RowHashCache::new();
     // One search: catch the table up to `p`, then probe (which inserts `p`).
     macro_rules! search {
         ($p:expr) => {{
             let p: usize = $p;
             debug_assert!(p <= ilimit);
-            if ntu < p && !lazy_skipping {
-                row_catch_up::<RL>(&mut tables.rows, src, ntu, p, &fc);
-            }
+            // Lazy skipping (C: `ms->lazySkipping`) probes one position in
+            // `step` and inserts nothing else, so hashing ahead would name
+            // rows nobody visits: hash on the spot, as libzstd does.
+            let (h, t) = if lazy_skipping {
+                row_lazy_key::<HT>(src, p, &fc)
+            } else {
+                if ntu < p {
+                    row_catch_up::<RL, HT>(&mut tables.rows, src, ntu, p, &fc, &mut hc);
+                }
+                hc.take::<RL, HT>(&tables.rows, src, p, &fc)
+            };
             ntu = p + 1;
             searches += 1;
-            row_find_best::<0, RL>(&ctx, p, tables)
+            row_find_cached::<RL>(&ctx, p, h, t, tables)
         }};
     }
     'outer: while ip <= ilimit {
@@ -5516,8 +5801,8 @@ fn find_lazy(
     // and those were per-position paths too. Consistency, not a new judgement.
     if tables.chain_wide && row_find_enabled() && !tables.rows.head.is_empty() && row_parse_c() {
         macro_rules! go {
-            ($rl:literal) => {
-                find_lazy_rows::<$rl>(
+            ($rl:literal, $ht:literal) => {
+                find_lazy_rows::<$rl, $ht>(
                     src,
                     block_start,
                     block_end,
@@ -5529,10 +5814,13 @@ fn find_lazy(
                 )
             };
         }
-        return match tables.rows.row_log() {
-            6 => go!(6),
-            5 => go!(5),
-            _ => go!(4),
+        return match (tables.rows.row_log(), tables.row_htag) {
+            (6, true) => go!(6, true),
+            (5, true) => go!(5, true),
+            (_, true) => go!(4, true),
+            (6, false) => go!(6, false),
+            (5, false) => go!(5, false),
+            (_, false) => go!(4, false),
         };
     }
     find_lazy_sel(
@@ -7482,15 +7770,24 @@ fn row_greedy_htag() -> bool {
     n == 1
 }
 
-/// Whether a frame's rows carry hash tags: a Greedy frame on wide-key rows
-/// with the C parse (i.e. one `find_greedy_rows` serves) and the arm on.
-/// Decided where `chain_wide` is, so every producer of the frame agrees.
+/// Whether a frame's rows carry hash tags rather than the gram's last byte.
+/// Decided where `chain_wide` is, so every producer of the frame -- its
+/// parse and the primer -- agrees. Two parses, two arms:
+///   * the frames `find_greedy_rows` serves (`row_fused_strategy`: Greedy,
+///     and Lazy below search log 4) -- `ROW_GREEDY_HTAG_ARM`;
+///   * the deeper `Lazy` / `Lazy2` frames `find_lazy_rows` serves (the test
+///     `find_lazy` dispatches on) -- `ROW_LAZY_HTAG_ARM`.
 pub(crate) fn row_htag_for(params: CompressionParameters, tables: &MatchTables) -> bool {
-    row_fused_strategy(params)
-        && tables.chain_wide
-        && !tables.rows.head.is_empty()
-        && row_parse_c()
-        && row_greedy_htag()
+    if !(tables.chain_wide && !tables.rows.head.is_empty() && row_parse_c()) {
+        return false;
+    }
+    if row_fused_strategy(params) {
+        row_greedy_htag()
+    } else {
+        matches!(params.strategy, Strategy::Lazy | Strategy::Lazy2)
+            && row_find_enabled()
+            && row_lazy_htag()
+    }
 }
 
 /// The frames `find_greedy_rows` parses when they have rows: `Greedy`
@@ -8300,6 +8597,21 @@ fn maybe_latch_wide_chain(
         p += 1;
     }
     tables.chain_wide = true;
+    debug_assert!(!tables.row_htag);
+}
+
+/// The row key AND a HASH tag from one multiply: the eight product bits just
+/// below the key's (libzstd's `hash & ZSTD_ROW_HASH_TAG_MASK` over a hash
+/// eight bits wider than the row index). The key is bit-identical to
+/// `hash_wide_link_tag_b(..).0`. `shift64 >= 40` (the hash log is at most
+/// 24), so `- 8` cannot wrap. Same definition as `veins/greedy`'s, for
+/// `row_htag` frames.
+#[inline(always)]
+pub(crate) fn row_key_htag(src: &[u8], p: usize, shift64: u32, smask: u64) -> (usize, u8) {
+    debug_assert!(shift64 >= 40);
+    let w =
+        ((load_u64le(src, p) & smask).wrapping_mul(FAST_HASH_PRIME64) >> (shift64 - 8)) as usize;
+    (w >> 8, w as u8)
 }
 
 /// Wide bucket key from one u64 load and one multiply, with the ladder's
