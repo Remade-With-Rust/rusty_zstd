@@ -1,4 +1,4 @@
-### In The Wild with 1,612 Active Installs
+### In The Wild with 1,842 Active Installs
 > [MATA Network](https://mata.network) uses `rusty_zstd` as their unified compression tool
 > deploying across Windows, PC, MAC, Linux, Android, iPhone, WASM, and ESP-32 for Home devices.
 > This diverse ecosystem is battle testing our code base in every environment for performance,
