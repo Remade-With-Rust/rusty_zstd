@@ -325,7 +325,9 @@ pub use encode::take_wide_latch;
 #[cfg(feature = "alloc")]
 pub use encode::{set_digest_arm, set_digest_verify_arm};
 #[cfg(feature = "profile")]
-pub use huffman::{take_e11_walked, take_e12_scan, take_n13_stats, take_x2_stats};
+pub use huffman::{
+    take_e11_walked, take_e12_scan, take_n13_stats, take_x2_lazy_fills, take_x2_stats,
+};
 #[cfg(feature = "profile")]
 pub use huffman::{take_f4x2_arm, take_x4_arms, take_x4_x1_calls};
 #[doc(hidden)]
