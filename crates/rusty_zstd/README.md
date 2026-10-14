@@ -34,10 +34,10 @@ cargo add rusty_zstd
 
 ```toml
 [dependencies]
-rusty_zstd = "0.3"
+rusty_zstd = "0.4"
 
 # …or for embedded / wasm targets with no `std`:
-rusty_zstd = { version = "0.3", default-features = false, features = ["alloc"] }
+rusty_zstd = { version = "0.4", default-features = false, features = ["alloc"] }
 ```
 
 The minimum supported configuration is `no_std + alloc` — every entry point
@@ -136,6 +136,24 @@ removed in any release.
 
 ## Performance
 
+**0.4.0: small frames decode 4–6× faster.** For data compressed one row per
+frame (SpaceDB-shaped JSON rows at level 3), decode time per row against 0.3.1
+and against libzstd 1.5.7 in-process:
+
+| row | **0.4.0** | 0.3.1 | libzstd `ZSTD_decompress` | libzstd, reused `DCtx` |
+|---:|---:|---:|---:|---:|
+| 128 B | **1.32 µs** | 7.14 µs | 1.80 µs | 0.92 µs |
+| 256 B | **1.61 µs** | 7.66 µs | 1.95 µs | 1.07 µs |
+| 512 B | **2.02 µs** | 8.17 µs | 2.14 µs | 1.22 µs |
+| 1 KiB | **2.91 µs** | 8.91 µs | 2.42 µs | 1.48 µs |
+| 4 KiB | **7.08 µs** | 12.41 µs | 4.50 µs | 3.48 µs |
+
+Up to 512 B, `rusty_zstd::decompress` beats libzstd's one-shot API; libzstd
+with a reused decompression context is still 1.2–2× faster. Pinned, global
+minimum over 10 rotated rounds, rusty_alloc 2.2.6 as the global allocator,
+identical output on every arm. Method and the refuted alternatives:
+[`docs/plans/small-frame-decode.md`](https://github.com/Remade-With-Rust/rusty_zstd/blob/main/docs/plans/small-frame-decode.md).
+
 Both CLIs at their real defaults — `zstd -<lvl> <files>` against
 `rzstd -<lvl> <files>`, no flags beyond the level, one invocation per run over
 19 corpus files capped at 8 MiB each (143.9 MB), 10 alternating runs per arm,
@@ -144,21 +162,23 @@ Ratios are C's time over ours: **above 1× we are faster.**
 
 | level | encode vs C | decode vs C | size vs C |
 |---|---:|---:|---:|
-| L1 | **1.31–1.58×** | **1.42–1.78×** | +2.00% |
-| L3 (default) | 0.90–1.35× | **1.25–1.69×** | +1.76% |
-| L9 | **1.06–1.37×** | **1.07–4.44×** | +0.29% |
-| L19 | **1.18–1.43×** | **1.41–1.90×** | +3.82% |
+| L1 | **1.34×** | **2.14×** | +2.00% |
+| L3 (default) | **1.08×** | **1.81×** | +1.76% |
+| L9 | **1.09×** | **2.04×** | +0.29% |
+| L19 | **1.30×** | **2.48×** | +3.82% |
 
-Measured for 0.3.0 against the official zstd 1.5.7 binary. Speed cells are
-min–max over paired samples on a non-quiescent host. **Size** is the full,
-uncapped corpus (355,593,492 bytes) and is deterministic.
+Measured for 0.4.0 against the official zstd 1.5.7 binary; each cell is C's
+fastest run over ours (the paired medians agree within 0.13). **Size** is the
+full, uncapped corpus (355,593,492 bytes) and is deterministic; our encoder's
+output is byte-identical to 0.3.0's.
 
 **These are whole-program numbers (read + codec + write), and C's CLI is slow
 at writing files on this host — the decode column is mostly that.** In the
-codec alone (in-process, no checksum, no I/O, against `zstd -b
---single-thread` on six silesia files) our encode runs at 0.91–1.27× of C's
-speed at L1, 0.74–0.99× at L3, 0.91–1.08× at L9 and 1.20–1.49× at L19. Judge
-end-user experience from the table; judge codec work from
+codec alone (in-process, no checksum, no I/O, against `zstd -b -T1` on six
+silesia files capped at 8 MiB) our encode runs at 0.89–1.30× of C's speed at
+L1, 0.75–0.94× at L3, 0.90–1.09× at L9 and 1.17–1.49× at L19 — but **our
+decode runs at 0.42–0.86× of C's on large inputs**, the next campaign. Judge
+end-user experience from the tables; judge codec work from
 [`docs/plans/m7-anatomy.md`](https://github.com/Remade-With-Rust/rusty_zstd/blob/main/docs/plans/m7-anatomy.md).
 
 **0.3.0 made encode 1.8× faster than 0.2.5** (geometric mean over six silesia

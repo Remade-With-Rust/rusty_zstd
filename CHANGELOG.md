@@ -6,6 +6,37 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Released -- 0.4.0 (2026-10-14): small frames decode 4-6x faster
+
+The small-frame decode campaign (`docs/plans/small-frame-decode.md`), driven
+by SpaceDB, which stores every row as its own level-3 frame. Seven bricks,
+each its own commit with its numbers; decoded and compressed output
+byte-identical to 0.3.1; API unchanged. Against 0.3.1, rusty_alloc 2.2.6 as
+the global allocator:
+
+| row size | Ir per decoded row | wall clock |
+|---:|---:|---:|
+| 128 B | 142,424 -> 19,009 (-86.7%) | 5.4x faster |
+| 256 B | 150,746 -> 23,984 (-84.1%) | 4.8x |
+| 512 B | 157,817 -> 32,508 (-79.4%) | 4.0x |
+| 1 KiB | 167,534 -> 49,746 (-70.3%) | 3.1x |
+| 4 KiB | 238,788 -> 132,990 (-44.3%) | 1.8x |
+
+Large files: -3.5% instructions, wall clock unchanged within the null arm.
+Dictionary load -35%. Against libzstd 1.5.7 in-process, our one-shot decode
+now beats `ZSTD_decompress` up to 512 B per row; a reused `DCtx` is still
+1.2-2x faster.
+
+The README's performance tables are re-measured for this release, and both
+harnesses are now checked in: `bench/cli-board.ps1` (CLI vs CLI, now quoting
+C's best run over ours, the floor on a loaded host) and
+`bench/codec-board.ps1` with the `codec1` bench example (in-process vs
+`zstd -b`, files capped at 8 MiB -- C's own `zstd -b` asserts on whole mozilla
+at L3, which is why the house `rzstd-bench --m7-speed` cannot take them).
+The codec board added a DECODE row the README never had: on large inputs our
+decoder runs at 0.42-0.86x of C's speed. Stated in the README as the next
+campaign, and the roadmap's 1.11x decode bar is marked not met.
+
 ### Released -- 0.3.1 (2026-10-14): security fixes SEC-01..SEC-05
 
 Five issues from an external report, each reproduced on 0.3.0 before it was

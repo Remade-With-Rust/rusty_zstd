@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.3.1...rusty_zstd-v0.4.0) - 2026-10-14
+
+**Small frames decode 4-6x faster.** Rows of 96 B-1 KiB -- one frame per
+database row, the SpaceDB shape -- spent most of their decode building tables
+they never read. Decoded and compressed output are byte-identical to 0.3.1,
+and the API is unchanged; the minor version marks the size of the change.
+
+Decode time against 0.3.1, SpaceDB-shaped JSON rows at level 3 (one row per
+frame, kept only if it shrank, `rusty_zstd::decompress`), rusty_alloc 2.2.6 as
+the global allocator, pinned, global minimum over rotated rounds:
+
+| row | 96 B | 128 B | 256 B | 512 B | 1 KiB | 2 KiB | 4 KiB | 16 KiB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| speedup | 6.5x | 5.4x | 4.8x | 4.0x | 3.1x | 2.4x | 1.8x | 1.2x |
+
+Instructions per decoded row (callgrind) fall 87% at 128 B, 84% at 256 B and
+70% at 1 KiB; large files are unchanged within noise (-3.5% instructions).
+Dictionary load is 35% cheaper. Against libzstd 1.5.7 in-process on the same
+rows, `rusty_zstd::decompress` now beats `ZSTD_decompress` (one-shot) up to
+512 B; libzstd with a reused `DCtx` is still 1.2-2x faster.
+
+### Performance
+
+- *(huf)* build the X2 (two-symbol) Huffman decode table only for sections
+  that can use it, lazily for a treeless section reusing an X1-only table
+- *(huf)* build X2 only from 4 KiB, and only when the decoder selection will
+  use it (threshold chosen by an instruction and wall-clock sweep)
+- *(fse)* the predefined sequence decode tables are built at compile time
+- *(dict)* a dictionary's Huffman tree is read once, not three times
+- *(bit)* skip the no-op rewind once the reader is at the stream's start
+- *(decode)* the frame reserve includes the copy pad, so single-segment
+  frames no longer reallocate their output on the first block
+- *(fse)* tree weights decode four symbols per reload (libzstd's fast loop)
+
 ## [0.3.1](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.3.0...rusty_zstd-v0.3.1) - 2026-10-14
 
 Compressed output is byte-identical to 0.3.0 for every in-range parameter
