@@ -4280,6 +4280,64 @@ mod tests {
         }
     }
 
+    /// The weights decoder's 4-symbol fast loop must agree with the
+    /// per-symbol oracle (`fse::decompress_weights`, which has no fast loop)
+    /// on every real tree AND on every single-bit corruption of it: same
+    /// weights when both succeed, failure when either fails.
+    #[test]
+    fn weights_fast_loop_matches_oracle() {
+        let mut x = 0x1234_5678_9ABC_DEF1u64;
+        let mut seen_long = 0;
+        for alpha in [16u32, 40, 96, 128, 200, 256] {
+            for skew in [1u32, 2, 3] {
+                let src: Vec<u8> = (0..20_000)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        let r = (x % u64::from(alpha)) as u32;
+                        (r.pow(skew) / alpha.pow(skew - 1)) as u8
+                    })
+                    .collect();
+                let Ok(ct) = build_ctable(&src) else { continue };
+                let Ok(tree) = write_tree_fse(&ct.weights_wo_last) else {
+                    continue;
+                };
+                if tree[0] >= 128 {
+                    continue; // direct weights: no FSE stream to test
+                }
+                let body = &tree[1..1 + usize::from(tree[0])];
+                if body.len() >= 16 {
+                    seen_long += 1;
+                }
+                let check = |b: &[u8], tag: &str| {
+                    let mut buf = [0u8; 256];
+                    let fast = fse::decompress_weights_into(&mut buf, b, 255);
+                    let slow = fse::decompress_weights(b, 255);
+                    match (fast, slow) {
+                        (Ok((n, _)), Ok((w, _))) => assert_eq!(&buf[..n], &w[..], "{tag}"),
+                        (Err(_), Err(_)) => {}
+                        (f, s) => panic!(
+                            "{tag}: fast {:?} vs oracle {:?}",
+                            f.map(|r| r.0),
+                            s.map(|r| r.1)
+                        ),
+                    }
+                };
+                check(body, "clean");
+                for bit in 0..body.len() * 8 {
+                    let mut m = body.to_vec();
+                    m[bit / 8] ^= 1 << (bit % 8);
+                    check(&m, &format!("alpha {alpha} skew {skew} bit {bit}"));
+                }
+            }
+        }
+        assert!(
+            seen_long >= 3,
+            "too few weight streams long enough for the fast loop"
+        );
+    }
+
     /// `read_tree_tables` (one weight parse, both tables) must equal the
     /// tables the old two-parse path built: the decode table `read_table`
     /// gives, and an encode table from weights the ALLOCATING oracle decodes.

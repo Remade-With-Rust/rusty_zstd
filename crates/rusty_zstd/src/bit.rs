@@ -146,6 +146,16 @@ impl<'a> BitRev<'a> {
         self.bits_consumed > 64 && self.ptr == 0
     }
 
+    /// C `BIT_reloadDStream() == BIT_DStream_unfinished` after a reload: the
+    /// window still has at least 8 bytes of stream BEHIND it, so the container
+    /// was refilled whole (>= 57 unread bits) and nothing near the end of the
+    /// stream is in play. A fast loop may read up to 57 bits before its next
+    /// reload without checking anything.
+    #[inline(always)]
+    pub(crate) fn unfinished(&self) -> bool {
+        self.ptr >= 8 && self.bits_consumed < 8
+    }
+
     /// C `BIT_endOfDStream`: every bit of the stream consumed, and no more.
     ///
     /// SEC-03: a conformant stream ends EXACTLY on its padding mark, and

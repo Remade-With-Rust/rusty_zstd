@@ -1697,6 +1697,37 @@ fn weights_into_body(dst: &mut [u8], src: &[u8], max_out: usize) -> Result<(usiz
     let mut s1 = table.init_state(&mut br);
     let mut s2 = table.init_state(&mut br);
     let mut n_out = 0usize;
+    // C `FSE_decompress_usingDTable_generic`'s fast loop: FOUR symbols per
+    // reload while the stream is far from its start. Weight tables have an
+    // accuracy log of at most 6 (`read_ncount_into(.., 6)` above), so four
+    // states read at most 24 bits of the >= 57 a reload leaves when
+    // `unfinished` holds -- no per-symbol reload, no `overflowed` test (it
+    // needs `ptr == 0`), no per-symbol bound. The tail below then resumes from
+    // the identical reader state, so output and errors are unchanged.
+    //
+    // A tree for ASCII text has ~120 weights (one per symbol up to the
+    // largest present); this loop is where small frames spent ~20% of their
+    // decode before it existed.
+    while n_out + 4 <= dst.len() {
+        let _ = br.reload();
+        if !br.unfinished() {
+            break;
+        }
+        let d = &mut dst[n_out..n_out + 4];
+        let e1 = table.entry(s1);
+        d[0] = e1.symbol;
+        s1 = FseTable::advance(e1, &mut br);
+        let e2 = table.entry(s2);
+        d[1] = e2.symbol;
+        s2 = FseTable::advance(e2, &mut br);
+        let e1 = table.entry(s1);
+        d[2] = e1.symbol;
+        s1 = FseTable::advance(e1, &mut br);
+        let e2 = table.entry(s2);
+        d[3] = e2.symbol;
+        s2 = FseTable::advance(e2, &mut br);
+        n_out += 4;
+    }
     loop {
         if n_out >= dst.len() {
             return Err(Error::Corruption);
