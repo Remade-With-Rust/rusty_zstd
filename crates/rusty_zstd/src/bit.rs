@@ -276,6 +276,24 @@ impl<'a> BitRev<'a> {
     #[cold]
     #[inline(never)]
     fn rewind_to_start(&mut self) {
+        // Already AT the start: the window is `src[0..8]` and the container is
+        // that word shifted by `bits_consumed` -- exactly what the rebuild
+        // below would produce. A short stream (tree weights, sequences, a
+        // small literal stream) spends most of its reads here, and every
+        // reload repeated the copy and shift for nothing: 3.3% of decoding a
+        // 256-byte row before this return.
+        if self.ptr == 0 {
+            debug_assert!(
+                self.bits_consumed >= 64 || {
+                    let n = self.src.len().min(8);
+                    let mut buf = [0u8; 8];
+                    buf[..n].copy_from_slice(&self.src[..n]);
+                    shl64(u64::from_le_bytes(buf), self.bits_consumed) == self.bit_container
+                },
+                "ptr == 0 but the container is not src[0..8] << bits_consumed"
+            );
+            return;
+        }
         let nb = self.ptr;
         self.ptr = 0;
         self.bits_consumed -= (nb as u32) * 8;
