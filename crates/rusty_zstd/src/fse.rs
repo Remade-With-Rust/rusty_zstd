@@ -318,6 +318,8 @@ impl FseTable {
         br.read_bits(u32::from(self.accuracy_log)) as u16
     }
 
+    /// Test oracle: the symbol for `state`, read through the struct fields.
+    #[cfg(test)]
     pub(crate) fn peek_symbol(&self, state: u16) -> Result<u16, Error> {
         Ok(u16::from(self.entry(state).symbol))
     }
@@ -1522,13 +1524,16 @@ impl FseCTable {
 ///
 /// TWIN RETIRED, and the note it carried was wrong about its own frequency.
 /// It read "per new-table block on the literal decode path" -- but the decode
-/// path stopped calling this at W39. Its two remaining callers are
-/// `huffman::read_ctable` (dictionary load, once per dictionary) and a test.
+/// path stopped calling this at W39, and dictionary load stopped at the
+/// small-frame work (`huffman::read_tree_tables` parses the weights once,
+/// through `decompress_weights_into`). It is now TEST-ONLY: the allocating
+/// oracle the `_into` decoder is held against.
 /// A twin cannot pay for itself at once-per-dictionary, and this one was not
 /// even trying: `decompress_weights_inner` is `#[inline(never)]`, so the twin
 /// compiled to a single `jmp` to a baseline symbol and every shift in the body
 /// stayed `%cl`. The real per-block path is `decompress_weights_into` below,
 /// which had no twin at all -- it has one now.
+#[cfg(test)]
 pub(crate) fn decompress_weights(src: &[u8], max_out: usize) -> Result<(Vec<u8>, usize), Error> {
     decompress_weights_inner(src, max_out)
 }
@@ -1663,6 +1668,7 @@ fn weights_into_body(dst: &mut [u8], src: &[u8], max_out: usize) -> Result<(usiz
 // whole body at every site, and the hosts here are twinned
 // (baseline / bmi2 / avx2). Same finding as `select_seq_table`, which
 // shrank `write_sequences` from 12,413 to 2,216 instructions.
+#[cfg(test)]
 #[inline(never)]
 fn decompress_weights_inner(src: &[u8], max_out: usize) -> Result<(Vec<u8>, usize), Error> {
     #[cfg(feature = "std")]

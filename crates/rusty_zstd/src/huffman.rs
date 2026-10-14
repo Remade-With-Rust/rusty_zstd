@@ -4,7 +4,7 @@ use crate::bit::BitRev;
 use crate::error::Error;
 use crate::fse;
 
-#[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", test))]
 use alloc::vec;
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
@@ -877,18 +877,30 @@ impl HuffmanTable {
 /// hot one. At most once per block, a call is free; the note below the
 /// attribute was also sitting BELOW it, which is why the two doc blocks had
 /// drifted apart.
-#[inline(never)]
 ///
 /// `want_x2`: also build the X2 (two-symbol) table. It costs an upsample to
 /// `FAST_TABLELOG` plus a 2,048-entry gather, which dwarfs decoding a small
 /// section, so a caller that knows its section can never take the X2 arm
 /// passes `false` (see [`want_x2`]). The table then decodes on X1, and
 /// [`HuffmanTable::ensure_x2`] can add X2 later if a reuse needs it.
+#[inline(never)]
 pub(crate) fn read_table(
     recycle: Option<HuffmanTable>,
     src: &[u8],
     want_x2: bool,
 ) -> Result<(HuffmanTable, usize), Error> {
+    let mut wbuf = [0u8; 256];
+    let (wlen, used) = read_weights(src, &mut wbuf)?;
+    let table = table_from_weights(recycle, &mut wbuf, wlen, want_x2)?;
+    Ok((table, used))
+}
+
+/// Parse a Huffman_Tree_Description's weights (direct 4-bit, or FSE-coded)
+/// into `wbuf`: `(weights written, description bytes used)`. The last
+/// symbol's weight is implied and is NOT written; `table_from_weights` derives
+/// it.
+#[inline(always)]
+fn read_weights(src: &[u8], wbuf: &mut [u8; 256]) -> Result<(usize, usize), Error> {
     if src.is_empty() {
         return Err(Error::Corruption);
     }
@@ -899,8 +911,7 @@ pub(crate) fn read_table(
     // the buffer is bounded and small. The FSE arm copies its (already
     // pre-sized, W29) output in, which trades one memcpy of <=255 bytes for one
     // heap allocation per direct-weights table.
-    let mut wbuf = [0u8; 256];
-    let (wlen, used) = if header >= 128 {
+    if header >= 128 {
         let nsym = header as usize - 127;
         let nbytes = nsym.div_ceil(2);
         if 1 + nbytes > src.len() {
@@ -915,18 +926,16 @@ pub(crate) fn read_table(
             let b = *unsafe { src.get_unchecked(1 + i / 2) };
             *slot = if i % 2 == 0 { b >> 4 } else { b & 0x0F };
         }
-        (nsym, 1 + nbytes)
+        Ok((nsym, 1 + nbytes))
     } else {
         let csize = header as usize;
         if csize == 0 || 1 + csize > src.len() {
             return Err(Error::Corruption);
         }
         // W39: decode straight into the stack buffer -- no Vec, no copy.
-        let (wlen, _) = fse::decompress_weights_into(&mut wbuf, &src[1..1 + csize], 255)?;
-        (wlen, 1 + csize)
-    };
-    let table = table_from_weights(recycle, &mut wbuf, wlen, want_x2)?;
-    Ok((table, used))
+        let (wlen, _) = fse::decompress_weights_into(wbuf, &src[1..1 + csize], 255)?;
+        Ok((wlen, 1 + csize))
+    }
 }
 
 // STACKED-ATTRIBUTE HAZARD, third sighting: an `#[inline(always)]` sat here,
@@ -2416,36 +2425,25 @@ pub(crate) fn ctable_from_weights(weights: &[u8]) -> Result<HuffCTable, Error> {
     ))
 }
 
-/// Parse a Huffman_Tree_Description into an encode table.
+/// Read a Huffman_Tree_Description ONCE and build both of a dictionary's
+/// tables from it: the decode table (with X2 -- it serves every frame that
+/// uses the dictionary) and the encoder's code table. `(decode, encode,
+/// description bytes used)`.
+///
+/// This replaced `read_ctable`, which re-read the description to build the
+/// encode table after `Dictionary::from_bytes` had already read it for the
+/// decode table: two weight parses and THREE table builds per load, one of
+/// them a full X2 build whose only output was the byte count
+/// (docs/plans/small-frame-decode.md, Finding 2). Validation is unchanged:
+/// both tables still go through `table_from_weights`.
 #[cfg(feature = "alloc")]
-pub(crate) fn read_ctable(src: &[u8]) -> Result<(HuffCTable, usize), Error> {
-    let (table, used) = read_table(None, src, true)?;
-    let _ = table;
-    let header = src[0];
-    let weights = if header >= 128 {
-        let nsym = header as usize - 127;
-        let nbytes = nsym.div_ceil(2);
-        // This site had NO bound of its own: `_nbytes` was computed and thrown
-        // away, and it was safe only because `read_table(src)` above validated
-        // the same bound for the same header and would have returned `Err`.
-        // That is an indirect argument across a call boundary; state it here.
-        if 1 + nbytes > src.len() {
-            return Err(Error::Corruption);
-        }
-        let mut w = vec![0u8; nsym];
-        for (i, slot) in w.iter_mut().enumerate() {
-            debug_assert!(1 + i / 2 < src.len());
-            #[allow(unsafe_code)]
-            let b = *unsafe { src.get_unchecked(1 + i / 2) };
-            *slot = if i % 2 == 0 { b >> 4 } else { b & 0x0F };
-        }
-        w
-    } else {
-        let csize = header as usize;
-        let (w, _) = fse::decompress_weights(&src[1..1 + csize], 255)?;
-        w
-    };
-    ctable_from_weights(&weights).map(|ct| (ct, used))
+pub(crate) fn read_tree_tables(src: &[u8]) -> Result<(HuffmanTable, HuffCTable, usize), Error> {
+    let mut wbuf = [0u8; 256];
+    let (wlen, used) = read_weights(src, &mut wbuf)?;
+    // Before `table_from_weights`, which appends the implied last weight.
+    let ct = ctable_from_weights(&wbuf[..wlen])?;
+    let dt = table_from_weights(None, &mut wbuf, wlen, true)?;
+    Ok((dt, ct, used))
 }
 
 #[cfg(feature = "alloc")]
@@ -4280,6 +4278,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `read_tree_tables` (one weight parse, both tables) must equal the
+    /// tables the old two-parse path built: the decode table `read_table`
+    /// gives, and an encode table from weights the ALLOCATING oracle decodes.
+    /// Both tree encodings (direct 4-bit and FSE-coded).
+    #[test]
+    fn read_tree_tables_matches_separate_reads() {
+        let fox = b"The quick brown fox jumps over the lazy dog. 0123456789.\n";
+        let mut src = Vec::new();
+        while src.len() < 2048 {
+            src.extend_from_slice(fox);
+        }
+        let ct = build_ctable(&src).expect("build");
+        let raw = write_tree_raw(&ct.weights_wo_last).expect("raw tree");
+        let fse_tree = write_tree_fse(&ct.weights_wo_last).expect("FSE tree");
+        for (name, desc) in [("raw", &raw), ("fse", &fse_tree)] {
+            let (dt, ct2, used) = read_tree_tables(desc).expect(name);
+            let (want_dt, want_used) = read_table(None, desc, true).unwrap();
+            assert_eq!(used, want_used, "{name}");
+            assert_eq!(dt.table, want_dt.table, "{name}");
+            assert_eq!(dt.table_x2, want_dt.table_x2, "{name}");
+            assert_eq!(dt.max_bits, want_dt.max_bits, "{name}");
+            let weights = if desc[0] >= 128 {
+                ct.weights_wo_last.clone()
+            } else {
+                fse::decompress_weights(&desc[1..], 255).unwrap().0
+            };
+            let want_ct = ctable_from_weights(&weights).unwrap();
+            assert_eq!(ct2.weights_wo_last, want_ct.weights_wo_last, "{name}");
+            assert_eq!(ct2.entry, want_ct.entry, "{name}");
+            assert_eq!(ct2.celt, want_ct.celt, "{name}");
+            assert_eq!(ct2.max_nbits, want_ct.max_nbits, "{name}");
+        }
+        assert!(read_tree_tables(&[]).is_err());
+        assert!(
+            read_tree_tables(&[200]).is_err(),
+            "truncated direct weights"
+        );
     }
 
     #[test]

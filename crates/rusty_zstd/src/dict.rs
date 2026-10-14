@@ -116,8 +116,7 @@ fn parse_trained(src: &[u8]) -> Result<Dictionary, Error> {
     let idb: [u8; 4] = src[4..8].try_into().map_err(|_| Error::Corruption)?;
     let id = u32::from_le_bytes(idb);
     let mut pos = 8usize;
-    let (huff_d, hn) = huffman::read_table(None, &src[pos..], true)?;
-    let (huff_c, _) = huffman::read_ctable(&src[pos..])?;
+    let (huff_d, huff_c, hn) = huffman::read_tree_tables(&src[pos..])?;
     pos += hn;
     let (of_d, of_c, n) = fse::read_ncount_ctable(&src[pos..], 31, 8)?;
     pos += n;
