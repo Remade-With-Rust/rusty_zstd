@@ -190,6 +190,12 @@ impl BlockState {
     }
 }
 
+/// Slack the sequence decoder keeps past a block's last possible output byte:
+/// its fixed-width literal/match copies may write (never read back) up to 64
+/// bytes beyond `len`. It reserves `block_max + COPY_PAD` per block (COPYMATCH
+/// CUT 1); a caller that knows the frame's size reserves the pad up front too.
+pub(crate) const COPY_PAD: usize = 64;
+
 pub(crate) fn decode_compressed_block(
     payload: &[u8],
     out: &mut Vec<u8>,
@@ -942,7 +948,6 @@ fn decode_sequences_inner(
     // budget bound (`len - block_start <= block_max`, below) gives
     // `capacity - len >= 64` at every sequence, and the hot tiers assert it
     // instead of testing it.
-    const COPY_PAD: usize = 64;
     out.reserve(block_max as usize + COPY_PAD);
     // COPYMATCH CUT 2 -- the RFC block bound, enforced as a RUNNING BUDGET.
     // One subtract-and-branch per sequence replaces the old per-sequence

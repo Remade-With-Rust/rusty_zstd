@@ -1,7 +1,7 @@
 //! One-shot decompress: skippable, raw, RLE, and compressed frames.
 
 use crate::block::{parse_block_header, BlockType};
-use crate::compressed::{decode_compressed_block, BlockState};
+use crate::compressed::{decode_compressed_block, BlockState, COPY_PAD};
 #[cfg(feature = "alloc")]
 use crate::dict::Dictionary;
 use crate::error::Error;
@@ -471,7 +471,12 @@ fn decode_zstd_frame(
         // always within that, so this only ever trims a lie -- and the
         // mismatch is still reported, by the content-size check at the end.
         let provable = (r.remaining() / 3).saturating_mul(block_max as usize);
-        out.try_reserve(extra.min(provable))
+        // + COPY_PAD: the sequence decoder reserves `block_max + COPY_PAD`
+        // beyond `len` for each compressed block. For a single-segment frame
+        // `block_max` IS the content size, so an exact reserve came up 64 bytes
+        // short and every such frame paid a realloc -- an allocation and a
+        // copy of the output -- on its first compressed block.
+        out.try_reserve(extra.min(provable).saturating_add(COPY_PAD))
             .map_err(|_| Error::ContentSizeTooLarge)?;
     }
     // A frame with NO declared content size got no reserve at all, so `out`
