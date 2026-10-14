@@ -408,8 +408,11 @@ pub(crate) fn decode_literals(
             // 8 KiB) to the new build instead of dropping them and allocating
             // fresh. It is replaced on the next line anyway.
             let huff_recycle = state.huff.take();
-            let (table, tree_size) =
-                huffman::read_table(huff_recycle, section, huffman::x2_reachable(regen as usize))?;
+            let (table, tree_size) = huffman::read_table(
+                huff_recycle,
+                section,
+                huffman::want_x2(regen as usize, csize as usize),
+            )?;
             // BRICK 63: MOVE the freshly-read table into `state`, then borrow it
             // back to decode with. It was being CLONED into `state` and the
             // original used for the decode -- a full decode-table allocation and
@@ -427,8 +430,8 @@ pub(crate) fn decode_literals(
         3 => {
             let table = state.huff.as_mut().ok_or(Error::Corruption)?;
             // The reused table may have been built X1-only for a smaller
-            // section; give this one X2 if it could use it.
-            if huffman::x2_reachable(regen as usize) {
+            // section; give this one X2 if building it pays here.
+            if huffman::want_x2(regen as usize, csize as usize) {
                 table.ensure_x2();
             }
             let table = &*table;

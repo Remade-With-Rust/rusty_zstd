@@ -882,7 +882,7 @@ impl HuffmanTable {
 /// `want_x2`: also build the X2 (two-symbol) table. It costs an upsample to
 /// `FAST_TABLELOG` plus a 2,048-entry gather, which dwarfs decoding a small
 /// section, so a caller that knows its section can never take the X2 arm
-/// passes `false` (see [`x2_reachable`]). The table then decodes on X1, and
+/// passes `false` (see [`want_x2`]). The table then decodes on X1, and
 /// [`HuffmanTable::ensure_x2`] can add X2 later if a reuse needs it.
 pub(crate) fn read_table(
     recycle: Option<HuffmanTable>,
@@ -1299,24 +1299,63 @@ pub(crate) fn x2_reachable(dst_size: usize) -> bool {
     dst_size >= X2_MIN_DST
 }
 
-/// C `HUF_selectDecoder` decode half. We already built X1 and X2, so tableTime
-/// is sunk; using it would pick X1 too often (C pays tableTime because it builds
-/// only one). X2 still pays the 1/32 cache penalty. `dst < 256` stays X1 (D256=0).
+/// C `HUF_selectDecoder` decode half, for a table whose X2 is ALREADY built:
+/// its table time is sunk, and counting it would pick X1 too often. X2 still
+/// pays the 1/32 cache penalty. `dst < 256` stays X1 (D256 = 0).
 fn select_x2(dst_size: usize, src_size: usize) -> bool {
     if !x2_reachable(dst_size) {
         return false;
     }
-    let q = if src_size >= dst_size {
-        15
-    } else {
-        ((src_size * 16) / dst_size).min(15)
-    };
-    let d256 = (dst_size >> 8) as u32;
+    let (q, d256) = select_q_d256(dst_size, src_size);
     let (_, d0, _, d1) = ALGO_TIME[q];
     let time0 = d0.saturating_mul(d256);
     let mut time1 = d1.saturating_mul(d256);
     time1 += time1 >> 5;
     time1 < time0
+}
+
+/// Smallest section that builds the X2 table. Below it, decoding on X1 is
+/// cheaper than building X2 and decoding on it, in instructions AND in time.
+///
+/// Chosen by sweep (SpaceDB-shaped rows at L3, 6 silesia slices x L1/L3/L19,
+/// libzstd 1.5.7 frames). Callgrind Ir per frame, threshold vs 4096:
+///
+/// ```text
+///               1024     2048     4096     8192    16384    32768
+///   4 KiB row  +44.1%    +0.0%      0     +0.0%    +0.0%    +0.0%
+///   16 KiB row  +5.4%    +5.4%      0     +0.0%    +0.0%    +0.0%
+///   64 KiB row  +0.7%    +0.7%      0     +0.0%   +11.2%   +11.2%
+///   bulk        +0.2%    +0.1%      0     +0.02%   +0.8%    +2.7%
+/// ```
+///
+/// and wall clock (pinned, rotated rounds, global min; null arm 0.93-1.03):
+/// 1024 took 1.41x as long on 4 KiB rows and 1.14x on 16 KiB rows, 2048
+/// 1.15x on 16 KiB rows, 8192 tied 4096 everywhere. 4096 is also the low end
+/// of the tie, which favours X2 on bulk data.
+///
+/// REFUTED, recorded: C's whole `HUF_selectDecoder` (table time included) as
+/// the build decision. It agreed with 4096 on rows and lost +2.9% Ir on bulk
+/// (it keeps large high-Q sections on X1), with no wall-clock gain anywhere.
+const X2_BUILD_MIN: usize = 4096;
+
+/// Should a section build the X2 table? Only when it is large enough for the
+/// build to pay (`X2_BUILD_MIN`) AND `select_x2` would then decode with it --
+/// building a table the selector declines is pure cost. So a table built for
+/// X2 is always decoded with X2, and which decoder runs for a given section is
+/// exactly what it was when X2 was always built, from 4096 bytes up.
+pub(crate) fn want_x2(dst_size: usize, src_size: usize) -> bool {
+    dst_size >= X2_BUILD_MIN && select_x2(dst_size, src_size)
+}
+
+/// C `HUF_selectDecoder`'s inputs: the compression quantile `Q` (0..=15) and
+/// the output size in 256-byte units.
+fn select_q_d256(dst_size: usize, src_size: usize) -> (usize, u32) {
+    let q = if src_size >= dst_size {
+        15
+    } else {
+        ((src_size * 16) / dst_size).min(15)
+    };
+    (q, (dst_size >> 8) as u32)
 }
 
 /// C `algoTime[Q][single, double]` as `(tableTime, decode256Time)` pairs.
@@ -3801,7 +3840,7 @@ mod tests {
             panic!("first section must build a table")
         };
         let mut found = None;
-        for n in [900usize, 800, 1000, 600] {
+        for n in [6000usize, 7000, 5000, 4500] {
             let lits2 = gen(n);
             let (sec2, _) = encode_literals_section(&lits2, Some(&ct)).unwrap();
             if sec2[0] & 3 == 3 {
@@ -3810,15 +3849,22 @@ mod tests {
             }
         }
         let (lits2, sec2) = found.expect("encoder emitted no treeless section");
-        assert!(super::x2_reachable(lits2.len()));
+        let header_len = match (sec2[0] >> 2) & 3 {
+            0 | 1 => 3,
+            2 => 4,
+            _ => 5,
+        };
+        let csize = sec2.len() - header_len;
+        assert!(super::want_x2(lits2.len(), csize), "fixture must want X2");
 
         let mut want = lits1.clone();
         want.extend_from_slice(&lits2);
         let mut frame = Vec::new();
+        // 8 KiB window: Block_Maximum_Size must hold the second section.
         crate::encode::write_frame_header(
             &mut frame,
             want.len() as u64,
-            10,
+            13,
             false,
             Some(want.len() as u64),
             None,
@@ -4214,6 +4260,26 @@ mod tests {
             !select_x2(128 * 1024, 128 * 1024),
             "Q=15 incompressible: X1"
         );
+    }
+
+    #[test]
+    fn want_x2_builds_only_what_select_x2_will_use() {
+        assert!(!want_x2(255, 32), "below select_x2's floor");
+        assert!(!want_x2(4095, 1024), "below X2_BUILD_MIN");
+        assert!(want_x2(4096, 1024), "4 KiB at Q=4: built and used");
+        assert!(want_x2(128 * 1024, 16 * 1024), "128 KiB at ~12%");
+        assert!(
+            !want_x2(128 * 1024, 128 * 1024),
+            "Q=15: select_x2 declines, so nothing is built"
+        );
+        // Never build a table the selector would not decode with.
+        for dst in [4096usize, 8192, 65536, 131072] {
+            for src in (64..dst).step_by(dst / 37 + 1) {
+                if want_x2(dst, src) {
+                    assert!(select_x2(dst, src), "built but unused: {dst}/{src}");
+                }
+            }
+        }
     }
 
     #[test]
