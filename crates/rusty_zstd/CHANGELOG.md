@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.3.0...rusty_zstd-v0.3.1) - 2026-10-14
+
+Compressed output is byte-identical to 0.3.0 for every in-range parameter
+set, and every frame libzstd 1.5.7 produces still decodes.
+
+### Security
+
+- *(decode)* a Compressed block with zero sequences now has its literals
+  bounded by Block_Maximum_Size, as libzstd does. They were flushed unchecked:
+  a 14-byte frame regenerated 1 MiB through a 1 KiB window (SEC-01)
+- *(decode)* the one-shot decoder no longer reserves the header's
+  Frame_Content_Size verbatim -- a 14-byte header-only frame could commit
+  32 GiB. The reserve is capped by what the remaining input can regenerate
+  (SEC-02)
+- *(decode)* every Huffman stream and every sequence bitstream must now be
+  consumed exactly (`BIT_endOfDStream`). Corrupt frames that libzstd rejects
+  were accepted with plausible output when they carried no checksum. In the
+  4-stream Huffman case this is stricter than libzstd's fast decode loop,
+  which skips the check; its portable path performs it (SEC-03)
+- *(encode)* `CompressionParameters` from the caller are clamped to libzstd's
+  bounds (`CompressionParameters::clamped`) before reaching a match finder.
+  `min_match > 8` let DFast commit a match past its block's end, reaching an
+  unchecked slice -- undefined behaviour from safe code, usually seen as a
+  `capacity overflow` panic. The slice is now checked as well (SEC-04)
+- *(decode, encode)* big-endian targets: the FSE decode-table read and the
+  match-length counters assumed little-endian -- an out-of-bounds read while
+  decoding valid frames, and silently corrupt frames from the encoder. NEON
+  kernels are now limited to little-endian aarch64. Verified under Miri on
+  s390x: encoder output byte-identical to x86 at L1-L19 (SEC-05)
+
+### Added
+
+- `decompress_with_limit` / `decompress_into_with_limit`: one-shot decoding
+  with a caller-set output cap, failing with `ContentSizeTooLarge`
+- `CompressionParameters::clamped`
+
 ## [0.3.0](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.2.5...rusty_zstd-v0.3.0) - 2026-10-08
 
 **Encode is 1.8x faster.** On the standing board (dickens, samba, x-ray,

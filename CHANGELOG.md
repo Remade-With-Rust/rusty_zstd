@@ -6,6 +6,35 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Released -- 0.3.1 (2026-10-14): security fixes SEC-01..SEC-05
+
+Five issues from an external report, each reproduced on 0.3.0 before it was
+fixed. Compressed output is byte-identical to 0.3.0 (97 inputs x 15 levels,
+plus 2,000 random in-range parameter sets); decode speed is unchanged within
+noise.
+
+- SEC-01: a zero-sequence block's literals were not bounded by
+  Block_Maximum_Size (14 bytes -> 1 MiB through a 1 KiB window). Rejected now,
+  as libzstd does; `decompress_with_limit` adds a caller-set output cap.
+- SEC-02: the one-shot decoder reserved Frame_Content_Size verbatim (a 14-byte
+  frame committed 32 GiB). Capped by what the remaining input can regenerate.
+- SEC-03: Huffman and sequence bitstreams must be consumed exactly. Every
+  single-bit corruption of a checksum-less frame that libzstd rejects is now
+  rejected too (exhaustive at L1/L3/L19). Stricter than libzstd's FAST
+  4-stream Huffman loop, which skips its own end check
+  (`HUF_decompress4X*_usingDTable_internal_fast`); its portable path does not,
+  so such a frame's fate in libzstd depends on build and CPU.
+- SEC-04: caller `CompressionParameters` are clamped; `min_match > 8` reached
+  an unchecked slice in DFast -- undefined behaviour from safe code.
+- SEC-05: big-endian targets decoded valid frames with an out-of-bounds read
+  and encoded silently corrupt ones. Verified under Miri on s390x: output
+  byte-identical to x86 at L1-L19. NEON is limited to little-endian aarch64.
+
+Regression tests: `tests/strict_bitstream.rs` and
+`oversized_min_match_stays_inside_the_block` (all four fail on 0.3.0), plus
+unit tests in `decode.rs`, `bit.rs` and `fse.rs` (the last two run under Miri
+on s390x). Details: `crates/rusty_zstd/CHANGELOG.md`.
+
 ### Released -- 0.3.0 (2026-10-08): encode 1.8x faster; L4-L12 output changes
 
 The encoder-veins campaign, against 0.2.5 on the standing board (dickens,
