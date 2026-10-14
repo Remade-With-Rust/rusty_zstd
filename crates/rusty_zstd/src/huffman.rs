@@ -1054,6 +1054,12 @@ fn table_from_weights(
     let mut table: Vec<u16> = rec_x1;
     table.clear();
     table.reserve(1usize << FAST_TABLELOG);
+    // REFUTED (small-frame decode, 2026-10-14): dropping this zero-fill and
+    // growing the table with `resize(pos + length, entry)` per symbol (each
+    // slot written once). Callgrind, rusty_alloc 2.2.6: rows 96-384 B +0.7% to
+    // +2.5% (many short runs; a `resize` call per symbol beats a small memset),
+    // rows 4-16 KiB -1.2% to -1.9%, dictionary load -1.4%. Opposite signs, and
+    // the small-frame target lost.
     table.resize(table_size, 0);
     // W32 -- `symbols` on the STACK. Bounded by 256: it is indexed by symbol
     // value, and symbols are `u8`. Same bounded-buffer move as `symbol_next`

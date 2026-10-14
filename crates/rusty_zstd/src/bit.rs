@@ -292,6 +292,11 @@ impl<'a> BitRev<'a> {
         // small literal stream) spends most of its reads here, and every
         // reload repeated the copy and shift for nothing: 3.3% of decoding a
         // 256-byte row before this return.
+        //
+        // REFUTED, recorded: the same test INLINE in `reload` (`else if
+        // self.ptr != 0`), saving the call. It grows every inlined copy of
+        // `reload`: +0.3% to +0.7% Ir on rows and +0.4% on bulk at opt-level
+        // "s". The outlined test is the one that pays.
         if self.ptr == 0 {
             debug_assert!(
                 self.bits_consumed >= 64 || {
