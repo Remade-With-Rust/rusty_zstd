@@ -16,6 +16,7 @@ so it is not re-litigated.
 | [`inline-execution.md`](inline-execution.md) | Inlining and outlining decisions, with the instruction counts behind them |
 | [`fast-trans.md`](fast-trans.md) | The fast-path transform work |
 | [`supercharge-engine.md`](supercharge-engine.md) | The engine-level plan the above descends from |
+| [`small-frame-decode.md`](small-frame-decode.md) | Small-frame (SpaceDB row) decode, **applied 2026-10-14**: lazy X2 tables, a 4 KiB X2 threshold, compile-time predefined FSE tables and four smaller bricks; rows of 128-512 B decode in 13-21% of 0.3.1's instructions (4.1-5.4x faster wall clock, rusty_alloc), output identical. Refutations kept on the page |
 
 ## A note on `gg-*` references
 
