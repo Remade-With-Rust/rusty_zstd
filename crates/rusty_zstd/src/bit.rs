@@ -146,6 +146,25 @@ impl<'a> BitRev<'a> {
         self.bits_consumed > 64 && self.ptr == 0
     }
 
+    /// C `BIT_endOfDStream`: every bit of the stream consumed, and no more.
+    ///
+    /// SEC-03: a conformant stream ends EXACTLY on its padding mark, and
+    /// libzstd rejects one that does not, at the end of every Huffman stream
+    /// and after the sequence loop. Without it, a corrupt stream that happened
+    /// to yield the right symbol COUNT was accepted with the wrong symbols.
+    ///
+    /// Holds whatever reloads did or did not run after the last read: data is
+    /// only ever read from the 8-byte window at `ptr`, so consuming every
+    /// stream bit forces `ptr` to 0 (bytes below it were never loaded) with
+    /// all 64 window bits used; `rewind_to_start` keeps exactly that
+    /// accounting, and a reader of fewer than 8 bytes starts at `ptr == 0`
+    /// with the missing bytes pre-counted as consumed. Reading past the start
+    /// (`bits_consumed > 64`) fails it too.
+    #[inline(always)]
+    pub(crate) fn finished_exactly(&self) -> bool {
+        self.ptr == 0 && self.bits_consumed == 64
+    }
+
     /// Resume after C `HUF_decompress4X2` fast loop: `ptr` is the loaded window,
     /// `bits_consumed` is `trailing_zeros` of the left-justified register.
     #[inline(always)]
@@ -503,6 +522,37 @@ mod tests {
             let got = br.look_bits(n);
             let want = crate::simd::look_n_bits_shift(raw, skip, n);
             assert_eq!(got, want, "n={n}");
+        }
+    }
+
+    /// SEC-03: `finished_exactly` is true after reading exactly the payload
+    /// bits -- for short (< 8 byte) and long streams, with or without a reload
+    /// after the last read -- and false one bit short or one bit over.
+    #[test]
+    fn finished_exactly_marks_the_exact_end() {
+        for len in [1usize, 2, 7, 8, 9, 16, 23] {
+            for last in [0x01u8, 0x02, 0x80, 0x5A] {
+                let mut src: Vec<u8> = (0..len as u8).map(|i| i.wrapping_mul(37) ^ 0xA5).collect();
+                src[len - 1] = last;
+                let payload = 8 * (len as u32 - 1) + (31 - u32::from(last).leading_zeros());
+                for reload_after in [false, true] {
+                    let mut br = BitRev::new(&src).unwrap();
+                    let mut left = payload;
+                    while left > 0 {
+                        assert!(!br.finished_exactly(), "len {len} last {last:#x}: early");
+                        let _ = br.reload();
+                        let n = left.min(7);
+                        br.read_bits(n);
+                        left -= n;
+                    }
+                    if reload_after {
+                        let _ = br.reload();
+                    }
+                    assert!(br.finished_exactly(), "len {len} last {last:#x}: at end");
+                    br.read_bits(1);
+                    assert!(!br.finished_exactly(), "len {len} last {last:#x}: overread");
+                }
+            }
         }
     }
 }

@@ -94,7 +94,19 @@ impl FseView<'_> {
             let p = self.ptr.add(state as usize);
             // SAFETY: `FseEntry` is repr(C, align(4)) and 4 bytes, so `p` is a
             // validly-aligned u32 address holding 4 initialised bytes.
-            *p.cast::<u32>()
+            #[cfg(target_endian = "little")]
+            {
+                *p.cast::<u32>()
+            }
+            // SEC-05: the packed layout below is the LITTLE-endian reading of
+            // the struct. A native load on a big-endian target puts `baseline`'s
+            // low byte where `fse_symbol` looks, and the sequence loop indexes
+            // its code tables with that byte unchecked. Pack from the fields.
+            #[cfg(target_endian = "big")]
+            {
+                let e = *p;
+                u32::from(e.baseline) | (u32::from(e.symbol) << 16) | (u32::from(e.num_bits) << 24)
+            }
         }
     }
 }
@@ -1707,6 +1719,26 @@ fn decompress_weights_inner(src: &[u8], max_out: usize) -> Result<(Vec<u8>, usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-05: the packed `u32` must carry the FIELDS, on any byte order. A
+    /// native load fails this on big-endian (run it under Miri on s390x):
+    /// `fse_symbol` would read `baseline`'s low byte.
+    #[test]
+    fn entry_u32_packs_the_fields() {
+        let e = FseEntry {
+            baseline: 0x1234,
+            symbol: 0x23,
+            num_bits: 7,
+        };
+        let t = FseTable {
+            decode: alloc::vec![e; 2],
+            accuracy_log: 1,
+        };
+        let w = t.view().entry_u32(1);
+        assert_eq!(fse_baseline(w), 0x1234);
+        assert_eq!(fse_symbol(w), 0x23);
+        assert_eq!(fse_nbits(w), 7);
+    }
 
     #[test]
     fn default_ll_matches_rfc_appendix() {

@@ -63,6 +63,9 @@ pub fn compress_mt(
     write_dict_id: bool,
     adv: AdvancedOptions,
 ) -> Result<Vec<u8>, Error> {
+    // SEC-04: the job geometry below reads `window_log` before
+    // `encode_oneshot` gets to clamp it.
+    let params = params.clamped();
     let workers = adv.nb_workers.clamp(1, NB_WORKERS_MAX) as usize;
     let overlap = overlap_size(params.window_log, adv.overlap_log, params.strategy);
     let job = resolve_job_size(adv.job_size, params.window_log, overlap);

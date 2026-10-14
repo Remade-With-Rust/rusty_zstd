@@ -227,6 +227,12 @@ impl HuffmanTable {
             dst[i] = Self::decode_one(br, dt, mask, max)?;
             i += 1;
         }
+        // SEC-03: every stream -- single, and each of the four (fast path and
+        // fallback alike) -- finishes here, so this is the one end-of-stream
+        // check for X1. Once per stream.
+        if !br.finished_exactly() {
+            return Err(Error::Corruption);
+        }
         Ok(())
     }
 
@@ -269,6 +275,10 @@ impl HuffmanTable {
                 max,
             )?;
             i += 1;
+        }
+        // SEC-03: the X2 twin of `decode_into_x1`'s end-of-stream check.
+        if !br.finished_exactly() {
+            return Err(Error::Corruption);
         }
         Ok(())
     }
@@ -3566,8 +3576,13 @@ mod tests {
             assert_eq!(sec[0] & 3, 1, "n={n}: literals section type must be RLE");
             let mut r = crate::reader::Reader::new(&sec);
             let mut st = crate::compressed::BlockState::new();
-            let got =
-                crate::compressed::decode_literals(Vec::new(), &mut r, &mut st).expect("decode");
+            let got = crate::compressed::decode_literals(
+                Vec::new(),
+                &mut r,
+                &mut st,
+                crate::frame::BLOCKSIZE_MAX,
+            )
+            .expect("decode");
             assert_eq!(got, lits, "n={n}");
         }
         let mut mixed = vec![b'q'; 64];

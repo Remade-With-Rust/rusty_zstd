@@ -121,7 +121,13 @@ pub(crate) fn row_rot<const RL: u32>(mask: RowMask, head: u32) -> RowMask {
 /// Dead on x86_64/aarch64 by construction -- the vector kernel is used
 /// there. It stays compiled so the unit tests can hold it against the
 /// kernel, and it IS the implementation on every other arch.
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(
+    any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little")
+    ),
+    allow(dead_code)
+)]
 #[inline]
 pub(crate) fn row_tag_mask_oracle(tags: &[u8], want: u8) -> RowMask {
     debug_assert!(tags.len() <= 1 << ROW_LOG_MAX);
@@ -168,7 +174,7 @@ pub(crate) unsafe fn row_tag_mask_raw<const RL: u32>(tags: *const u8, want: u8) 
             m
         }
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     {
         // NEON has no `pmovmskb`. The standard replacement: compare, AND with a
         // per-lane bit weight, then reduce each half. This is the shape every
@@ -194,7 +200,10 @@ pub(crate) unsafe fn row_tag_mask_raw<const RL: u32>(tags: *const u8, want: u8) 
             m
         }
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little")
+    )))]
     {
         // SAFETY: the caller guarantees `1 << RL` readable bytes.
         row_tag_mask_oracle(

@@ -365,6 +365,20 @@ pub(crate) fn count_eq_len(a: &[u8], b: &[u8]) -> usize {
     count_eq_len_ge8(a, b, max)
 }
 
+/// Unaligned 8-byte load read as LITTLE-endian, so that `trailing_zeros` of an
+/// XOR names the first differing byte in memory order on every target. On
+/// little-endian `from_le` is the identity and this is the plain load it
+/// replaced; on big-endian the native load put byte 0 in the TOP bits and the
+/// match counters reported equal runs that were not (SEC-05).
+///
+/// # Safety
+/// `p[0..8]` must be readable.
+#[inline(always)]
+unsafe fn ld64_le(p: *const u8) -> u64 {
+    // SAFETY: forwarded from the caller.
+    u64::from_le(unsafe { core::ptr::read_unaligned(p as *const u64) })
+}
+
 /// One 8-byte compare of the ladder. `Some(index of the first differing byte)`
 /// or `None` when the word matched.
 ///
@@ -373,12 +387,7 @@ pub(crate) fn count_eq_len(a: &[u8], b: &[u8]) -> usize {
 #[inline(always)]
 unsafe fn word_ne(a: *const u8, b: *const u8, n: usize) -> Option<usize> {
     // SAFETY: the caller guarantees both 8-byte reads are in bounds.
-    let (av, bv) = unsafe {
-        (
-            core::ptr::read_unaligned(a.add(n) as *const u64),
-            core::ptr::read_unaligned(b.add(n) as *const u64),
-        )
-    };
+    let (av, bv) = unsafe { (ld64_le(a.add(n)), ld64_le(b.add(n))) };
     if av != bv {
         Some(n + ((av ^ bv).trailing_zeros() as usize) / 8)
     } else {
@@ -464,8 +473,8 @@ unsafe fn finish_words(a: *const u8, b: *const u8, mut n: usize, max: usize) -> 
         if n == max {
             return max;
         }
-        let av = core::ptr::read_unaligned(a.add(max - 8) as *const u64);
-        let bv = core::ptr::read_unaligned(b.add(max - 8) as *const u64);
+        let av = ld64_le(a.add(max - 8));
+        let bv = ld64_le(b.add(max - 8));
         let x = av ^ bv;
         if x != 0 {
             return (max - 8) + (x.trailing_zeros() as usize) / 8;
@@ -606,7 +615,9 @@ pub(crate) unsafe fn count_eq_len_ge8_raw(a: *const u8, b: *const u8, max: usize
                 crate::kreach::hit(crate::kreach::K_COUNT_EQ_WIDE);
                 return count_eq_len_avx2(a, b, max);
             }
-            #[cfg(target_arch = "aarch64")]
+            // Little-endian only (SEC-05): the NEON kernel turns its lane
+            // mask into a byte index assuming lane 0 is the lowest address.
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             {
                 // NEON is baseline aarch64.
                 crate::kreach::hit(crate::kreach::K_COUNT_EQ_WIDE);
@@ -914,23 +925,23 @@ pub(crate) unsafe fn count_eq_len_words_raw(
         // FOUR words per iteration, ONE counter bump for them.
         while n + 32 <= max {
             eq_op_n(1, 4);
-            let a0 = core::ptr::read_unaligned(a.add(n) as *const u64);
-            let b0 = core::ptr::read_unaligned(b.add(n) as *const u64);
+            let a0 = ld64_le(a.add(n));
+            let b0 = ld64_le(b.add(n));
             if a0 != b0 {
                 return n + ((a0 ^ b0).trailing_zeros() as usize / 8);
             }
-            let a1 = core::ptr::read_unaligned(a.add(n + 8) as *const u64);
-            let b1 = core::ptr::read_unaligned(b.add(n + 8) as *const u64);
+            let a1 = ld64_le(a.add(n + 8));
+            let b1 = ld64_le(b.add(n + 8));
             if a1 != b1 {
                 return n + 8 + ((a1 ^ b1).trailing_zeros() as usize / 8);
             }
-            let a2 = core::ptr::read_unaligned(a.add(n + 16) as *const u64);
-            let b2 = core::ptr::read_unaligned(b.add(n + 16) as *const u64);
+            let a2 = ld64_le(a.add(n + 16));
+            let b2 = ld64_le(b.add(n + 16));
             if a2 != b2 {
                 return n + 16 + ((a2 ^ b2).trailing_zeros() as usize / 8);
             }
-            let a3 = core::ptr::read_unaligned(a.add(n + 24) as *const u64);
-            let b3 = core::ptr::read_unaligned(b.add(n + 24) as *const u64);
+            let a3 = ld64_le(a.add(n + 24));
+            let b3 = ld64_le(b.add(n + 24));
             if a3 != b3 {
                 return n + 24 + ((a3 ^ b3).trailing_zeros() as usize / 8);
             }
@@ -1045,7 +1056,7 @@ unsafe fn count_eq_len_avx2(a: *const u8, b: *const u8, max: usize) -> usize {
 ///
 /// # Safety
 /// NEON only; guaranteed by `#[target_feature]`.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[target_feature(enable = "neon")]
 #[inline]
 unsafe fn neon_nib_mask(eq: core::arch::aarch64::uint8x16_t) -> u64 {
@@ -1063,7 +1074,7 @@ unsafe fn neon_nib_mask(eq: core::arch::aarch64::uint8x16_t) -> u64 {
 /// # Safety
 /// `a[0..max]` and `b[0..max]` must be valid to read, and `max >= 32` -- the
 /// same contract as the AVX2 twin, from the same `max >= 64` dispatch gate.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[target_feature(enable = "neon")]
 unsafe fn count_eq_len_neon(a: *const u8, b: *const u8, max: usize) -> usize {
     use core::arch::aarch64::{vandq_u8, vceqq_u8, vld1q_u8};

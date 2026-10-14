@@ -194,7 +194,52 @@ pub fn decompress_into_with(
     opts: DecompressOptions,
 ) -> Result<usize, Error> {
     let start = dst.len();
-    decompress_into_history(src, opts, None, &[], dst)?;
+    decompress_into_history(src, opts, None, &[], dst, usize::MAX)?;
+    Ok(dst.len() - start)
+}
+
+/// [`decompress_with`], refusing to produce more than `max_output` bytes.
+///
+/// The decompressed size of a frame is chosen by whoever wrote it, and a
+/// hostile frame can expand ~32,000x (one 4-byte RLE block regenerates 128 KiB).
+/// A service decoding untrusted input should bound it here rather than after
+/// the fact. Returns [`Error::ContentSizeTooLarge`] when the output would exceed
+/// the cap: up front if a frame header DECLARES more than the cap allows,
+/// otherwise at the first block that crosses it -- so at most one block
+/// (<= 128 KiB) past the cap is ever written before the call fails.
+///
+/// ```
+/// let frame = rusty_zstd::compress(&[0u8; 100_000], 3).unwrap();
+/// let opts = rusty_zstd::DecompressOptions::default();
+/// assert!(rusty_zstd::decompress_with_limit(&frame, opts, 100_000).is_ok());
+/// assert_eq!(
+///     rusty_zstd::decompress_with_limit(&frame, opts, 99_999),
+///     Err(rusty_zstd::Error::ContentSizeTooLarge)
+/// );
+/// ```
+#[cfg(feature = "alloc")]
+pub fn decompress_with_limit(
+    src: &[u8],
+    opts: DecompressOptions,
+    max_output: usize,
+) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    decompress_into_history(src, opts, None, &[], &mut out, max_output)?;
+    Ok(out)
+}
+
+/// [`decompress_into_with`] with the [`decompress_with_limit`] output cap.
+/// `max_output` counts only the bytes this call appends, not what `dst`
+/// already holds. On error `dst` may hold a partial frame past its old length.
+#[cfg(feature = "alloc")]
+pub fn decompress_into_with_limit(
+    dst: &mut Vec<u8>,
+    src: &[u8],
+    opts: DecompressOptions,
+    max_output: usize,
+) -> Result<usize, Error> {
+    let start = dst.len();
+    decompress_into_history(src, opts, None, &[], dst, start.saturating_add(max_output))?;
     Ok(dst.len() - start)
 }
 
@@ -206,12 +251,15 @@ fn decompress_with_history(
     prefix: &[u8],
 ) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
-    decompress_into_history(src, opts, dict, prefix, &mut out)?;
+    decompress_into_history(src, opts, dict, prefix, &mut out, usize::MAX)?;
     Ok(out)
 }
 
 /// Shared body. `out` may already hold data; everything is appended, and each
 /// frame's back-references are bounded by its own start offset.
+///
+/// `out_cap` is an ABSOLUTE bound on `out.len()` (`usize::MAX`: none) -- see
+/// [`decompress_with_limit`].
 #[cfg(feature = "alloc")]
 fn decompress_into_history(
     src: &[u8],
@@ -219,6 +267,7 @@ fn decompress_into_history(
     dict: Option<&Dictionary>,
     prefix: &[u8],
     out: &mut Vec<u8>,
+    out_cap: usize,
 ) -> Result<(), Error> {
     if src.is_empty() {
         return Err(Error::UnexpectedEof);
@@ -244,7 +293,7 @@ fn decompress_into_history(
                 let _ = r.take(n)?;
             }
             FrameKind::Zstd(header) => {
-                decode_zstd_frame(&mut r, header, opts, dict, hist, out)?;
+                decode_zstd_frame(&mut r, header, opts, dict, hist, out, out_cap)?;
                 saw_zstd = true;
             }
         }
@@ -389,6 +438,7 @@ fn decode_zstd_frame(
     dict: Option<&Dictionary>,
     hist: &[u8],
     out: &mut Vec<u8>,
+    out_cap: usize,
 ) -> Result<(), Error> {
     let _dec = crate::prof::scope(crate::prof::Stage::DecodeTotal);
     if header.window_size > opts.window_max {
@@ -406,9 +456,22 @@ fn decode_zstd_frame(
             Some(_) => {}
         }
     }
+    let block_max = header.block_size_max();
     if let Some(n) = header.content_size {
         let extra = usize::try_from(n).map_err(|_| Error::ContentSizeTooLarge)?;
-        out.try_reserve(extra)
+        if extra > out_cap.saturating_sub(out.len()) {
+            return Err(Error::ContentSizeTooLarge);
+        }
+        // SEC-02: `Frame_Content_Size` is whatever the frame's author wrote, so
+        // reserving it verbatim let a 14-byte header-only frame commit 32 GiB.
+        // Reserve no more than the rest of the input can PROVABLY regenerate:
+        // every block costs at least its 3-byte header and yields at most
+        // `block_max` (Raw/RLE by their size field, Compressed by the sequence
+        // budget and the literal bound). A genuine frame's declared size is
+        // always within that, so this only ever trims a lie -- and the
+        // mismatch is still reported, by the content-size check at the end.
+        let provable = (r.remaining() / 3).saturating_mul(block_max as usize);
+        out.try_reserve(extra.min(provable))
             .map_err(|_| Error::ContentSizeTooLarge)?;
     }
     // A frame with NO declared content size got no reserve at all, so `out`
@@ -421,7 +484,6 @@ fn decode_zstd_frame(
     // constant. `reserve_from_first_block` is that hook.
     let mut sized_from_first_block = header.content_size.is_some();
 
-    let block_max = header.block_size_max();
     let start_len = out.len();
     let mut block_state = BlockState::from_dict(dict);
 
@@ -507,12 +569,18 @@ fn decode_zstd_frame(
                     if bh.size > block_max {
                         return Err(Error::BlockTooLarge);
                     }
+                    if bh.size as usize > out_cap.saturating_sub(out.len()) {
+                        return Err(Error::ContentSizeTooLarge);
+                    }
                     let payload = r.take(bh.size as usize)?;
                     out.extend_from_slice(payload);
                 }
                 BlockType::Rle => {
                     if bh.size > block_max {
                         return Err(Error::BlockTooLarge);
+                    }
+                    if bh.size as usize > out_cap.saturating_sub(out.len()) {
+                        return Err(Error::ContentSizeTooLarge);
                     }
                     let b = r.u8()?;
                     let n = bh.size as usize;
@@ -533,6 +601,11 @@ fn decode_zstd_frame(
                         start_len,
                         0,
                     )?;
+                    // The block's size is only known once decoded; it is at
+                    // most `block_max`, which bounds the overshoot.
+                    if out.len() > out_cap {
+                        return Err(Error::ContentSizeTooLarge);
+                    }
                 }
             }
             if let Some(h) = running.as_mut() {
@@ -899,5 +972,116 @@ mod tests {
         let mut src = A_NC.to_vec();
         src.push(0xFF);
         assert_eq!(decompress(&src).unwrap_err(), Error::TrailingBytes);
+    }
+
+    /// A 1 KiB-window frame (Block_Maximum_Size 1024, no FCS, no checksum) of
+    /// ONE compressed block: RLE literals of `regen` bytes and zero sequences.
+    fn literals_only_frame(regen: u32) -> Vec<u8> {
+        let mut f = alloc::vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
+        let payload = [
+            1 | (3 << 2) | (((regen & 0xF) as u8) << 4), // RLE literals, 20-bit size
+            (regen >> 4) as u8,
+            (regen >> 12) as u8,
+            b'A',
+            0x00, // Number_of_Sequences = 0
+        ];
+        let bh = 1 | (2 << 1) | ((payload.len() as u32) << 3);
+        f.extend_from_slice(&bh.to_le_bytes()[..3]);
+        f.extend_from_slice(&payload);
+        f
+    }
+
+    /// REGRESSION (SEC-01): a zero-sequence block's literals were flushed with
+    /// no Block_Maximum_Size check -- 14 bytes regenerated 1 MiB through a
+    /// 1 KiB window. libzstd rejects (`litSize > blockSizeMax`); so must we,
+    /// on the one-shot and the streaming path, and exactly at the bound.
+    #[test]
+    fn literals_only_block_is_bounded_by_block_max() {
+        assert_eq!(
+            decompress(&literals_only_frame(1024)).unwrap(),
+            alloc::vec![b'A'; 1024]
+        );
+        for regen in [1025u32, 128 * 1024, 0xF_FFFF] {
+            let f = literals_only_frame(regen);
+            assert_eq!(
+                decompress(&f).unwrap_err(),
+                Error::Corruption,
+                "regen {regen}"
+            );
+            let mut d = crate::Decompressor::new();
+            let mut buf = alloc::vec![0u8; 1 << 16];
+            assert_eq!(d.stream(&f, &mut buf, true).unwrap_err(), Error::Corruption);
+        }
+    }
+
+    /// REGRESSION (SEC-02): `Frame_Content_Size` was reserved verbatim before
+    /// any block was read, so a 14-byte header-only frame committed whatever it
+    /// declared (32 GiB succeeded on a test box). The reserve is now capped by
+    /// what the remaining input can regenerate -- here, nothing.
+    #[test]
+    fn declared_content_size_is_not_reserved_verbatim() {
+        for fcs in [32u64 << 30, 1 << 40, u64::MAX >> 1] {
+            let mut f = alloc::vec![0x28, 0xB5, 0x2F, 0xFD, 0xC0, 0x00];
+            f.extend_from_slice(&fcs.to_le_bytes());
+            let mut dst = Vec::new();
+            assert_eq!(
+                decompress_into(&mut dst, &f).unwrap_err(),
+                Error::UnexpectedEof
+            );
+            assert!(
+                dst.capacity() < 1 << 20,
+                "reserved {} for FCS {fcs}",
+                dst.capacity()
+            );
+        }
+    }
+
+    /// `decompress_with_limit`: the cap holds on every block type, on frames
+    /// with and without a declared size, and counts only appended bytes.
+    #[test]
+    fn output_limit_is_enforced() {
+        let opts = DecompressOptions::default();
+        // Raw blocks, declared size.
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let noise: Vec<u8> = (0..50_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        // RLE blocks; and a literals-only compressed block with NO declared
+        // size, so only the per-block check can catch it.
+        let cases = [
+            (crate::compress(&noise, 3).unwrap(), noise.len()),
+            (crate::compress(&[9u8; 300_000], 3).unwrap(), 300_000),
+            (literals_only_frame(1000), 1000),
+        ];
+        for (f, n) in &cases {
+            assert_eq!(decompress_with_limit(f, opts, *n).unwrap().len(), *n);
+            assert_eq!(
+                decompress_with_limit(f, opts, n - 1).unwrap_err(),
+                Error::ContentSizeTooLarge
+            );
+            let mut dst = alloc::vec![1u8; 10];
+            assert_eq!(
+                decompress_into_with_limit(&mut dst, f, opts, *n).unwrap(),
+                *n
+            );
+            let mut dst = alloc::vec![1u8; 10];
+            assert_eq!(
+                decompress_into_with_limit(&mut dst, f, opts, n - 1).unwrap_err(),
+                Error::ContentSizeTooLarge
+            );
+        }
+        // Concatenated frames share one cap.
+        let mut two = cases[2].0.clone();
+        two.extend_from_slice(&cases[2].0);
+        assert_eq!(decompress_with_limit(&two, opts, 2000).unwrap().len(), 2000);
+        assert_eq!(
+            decompress_with_limit(&two, opts, 1999).unwrap_err(),
+            Error::ContentSizeTooLarge
+        );
     }
 }

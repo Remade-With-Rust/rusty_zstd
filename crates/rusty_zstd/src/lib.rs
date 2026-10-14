@@ -181,9 +181,9 @@ pub use frame::{
 
 #[cfg(feature = "alloc")]
 pub use decode::{
-    decompress, decompress_into, decompress_into_with, decompress_using_dict,
-    decompress_using_dict_with, decompress_using_prefix, decompress_using_prefix_with,
-    inspect_frames, ListedFrame,
+    decompress, decompress_into, decompress_into_with, decompress_into_with_limit,
+    decompress_using_dict, decompress_using_dict_with, decompress_using_prefix,
+    decompress_using_prefix_with, decompress_with_limit, inspect_frames, ListedFrame,
 };
 #[cfg(feature = "alloc")]
 pub use dict::{

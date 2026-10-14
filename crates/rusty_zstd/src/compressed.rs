@@ -248,7 +248,7 @@ fn decode_compressed_block_inner(
     let literals = {
         let _l = crate::prof::scope(crate::prof::Stage::DecodeLiterals);
         let recycle = core::mem::take(&mut state.lit_buf);
-        decode_literals(recycle, &mut r, state)?
+        decode_literals(recycle, &mut r, state, block_max)?
     };
     // Bit accountant, decode side. Running this over C's OWN frame gives C's
     // literals/sequences split in the same units as the encoder's counters,
@@ -363,6 +363,7 @@ pub(crate) fn decode_literals(
     recycle: Vec<u8>,
     r: &mut Reader<'_>,
     state: &mut BlockState,
+    block_max: u32,
 ) -> Result<Vec<u8>, Error> {
     // THE HEADER PARSE IS ONE NON-ISA CALL. `decode_literals` stays
     // `#[inline(always)]` into the three `decode_compressed_block` twins BY
@@ -370,6 +371,16 @@ pub(crate) fn decode_literals(
     // above this function), but the sizes/streams parse is pure byte
     // arithmetic and was being stamped into each twin along with it.
     let (lit_type, regen, csize, n_streams) = parse_lit_header(r)?;
+    // SEC-01: the RFC bounds a block's whole regenerated size by
+    // Block_Maximum_Size, and the literals are part of it. The sequence loop
+    // enforces that through its running budget, but a ZERO-sequence block
+    // never enters the loop and flushed these straight to the output -- an
+    // RLE literal header alone could regenerate 1 MiB from five bytes,
+    // whatever the window. libzstd rejects this here (`litSize >
+    // blockSizeMax`), before the buffer is sized; so do we.
+    if regen > block_max {
+        return Err(Error::Corruption);
+    }
     match lit_type {
         // W37 -- the RAW and RLE literal arms recycle too.
         //
@@ -1591,6 +1602,13 @@ fn decode_sequences_inner(
     // WIN 1's exit publish: the cursors return to the Vec; WIN 6's literal
     // cursor returns to `lit_pos` for the tail.
     publish!();
+    // SEC-03: libzstd's "check if reached exact end" (`BIT_endOfDStream`). The
+    // loop discards `reload`'s result per sequence, so a stream that ran short
+    // or long was accepted as long as `nseq` sequences came out of it. Once per
+    // block, after the publish so `out` is consistent on the error path too.
+    if !br.finished_exactly() {
+        return Err(Error::Corruption);
+    }
     lit_pos = (lit_p as usize).wrapping_sub(lit_start as usize);
     // CUT 7's write-back: the loop is done, the history returns to the state.
     state.reps = reps;

@@ -155,7 +155,11 @@ unsafe fn premul_p2_avx2(
 /// aarch64 the kernel needs no call at all (NEON is baseline, so it inlines),
 /// so the tile size is very likely wrong here and MUST be re-swept. Run
 /// `xxhdiff` and `xxhgold` on the target before trusting this path.
-#[cfg(target_arch = "aarch64")]
+///
+/// Little-endian only (SEC-05): `vld1q_u64` loads each lane in NATIVE byte
+/// order, and XXH64 reads its input little-endian. `aarch64_be` takes the
+/// scalar stripes, which go through `from_le_bytes`.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[allow(unsafe_code)]
 unsafe fn premul_p2_neon(
     src: &[u8; PRE_TILE],
@@ -299,7 +303,7 @@ fn stripes_hybrid(input: &[u8], v: &mut [u64; 4]) -> usize {
     // and therefore pays no non-inlinable-call barrier. Until this existed,
     // every aarch64 build ran the scalar stripe loop even after D8a wired the
     // x86 kernel in.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     {
         if vec_arm_enabled() {
             return stripes_pre(input, v, |tile, out| {

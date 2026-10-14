@@ -269,6 +269,11 @@ fn compression_is_independent_of_call_history() {
 /// `min_match` survives the same treatment only by luck -- each consumer
 /// re-clamps with `.max(3)` and `match_ok` guards its own slices. Luck is not a
 /// contract, so this asserts the whole surface instead.
+///
+/// It did NOT survive (SEC-04): this pseudo-random source has too few matches
+/// to land one at a block's end, and that is where an oversized `min_match`
+/// broke. `oversized_min_match_stays_inside_the_block` holds the input that
+/// does; the entry points now apply `CompressionParameters::clamped`.
 #[test]
 fn out_of_range_parameters_never_panic() {
     let src: Vec<u8> = (0..600_000u32)
@@ -315,6 +320,53 @@ fn out_of_range_parameters_never_panic() {
                     );
                 }
             }
+        }
+    }
+}
+
+/// REGRESSION (SEC-04): `min_match > 8` let DFast commit a match running past
+/// `block_end` -- `match_ok` bounds its compare by the whole workspace, and the
+/// length was taken as `mls + count(.., block_end)` with the count clamped to 0.
+/// `anchor` then sat past the block end and the tail flush ran
+/// `get_unchecked(anchor..block_end)` on a reversed range: undefined behaviour
+/// from a safe struct literal, observed as a `capacity overflow` panic in
+/// release (130 of 160 configurations below, before the fix).
+///
+/// The input is what makes it reachable: random filler with one snippet planted
+/// every ~180 bytes, so FRESH (non-repcode) matches land at every block edge.
+/// The smooth sources elsewhere in this file never put one there.
+#[test]
+fn oversized_min_match_stays_inside_the_block() {
+    let mut seed = 0x1234_5678_9abc_def0u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for _ in 0..4 {
+        let mut src: Vec<u8> = (0..600_000).map(|_| rnd() as u8).collect();
+        let snip: Vec<u8> = (0..96).map(|_| rnd() as u8).collect();
+        let mut pos = 0usize;
+        while pos + 96 < src.len() {
+            src[pos..pos + 96].copy_from_slice(&snip);
+            pos += 96 + (rnd() % 160) as usize;
+        }
+        for (wlog, mml) in [(17u32, 16u32), (10, 16), (10, 12), (12, 32), (10, 255)] {
+            let mut p = rusty_zstd::compression_params(3, Some(src.len() as u64)).unwrap();
+            p.window_log = wlog;
+            p.min_match = mml;
+            let z = rusty_zstd::compress_with_params(&src, p, true)
+                .unwrap_or_else(|e| panic!("wlog {wlog} mml {mml}: {e:?}"));
+            assert_eq!(
+                rusty_zstd::decompress(&z).unwrap(),
+                src,
+                "wlog {wlog} mml {mml}: round-trip"
+            );
+            // Clamping is the whole effect: identical to the in-range maximum.
+            let mut q = p;
+            q.min_match = 7;
+            assert_eq!(z, rusty_zstd::compress_with_params(&src, q, true).unwrap());
         }
     }
 }

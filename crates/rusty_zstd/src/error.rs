@@ -23,7 +23,8 @@ pub enum Error {
     WindowTooLarge,
     /// Regenerated size does not match Frame_Content_Size.
     ContentSizeMismatch,
-    /// Claimed content size cannot be allocated.
+    /// Claimed content size cannot be allocated, or the output would exceed
+    /// the caller's cap ([`crate::decompress_with_limit`]).
     ContentSizeTooLarge,
     /// XXH64 content checksum did not match.
     ChecksumMismatch,

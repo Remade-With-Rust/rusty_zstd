@@ -171,8 +171,13 @@ fn silesia_mr_prefix_entropy_oracle() {
         match bh.ty {
             BlockType::Compressed => {
                 let mut lr = Reader::new(payload);
-                let got_lits = crate::compressed::decode_literals(Vec::new(), &mut lr, &mut state)
-                    .unwrap_or_else(|e| panic!("block {block_i} literals: {e:?}"));
+                let got_lits = crate::compressed::decode_literals(
+                    Vec::new(),
+                    &mut lr,
+                    &mut state,
+                    crate::frame::BLOCKSIZE_MAX,
+                )
+                .unwrap_or_else(|e| panic!("block {block_i} literals: {e:?}"));
                 let lit_pos = got_lits
                     .iter()
                     .zip(lits.iter())

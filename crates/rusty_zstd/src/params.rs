@@ -162,6 +162,28 @@ impl CompressionParameters {
         }
         Ok(())
     }
+
+    /// Every field forced into the range the encoder supports -- libzstd's
+    /// `ZSTD_c_*` bounds, which `compression_params` already produces.
+    ///
+    /// The fields are public, so a struct literal can carry anything; the
+    /// compress entry points apply this before the parameters reach a match
+    /// finder. That is load-bearing, not cosmetic (SEC-04): the finders take
+    /// `min_match <= 7` as an invariant, and a larger one let DFast commit a
+    /// match past the end of its block. In-range parameters are returned
+    /// unchanged, so this never alters the output for a valid configuration.
+    pub fn clamped(mut self) -> Self {
+        const WINDOWLOG_MAX: u32 = if usize::BITS == 32 { 30 } else { 31 };
+        const CHAINLOG_MAX: u32 = if usize::BITS == 32 { 29 } else { 30 };
+        self.window_log = self.window_log.clamp(10, WINDOWLOG_MAX);
+        self.chain_log = self.chain_log.clamp(6, CHAINLOG_MAX);
+        self.hash_log = self.hash_log.clamp(6, 30);
+        self.search_log = self.search_log.clamp(1, WINDOWLOG_MAX - 1);
+        self.min_match = self.min_match.clamp(3, 7);
+        self.target_length = self.target_length.min(crate::frame::BLOCKSIZE_MAX);
+        self.overlap_log = self.overlap_log.min(9);
+        self
+    }
 }
 
 const KB: u64 = 1024;

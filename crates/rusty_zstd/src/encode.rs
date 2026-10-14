@@ -381,6 +381,9 @@ pub(crate) fn encode_oneshot(
     adv: AdvancedOptions,
 ) -> Result<Vec<u8>, Error> {
     let _enc = crate::prof::scope(crate::prof::Stage::EncodeTotal);
+    // SEC-04: every public compress path that takes caller parameters funnels
+    // through here; nothing below this line may see an out-of-range field.
+    let params = params.clamped();
     let hist_prefix = dict.map(Dictionary::content).unwrap_or(prefix);
     let dict_id = if write_dict_id {
         dict.map(Dictionary::id).filter(|&id| id != 0)
@@ -8653,12 +8656,17 @@ pub fn take_link_tag() -> (u64, u64) {
     (LINK_SKIPS.swap(0, Relaxed), LINK_FALSE.swap(0, Relaxed))
 }
 
-/// Append `src[from..to]` to `lits` with the range proof supplied by the
-/// caller: every finder emit site maintains anchor <= from <= to <=
-/// block_end <= src.len(). The checked slice op compiled to a bounds test
-/// plus a panic branch per SEQUENCE in each finder.
+/// Append `src[from..to]` to `lits`. Every finder maintains
+/// anchor <= from <= to <= block_end <= src.len().
+///
+/// SEC-04: this was `get_unchecked(from..to)` behind a `debug_assert!`, in a
+/// SAFE function -- and the precondition is a finder invariant, not something
+/// this function can see. An out-of-range `min_match` broke it (DFast left
+/// `anchor` past `block_end`), which made the read undefined behaviour reached
+/// from safe code. The check is kept because the cost it was removed to save
+/// is gone: the per-SEQUENCE emits moved to `push_literals` long ago, and
+/// every remaining call (seven sites) is the once-per-BLOCK tail flush.
 #[inline(always)]
-#[allow(unsafe_code)]
 fn push_lits_range(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize) {
     debug_assert!(from <= to && to <= src.len());
     // NO wildcopy here, deliberately. A 16-byte fixed-width copy WAS added to
@@ -8668,8 +8676,9 @@ fn push_lits_range(lits: &mut Vec<u8>, src: &[u8], from: usize, to: usize) {
     // `push_literals` at all; fixing that gives L9 the full 16/32/64 tiering
     // instead of a second copy of tier 1. This helper is now what its name
     // says: the per-block tail flush, a few hundred calls per corpus.
-    crate::copies::add(crate::copies::C_LIT_PUSH, to - from);
-    lits.extend_from_slice(unsafe { src.get_unchecked(from..to) });
+    let run = &src[from..to];
+    crate::copies::add(crate::copies::C_LIT_PUSH, run.len());
+    lits.extend_from_slice(run);
 }
 
 /// Attribute only when the walk RAN and produced enough samples -- a block
