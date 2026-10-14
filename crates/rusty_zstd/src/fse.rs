@@ -568,17 +568,86 @@ pub(crate) const DEFAULT_OF_NORM: [i16; 29] = [
     1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
 ];
 
-#[inline(always)]
+/// The predefined (RFC 8878 Appendix A) sequence decode tables, built at
+/// COMPILE time.
+///
+/// Predefined mode rebuilt these from `DEFAULT_*_NORM` on every block that
+/// chose it -- an RFC constant recomputed per call, which on small frames
+/// (where predefined mode is the norm) was ~22% of decoding a 256-byte row:
+/// `default_ll` + `default_ml` + `default_of`, ~8K Ir per frame. The encoder
+/// already caches its side (`default_ctable_cached`); this is the decoder's
+/// half, and `const` makes it free on every target, `no_std` included.
+/// `default_ll`/`_ml`/`_of` (the runtime build) stay as the test oracle.
+pub(crate) static PREDEF_LL: [FseEntry; 64] = predefined_table(&DEFAULT_LL_NORM, 6);
+pub(crate) static PREDEF_ML: [FseEntry; 64] = predefined_table(&DEFAULT_ML_NORM, 6);
+pub(crate) static PREDEF_OF: [FseEntry; 32] = predefined_table(&DEFAULT_OF_NORM, 5);
+
+/// `FseTable::from_norm_buf`, as a `const fn` for the three RFC tables: the
+/// same spread, the same `(next_state, nb, baseline)` derivation. Any input it
+/// would reject is a compile error here, and `predefined_tables_match_runtime_build`
+/// holds it against the runtime build entry for entry.
+const fn predefined_table<const N: usize>(norm: &[i16], log: u8) -> [FseEntry; N] {
+    assert!(N == 1 << log && norm.len() <= 64);
+    let mut t = [FseEntry {
+        baseline: 0,
+        symbol: 0,
+        num_bits: 0,
+    }; N];
+    let mut next = [0u16; 64];
+    let mut high = N - 1;
+    let mut s = 0;
+    while s < norm.len() {
+        if norm[s] == -1 {
+            t[high].symbol = s as u8;
+            high -= 1;
+            next[s] = 1;
+        } else if norm[s] > 0 {
+            next[s] = norm[s] as u16;
+        }
+        s += 1;
+    }
+    let mask = N - 1;
+    let step = (N >> 1) + (N >> 3) + 3;
+    let mut pos = 0;
+    s = 0;
+    while s < norm.len() {
+        let mut i = 0;
+        while i < norm[s] {
+            t[pos].symbol = s as u8;
+            pos = (pos + step) & mask;
+            while pos > high {
+                pos = (pos + step) & mask;
+            }
+            i += 1;
+        }
+        s += 1;
+    }
+    let mut u = 0;
+    while u < N {
+        let sym = t[u].symbol as usize;
+        let ns = next[sym];
+        next[sym] += 1;
+        assert!(ns != 0);
+        let hb = 15 - ns.leading_zeros();
+        let nb = log as u32 - hb;
+        t[u].num_bits = nb as u8;
+        t[u].baseline = (((ns as u32) << nb) - N as u32) as u16;
+        u += 1;
+    }
+    t
+}
+
+#[cfg(test)]
 pub(crate) fn default_ll() -> Result<FseTable, Error> {
     FseTable::from_norm(&DEFAULT_LL_NORM, 6)
 }
 
-#[inline(always)]
+#[cfg(test)]
 pub(crate) fn default_ml() -> Result<FseTable, Error> {
     FseTable::from_norm(&DEFAULT_ML_NORM, 6)
 }
 
-#[inline(always)]
+#[cfg(test)]
 pub(crate) fn default_of() -> Result<FseTable, Error> {
     FseTable::from_norm(&DEFAULT_OF_NORM, 5)
 }
@@ -1744,6 +1813,27 @@ mod tests {
         assert_eq!(fse_baseline(w), 0x1234);
         assert_eq!(fse_symbol(w), 0x23);
         assert_eq!(fse_nbits(w), 7);
+    }
+
+    /// The compile-time predefined tables must equal the runtime build, entry
+    /// for entry -- `from_norm` is the oracle.
+    #[test]
+    fn predefined_tables_match_runtime_build() {
+        for (got, want) in [
+            (&PREDEF_LL[..], default_ll().unwrap()),
+            (&PREDEF_ML[..], default_ml().unwrap()),
+            (&PREDEF_OF[..], default_of().unwrap()),
+        ] {
+            assert_eq!(got.len(), want.decode.len());
+            assert_eq!(1usize << want.accuracy_log, got.len());
+            for (i, (g, w)) in got.iter().zip(&want.decode).enumerate() {
+                assert_eq!(
+                    (g.baseline, g.symbol, g.num_bits),
+                    (w.baseline, w.symbol, w.num_bits),
+                    "entry {i}"
+                );
+            }
+        }
     }
 
     #[test]

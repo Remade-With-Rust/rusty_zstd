@@ -842,7 +842,7 @@ fn decode_seq_header(
         35,
         9,
         state.ll.take(),
-        fse::default_ll,
+        &fse::PREDEF_LL,
     )?;
     pos += n;
     let (of, n) = seq_table(
@@ -851,7 +851,7 @@ fn decode_seq_header(
         31,
         8,
         state.of.take(),
-        fse::default_of,
+        &fse::PREDEF_OF,
     )?;
     pos += n;
     let (ml, n) = seq_table(
@@ -860,7 +860,7 @@ fn decode_seq_header(
         52,
         9,
         state.ml.take(),
-        fse::default_ml,
+        &fse::PREDEF_ML,
     )?;
     pos += n;
 
@@ -1689,7 +1689,7 @@ pub(crate) fn debug_seq_codes(
         35,
         9,
         state.ll.clone(),
-        fse::default_ll,
+        &fse::PREDEF_LL,
     )?;
     pos += n;
     let (of, n) = seq_table(
@@ -1698,7 +1698,7 @@ pub(crate) fn debug_seq_codes(
         31,
         8,
         state.of.clone(),
-        fse::default_of,
+        &fse::PREDEF_OF,
     )?;
     pos += n;
     let (ml, n) = seq_table(
@@ -1707,7 +1707,7 @@ pub(crate) fn debug_seq_codes(
         52,
         9,
         state.ml.clone(),
-        fse::default_ml,
+        &fse::PREDEF_ML,
     )?;
     pos += n;
     let bitstream = &src[pos..];
@@ -1798,14 +1798,27 @@ fn seq_table(
     // the allocator traffic is too rare to move the clock. Kept because it is
     // provably less work and byte-identical, not because it measured faster.
     prev: Option<FseTable>,
-    predefined: fn() -> Result<FseTable, Error>,
+    // The compile-time RFC table (`fse::PREDEF_*`); its length is 1 << log.
+    predefined: &'static [crate::fse::FseEntry],
 ) -> Result<(FseTable, usize), Error> {
     match mode {
         0 => {
-            // N21 probe: how often is an RFC-CONSTANT table rebuilt from scratch?
+            // N21 probe: how often is an RFC-CONSTANT table selected?
             #[cfg(feature = "profile")]
             N21_PREDEF.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            Ok((predefined()?, 0))
+            // Copy the constant table into the previous table's allocation
+            // (256 bytes at most) instead of rebuilding it from its norm.
+            let mut decode = prev.map(|t| t.decode).unwrap_or_default();
+            decode.clear();
+            decode.extend_from_slice(predefined);
+            let accuracy_log = predefined.len().trailing_zeros() as u8;
+            Ok((
+                FseTable {
+                    decode,
+                    accuracy_log,
+                },
+                0,
+            ))
         }
         1 => {
             // RLE takes its symbol as a RAW STREAM BYTE. Every other mode
@@ -3499,9 +3512,9 @@ mod tests {
     fn rle_seq_table_rejects_out_of_range_symbol() {
         // (max_sym, in-range symbol, out-of-range symbol)
         for &(max_sym, ok_sym, bad_sym) in &[(35usize, 35u8, 36u8), (31, 31, 32), (52, 52, 53)] {
-            let good = seq_table(&[ok_sym], 1, max_sym, 9, None, fse::default_ll);
+            let good = seq_table(&[ok_sym], 1, max_sym, 9, None, &fse::PREDEF_LL);
             assert!(good.is_ok(), "max_sym={max_sym} sym={ok_sym} should build");
-            let bad = seq_table(&[bad_sym], 1, max_sym, 9, None, fse::default_ll);
+            let bad = seq_table(&[bad_sym], 1, max_sym, 9, None, &fse::PREDEF_LL);
             assert!(
                 matches!(bad, Err(Error::Corruption)),
                 "max_sym={max_sym} sym={bad_sym} must be rejected, got {:?}",
@@ -3510,7 +3523,7 @@ mod tests {
         }
         // 255 is the worst case a single byte can carry.
         assert!(matches!(
-            seq_table(&[255u8], 1, 31, 8, None, fse::default_of),
+            seq_table(&[255u8], 1, 31, 8, None, &fse::PREDEF_OF),
             Err(Error::Corruption)
         ));
     }
