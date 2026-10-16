@@ -266,7 +266,10 @@ pub fn compress_with_advanced(
     write_dict_id: bool,
     adv: AdvancedOptions,
 ) -> Result<Vec<u8>, Error> {
-    if adv.nb_workers > 0 {
+    // `--rsyncable` runs through the job splitter even single-threaded: a
+    // sync point ends a job, and the job after it starts from fresh state,
+    // which is what lets the bytes after an edit compress identically.
+    if adv.nb_workers > 0 || adv.rsyncable {
         #[cfg(feature = "std")]
         {
             return crate::mt::compress_mt(src, params, checksum, dict, prefix, write_dict_id, adv);
@@ -664,11 +667,15 @@ fn encode_frame_blocks(
     entropy: &mut EntropyState,
     mut ldm_tables: Option<&mut crate::ldm::LdmTables>,
 ) -> Result<(), Error> {
+    // Reached with `rsyncable` only without `std` (no job splitter) and from
+    // the seekable writer: sync points still end blocks, so the block
+    // boundaries are content-defined, but the state carries across them.
     let rbits = if adv.rsyncable {
-        crate::ldm::rsync_bits(params.window_log)
+        crate::ldm::rsync_bits(params.window_log, adv.job_size)
     } else {
         0
     };
+    let mut last_sync = payload_off;
     let mut off = payload_off;
     let mut xxh = if checksum { Some(Xxh64::new()) } else { None };
     {
@@ -685,10 +692,12 @@ fn encode_frame_blocks(
                 workspace.len(),
             );
             let mut end = (off + bmax).min(workspace.len());
-            if adv.rsyncable && end > off + 64 {
-                if let Some(cut) = crate::ldm::rsync_cut(&workspace[off..end], rbits) {
-                    if cut > 32 && off + cut < workspace.len() {
-                        end = off + cut;
+            if adv.rsyncable {
+                let from = (last_sync + crate::ldm::RSYNC_MIN_BLOCK - 1).max(off);
+                if let Some(cut) = crate::ldm::rsync_next(workspace, from, end, rbits) {
+                    if cut < workspace.len() {
+                        end = cut;
+                        last_sync = cut;
                     }
                 }
             }

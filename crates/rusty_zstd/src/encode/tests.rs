@@ -1232,42 +1232,70 @@ fn enable_ldm_zstd_keys_roundtrip() {
 }
 
 #[test]
-fn rsyncable_splits_blocks() {
-    let src = xorshift(0xA11, 64 * 1024);
+fn rsyncable_stays_within_compress_bound() {
+    // Issue #26: the old cut rule split blocks every few hundred bytes and
+    // incompressible input grew past `compress_bound`.
+    for (seed, n) in [(0xA11u64, 64 * 1024), (0xA12, 1 << 20), (0xA13, 4 << 20)] {
+        let src = xorshift(seed, n);
+        for level in [1, 3] {
+            let params = compression_params(level, Some(src.len() as u64)).unwrap();
+            let z = compress_with_advanced(
+                &src,
+                params,
+                true,
+                None,
+                &[],
+                true,
+                AdvancedOptions {
+                    rsyncable: true,
+                    ..AdvancedOptions::default()
+                },
+            )
+            .unwrap();
+            assert!(z.len() <= crate::compress_bound(n), "L{level} n={n}: {} > bound", z.len());
+            assert_eq!(decompress(&z).unwrap(), src);
+        }
+    }
+}
+
+#[test]
+fn rsyncable_output_resynchronises_after_an_edit() {
+    // An insertion near the start: with --rsyncable everything after the next
+    // sync points must compress to the same bytes, so the two outputs share
+    // a long suffix. Without it they share almost nothing.
+    let src = wordy(0x5EC, 6 << 20);
+    let mut edited = src[..(1 << 20) + 12_345].to_vec();
+    edited.extend_from_slice(b"one inserted sentence. ");
+    edited.extend_from_slice(&src[(1 << 20) + 12_345..]);
     let mut params = compression_params(1, Some(src.len() as u64)).unwrap();
     params.window_log = 18;
-    let plain = compress_with_advanced(
-        &src,
-        params,
-        true,
-        None,
-        &[],
-        true,
-        AdvancedOptions::default(),
-    )
-    .unwrap();
-    let rsync = compress_with_advanced(
-        &src,
-        params,
-        true,
-        None,
-        &[],
-        true,
-        AdvancedOptions {
-            ldm: crate::ldm::LdmParams::enabled(),
-            rsyncable: true,
-            target_cblock_size: 0,
-            ..AdvancedOptions::default()
-        },
-    )
-    .unwrap();
-    let n_plain = count_zstd_blocks(&plain);
-    let n_rsync = count_zstd_blocks(&rsync);
-    assert_eq!(decompress(&rsync).unwrap(), src);
-    assert!(
-        n_rsync > n_plain,
-        "rsyncable should cut extra blocks (plain={n_plain} rsync={n_rsync})"
-    );
+    let run = |s: &[u8], rsyncable: bool| {
+        compress_with_advanced(
+            s,
+            params,
+            true,
+            None,
+            &[],
+            true,
+            AdvancedOptions {
+                rsyncable,
+                ..AdvancedOptions::default()
+            },
+        )
+        .unwrap()
+    };
+    let common_suffix = |a: &[u8], b: &[u8]| {
+        a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count()
+    };
+    let (a, b) = (run(&src, true), run(&edited, true));
+    assert_eq!(decompress(&a).unwrap(), src);
+    assert_eq!(decompress(&b).unwrap(), edited);
+    let shared = common_suffix(&a, &b);
+    // Measured 49%: resync waits for a sync point to end a job in both runs,
+    // and a job that fills first ends where its own start puts it.
+    assert!(shared * 3 > a.len(), "rsyncable shares only {shared} of {} bytes", a.len());
+    let plain = common_suffix(&run(&src, false), &run(&edited, false));
+    assert!(plain < shared / 4, "plain {plain} vs rsyncable {shared}");
 }
 
 #[test]

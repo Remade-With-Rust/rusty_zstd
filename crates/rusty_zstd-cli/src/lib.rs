@@ -135,7 +135,8 @@ fn compress_src(src: &[u8], args: &Args) -> Result<Vec<u8>, String> {
         eprintln!("--zstd={}", params.to_zstd_option_string());
     }
     let mut ldm = params.ldm_params();
-    if args.long_window.is_some() || args.rsyncable {
+    // `--rsyncable` does not imply `--long` (libzstd's does not either).
+    if args.long_window.is_some() {
         ldm.enable = true;
     }
     let mut workers = args.threads.unwrap_or(params.nb_workers);
@@ -739,7 +740,7 @@ fn print_help() {
     );
     println!("  --show-default-cparams      print --zstd=... for this input size");
     println!("  --long[=#]                  LDM; windowLog (default {DEFAULT_LONG_WINDOW_LOG})");
-    println!("  --rsyncable                 rolling-hash block cuts (enables LDM)");
+    println!("  --rsyncable                 content-defined sync points (rsync-friendly)");
     println!("  --target-compressed-block-size=#  cap uncompressed block from target csize");
     println!("  --seekable                  independent frames + skippable seek table");
     println!("  --max-frame-size=#          seekable frame size (default {DEFAULT_FRAME_SIZE})");

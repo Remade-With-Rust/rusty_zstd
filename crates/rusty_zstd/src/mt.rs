@@ -69,9 +69,28 @@ pub fn compress_mt(
     let workers = adv.nb_workers.clamp(1, NB_WORKERS_MAX) as usize;
     let overlap = overlap_size(params.window_log, adv.overlap_log, params.strategy);
     let job = resolve_job_size(adv.job_size, params.window_log, overlap);
-    if src.is_empty() || src.len() <= job {
+    // `--rsyncable` (issue #26): a job ends at a sync point or when full,
+    // whichever is first, as in libzstd. Each job is its own frame primed
+    // from the overlap before it, so after a sync point the output depends
+    // only on the content from `sync - overlap` on, and an edit leaves the
+    // frames after the next sync point byte-identical.
+    let ranges: Vec<(usize, usize)> = if adv.rsyncable {
+        let bits = crate::ldm::rsync_bits(params.window_log, adv.job_size);
+        crate::ldm::rsync_sections(src, bits, job)
+    } else {
+        let mut v = Vec::new();
+        let mut off = 0usize;
+        while off < src.len() {
+            let end = (off + job).min(src.len());
+            v.push((off, end));
+            off = end;
+        }
+        v
+    };
+    if ranges.len() <= 1 {
         let mut one = adv;
         one.nb_workers = 0;
+        one.rsyncable = false;
         return encode_oneshot(
             src,
             params,
@@ -84,16 +103,9 @@ pub fn compress_mt(
         );
     }
 
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    let mut off = 0usize;
-    while off < src.len() {
-        let end = (off + job).min(src.len());
-        ranges.push((off, end));
-        off = end;
-    }
-
     let mut job_adv = adv;
     job_adv.nb_workers = 0;
+    job_adv.rsyncable = false;
 
     let mut parts = Vec::with_capacity(ranges.len());
     parts.resize(ranges.len(), Vec::new());
@@ -179,6 +191,13 @@ where
         use core::sync::atomic::{AtomicUsize, Ordering};
         let n = ranges.len();
         let nthreads = workers.max(1).min(n.max(1));
+        // One worker (single-threaded `--rsyncable`): no thread to spawn.
+        if nthreads == 1 {
+            for (i, r) in ranges.iter().copied().enumerate() {
+                parts[i] = f(i, r)?;
+            }
+            return Ok(());
+        }
         let next = AtomicUsize::new(0);
         let mut err: Option<Error> = None;
         std::thread::scope(|s| {

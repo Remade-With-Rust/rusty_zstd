@@ -189,28 +189,90 @@ pub(crate) fn collect_ldm(
     hits
 }
 
-/// Rolling-hash cut for `--rsyncable`. Average gap `2^bits` bytes.
-pub(crate) fn rsync_cut(block: &[u8], bits: u32) -> Option<usize> {
-    if block.len() < 64 || bits == 0 {
+/// `--rsyncable` sync points, as libzstd places them (`zstdmt_compress.c`).
+///
+/// A sync point follows every position where a rolling hash of the last
+/// `RSYNC_LENGTH` bytes has its low `bits` all set, but never sooner than
+/// `RSYNC_MIN_BLOCK` after the previous one. The hash sees only those 32
+/// bytes, so a sync point depends on local content alone: an edit moves the
+/// sync points near it and leaves every later one where it was, shifted by
+/// the edit's length. That is what lets rsync find the unchanged tail.
+///
+/// This replaced a hash that never removed the bytes leaving its window
+/// (so it was not rolling) with a mean spacing of 256 B-64 KiB, each hit
+/// ending a block: output could exceed `compress_bound`, ratio fell 5-21%,
+/// and nothing resynchronised (issue #26).
+pub(crate) const RSYNC_LENGTH: usize = 32;
+/// libzstd's `RSYNC_MIN_BLOCK_SIZE`.
+pub(crate) const RSYNC_MIN_BLOCK: usize = 128 * 1024;
+/// `prime8bytes` and `ZSTD_ROLL_HASH_CHAR_OFFSET`.
+const RSYNC_PRIME: u64 = 0xCF1B_BCDC_B7A5_6463;
+const RSYNC_CHAR_OFFSET: u64 = 10;
+
+/// The first sync point `q` with `from < q <= to`: the hash window ends at
+/// `q - 1`, so `from` is the earliest window END considered.
+pub(crate) fn rsync_next(src: &[u8], from: usize, to: usize, bits: u32) -> Option<usize> {
+    let to = to.min(src.len());
+    if from >= to || from + 1 < RSYNC_LENGTH || bits == 0 {
         return None;
     }
-    let bits = bits.clamp(6, 20);
-    let mask = (1u32 << bits) - 1;
-    let mut h = 0u32;
-    let last = block.len() - 32;
-    for (i, &b) in block.iter().enumerate() {
+    let mask = (1u64 << bits.min(63)) - 1;
+    let pp = RSYNC_PRIME.wrapping_pow(RSYNC_LENGTH as u32 - 1);
+    let mut h = 0u64;
+    for &b in &src[from + 1 - RSYNC_LENGTH..=from] {
         h = h
-            .rotate_left(1)
-            .wrapping_add(u32::from(b).wrapping_mul(0x9E37_79B1));
-        if i >= 32 && i < last && (h & mask) == 0 {
-            return Some(i + 1);
-        }
+            .wrapping_mul(RSYNC_PRIME)
+            .wrapping_add(u64::from(b) + RSYNC_CHAR_OFFSET);
     }
-    None
+    let mut p = from;
+    loop {
+        if h & mask == mask {
+            return Some(p + 1);
+        }
+        p += 1;
+        if p >= to {
+            return None;
+        }
+        let out = u64::from(src[p - RSYNC_LENGTH]) + RSYNC_CHAR_OFFSET;
+        h = h
+            .wrapping_sub(out.wrapping_mul(pp))
+            .wrapping_mul(RSYNC_PRIME)
+            .wrapping_add(u64::from(src[p]) + RSYNC_CHAR_OFFSET);
+    }
 }
 
-pub(crate) fn rsync_bits(window_log: u32) -> u32 {
-    window_log.saturating_sub(10).clamp(8, 16)
+/// Hit-mask width: a mean sync spacing of one MT job, as libzstd
+/// (`highbit(jobSizeKB) + 10`, with the default job `2^max(20, wlog + 2)`).
+pub(crate) fn rsync_bits(window_log: u32, job_size: usize) -> u32 {
+    let job = if job_size > 0 {
+        job_size.max(512 * 1024)
+    } else {
+        1usize << (window_log + 2).clamp(20, 30)
+    };
+    usize::BITS - 1 - job.leading_zeros()
+}
+
+/// `src` cut at its sync points, each section also capped at `max_len` (a
+/// libzstd job ends at a sync point or when full, whichever comes first).
+/// Exclusive ends; the sections tile `src`.
+pub(crate) fn rsync_sections(
+    src: &[u8],
+    bits: u32,
+    max_len: usize,
+) -> alloc::vec::Vec<(usize, usize)> {
+    let max_len = max_len.max(RSYNC_MIN_BLOCK);
+    let mut v = alloc::vec::Vec::new();
+    let mut start = 0usize;
+    while start < src.len() {
+        let cap = start.saturating_add(max_len).min(src.len());
+        let end = match rsync_next(src, start + RSYNC_MIN_BLOCK - 1, cap, bits) {
+            Some(q) if q < src.len() => q,
+            _ => cap,
+        };
+        v.push((start, end));
+        start = end;
+    }
+    v
 }
 
 fn ldm_hash(src: &[u8], ip: usize, hash_log: u32) -> usize {
@@ -324,15 +386,71 @@ mod tests {
         assert_eq!(crate::decompress(&zst).expect("ldm decode"), src);
     }
 
+    fn xorshift_bytes(seed: u64, n: usize) -> alloc::vec::Vec<u8> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
     #[test]
-    fn rsync_cut_hits_mask() {
-        let mut block = vec![0u8; 4096];
-        for (i, b) in block.iter_mut().enumerate() {
-            *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+    fn rsync_bits_follow_the_job_size() {
+        assert_eq!(rsync_bits(18, 0), 20);
+        assert_eq!(rsync_bits(21, 0), 23);
+        assert_eq!(rsync_bits(27, 0), 29);
+        assert_eq!(rsync_bits(21, 1 << 20), 20);
+        assert_eq!(rsync_bits(21, 1000), 19);
+    }
+
+    // The rolling hash really rolls: computed fresh at every window it agrees
+    // with the incremental one, so a sync point depends only on 32 bytes.
+    #[test]
+    fn rsync_hash_depends_only_on_its_window() {
+        let src = xorshift_bytes(0x5EED, 1 << 20);
+        let bits = 12;
+        let mut fresh = alloc::vec::Vec::new();
+        for p in RSYNC_LENGTH - 1..src.len() {
+            let mut h = 0u64;
+            for &b in &src[p + 1 - RSYNC_LENGTH..=p] {
+                h = h
+                    .wrapping_mul(RSYNC_PRIME)
+                    .wrapping_add(u64::from(b) + RSYNC_CHAR_OFFSET);
+            }
+            if h & ((1 << bits) - 1) == (1 << bits) - 1 {
+                fresh.push(p + 1);
+            }
         }
-        let cut = rsync_cut(&block, 8).expect("rsync cut on 4 KiB");
-        assert!(cut > 32 && cut < block.len() - 32, "cut={cut}");
-        assert_eq!(rsync_bits(18), 8);
-        assert_eq!(rsync_bits(27), 16);
+        let mut rolled = alloc::vec::Vec::new();
+        let mut from = RSYNC_LENGTH - 1;
+        while let Some(q) = rsync_next(&src, from, src.len(), bits) {
+            rolled.push(q);
+            from = q;
+        }
+        assert!(fresh.len() > 100, "{}", fresh.len());
+        assert_eq!(fresh, rolled);
+    }
+
+    // An insertion moves the sections after it by its length and no more.
+    #[test]
+    fn rsync_sections_resynchronise_after_an_edit() {
+        let src = xorshift_bytes(0xED17, 8 << 20);
+        let bits = 18;
+        let a = rsync_sections(&src, bits, usize::MAX);
+        let mut edited = src[..300_000].to_vec();
+        edited.extend_from_slice(b"an inserted line
+");
+        edited.extend_from_slice(&src[300_000..]);
+        let b = rsync_sections(&edited, bits, usize::MAX);
+        assert!(a.len() > 8, "{}", a.len());
+        assert!(a.iter().all(|&(s, e)| e - s >= RSYNC_MIN_BLOCK || e == src.len()));
+        let tail = |v: &[(usize, usize)], shift: usize| -> alloc::vec::Vec<usize> {
+            v.iter().map(|&(_, e)| e - shift).filter(|&e| e > 600_000).collect()
+        };
+        assert_eq!(tail(&a, 0), tail(&b, 17));
     }
 }
