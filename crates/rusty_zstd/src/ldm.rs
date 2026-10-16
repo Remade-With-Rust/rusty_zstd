@@ -442,14 +442,21 @@ mod tests {
         let bits = 18;
         let a = rsync_sections(&src, bits, usize::MAX);
         let mut edited = src[..300_000].to_vec();
-        edited.extend_from_slice(b"an inserted line
-");
+        edited.extend_from_slice(
+            b"an inserted line
+",
+        );
         edited.extend_from_slice(&src[300_000..]);
         let b = rsync_sections(&edited, bits, usize::MAX);
         assert!(a.len() > 8, "{}", a.len());
-        assert!(a.iter().all(|&(s, e)| e - s >= RSYNC_MIN_BLOCK || e == src.len()));
+        assert!(a
+            .iter()
+            .all(|&(s, e)| e - s >= RSYNC_MIN_BLOCK || e == src.len()));
         let tail = |v: &[(usize, usize)], shift: usize| -> alloc::vec::Vec<usize> {
-            v.iter().map(|&(_, e)| e - shift).filter(|&e| e > 600_000).collect()
+            v.iter()
+                .map(|&(_, e)| e - shift)
+                .filter(|&e| e > 600_000)
+                .collect()
         };
         assert_eq!(tail(&a, 0), tail(&b, 17));
     }

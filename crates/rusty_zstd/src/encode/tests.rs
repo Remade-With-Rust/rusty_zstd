@@ -1252,7 +1252,11 @@ fn rsyncable_stays_within_compress_bound() {
                 },
             )
             .unwrap();
-            assert!(z.len() <= crate::compress_bound(n), "L{level} n={n}: {} > bound", z.len());
+            assert!(
+                z.len() <= crate::compress_bound(n),
+                "L{level} n={n}: {} > bound",
+                z.len()
+            );
             assert_eq!(decompress(&z).unwrap(), src);
         }
     }
@@ -1285,7 +1289,11 @@ fn rsyncable_output_resynchronises_after_an_edit() {
         .unwrap()
     };
     let common_suffix = |a: &[u8], b: &[u8]| {
-        a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count()
+        a.iter()
+            .rev()
+            .zip(b.iter().rev())
+            .take_while(|(x, y)| x == y)
+            .count()
     };
     let (a, b) = (run(&src, true), run(&edited, true));
     assert_eq!(decompress(&a).unwrap(), src);
@@ -1293,7 +1301,11 @@ fn rsyncable_output_resynchronises_after_an_edit() {
     let shared = common_suffix(&a, &b);
     // Measured 49%: resync waits for a sync point to end a job in both runs,
     // and a job that fills first ends where its own start puts it.
-    assert!(shared * 3 > a.len(), "rsyncable shares only {shared} of {} bytes", a.len());
+    assert!(
+        shared * 3 > a.len(),
+        "rsyncable shares only {shared} of {} bytes",
+        a.len()
+    );
     let plain = common_suffix(&run(&src, false), &run(&edited, false));
     assert!(plain < shared / 4, "plain {plain} vs rsyncable {shared}");
 }

@@ -192,7 +192,9 @@ mod tests {
     // #27: a one-byte Dictionary_ID field holding 0 means no dictionary.
     #[test]
     fn dict_id_zero_is_no_dictionary() {
-        let f = [0x28, 0xB5, 0x2F, 0xFD, 0x21, 0x00, 0x01, 0x09, 0x00, 0x00, 0x61];
+        let f = [
+            0x28, 0xB5, 0x2F, 0xFD, 0x21, 0x00, 0x01, 0x09, 0x00, 0x00, 0x61,
+        ];
         match get_frame_header(&f).unwrap() {
             FrameKind::Zstd(h) => assert_eq!(h.dict_id, None),
             other => panic!("unexpected {other:?}"),
