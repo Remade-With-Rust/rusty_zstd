@@ -710,6 +710,13 @@ impl Decompressor {
     }
 
     /// Use `prefix` as match history (`--patch-from`).
+    ///
+    /// The prefix applies to every frame in the stream, as it does for the
+    /// one-shot [`crate::decompress_using_prefix`] and libzstd's one-shot
+    /// `ZSTD_decompressDCtx`. libzstd's streaming decoder uses a referenced
+    /// prefix for the first frame only, so a later frame that relies on it
+    /// decodes here and fails there (issue #29). A frame that does not
+    /// reference the prefix decodes identically either way.
     pub fn set_prefix(&mut self, prefix: &[u8]) {
         self.dict = None;
         self.prefix = prefix.to_vec();
