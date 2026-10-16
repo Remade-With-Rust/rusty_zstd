@@ -20,7 +20,8 @@ pub const DEFAULT_WINDOW_MAX: u64 = 128 * 1024 * 1024;
 pub struct FrameHeader {
     /// Back-reference window in bytes.
     pub window_size: u64,
-    /// Dictionary_ID if present.
+    /// Dictionary_ID if present and nonzero; a field holding 0 means "no
+    /// dictionary" and reads as `None`.
     pub dict_id: Option<u32>,
     /// Frame_Content_Size if present.
     pub content_size: Option<u64>,
@@ -81,7 +82,8 @@ pub(crate) fn parse_zstd_header(r: &mut Reader<'_>) -> Result<FrameHeader, Error
     let desc = r.u8()?;
     let fcs_flag = desc >> 6;
     let single_segment = (desc & 0x20) != 0;
-    let unused = (desc & 0x10) != 0;
+    // Bit 4 is Unused_Bit: RFC 8878 3.1.1.1.1.4 says a decoder must ignore
+    // it (libzstd does), unlike the Reserved_Bit below.
     let reserved = (desc & 0x08) != 0;
     let checksum = (desc & 0x04) != 0;
     let dict_flag = desc & 0x03;
@@ -89,10 +91,6 @@ pub(crate) fn parse_zstd_header(r: &mut Reader<'_>) -> Result<FrameHeader, Error
     if reserved {
         return Err(Error::ReservedBitSet);
     }
-    if unused {
-        return Err(Error::UnusedBitSet);
-    }
-
     let window_desc = if single_segment { None } else { Some(r.u8()?) };
 
     let dict_id = match dict_flag {
@@ -101,7 +99,10 @@ pub(crate) fn parse_zstd_header(r: &mut Reader<'_>) -> Result<FrameHeader, Error
         2 => Some(u32::from(r.u16_le()?)),
         3 => Some(r.u32_le()?),
         _ => return Err(Error::BadMagic),
-    };
+    }
+    // A present field holding 0 means "no dictionary" (RFC 8878 3.1.1.1.3),
+    // which is how libzstd reads it.
+    .filter(|&id| id != 0);
 
     let content_size = match fcs_flag {
         0 if single_segment => Some(u64::from(r.u8()?)),
@@ -176,6 +177,28 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    // #28: Unused_Bit (FHD bit 4) is ignored, as libzstd does.
+    #[test]
+    fn unused_bit_is_ignored() {
+        let mut f = A_NC.to_vec();
+        f[4] |= 0x10;
+        assert!(matches!(get_frame_header(&f).unwrap(), FrameKind::Zstd(_)));
+        #[cfg(feature = "alloc")]
+        assert_eq!(crate::decompress(&f).unwrap(), b"a");
+    }
+
+    // #27: a one-byte Dictionary_ID field holding 0 means no dictionary.
+    #[test]
+    fn dict_id_zero_is_no_dictionary() {
+        let f = [0x28, 0xB5, 0x2F, 0xFD, 0x21, 0x00, 0x01, 0x09, 0x00, 0x00, 0x61];
+        match get_frame_header(&f).unwrap() {
+            FrameKind::Zstd(h) => assert_eq!(h.dict_id, None),
+            other => panic!("unexpected {other:?}"),
+        }
+        #[cfg(feature = "alloc")]
+        assert_eq!(crate::decompress(&f).unwrap(), b"a");
     }
 
     #[test]

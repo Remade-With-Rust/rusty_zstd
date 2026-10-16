@@ -13,7 +13,8 @@ pub enum Error {
     BadMagic,
     /// Frame_Header_Descriptor reserved bit (bit 3) is set.
     ReservedBitSet,
-    /// Frame_Header_Descriptor unused bit (bit 4) is set.
+    /// Frame_Header_Descriptor unused bit (bit 4) is set. No longer returned:
+    /// since 0.4.1 the decoder ignores the bit, as RFC 8878 and libzstd do.
     UnusedBitSet,
     /// Block_Type 3 (reserved).
     ReservedBlockType,
