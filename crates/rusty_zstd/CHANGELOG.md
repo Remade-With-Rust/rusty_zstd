@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.4.0...rusty_zstd-v0.4.1) - 2026-10-16
+
+Fixes for the twelve issues filed against 0.4.0 (#23-#34): eleven confirmed,
+#29 documented as intended. Compressed output is byte-identical to 0.4.0
+except where noted below: `--rsyncable`, streamed frame headers given a size
+hint or a pledge, and dictionary frames 0.4.0 wrote invalid.
+
+### Fixed
+
+- *(encode)* a trained dictionary's repeat offsets larger than the window
+  were still offered as matches after the frame's first Window_Size bytes,
+  emitting frames our own decoder rejected as corrupt (#23)
+- *(stream)* `Compressor::with_options`' size hint was also the pledge:
+  written as Frame_Content_Size and enforced only after the last block, so a
+  retried `End` returned `Ok(done)` on a frame no decoder accepts. The hint
+  now only picks parameters (libzstd's `ZSTD_c_srcSizeHint`); a pledge is
+  checked as input arrives and before the last block; errors are sticky
+  until `reset()`; pledged frames are Single_Segment again (#24)
+- *(rsyncable)* sync points now come from libzstd's 32-byte rolling hash,
+  at least 128 KiB apart with a mean spacing of one job, and each ends a
+  job, so output after an edit resynchronises as libzstd's does. The old
+  cut rule could exceed `compress_bound`, cost 5-21% in size, and never
+  resynchronised. The CLI no longer forces `--long` for `--rsyncable` (#26)
+- *(frame)* a Dictionary_ID field holding 0 means no dictionary (#27), and
+  the Frame_Header_Descriptor's unused bit is ignored (#28), as RFC 8878 and
+  libzstd have it
+- *(stream)* after `End`, the next `stream()` call with input starts a new
+  frame, as `ZSTD_compressStream2` does; it used to report `done` forever
+  and drop the input (#30)
+- *(env)* the `RZSTD_*` environment variables are read only with the new
+  `bench-arms` feature (implied by `profile`). They were read in every build,
+  so a process's environment could change compressed bytes or lift the
+  decoder's 8 MiB reserve cap on hostile headers (#33)
+
+### Performance
+
+- *(stream)* one large `Compressor::stream()` call now costs what the same
+  input in 128 KiB chunks does (was 3.2x slower at L1, 1.9x at L3, for 128
+  MiB), byte-identical (#31)
+- *(encode)* a one-shot result gives back its unused `compress_bound`
+  reservation: a 3.4 KB frame of a 32 MiB input held 32 MiB (#32)
+
+### Added
+
+- `Compressor::reset()` (`ZSTD_CCtx_reset(ZSTD_reset_session_only)`)
+- feature `bench-arms`
+
+### Deprecated
+
+- `set_hash_tight_arm`: a process-wide bench arm, the one visible in the
+  docs; it moves behind `bench-arms` in 0.5.0 with the hidden setters
+
+### Documentation
+
+- the READMEs said all `unsafe` lived in `simd.rs`; it is in 16 modules.
+  `tools/unsafe_census.py` now writes the per-module count into the README
+  and CI fails when it drifts (#34)
+- `Decompressor::set_prefix` applies the prefix to every frame of the
+  stream, like libzstd's one-shot `ZSTD_decompressDCtx`; libzstd's streaming
+  decoder uses it for the first frame only (#29)
+
 ## [0.4.0](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.3.1...rusty_zstd-v0.4.0) - 2026-10-14
 
 **Small frames decode 4-6x faster.** Rows of 96 B-1 KiB -- one frame per

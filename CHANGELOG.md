@@ -6,6 +6,40 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Released -- 0.4.1 (2026-10-16): the 0.4.0 issue batch (#23-#34)
+
+Twelve issues were filed against 0.4.0 on 2026-10-16. Each was reproduced
+against libzstd 1.5.7 built from source before it was fixed: eleven were real
+(#24, #26 and #33 worse than filed), and #29 is a documented difference. One
+commit per issue, each with its numbers:
+
+| # | what | verdict | fix |
+|---|---|---|---|
+| 23 | dictionary reps beyond the window | real: we wrote frames our decoder rejects | the search hint drops them past the first window |
+| 24 | size hint vs pledge | real: a retried `End` reported a corrupt frame done | hint picks parameters only; pledge checked early; sticky errors |
+| 25 | trainer super-linear | real: ~N^2, 700-1800x slower than libzstd | **0.5.0** (FASTCOVER port) |
+| 26 | `--rsyncable` | real: past `compress_bound`, +5-21% size, no resync | libzstd's rolling hash; sync points end jobs |
+| 27 | Dictionary_ID 0 | real | read as no dictionary |
+| 28 | FHD unused bit | real | ignored |
+| 29 | prefix on every frame | differs from libzstd streaming only | documented |
+| 30 | `Compressor` after `End` | real: spun or dropped input | next input starts a new frame; `reset()` |
+| 31 | one large `stream()` call | real (1.9x at L3, 3.2x at L1) | absorb per block; amortised output reclaim |
+| 32 | dictionary/prefix copies the input | real for one-shot | result capacity trimmed now; the copy goes in **0.5.0** |
+| 33 | `RZSTD_*` env live in every build | real: changed bytes, lifted a decoder cap | read only with `bench-arms` |
+| 34 | "all unsafe is in simd.rs" | real: 16 modules | README census, checked in CI |
+
+Measured for the two behaviour changes:
+
+- `--rsyncable`, 1 byte inserted at len/3, share of the edited output in
+  blocks unchanged from the original's, ours / libzstd: dickens L1 74.3 /
+  74.1%, mozilla L1 91.8 / 91.8%, mozilla L3 60.1 / 60.4%, webster L1-L9
+  96.3-96.4% both. Size against plain -2.4..+1.0% (0.4.0: +5..+21%; libzstd
+  -0.04..+0.26%).
+- One 128 MiB `stream()` call against 128 KiB chunks, pinned: L1 3.20x ->
+  1.04x, L3 1.88x -> 1.02x. Streamed output on a 600-case gate (6 corpora x
+  5 levels x plain/hint/pledge/dict/prefix x 4 chunkings) is byte-identical
+  to 0.4.0 except the headers #24 changes on purpose.
+
 ### Released -- 0.4.0 (2026-10-14): small frames decode 4-6x faster
 
 The small-frame decode campaign (`docs/plans/small-frame-decode.md`), driven
