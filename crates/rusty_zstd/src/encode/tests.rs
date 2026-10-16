@@ -1231,6 +1231,29 @@ fn enable_ldm_zstd_keys_roundtrip() {
     assert_eq!(decompress(&zst).expect("decode"), src);
 }
 
+// #32: the result gives back its unused compress_bound reservation.
+#[test]
+fn one_shot_result_does_not_keep_its_bound() {
+    let src = vec![b'a'; 4 << 20];
+    for level in [1, 3, 19] {
+        let z = compress(&src, level).unwrap();
+        assert!(
+            z.capacity() < z.len() + super::TRIM_SLACK,
+            "L{level}: {} for {}",
+            z.capacity(),
+            z.len()
+        );
+        let d = crate::Dictionary::raw(vec![b'a'; 4096]);
+        let z = crate::compress_using_dict(&src, &d, level).unwrap();
+        let z2 = crate::compress_using_dict(&src, &d, level).unwrap();
+        assert_eq!(z, z2);
+        assert!(
+            z2.capacity() < z2.len() + super::TRIM_SLACK,
+            "dict L{level}"
+        );
+    }
+}
+
 #[test]
 fn rsyncable_stays_within_compress_bound() {
     // Issue #26: the old cut rule split blocks every few hundred bytes and

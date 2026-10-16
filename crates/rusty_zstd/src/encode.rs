@@ -588,7 +588,22 @@ pub(crate) fn encode_oneshot(
         &mut entropy,
         ldm_tables.as_mut(),
     )?;
-    Ok(out)
+    Ok(trim_output(out))
+}
+
+/// Unused capacity worth a reallocation to give back (see `trim_output`).
+const TRIM_SLACK: usize = 64 * 1024;
+
+/// Give back the `compress_bound` reservation a frame did not use (issue
+/// #32): a 3.4 KB frame of a 32 MiB input held 32 MiB of capacity for as long
+/// as the caller kept it, doubling memory for anyone keeping many results.
+/// Below 64 KiB of slack it is left alone, so small rows pay no reallocation.
+#[inline]
+fn trim_output(mut out: Vec<u8>) -> Vec<u8> {
+    if out.capacity() - out.len() >= TRIM_SLACK {
+        out.shrink_to_fit();
+    }
+    out
 }
 
 /// How a frame represents its match-filter tags: packed into the table slots
@@ -1498,7 +1513,7 @@ fn encode_with_digest(
         work.restore(src.len() <= block_max, flags_ok, src.len());
         work.release();
     }
-    Some(r.map(|()| out))
+    Some(r.map(|()| trim_output(out)))
 }
 
 /// `RZSTD_BLOCK_KB`, resolved ONCE per process. 0 = unresolved, else `kb + 1`
