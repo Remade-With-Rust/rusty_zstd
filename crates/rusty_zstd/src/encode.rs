@@ -694,6 +694,7 @@ fn encode_frame_blocks(
             }
             let last = end == workspace.len();
             let before_block = out.len();
+            tables.far_reps_ok = end - payload_off <= window;
             encode_block(
                 out,
                 workspace,

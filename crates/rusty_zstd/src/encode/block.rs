@@ -66,6 +66,17 @@ pub(crate) fn encode_block_inner(
     ldm_p: crate::ldm::LdmParams,
 ) -> Result<(), Error> {
     let block = &src[block_start..block_end];
+    // Past the first Window_Size bytes of output an offset must be <=
+    // Window_Size, so a dictionary-seeded rep beyond it is no longer a legal
+    // search candidate (issue #23: the finders bound reps per block, not per
+    // position, and emitted frames our decoder rejects). 0 disables a rep in
+    // every finder. Only the search hint changes; the rep state the sequence
+    // coder carries is untouched.
+    let hint = if tables.far_reps_ok {
+        *reps
+    } else {
+        reps.map(|r| if r as usize > window { 0 } else { r })
+    };
     if block.is_empty() {
         crate::prof::note_raw_block();
         write_block_header(out, last, BlockType::Raw, 0);
@@ -148,7 +159,7 @@ pub(crate) fn encode_block_inner(
             &mut probe,
             None,
             ldm_p,
-            *reps,
+            hint,
         );
         let _m = crate::prof::scope(crate::prof::Stage::EncodeMatchFind);
         let r = find_sequences(
@@ -160,7 +171,7 @@ pub(crate) fn encode_block_inner(
             tables,
             ldm,
             ldm_p,
-            *reps,
+            hint,
         );
         note_step_probe(tables, &r.0, r.1.len(), &s2, l2.len());
         r
@@ -175,7 +186,7 @@ pub(crate) fn encode_block_inner(
             tables,
             ldm,
             ldm_p,
-            *reps,
+            hint,
         )
     };
     // P1/gg-matchfind candidate signal, computed once for every tap below.

@@ -50,6 +50,10 @@ pub(crate) struct MatchTables {
     pub(crate) rows: crate::rowfind::RowTable,
     /// Workspace index: matches must start at or after this (MT overlap prime).
     pub(crate) frame_start: usize,
+    /// True while the current block ends within the first Window_Size bytes
+    /// of frame output, where a dictionary's seeded reps may exceed the
+    /// window. Past it they may not (issue #23); set per block.
+    pub(crate) far_reps_ok: bool,
     /// Sequences the previous block produced, used to size the next block's
     /// `seqs` reservation. A fixed fraction of the block length cannot work:
     /// nci needs ~4k slots per 128 KiB block while sao needs ~357, and
@@ -335,6 +339,7 @@ impl Clone for MatchTables {
             chain: Vec::new(),
             rows: crate::rowfind::RowTable::default(),
             frame_start: self.frame_start,
+            far_reps_ok: self.far_reps_ok,
             last_nseq: self.last_nseq,
             step_pick: self.step_pick,
             step_used: self.step_used,
@@ -766,6 +771,7 @@ impl MatchTables {
                 r
             },
             frame_start: 0,
+            far_reps_ok: true,
             last_nseq: 0,
             step_pick: 0,
             step_used: 0,

@@ -423,6 +423,7 @@ impl Compressor {
             self.hist_done = block_end;
         }
         let window = 1usize << self.params.window_log.min(31);
+        self.tables.far_reps_ok = self.produced_in + take as u64 <= window as u64;
         encode_block_from_scratch(
             &mut self.out_acc,
             &self.hist,
