@@ -96,6 +96,7 @@ fn digest_key_follows_every_priming_arm() {
             }
         }),
         ("hash_tight", |on| {
+            #[allow(deprecated)]
             rusty_zstd::set_hash_tight_arm(u32::from(!on))
         }),
     ];

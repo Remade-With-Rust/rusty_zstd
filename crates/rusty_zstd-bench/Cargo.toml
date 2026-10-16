@@ -20,7 +20,10 @@ name = "rzstd-bench"
 path = "src/main.rs"
 
 [dependencies]
-rusty_zstd = { path = "../rusty_zstd" }
+# `bench-arms`: the harness drives the `RZSTD_*` environment arms. Build the
+# CLI on its own (`-p rusty_zstd-cli`) when timing it, or Cargo's feature
+# unification turns the arms on there too.
+rusty_zstd = { path = "../rusty_zstd", features = ["bench-arms"] }
 rzstd-alloc = { path = "../rzstd-alloc" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -57,6 +57,14 @@ jobs:
             exit 1
           fi
           echo 'poison check ok: the gate fails when the arms are forced scalar'
+      # ENV ARMS (issue #33). The plain `Test` step above proves the RZSTD_*
+      # variables cannot reach a default build; this proves the same knobs DO
+      # reach a `bench-arms` build, so that equality is not vacuous, and that
+      # each knob is read once per process rather than per block.
+      - name: Env arms are live with bench-arms
+        run: cargo test -p rusty_zstd --release --features bench-arms --test env_inert
+      - name: Env arms are read once per process
+        run: cargo test -p rusty_zstd --release --features profile --test env_reads_gate
       - name: Doc tests (the README's examples)
         run: cargo test -p rusty_zstd --doc
       - name: CLI version + aliases

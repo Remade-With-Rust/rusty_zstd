@@ -50,6 +50,7 @@ returns or fills a `Vec`, so `alloc` is required. MSRV is **1.85**.
 | `std` | ✅ | `std::io`-shaped streaming, multi-threading, the trainer, runtime ISA dispatch |
 | `alloc` | ✅ | implied by `std`; the minimum supported configuration |
 | `profile` | | the in-process stage profiler and its counters (off = zero overhead) |
+| `bench-arms` | | reads the `RZSTD_*` A/B arms from the environment, for benchmark harnesses only (implied by `profile`); without it the environment cannot change the codec |
 
 ## Quick start
 

@@ -47,14 +47,16 @@ compile_error!(
      The minimum supported configuration is `--no-default-features --features alloc`."
 );
 
-/// `std::env::var` where there is a `std`, `Err(())` where there is not.
+/// `std::env::var` with the `bench-arms` feature, `Err(())` without it.
 ///
-/// Every env knob in this crate is a BENCH ARM with a shipping default, and
-/// `no_std + alloc` is a supported target with no `std::env` -- so 20 of them
-/// were hard build errors there. Routing them all through one shim keeps the
-/// call sites unchanged, keeps the knobs working under `std`, and stops the
-/// next knob anyone adds from breaking the no_std build again.
-#[cfg(all(feature = "alloc", feature = "std"))]
+/// Every env knob in this crate is a BENCH ARM with a shipping default.
+/// Until 0.4.1 they were read in every `std` build, so the environment of a
+/// process using the library could change compressed output (an L19 frame
+/// grew 85% under one knob) and lift the decoder's 8 MiB reserve cap on
+/// hostile headers (issue #33). Now only builds that ask for the arms read
+/// them. Routing every knob through this one shim keeps the call sites
+/// unchanged and also covers `no_std + alloc`, which has no `std::env`.
+#[cfg(all(feature = "alloc", feature = "std", feature = "bench-arms"))]
 #[inline]
 pub(crate) fn env_knob(name: &str) -> Result<alloc::string::String, ()> {
     // Every read is an OS lookup AND a `String` allocation, for a value fixed
@@ -109,9 +111,9 @@ pub fn take_env_reads() -> u64 {
     ENV_READS.swap(0, core::sync::atomic::Ordering::Relaxed)
 }
 
-/// No-std twin: every knob reads as unset, so every call site takes its
-/// shipping default.
-#[cfg(all(feature = "alloc", not(feature = "std")))]
+/// Without `bench-arms` (or without `std`) every knob reads as unset, so
+/// every call site takes its shipping default.
+#[cfg(all(feature = "alloc", not(all(feature = "std", feature = "bench-arms"))))]
 #[inline]
 pub(crate) fn env_knob(_name: &str) -> Result<alloc::string::String, ()> {
     Err(())
@@ -215,6 +217,7 @@ pub use mt::{
     JOB_SIZE_MIN, NB_WORKERS_MAX,
 };
 #[cfg(feature = "alloc")]
+#[allow(deprecated)]
 pub use params::{compression_params, set_hash_tight_arm, CompressionParameters, Strategy};
 #[cfg(feature = "profile")]
 pub use rowfind::take_row_walk;
@@ -267,7 +270,10 @@ pub fn compress_bound(src_len: usize) -> usize {
 // `rusty_zstd-bench`. Every one has a shipping default and exists to be flipped
 // inside a measurement harness. They are hidden from the rendered docs and
 // carry NO semver promise: they may be renamed or removed in any release.
-// Nothing here changes a default or an output byte.
+// Calling a setter DOES change behaviour and output bytes -- that is what an
+// arm is for -- so nothing outside a harness should call one. In 0.5.0 they
+// move behind the `bench-arms` feature, which already gates the `RZSTD_*`
+// environment variables that drive the same arms.
 // ---------------------------------------------------------------------------
 
 #[doc(hidden)]

@@ -44,7 +44,8 @@ pub static ENC_SLIDE: [crate::census64::AtomicU64; 2] = [
 /// `k` means: hold up to `k` windows of history, and on overflow drop back to
 /// one. A slide then costs the same as ever but fires every `(k - 1) * window`
 /// bytes, so the slide's whole overhead -- memmove, six table clears and the
-/// re-prime -- scales as `1 / (k - 1)`. Default 2 (the Section 20 value).
+/// re-prime -- scales as `1 / (k - 1)`. Default 3 (Section 20b; 2 was
+/// Section 20's).
 fn enc_slide_mul() -> usize {
     match crate::env_knob("RZSTD_ENC_SLIDE_MUL")
         .ok()
@@ -226,7 +227,7 @@ impl Compressor {
         // `MatchTables::new` no longer allocates it (see ffanat), so do it here.
         tables.alloc_fast_tags(params);
         Ok(Self {
-            // Defaults to the env knob, which defaults to the shipping 2.
+            // The env knob (`bench-arms` builds only), else the shipping 3.
             slide_mul: enc_slide_mul(),
             tables,
             params,

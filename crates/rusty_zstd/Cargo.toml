@@ -31,7 +31,12 @@ legacy = ["std"]
 seekable = ["std"]
 train = ["std"]
 mt = ["std"]
-profile = ["std"]
+# Campaign A/B arms: the `RZSTD_*` environment variables are read only with
+# this on. Off, every knob reads as unset and takes its shipping default, so
+# the environment cannot change an output byte or lift a decoder limit
+# (issue #33). `rusty_zstd-bench` turns it on; `profile` implies it.
+bench-arms = ["std"]
+profile = ["std", "bench-arms"]
 # Install rusty_alloc as the process-wide allocator.
 #
 # OFF by default, and that is deliberate rather than cautious. `rusty_alloc_default`

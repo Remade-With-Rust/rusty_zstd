@@ -336,6 +336,14 @@ fn row_to_params(row: Row) -> CompressionParameters {
 static HASH_TIGHT_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Bench hook for the source-sized hash. 0 restores C's sizing.
+///
+/// A process-wide A/B arm, not a tuning API: it changes compressed output
+/// for every caller in the process. It is the one arm that was visible in
+/// the rendered docs, and it moves behind the `bench-arms` feature in 0.5.0.
+#[deprecated(
+    since = "0.4.1",
+    note = "process-wide bench arm; moves behind the `bench-arms` feature in 0.5.0"
+)]
 pub fn set_hash_tight_arm(v: u32) {
     HASH_TIGHT_ARM.store(v, core::sync::atomic::Ordering::Relaxed);
 }
