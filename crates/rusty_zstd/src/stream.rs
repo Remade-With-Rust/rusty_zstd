@@ -85,6 +85,12 @@ fn dec_reserve_cap() -> u64 {
     8 << 20
 }
 
+/// Bytes past a block's end that `Compressor::stream` holds in history before
+/// coding the block. The finders read at most 8 bytes past `block_end` (the
+/// widest hash load; the tree routes on 1), so 32 reproduces what they saw
+/// when a call's whole input was appended before any block was coded.
+const ABSORB_LOOKAHEAD: usize = 32;
+
 /// History length at which the window slides, for this `window`.
 fn slide_threshold(mul: usize, window: usize) -> usize {
     let extra = mul.saturating_sub(2).saturating_mul(window);
@@ -314,8 +320,6 @@ impl Compressor {
                 done: self.out_pending() == 0,
             });
         }
-        crate::copies::add(crate::copies::C_ENC_IN_ACC, input.len());
-        self.hist.extend_from_slice(input);
         if !self.started {
             write_frame_header(
                 &mut self.out_acc,
@@ -328,12 +332,34 @@ impl Compressor {
                 } else {
                     None
                 },
-                !self.hist.is_empty(),
+                !self.hist.is_empty() || !input.is_empty(),
             );
             self.started = true;
         }
 
         let block_max = (1usize << self.params.window_log.min(31)).min(BLOCKSIZE_MAX as usize);
+        // Absorb the input one block at a time, coding each block as it
+        // fills (issue #31). Appending the whole call first made `hist` hold
+        // all of it, so every window slide memmoved the uncoded remainder too:
+        // one 128 MiB call ran 1.7-3.1x slower than the same bytes in 128 KiB
+        // chunks. The blocks, their boundaries and the slides are the ones
+        // the whole-call append produced, so the output is unchanged -- with
+        // one subtlety: the finders may read a few bytes past `block_end`
+        // (the binary tree routes on `src[block_end]`), so a full block is
+        // coded only once `ABSORB_LOOKAHEAD` bytes past it are in `hist`, or
+        // the call's input has run out, exactly as when all of it was there.
+        let mut rest = input;
+        while !rest.is_empty() {
+            if self.pending() >= block_max + ABSORB_LOOKAHEAD {
+                self.emit_block(block_max, false)?;
+                continue;
+            }
+            let n = (block_max + ABSORB_LOOKAHEAD - self.pending()).min(rest.len());
+            crate::copies::add(crate::copies::C_ENC_IN_ACC, n);
+            self.hist.extend_from_slice(&rest[..n]);
+            rest = &rest[n..];
+        }
+
         let emit_all = matches!(flush, Flush::Flush | Flush::End);
         while self.pending() >= block_max || (emit_all && self.pending() > 0) {
             let take = self.pending().min(block_max);
@@ -376,8 +402,12 @@ impl Compressor {
     }
 
     /// CUT 7: hand the caller its bytes and advance the cursor; reclaim the
-    /// dead prefix only when everything is read (a `clear`) or it exceeds
-    /// 64 KiB -- never a per-call memmove of the unread remainder.
+    /// dead prefix only when everything is read (a `clear`), or when it is at
+    /// least 64 KiB AND at least as long as the unread remainder it would
+    /// move. The second condition is issue #31: with a large backlog and a
+    /// small output buffer, reclaiming at every 64 KiB moved the whole backlog
+    /// per call -- 5.25 GB of memmove for one 128 MiB L3 call. Now each byte
+    /// moves at most about once.
     fn take_output(&mut self, output: &mut [u8]) -> usize {
         let n = self.out_pending().min(output.len());
         crate::copies::add(crate::copies::C_ENC_OUT, n);
@@ -386,7 +416,7 @@ impl Compressor {
         if self.out_off == self.out_acc.len() {
             self.out_acc.clear();
             self.out_off = 0;
-        } else if self.out_off >= 64 * 1024 {
+        } else if self.out_off >= 64 * 1024 && self.out_off >= self.out_pending() {
             crate::copies::add(
                 crate::copies::C_ENC_OUT_COMPACT,
                 self.out_acc.len() - self.out_off,
