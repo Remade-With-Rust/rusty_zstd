@@ -155,8 +155,9 @@ mod rowfind;
 mod scratch;
 #[cfg(feature = "alloc")]
 mod seekable;
-/// Tiny documented `unsafe` island: runtime-dispatched AVX2/NEON kernels.
-/// Callers stay safe. Scalar twins remain the oracle and the fallback.
+/// Runtime-dispatched AVX2/NEON kernels; callers stay safe. Scalar twins
+/// remain the oracle and the fallback. Not the only `unsafe` in the crate:
+/// `tools/unsafe_census.py` counts every site per module.
 #[allow(unsafe_code)]
 mod simd;
 #[cfg(feature = "alloc")]

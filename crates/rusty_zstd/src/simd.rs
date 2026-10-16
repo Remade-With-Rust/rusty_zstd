@@ -492,8 +492,8 @@ unsafe fn finish_words(a: *const u8, b: *const u8, mut n: usize, max: usize) -> 
 /// visible only in the asm: the two `slice_index_fail` pads did NOT go away
 /// (the sub-8 frame-edge branch still needs subslices), and the `assert!` that
 /// made the raw call sound in safe code added a THIRD panic path with its own
-/// `panic_fmt` setup. `unsafe` cannot move to the call site either -- the
-/// crate root is `#![deny(unsafe_code)]` with `mod simd` the only island.
+/// `panic_fmt` setup. Moving the `unsafe` to the call site would need an
+/// `#[allow(unsafe_code)]` there too, for the same non-result.
 ///
 /// This is the "bounds-check tax is ~0" law landing again: LLVM had already
 /// folded both range checks into six instructions shared by every path.

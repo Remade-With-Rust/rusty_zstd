@@ -110,6 +110,10 @@ jobs:
       - run: cargo clippy -p rusty_zstd -p rusty_zstd-cli -p rzstd-alloc --all-targets -- -D warnings
       - name: ASCII sources
         run: bash scripts/check-ascii-rs.sh crates
+      # README's per-module `unsafe` table is generated from the source; fail
+      # when the two disagree (issue #34: it claimed one module, there were 16).
+      - name: unsafe census is current
+        run: python3 tools/unsafe_census.py --check README.md
       # An ISA twin is byte-identical to its baseline sibling by construction,
       # so the whole correctness suite is blind to every way a twin can be
       # wrong. This catches the two source-level ways -- see the script header.

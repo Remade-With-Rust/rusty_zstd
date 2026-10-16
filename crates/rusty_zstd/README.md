@@ -14,7 +14,9 @@
 
 > **A ground-up, pure-Rust [Zstandard](https://facebook.github.io/zstd/)
 > ([RFC 8878](https://datatracker.ietf.org/doc/html/rfc8878)) compressor and
-> decompressor.** `#![deny(unsafe_code)]` everywhere but one audited SIMD island,
+> decompressor.** `#![deny(unsafe_code)]` at the root, with `unsafe` opted into
+> item by item in the hot loops — every site counted per module in the
+> [repository README](https://github.com/Remade-With-Rust/rusty_zstd#where-unsafe-is-used) —
 > **zero dependencies**, no C, no `*-sys` crate, no FFI. Every frame it emits
 > decompresses in facebook/zstd v1.5.7 and every frame that emits decompresses
 > here — dual-gated on the Silesia corpus every commit.
