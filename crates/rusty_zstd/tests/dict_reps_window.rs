@@ -5,8 +5,8 @@
 #![cfg(feature = "std")]
 
 use rusty_zstd::{
-    compress_with_history, compression_params, decompress_using_dict, train, Dictionary,
-    TrainOptions,
+    compress_with_history, compression_params, decompress_using_dict, train, CompressOptions,
+    Compressor, Dictionary, Flush, TrainOptions,
 };
 
 fn xorshift(seed: u64, n: usize) -> Vec<u8> {
@@ -43,7 +43,12 @@ pub fn dict_with_reps(reps: [u32; 3], extra: &[u8]) -> Dictionary {
 /// Repeats with period `r`, so a rep of `r` matches everywhere and nothing
 /// shorter does.
 fn periodic(r: usize, len: usize) -> Vec<u8> {
-    xorshift(0x9E37_79B9_7F4A_7C15, r).iter().cycle().take(len).copied().collect()
+    xorshift(0x9E37_79B9_7F4A_7C15, r)
+        .iter()
+        .cycle()
+        .take(len)
+        .copied()
+        .collect()
 }
 
 #[test]
@@ -57,6 +62,40 @@ fn dictionary_reps_beyond_the_window_decode() {
         p.hash_log = p.hash_log.min(11);
         p.chain_log = p.chain_log.min(11);
         let zst = compress_with_history(&src, p, true, Some(&dict), &[], true).unwrap();
+        let back = decompress_using_dict(&zst, &dict)
+            .unwrap_or_else(|e| panic!("L{level}: our decoder rejects our frame: {e:?}"));
+        assert_eq!(back, src, "L{level}");
+    }
+}
+
+#[test]
+fn dictionary_reps_beyond_the_window_decode_streaming() {
+    // A 16 KiB size hint gives a 16 KiB window; the rep is 20,000.
+    let r = 20_000u32;
+    let dict = dict_with_reps([r, 4, 8], &xorshift(9, 24 * 1024));
+    let src = periodic(r as usize, 256 * 1024);
+    for level in [1, 3, 5, 9, 16] {
+        let opts = CompressOptions {
+            level,
+            checksum: true,
+        };
+        let mut c = Compressor::with_options(opts, Some(16 * 1024)).unwrap();
+        c.set_dictionary(&dict).unwrap();
+        let mut out = vec![0u8; 1 << 16];
+        let mut zst = Vec::new();
+        let mut input = src.as_slice();
+        while !input.is_empty() {
+            let st = c.stream(input, &mut out, Flush::Continue).unwrap();
+            zst.extend_from_slice(&out[..st.output_produced]);
+            input = &input[st.input_consumed..];
+        }
+        loop {
+            let st = c.stream(&[], &mut out, Flush::End).unwrap();
+            zst.extend_from_slice(&out[..st.output_produced]);
+            if st.done {
+                break;
+            }
+        }
         let back = decompress_using_dict(&zst, &dict)
             .unwrap_or_else(|e| panic!("L{level}: our decoder rejects our frame: {e:?}"));
         assert_eq!(back, src, "L{level}");

@@ -153,12 +153,24 @@ pub fn decompress_stream_out_size() -> usize {
 }
 
 /// Reusable compressor (one frame at a time).
+///
+/// After a frame ends -- `Flush::End` has reported `done` -- the next call
+/// that carries input starts a new frame with the same level, checksum flag
+/// and dictionary, as libzstd's `ZSTD_compressStream2` does. A prefix
+/// ([`Self::set_prefix`]) and a pledged size apply to one frame only.
+/// [`Self::reset`] abandons a frame in progress.
 pub struct Compressor {
     /// History multiplier at which the window slides; see `set_slide_mul`.
     slide_mul: usize,
     params: CompressionParameters,
     checksum: bool,
     pledged: Option<u64>,
+    /// The first error a frame hit. It sticks: every later call returns it
+    /// until [`Self::reset`], so a retried `End` cannot report a frame done
+    /// that is not (issue #24). libzstd's errors are sticky the same way.
+    err: Option<Error>,
+    /// Kept to load into every frame, as libzstd keeps a referenced CDict.
+    dict: Option<crate::dict::Dictionary>,
     started: bool,
     ended: bool,
     xxh: Xxh64,
@@ -198,7 +210,14 @@ impl Compressor {
         )
     }
 
-    /// New compressor with options and an optional size hint (picks window/hash).
+    /// New compressor with options and an optional size hint.
+    ///
+    /// The hint only picks the parameters -- window, hash and chain sizes --
+    /// as libzstd's `ZSTD_c_srcSizeHint` does: it is not a promise and is not
+    /// written into the frame, and the stream may be longer or shorter. To
+    /// promise the exact size and have it written as Frame_Content_Size, call
+    /// [`Self::set_pledged_src_size`]. (Before 0.4.1 the hint was also the
+    /// pledge, so a wrong hint failed the frame.)
     pub fn with_options(opts: CompressOptions, src_hint: Option<u64>) -> Result<Self, Error> {
         let params = compression_params(opts.level, src_hint)?;
         let mut tables = MatchTables::new(params);
@@ -212,7 +231,9 @@ impl Compressor {
             tables,
             params,
             checksum: opts.checksum,
-            pledged: src_hint,
+            pledged: None,
+            err: None,
+            dict: None,
             started: false,
             ended: false,
             xxh: Xxh64::new(),
@@ -229,25 +250,41 @@ impl Compressor {
         })
     }
 
-    /// Pledge uncompressed size before the first [`Self::stream`] call (writes FCS).
+    /// Pledge the frame's exact uncompressed size before its first
+    /// [`Self::stream`] call; it is written as Frame_Content_Size. Feeding
+    /// more than the pledge, or ending the frame short of it, fails with
+    /// [`Error::ContentSizeMismatch`] before a last block is written, and
+    /// the error sticks until [`Self::reset`]. Applies to one frame.
     pub fn set_pledged_src_size(&mut self, size: u64) {
+        self.next_frame_if_finished();
         if !self.started {
             self.pledged = Some(size);
         }
     }
 
-    /// Load a dictionary before the first [`Self::stream`] call.
+    /// Load a dictionary before a frame's first [`Self::stream`] call. It is
+    /// used for every later frame too, until replaced or a prefix is set.
     pub fn set_dictionary(&mut self, dict: &crate::dict::Dictionary) -> Result<(), Error> {
+        self.next_frame_if_finished();
         if self.started {
             return Err(Error::Corruption);
         }
+        if self.dict.is_some() || !self.hist.is_empty() {
+            self.clear_history();
+        }
+        self.dict = Some(dict.clone());
+        self.load_dictionary(dict);
+        self.write_dict_id = self.dict_id.is_some();
+        Ok(())
+    }
+
+    /// Prime cleared history with `dict` (its content, tables, entropy, reps).
+    fn load_dictionary(&mut self, dict: &crate::dict::Dictionary) {
         self.dict_id = if dict.id() != 0 {
             Some(dict.id())
         } else {
             None
         };
-        self.write_dict_id = self.dict_id.is_some();
-        self.hist.clear();
         self.hist.extend_from_slice(dict.content());
         self.hist_done = self.hist.len();
         let window = 1usize << self.params.window_log.min(31);
@@ -262,17 +299,21 @@ impl Compressor {
             self.entropy.seed_from_dict(e);
             self.reps = e.reps;
         }
-        Ok(())
     }
 
-    /// Use `prefix` as match history (`--patch-from`). No Dictionary_ID is written.
+    /// Use `prefix` as match history (`--patch-from`) for the next frame
+    /// only, as libzstd's `ZSTD_CCtx_refPrefix`; it replaces any dictionary.
+    /// No Dictionary_ID is written.
     pub fn set_prefix(&mut self, prefix: &[u8]) -> Result<(), Error> {
+        self.next_frame_if_finished();
         if self.started {
             return Err(Error::Corruption);
         }
-        self.dict_id = None;
+        if self.dict.is_some() || !self.hist.is_empty() {
+            self.clear_history();
+        }
+        self.dict = None;
         self.write_dict_id = false;
-        self.hist.clear();
         self.hist.extend_from_slice(prefix);
         self.hist_done = self.hist.len();
         let window = 1usize << self.params.window_log.min(31);
@@ -300,25 +341,98 @@ impl Compressor {
     }
 
     pub fn set_write_dict_id(&mut self, write: bool) {
+        self.next_frame_if_finished();
         if !self.started {
             self.write_dict_id = write;
         }
     }
 
+    /// Abandon the frame in progress, if any, and any output not yet taken,
+    /// and clear a sticky error and the pledged size. The level, checksum
+    /// flag and dictionary are kept; a prefix is dropped (it applies to one
+    /// frame). The next frame compresses exactly as it would on a fresh
+    /// `Compressor` with the same settings. libzstd's
+    /// `ZSTD_CCtx_reset(ZSTD_reset_session_only)`.
+    pub fn reset(&mut self) {
+        self.clear_history();
+        self.pledged = None;
+        self.err = None;
+        self.started = false;
+        self.ended = false;
+        self.xxh = Xxh64::new();
+        self.out_acc.clear();
+        self.out_off = 0;
+        self.produced_in = 0;
+        self.last_block_written = false;
+        if let Some(d) = self.dict.take() {
+            self.load_dictionary(&d);
+            self.dict = Some(d);
+        }
+    }
+
+    /// Fresh match tables, entropy and reps, and no history: the state of a
+    /// new `Compressor`, so nothing a previous frame, dictionary or prefix
+    /// left behind can reach the next frame's bytes.
+    fn clear_history(&mut self) {
+        let mut tables = MatchTables::new(self.params);
+        tables.alloc_fast_tags(self.params);
+        self.tables = tables;
+        self.reps = [1, 4, 8];
+        self.entropy = EntropyState::default();
+        self.hist.clear();
+        self.hist_done = 0;
+        self.dict_id = None;
+    }
+
+    /// A finished frame whose output is all taken: the next frame may begin.
+    fn next_frame_if_finished(&mut self) {
+        if self.ended && self.out_pending() == 0 && self.err.is_none() {
+            self.reset();
+        }
+    }
+
+    /// Record `e` as the frame's sticky error and return it.
+    fn fail(&mut self, e: Error) -> Error {
+        self.err = Some(e);
+        e
+    }
+
     /// Streaming compress. Copies produced bytes into `output`.
+    ///
+    /// Once a frame is done, a call with input starts the next frame (see
+    /// the type's docs); a call with no input just reports `done` again.
     pub fn stream(
         &mut self,
         input: &[u8],
         output: &mut [u8],
         flush: Flush,
     ) -> Result<StreamStatus, Error> {
+        if let Some(e) = self.err {
+            return Err(e);
+        }
+        let mut produced = 0;
         if self.ended {
-            let n = self.take_output(output);
-            return Ok(StreamStatus {
-                input_consumed: 0,
-                output_produced: n,
-                done: self.out_pending() == 0,
-            });
+            produced = self.take_output(output);
+            if self.out_pending() > 0 || input.is_empty() {
+                return Ok(StreamStatus {
+                    input_consumed: 0,
+                    output_produced: produced,
+                    done: self.out_pending() == 0,
+                });
+            }
+            // Issue #30: this used to report `done` with nothing consumed,
+            // forever -- a feed loop spun, and a loop that did not check
+            // `input_consumed` silently dropped the data.
+            self.reset();
+        }
+        // Issue #24: check the pledge as input arrives and before a last
+        // block, never after it -- the frame must not end with a wrong size.
+        if let Some(p) = self.pledged {
+            let taken = self.produced_in + self.pending() as u64;
+            let after = taken.saturating_add(input.len() as u64);
+            if after > p || (flush == Flush::End && after != p) {
+                return Err(self.fail(Error::ContentSizeMismatch));
+            }
         }
         if !self.started {
             write_frame_header(
@@ -332,7 +446,11 @@ impl Compressor {
                 } else {
                     None
                 },
-                !self.hist.is_empty() || !input.is_empty(),
+                // External history is the dictionary or prefix already in
+                // `hist`; the input is not appended yet. This read
+                // `!hist.is_empty()` after the append, so a first call with
+                // data never got a Single_Segment frame (issue #24).
+                !self.hist.is_empty(),
             );
             self.started = true;
         }
@@ -351,7 +469,9 @@ impl Compressor {
         let mut rest = input;
         while !rest.is_empty() {
             if self.pending() >= block_max + ABSORB_LOOKAHEAD {
-                self.emit_block(block_max, false)?;
+                if let Err(e) = self.emit_block(block_max, false) {
+                    return Err(self.fail(e));
+                }
                 continue;
             }
             let n = (block_max + ABSORB_LOOKAHEAD - self.pending()).min(rest.len());
@@ -364,7 +484,9 @@ impl Compressor {
         while self.pending() >= block_max || (emit_all && self.pending() > 0) {
             let take = self.pending().min(block_max);
             let last = flush == Flush::End && take == self.pending();
-            self.emit_block(take, last)?;
+            if let Err(e) = self.emit_block(take, last) {
+                return Err(self.fail(e));
+            }
             if !last && flush == Flush::Flush && self.pending() == 0 {
                 break;
             }
@@ -378,7 +500,9 @@ impl Compressor {
 
         if flush == Flush::End && !self.ended {
             if self.pending() == 0 {
-                self.emit_empty_last_if_needed()?;
+                if let Err(e) = self.emit_empty_last_if_needed() {
+                    return Err(self.fail(e));
+                }
             }
             if self.checksum {
                 self.out_acc
@@ -387,10 +511,10 @@ impl Compressor {
             self.ended = true;
         }
 
-        let n = self.take_output(output);
+        let n = self.take_output(&mut output[produced..]);
         Ok(StreamStatus {
             input_consumed: input.len(),
-            output_produced: n,
+            output_produced: produced + n,
             done: self.ended && self.out_pending() == 0,
         })
     }
@@ -523,11 +647,6 @@ impl Compressor {
         self.produced_in += take as u64;
         if last {
             self.last_block_written = true;
-        }
-        if let (true, Some(n)) = (last, self.pledged) {
-            if self.produced_in != n {
-                return Err(Error::ContentSizeMismatch);
-            }
         }
         Ok(())
     }
@@ -1042,7 +1161,7 @@ mod tests {
                 .stream(&src[off..off + n], &mut tmp, Flush::Continue)
                 .unwrap();
             zst.extend_from_slice(&tmp[..st.output_produced]);
-            off += n;
+            off += st.input_consumed;
         }
         loop {
             let st = c.stream(&[], &mut tmp, Flush::End).unwrap();
@@ -1097,6 +1216,170 @@ mod tests {
                 .unwrap_or(got.len().min(src.len()));
             panic!("stream mismatch at {pos}/{}", src.len());
         }
+    }
+
+    /// One frame of `data` through `c`: fed with `Continue`, then `End`.
+    fn frame(c: &mut Compressor, data: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut out = vec![0u8; 4096];
+        let mut z = Vec::new();
+        let mut input = data;
+        while !input.is_empty() {
+            let st = c.stream(input, &mut out, Flush::Continue)?;
+            z.extend_from_slice(&out[..st.output_produced]);
+            input = &input[st.input_consumed..];
+        }
+        loop {
+            let st = c.stream(&[], &mut out, Flush::End)?;
+            z.extend_from_slice(&out[..st.output_produced]);
+            if st.done {
+                return Ok(z);
+            }
+        }
+    }
+
+    fn sample(n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| b"stream issue sample text "[i % 25] ^ ((i / 997) as u8 & 3))
+            .collect()
+    }
+
+    fn header(z: &[u8]) -> FrameHeader {
+        match crate::get_frame_header(z).unwrap() {
+            FrameKind::Zstd(h) => h,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // #24: the size hint picks parameters only; it is neither written nor
+    // enforced.
+    #[test]
+    fn size_hint_is_not_a_pledge() {
+        let src = sample(10_000);
+        let opts = CompressOptions {
+            level: 3,
+            checksum: true,
+        };
+        for hint in [100u64, 10_000, 1 << 20] {
+            let mut c = Compressor::with_options(opts, Some(hint)).unwrap();
+            let z = frame(&mut c, &src).unwrap();
+            assert_eq!(header(&z).content_size, None, "hint {hint}");
+            assert_eq!(crate::decompress(&z).unwrap(), src, "hint {hint}");
+        }
+    }
+
+    // #24: a pledge exceeded fails before a last block is written, and the
+    // error sticks: a retried End used to return Ok(done) on a frame neither
+    // decoder accepts.
+    #[test]
+    fn exceeded_pledge_fails_and_sticks() {
+        let src = sample(300_000);
+        let mut c = Compressor::new(1).unwrap();
+        c.set_pledged_src_size(200_000);
+        let mut out = vec![0u8; 1 << 20];
+        assert_eq!(
+            c.stream(&src, &mut out, Flush::Continue).unwrap_err(),
+            Error::ContentSizeMismatch
+        );
+        for flush in [Flush::End, Flush::End, Flush::Continue] {
+            assert_eq!(
+                c.stream(&[], &mut out, flush).unwrap_err(),
+                Error::ContentSizeMismatch
+            );
+        }
+        c.reset();
+        let z = frame(&mut c, &src).unwrap();
+        assert_eq!(crate::decompress(&z).unwrap(), src);
+    }
+
+    #[test]
+    fn short_pledge_fails_at_end_and_sticks() {
+        let src = sample(5_000);
+        let mut c = Compressor::new(3).unwrap();
+        c.set_pledged_src_size(6_000);
+        let mut out = vec![0u8; 1 << 16];
+        let st = c.stream(&src, &mut out, Flush::Continue).unwrap();
+        assert_eq!(st.input_consumed, src.len());
+        for _ in 0..3 {
+            assert_eq!(
+                c.stream(&[], &mut out, Flush::End).unwrap_err(),
+                Error::ContentSizeMismatch
+            );
+        }
+    }
+
+    // #24: a pledged frame without a dictionary or prefix is Single_Segment,
+    // as one-shot frames are, even when the first call carries the data.
+    #[test]
+    fn pledged_frame_is_single_segment() {
+        let src = sample(1_000);
+        let mut c = Compressor::new(3).unwrap();
+        c.set_pledged_src_size(src.len() as u64);
+        let mut out = vec![0u8; 4096];
+        let st = c.stream(&src, &mut out, Flush::End).unwrap();
+        assert!(st.done);
+        let z = &out[..st.output_produced];
+        let h = header(z);
+        assert!(h.single_segment);
+        assert_eq!(h.content_size, Some(1_000));
+        assert_eq!(crate::decompress(z).unwrap(), src);
+    }
+
+    // #30: after End, the next call with input starts a new frame, which is
+    // byte-identical to what a fresh Compressor makes. A call with no input
+    // just reports done again.
+    #[test]
+    fn reused_compressor_starts_a_new_frame() {
+        let a = sample(70_000);
+        let b = sample(150_000);
+        let mut c = Compressor::new(3).unwrap();
+        let za = frame(&mut c, &a).unwrap();
+        let mut out = vec![0u8; 64];
+        let st = c.stream(&[], &mut out, Flush::End).unwrap();
+        assert_eq!(
+            (st.input_consumed, st.output_produced, st.done),
+            (0, 0, true)
+        );
+        let zb = frame(&mut c, &b).unwrap();
+        assert_eq!(zb, frame(&mut Compressor::new(3).unwrap(), &b).unwrap());
+        let mut both = za.clone();
+        both.extend_from_slice(&zb);
+        let mut ab = a.clone();
+        ab.extend_from_slice(&b);
+        assert_eq!(crate::decompress(&both).unwrap(), ab);
+    }
+
+    // #30: the dictionary carries over to the next frame; a prefix does not.
+    #[test]
+    fn dictionary_persists_prefix_does_not() {
+        let dict = crate::dict::Dictionary::raw(sample(8_000));
+        let src = sample(20_000);
+        let mut c = Compressor::new(3).unwrap();
+        c.set_dictionary(&dict).unwrap();
+        let z1 = frame(&mut c, &src).unwrap();
+        let z2 = frame(&mut c, &src).unwrap();
+        assert_eq!(z1, z2);
+        assert_eq!(crate::decompress_using_dict(&z2, &dict).unwrap(), src);
+
+        let prefix = sample(8_000);
+        let mut c = Compressor::new(3).unwrap();
+        c.set_prefix(&prefix).unwrap();
+        let z1 = frame(&mut c, &src).unwrap();
+        let z2 = frame(&mut c, &src).unwrap();
+        assert_eq!(crate::decompress_using_prefix(&z1, &prefix).unwrap(), src);
+        assert_eq!(z2, frame(&mut Compressor::new(3).unwrap(), &src).unwrap());
+    }
+
+    // #30: reset abandons a frame in progress and its untaken output.
+    #[test]
+    fn reset_abandons_the_frame() {
+        let src = sample(300_000);
+        let mut c = Compressor::new(1).unwrap();
+        c.set_pledged_src_size(1);
+        let mut out = vec![0u8; 16];
+        let _ = c.stream(&src[..1], &mut out, Flush::Continue).unwrap();
+        c.reset();
+        let z = frame(&mut c, &src).unwrap();
+        assert_eq!(z, frame(&mut Compressor::new(1).unwrap(), &src).unwrap());
     }
 
     #[test]
