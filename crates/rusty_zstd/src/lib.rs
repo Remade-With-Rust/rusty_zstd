@@ -198,9 +198,9 @@ pub use encode::take_fused;
 pub use encode::take_row_bucket;
 #[cfg(feature = "alloc")]
 pub use encode::{
-    compress, compress_using_dict, compress_using_dict_with, compress_using_prefix, compress_with,
-    compress_with_advanced, compress_with_history, compress_with_params, AdvancedOptions,
-    CompressOptions,
+    compress, compress_into_with, compress_using_dict, compress_using_dict_with,
+    compress_using_prefix, compress_with, compress_with_advanced, compress_with_history,
+    compress_with_params, AdvancedOptions, CompressOptions,
 };
 #[cfg(all(feature = "alloc", feature = "std"))]
 pub use in_bench::{

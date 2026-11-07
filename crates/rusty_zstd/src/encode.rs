@@ -90,6 +90,37 @@ pub fn compress_with(src: &[u8], opts: CompressOptions) -> Result<Vec<u8>, Error
     )
 }
 
+/// [`compress_with`], appending the frame to `dst` instead of returning a new
+/// buffer. A caller compressing many small payloads keeps one buffer and pays
+/// no `compress_bound`-sized allocation and free per frame.
+///
+/// The appended bytes are exactly those `compress_with` returns. `dst` is not
+/// cleared; on error it is truncated back to its length on entry.
+#[cfg(feature = "alloc")]
+pub fn compress_into_with(
+    dst: &mut Vec<u8>,
+    src: &[u8],
+    opts: CompressOptions,
+) -> Result<(), Error> {
+    let params = compression_params(opts.level, Some(src.len() as u64))?;
+    let start = dst.len();
+    let r = encode_oneshot_into(
+        dst,
+        src,
+        params,
+        opts.checksum,
+        Some(src.len() as u64),
+        None,
+        &[],
+        true,
+        AdvancedOptions::default(),
+    );
+    if r.is_err() {
+        dst.truncate(start);
+    }
+    r
+}
+
 /// FINDING 1 (Gate 2 @ L19): size the window from payload + prefix, as C does.
 ///
 /// libzstd's `ZSTD_adjustCParams(cPar, srcSize, dictSize)` clamps `windowLog`
@@ -383,6 +414,35 @@ pub(crate) fn encode_oneshot(
     write_dict_id: bool,
     adv: AdvancedOptions,
 ) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::with_capacity(crate::compress_bound(src.len()));
+    encode_oneshot_into(
+        &mut out,
+        src,
+        params,
+        checksum,
+        pledged,
+        dict,
+        prefix,
+        write_dict_id,
+        adv,
+    )?;
+    Ok(trim_output(out))
+}
+
+/// [`encode_oneshot`], appending the frame to `out`. On error `out` may hold
+/// a partial frame; the public caller truncates it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_oneshot_into(
+    out: &mut Vec<u8>,
+    src: &[u8],
+    params: CompressionParameters,
+    checksum: bool,
+    pledged: Option<u64>,
+    dict: Option<&Dictionary>,
+    prefix: &[u8],
+    write_dict_id: bool,
+    adv: AdvancedOptions,
+) -> Result<(), Error> {
     let _enc = crate::prof::scope(crate::prof::Stage::EncodeTotal);
     // SEC-04: every public compress path that takes caller parameters funnels
     // through here; nothing below this line may see an out-of-range field.
@@ -398,7 +458,7 @@ pub(crate) fn encode_oneshot(
     #[cfg(feature = "std")]
     if let Some(d) = dict {
         if !src.is_empty() && adv == AdvancedOptions::default() && digest_mode() != 1 {
-            if let Some(r) = encode_with_digest(src, params, checksum, pledged, d, dict_id) {
+            if let Some(r) = encode_with_digest(out, src, params, checksum, pledged, d, dict_id) {
                 return r;
             }
         }
@@ -506,9 +566,9 @@ pub(crate) fn encode_oneshot(
             reps = e.reps;
         }
     }
-    let mut out = Vec::with_capacity(crate::compress_bound(src.len()));
+    out.reserve(crate::compress_bound(src.len()));
     write_frame_header(
-        &mut out,
+        out,
         src.len() as u64,
         params.window_log,
         checksum,
@@ -517,11 +577,11 @@ pub(crate) fn encode_oneshot(
         !hist_prefix.is_empty() && !adv.prime_only,
     );
     if src.is_empty() {
-        write_block_header(&mut out, true, BlockType::Raw, 0);
+        write_block_header(out, true, BlockType::Raw, 0);
         if checksum {
             out.extend_from_slice(&content_checksum(src).to_le_bytes());
         }
-        return Ok(out);
+        return Ok(());
     }
     let window = 1usize << params.window_log.min(31);
     let block_max = frame_block_max(window, adv);
@@ -574,7 +634,7 @@ pub(crate) fn encode_oneshot(
         crate::ldm::prime_ldm(lt, workspace, payload_off, window, rp);
     }
     encode_frame_blocks(
-        &mut out,
+        out,
         workspace,
         payload_off,
         src.len(),
@@ -587,8 +647,7 @@ pub(crate) fn encode_oneshot(
         &mut reps,
         &mut entropy,
         ldm_tables.as_mut(),
-    )?;
-    Ok(trim_output(out))
+    )
 }
 
 /// Unused capacity worth a reallocation to give back (see `trim_output`).
@@ -1430,13 +1489,15 @@ impl DictWork {
 #[cfg(feature = "std")]
 #[inline(never)]
 fn encode_with_digest(
+    out: &mut Vec<u8>,
     src: &[u8],
     params: CompressionParameters,
     checksum: bool,
     pledged: Option<u64>,
     dict: &Dictionary,
     dict_id: Option<u32>,
-) -> Option<Result<Vec<u8>, Error>> {
+) -> Option<Result<(), Error>> {
+    // Every `None` below is returned before `out` is touched.
     let content = dict.content();
     let window = 1usize << params.window_log.min(31);
     // The same reachable-tail cut the legacy path makes (GATE 2 @ L3).
@@ -1472,9 +1533,9 @@ fn encode_with_digest(
         entropy.seed_from_dict(e);
         reps = e.reps;
     }
-    let mut out = Vec::with_capacity(crate::compress_bound(src.len()));
+    out.reserve(crate::compress_bound(src.len()));
     write_frame_header(
-        &mut out,
+        out,
         src.len() as u64,
         params.window_log,
         checksum,
@@ -1485,7 +1546,7 @@ fn encode_with_digest(
     let adv = AdvancedOptions::default();
     let block_max = frame_block_max(window, adv);
     let r = encode_frame_blocks(
-        &mut out,
+        out,
         &work.workspace,
         tail_len,
         src.len(),
@@ -1513,7 +1574,7 @@ fn encode_with_digest(
         work.restore(src.len() <= block_max, flags_ok, src.len());
         work.release();
     }
-    Some(r.map(|()| trim_output(out)))
+    Some(r)
 }
 
 /// `RZSTD_BLOCK_KB`, resolved ONCE per process. 0 = unresolved, else `kb + 1`

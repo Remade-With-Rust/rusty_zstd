@@ -1231,6 +1231,37 @@ fn enable_ldm_zstd_keys_roundtrip() {
     assert_eq!(decompress(&zst).expect("decode"), src);
 }
 
+// `compress_into_with` appends exactly `compress_with`'s frame to what the
+// buffer already holds, for every size class and both checksum settings.
+#[test]
+fn compress_into_with_appends_compress_with_frame() {
+    let big = wordy(0x1A70, 300_000);
+    let inputs: [&[u8]; 4] = [b"", b"x", &big[..1000], &big];
+    let mut dst = b"prefix".to_vec();
+    let mut want = dst.clone();
+    for src in inputs {
+        for level in [-1, 1, 3, 19] {
+            for checksum in [false, true] {
+                let opts = CompressOptions { level, checksum };
+                want.extend_from_slice(&compress_with(src, opts).unwrap());
+                compress_into_with(&mut dst, src, opts).unwrap();
+                assert_eq!(dst, want, "len {} L{level} ck {checksum}", src.len());
+            }
+        }
+    }
+}
+
+#[test]
+fn compress_into_with_leaves_dst_alone_on_error() {
+    let mut dst = b"keep".to_vec();
+    let opts = CompressOptions {
+        level: 99,
+        checksum: true,
+    };
+    assert!(compress_into_with(&mut dst, b"data", opts).is_err());
+    assert_eq!(dst, b"keep");
+}
+
 // #32: the result gives back its unused compress_bound reservation.
 #[test]
 fn one_shot_result_does_not_keep_its_bound() {
