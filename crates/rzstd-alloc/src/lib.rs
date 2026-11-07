@@ -4,17 +4,15 @@
 //! never in a shared library. This crate holds the exact `rusty_alloc-api`
 //! pin so feature code never names that crate.
 //!
-//! PIN: `=2.2.5` (was `=2.0.5`, `=2.0.0`, and `=1.1.4` before that). The doc here once
-//! said `=1.1.0` while the manifest said `=1.1.4` -- a stale comment beside
-//! the thing it documents, which is the one place a pin must not drift. Read
-//! the version from `Cargo.toml`.
+//! PIN: read the version from `Cargo.toml` (`=2.4.0` as of 0.4.2; before that
+//! `=2.2.6`, `=2.2.5`, `=2.0.5`, `=2.0.0` and `=1.1.4`). This comment once
+//! named a different pin than the manifest -- a stale comment beside the thing
+//! it documents, which is the one place a pin must not drift.
 //!
-//! KNOWN SPLIT, deliberate: `rusty_zstd`'s optional `rusty-alloc` feature goes
-//! through `rusty_alloc_default`, which as of 0.1.2 still tracks the 1.x line
-//! (1.1.6). So the CLI and bench binaries run rusty_alloc 2.2.5 through THIS
-//! seam while that feature would install 1.1.6. No single binary links both --
-//! `cargo tree` on the CLI shows only 2.2.5 -- but the two paths are on
-//! different majors until `rusty_alloc_default` publishes a 2.x.
+//! `rusty_zstd`'s optional `rusty-alloc` feature installs the allocator
+//! through `rusty_alloc_default` instead (so several crates enabling the
+//! feature still link one `#[global_allocator]`); it pins the same
+//! `rusty_alloc-api` release as this seam.
 
 #![no_std]
 
