@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.4.1...rusty_zstd-v0.4.2) - 2026-11-07
+
+Compressed and decoded output are byte-identical to 0.4.1.
+
+### Added
+
+- `compress_into_with(dst, src, opts)`: `compress_with` appending its frame
+  to a caller's `Vec`, so a caller compressing many small payloads keeps one
+  buffer instead of allocating and freeing a `compress_bound`-sized one per
+  frame. On error `dst` is truncated back to its length on entry. From
+  SpaceDB's instruction-count campaign (callgrind Ir per driver: ir_redb
+  -889,181, ir_store -171,107, ir_crdt +44,602)
+
+### Changed
+
+- *(alloc)* the optional `rusty-alloc` feature now installs rusty_alloc
+  2.4.0, through `rusty_alloc_default` 0.1.5 (was 0.1.2, which pinned 1.1.6);
+  the CLI and bench binaries move to 2.4.0 as well (were 2.2.6)
+
 ## [0.4.1](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.4.0...rusty_zstd-v0.4.1) - 2026-10-16
 
 Fixes for the twelve issues filed against 0.4.0 (#23-#34): eleven confirmed,

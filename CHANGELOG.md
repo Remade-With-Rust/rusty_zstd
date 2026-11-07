@@ -6,6 +6,18 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Released -- 0.4.2 (2026-11-07): `compress_into_with`, rusty_alloc 2.4.0
+
+- `compress_into_with` appends a one-shot frame to a caller's `Vec`
+  (SpaceDB's row packer keeps one thread-local buffer). The digested
+  dictionary path now writes into the same buffer, so `compress_using_dict`
+  keeps one allocation and no extra copy. Byte-identical to 0.4.1 on 256
+  one-shot outputs; 2,000 x 256 B dictionary rows unchanged within noise.
+- rusty_alloc 2.4.0 everywhere: the `rusty-alloc` feature through
+  `rusty_alloc_default` 0.1.5 (published for this; it stays the one
+  installer, so crates enabling the feature still link a single
+  `#[global_allocator]`), and the CLI/bench seam `rzstd-alloc`.
+
 ### Released -- 0.4.1 (2026-10-16): the 0.4.0 issue batch (#23-#34)
 
 Twelve issues were filed against 0.4.0 on 2026-10-16. Each was reproduced
