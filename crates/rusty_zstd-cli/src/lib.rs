@@ -321,11 +321,29 @@ fn run_train(args: &Args) -> Result<(), String> {
     if args.files.is_empty() {
         return Err("--train requires sample files".into());
     }
-    let mut owned = Vec::new();
-    for f in &args.files {
-        owned.push(fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?);
+    // As `zstd --train` (programs/dibio.c): the file list is shuffled with a
+    // fixed seed, which decides the train/test split; `-B#` cuts each file
+    // into #-byte samples; without it each file is one sample, truncated to
+    // 128 KiB. Empty files are skipped.
+    let mut files: Vec<&PathBuf> = args.files.iter().collect();
+    dib_shuffle(&mut files);
+    let mut data = Vec::with_capacity(files.len());
+    for f in files {
+        let bytes = fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
+        if !bytes.is_empty() {
+            data.push(bytes);
+        }
     }
-    let refs: Vec<&[u8]> = owned.iter().map(|s| s.as_slice()).collect();
+    let refs: Vec<&[u8]> = data
+        .iter()
+        .flat_map(|d| -> Vec<&[u8]> {
+            if args.job_size > 0 {
+                d.chunks(args.job_size).collect()
+            } else {
+                vec![&d[..d.len().min(SAMPLESIZE_MAX)]]
+            }
+        })
+        .collect();
     let dict = train(&refs, args.train).map_err(|e| e.to_string())?;
     if args.stdout {
         io::stdout()
@@ -339,6 +357,23 @@ fn run_train(args: &Args) -> Result<(), String> {
         .ok_or_else(|| " --train requires -o FILE (or -c)".to_string())?;
     write_out(&out, &dict, args.force)?;
     Ok(())
+}
+
+/// `SAMPLESIZE_MAX` in programs/dibio.c.
+const SAMPLESIZE_MAX: usize = 128 << 10;
+
+/// `DiB_shuffle`: Fisher-Yates over the file list with `DiB_rand`, seed
+/// `0xFD2FB528`, so a given file list splits into the same train and test
+/// samples as `zstd --train`.
+fn dib_shuffle<T>(v: &mut [T]) {
+    let mut seed: u32 = 0xFD2F_B528;
+    for i in (1..v.len()).rev() {
+        seed = seed.wrapping_mul(2_654_435_761);
+        seed ^= 2_246_822_519;
+        seed = seed.rotate_left(13);
+        let j = (seed >> 5) as usize % (i + 1);
+        v.swap(i, j);
+    }
 }
 
 fn write_out(path: &Path, data: &[u8], force: bool) -> Result<(), String> {
@@ -389,7 +424,11 @@ fn apply_train_kv(opts: &mut TrainOptions, spec: &str) -> Result<(), String> {
             "steps" => opts.steps = v.parse().map_err(|_| format!("invalid steps={v}"))?,
             "f" => opts.f = v.parse().map_err(|_| format!("invalid f={v}"))?,
             "accel" => opts.accel = v.parse().map_err(|_| format!("invalid accel={v}"))?,
-            "split" => opts.split = v.parse().map_err(|_| format!("invalid split={v}"))?,
+            // A percentage, as zstd's `split=75` (programs/zstdcli.c).
+            "split" => {
+                let pct: u32 = v.parse().map_err(|_| format!("invalid split={v}"))?;
+                opts.split = f64::from(pct.min(100)) / 100.0;
+            }
             "s" | "selectivity" => {
                 opts.selectivity = v.parse().map_err(|_| format!("invalid selectivity={v}"))?;
             }
@@ -640,17 +679,26 @@ fn parse_args() -> Result<Args, String> {
             s if s.starts_with("--train-cover=") => {
                 mode = Mode::Train;
                 train_opts = TrainOptions::cover();
-                apply_train_kv(&mut train_opts, &s[14..])?;
+                apply_train_kv(
+                    &mut train_opts,
+                    s.strip_prefix("--train-cover=").unwrap_or(""),
+                )?;
             }
             s if s.starts_with("--train-fastcover=") => {
                 mode = Mode::Train;
                 train_opts = TrainOptions::fastcover();
-                apply_train_kv(&mut train_opts, &s[19..])?;
+                apply_train_kv(
+                    &mut train_opts,
+                    s.strip_prefix("--train-fastcover=").unwrap_or(""),
+                )?;
             }
             s if s.starts_with("--train-legacy=") => {
                 mode = Mode::Train;
                 train_opts = TrainOptions::legacy();
-                apply_train_kv(&mut train_opts, &s[15..])?;
+                apply_train_kv(
+                    &mut train_opts,
+                    s.strip_prefix("--train-legacy=").unwrap_or(""),
+                )?;
             }
             s if s.starts_with("--maxdict=") => {
                 train_opts.max_dict = s[10..].parse().map_err(|_| "invalid --maxdict=")?;
