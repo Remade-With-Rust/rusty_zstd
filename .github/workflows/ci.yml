@@ -65,6 +65,10 @@ jobs:
         run: cargo test -p rusty_zstd --release --features bench-arms --test env_inert
       - name: Env arms are read once per process
         run: cargo test -p rusty_zstd --release --features profile --test env_reads_gate
+      # The setters exist only with `bench-arms` (issue #33), so the digest's
+      # arm-keying gate runs there.
+      - name: Digest arm keys
+        run: cargo test -p rusty_zstd --release --features bench-arms --test digest_arms
       - name: Doc tests (the README's examples)
         run: cargo test -p rusty_zstd --doc
       - name: CLI version + aliases
@@ -116,6 +120,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt -p rusty_zstd -p rusty_zstd-cli -p rzstd-alloc -- --check
       - run: cargo clippy -p rusty_zstd -p rusty_zstd-cli -p rzstd-alloc --all-targets -- -D warnings
+      # A default build allows dead code on the campaign arms it does not
+      # export (issue #33); this build exports them and still denies it.
+      - run: cargo clippy -p rusty_zstd --all-targets --features bench-arms -- -D warnings
       - name: ASCII sources
         run: bash scripts/check-ascii-rs.sh crates
       # README's per-module `unsafe` table is generated from the source; fail

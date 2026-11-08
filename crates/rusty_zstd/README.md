@@ -50,7 +50,7 @@ returns or fills a `Vec`, so `alloc` is required. MSRV is **1.85**.
 | `std` | ✅ | `std::io`-shaped streaming, multi-threading, the trainer, runtime ISA dispatch |
 | `alloc` | ✅ | implied by `std`; the minimum supported configuration |
 | `profile` | | the in-process stage profiler and its counters (off = zero overhead) |
-| `bench-arms` | | reads the `RZSTD_*` A/B arms from the environment, for benchmark harnesses only (implied by `profile`); without it the environment cannot change the codec |
+| `bench-arms` | | the repository's A/B arms: reads the `RZSTD_*` environment variables and exports the `#[doc(hidden)]` setters and counters, for benchmark harnesses only (implied by `profile`); without it nothing can move the codec off its shipping defaults |
 
 ## Quick start
 
@@ -134,8 +134,9 @@ assert_eq!(decompress_using_dict(&packed, &dict)?, samples[0]);
 | **Checksum** | `xxh64` — the frame content hash, usable on its own |
 
 Items marked `#[doc(hidden)]` are campaign instrumentation for the repository's
-own benchmark harness. They carry **no semver promise** and may be renamed or
-removed in any release.
+own benchmark harness. Since 0.5.0 they exist only with the `bench-arms`
+feature; they carry **no semver promise** and may be renamed or removed in any
+release.
 
 ## Performance
 

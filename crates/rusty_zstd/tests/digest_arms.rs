@@ -19,7 +19,7 @@
 //!
 //! ONE test, on purpose: the arms are process-global, the harness runs tests
 //! on parallel threads, and this file is its own process.
-#![cfg(feature = "std")]
+#![cfg(feature = "bench-arms")]
 
 use rusty_zstd::{
     compress_using_dict, compress_with_history, compression_params, decompress_using_dict,

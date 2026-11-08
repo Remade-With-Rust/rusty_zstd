@@ -33,7 +33,8 @@ fn push_literals_matches_extend_from_slice() {
     }
 }
 use super::*;
-use crate::{decompress, frame_block_census};
+use crate::decode::frame_block_census;
+use crate::decompress;
 
 fn rt(src: &[u8], level: i32) {
     let zst = compress(src, level).expect("compress");
@@ -519,7 +520,7 @@ fn size_table_silesia() {
 fn census_zeros_all_rle() {
     let src = vec![0u8; 128 * 1024 * 2];
     let zst = compress(&src, 1).expect("compress");
-    let c = crate::frame_block_census(&zst).expect("census");
+    let c = crate::decode::frame_block_census(&zst).expect("census");
     assert_eq!(c.compressed, 0);
     assert_eq!(c.raw, 0);
     assert_eq!(c.rle, 2);

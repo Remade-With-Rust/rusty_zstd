@@ -24,6 +24,11 @@
     not(feature = "std"),
     allow(dead_code, unused_variables, unused_imports)
 )]
+// Without `bench-arms` the campaign setters and counters are not exported
+// (issue #33), which strands their definitions and the statics only they
+// touch. A `bench-arms` build exports every one of them, so it is the build
+// that still reports genuinely dead code; CI checks it with `-D warnings`.
+#![cfg_attr(not(feature = "bench-arms"), allow(dead_code, unused_imports))]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -216,9 +221,12 @@ pub use mt::{
     compress_mt, default_nb_workers, default_overlap_log, overlap_size, resolve_job_size,
     JOB_SIZE_MIN, NB_WORKERS_MAX,
 };
-#[cfg(feature = "alloc")]
+#[doc(hidden)]
+#[cfg(feature = "bench-arms")]
 #[allow(deprecated)]
-pub use params::{compression_params, set_hash_tight_arm, CompressionParameters, Strategy};
+pub use params::set_hash_tight_arm;
+#[cfg(feature = "alloc")]
+pub use params::{compression_params, CompressionParameters, Strategy};
 #[cfg(feature = "profile")]
 pub use rowfind::take_row_walk;
 #[cfg(feature = "profile")]
@@ -271,22 +279,44 @@ pub fn compress_bound(src_len: usize) -> usize {
 // inside a measurement harness. They are hidden from the rendered docs and
 // carry NO semver promise: they may be renamed or removed in any release.
 // Calling a setter DOES change behaviour and output bytes -- that is what an
-// arm is for -- so nothing outside a harness should call one. In 0.5.0 they
-// move behind the `bench-arms` feature, which already gates the `RZSTD_*`
-// environment variables that drive the same arms.
+// arm is for -- so since 0.5.0 every item here exists only with the
+// `bench-arms` feature (issue #33), the same gate as the `RZSTD_*`
+// environment variables that drive the same arms. A default build compiles
+// none of them and has no way to move an arm off its shipping default.
 // ---------------------------------------------------------------------------
+
+/// Issue #33's standing check, run by `cargo test --doc`: without
+/// `bench-arms` none of the campaign setters exists.
+#[cfg_attr(
+    not(feature = "bench-arms"),
+    doc = "```compile_fail\nrusty_zstd::set_row_arm(false);\n```"
+)]
+#[cfg_attr(
+    not(feature = "bench-arms"),
+    doc = "```compile_fail\nrusty_zstd::reset_env_arms();\n```"
+)]
+#[cfg_attr(
+    not(feature = "bench-arms"),
+    doc = "```compile_fail\n#[allow(deprecated)]\nrusty_zstd::set_hash_tight_arm(1);\n```"
+)]
+#[cfg_attr(
+    not(feature = "bench-arms"),
+    doc = "```\nlet _ = rusty_zstd::compress(b\"still here\", 3).unwrap();\n```"
+)]
+#[allow(dead_code)]
+const ARMS_NEED_BENCH_ARMS: () = ();
 
 #[doc(hidden)]
 #[cfg(feature = "profile")]
-#[doc(hidden)]
 pub use bit::take_reload_calls;
-#[cfg(feature = "profile")]
 #[doc(hidden)]
+#[cfg(feature = "profile")]
 pub use bit::take_reload_refills;
 #[doc(hidden)]
 #[cfg(feature = "dupladder")]
 pub use compressed::{set_dup_arm, set_dup_k};
 #[doc(hidden)]
+#[cfg(feature = "bench-arms")]
 pub use compressed::{
     set_litcopy_arm, set_lut_arm, set_matchcopy_arm, set_pipe1_arm, set_pipeline_arm,
     set_prefetch_arm, set_seqcheck_arm, set_seqloop_avx2_arm,
@@ -298,11 +328,13 @@ pub use compressed::{
     take_dec_untiered, take_n21_predef,
 };
 #[doc(hidden)]
-#[cfg(feature = "alloc")]
+#[cfg(feature = "bench-arms")]
 pub use decode::{frame_block_census, BlockCensus};
 #[doc(hidden)]
+#[cfg(feature = "bench-arms")]
 pub use decode::{set_ck_fuse_arm, set_ck_stream_arm};
 #[doc(hidden)]
+#[cfg(feature = "bench-arms")]
 pub use encode::{set_enc_avx2_arm, set_fast_hash_arm, set_fast_pack_arm};
 #[doc(hidden)]
 #[cfg(feature = "profile")]
@@ -313,35 +345,43 @@ pub use encode::{
     take_walk_classes, take_walk_phantom, take_walk_signals, FF_LATCH, FF_LAZY_FIRES,
 };
 #[doc(hidden)]
+#[cfg(feature = "bench-arms")]
 pub use encode::{take_ent_save, take_n9_basic};
 #[doc(hidden)]
 #[cfg(feature = "profile")]
 pub use fse::take_d6_spread;
 
 #[doc(hidden)]
+#[cfg(feature = "bench-arms")]
 pub use encode::set_dfast_bext_arm;
+#[doc(hidden)]
 #[cfg(feature = "profile")]
 pub use encode::take_dfast_bext;
+#[doc(hidden)]
 #[cfg(feature = "profile")]
 pub use encode::take_rep2_prize;
+#[doc(hidden)]
 #[cfg(feature = "profile")]
 pub use encode::take_walk_exit;
+#[doc(hidden)]
 #[cfg(feature = "profile")]
 pub use encode::take_wide_latch;
 #[doc(hidden)]
-#[cfg(feature = "alloc")]
+#[cfg(feature = "bench-arms")]
 pub use encode::{set_digest_arm, set_digest_verify_arm};
+#[doc(hidden)]
 #[cfg(feature = "profile")]
 pub use huffman::{
     take_e11_walked, take_e12_scan, take_n13_stats, take_x2_lazy_fills, take_x2_stats,
 };
+#[doc(hidden)]
 #[cfg(feature = "profile")]
 pub use huffman::{take_f4x2_arm, take_x4_arms, take_x4_x1_calls};
 #[doc(hidden)]
-#[cfg(feature = "alloc")]
+#[cfg(feature = "bench-arms")]
 pub use params::set_cparam_clamp_arm;
 #[doc(hidden)]
-#[cfg(feature = "std")]
+#[cfg(feature = "bench-arms")]
 pub use params::set_strategy_arm;
 #[doc(hidden)]
 #[cfg(all(feature = "alloc", feature = "profile"))]
@@ -350,10 +390,12 @@ pub use simd::{bench_eq_avx2, bench_eq_words, set_eqlen_arm, take_eq_ops, take_e
 #[cfg(feature = "profile")]
 pub use xxh64::census as xxh_census;
 #[doc(hidden)]
+#[cfg(feature = "bench-arms")]
 pub use xxh64::{set_xxh_avx2_arm, Xxh64 as Xxh64Pub};
 
 /// Bench-only re-export of the frame checksum hash (GATE 20 ceiling work).
 #[doc(hidden)]
+#[cfg(feature = "bench-arms")]
 pub fn xxh64_pub(d: &[u8]) -> u64 {
     xxh64::xxh64(d)
 }
@@ -365,7 +407,7 @@ pub use encode::take_digest_census;
 #[cfg(feature = "profile")]
 pub use encode::take_ltag_audit;
 #[doc(hidden)]
-#[cfg(feature = "alloc")]
+#[cfg(feature = "bench-arms")]
 pub use encode::{
     reset_env_arms, set_accel_shift_arm, set_bt_spec_arm, set_chain_tag_arm,
     set_dfast_fill_anchor_arm, set_dfast_fill_n_arm, set_dfast_fill_stride_arm,
@@ -397,13 +439,14 @@ pub use encode::{
     take_prime_iters, take_rep_rate, take_route_hist, take_tag_rejects,
 };
 #[doc(hidden)]
+#[cfg(feature = "bench-arms")]
 pub use encode::{
     set_bt_deep_arm, set_bt_deep_min_arm, set_bt_depth_cached_arm, set_bt_depth_target_arm,
     set_dfast_litpush_arm, set_lit_push_tiers_arm, take_lit_hist, take_lit_push, take_lit_tiers,
     take_opt_signals,
 };
 #[doc(hidden)]
-#[cfg(feature = "alloc")]
+#[cfg(feature = "bench-arms")]
 pub use prof::{
     dump as prof_dump, encode_counts as prof_encode_counts, note_hash_fill as prof_note_hash_fill,
     reset as prof_reset, scope as prof_scope, stage_calls as prof_stage_calls,

@@ -23,6 +23,10 @@ all-features = false
 name = "rusty_zstd"
 path = "src/lib.rs"
 
+[[example]]
+name = "census"
+required-features = ["bench-arms"]
+
 [features]
 default = ["std"]
 std = ["alloc"]
