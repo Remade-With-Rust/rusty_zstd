@@ -591,6 +591,21 @@ pub(crate) fn encode_oneshot_into(
         None
     };
     let mut ldm_tables = ldm_res.map(crate::ldm::LdmTables::new);
+    if hand_over_in_place(hist_prefix.len(), src.len(), window, adv) {
+        return encode_handover(
+            out,
+            src,
+            hist_prefix,
+            params,
+            window,
+            block_max,
+            checksum,
+            adv,
+            &mut tables,
+            &mut reps,
+            &mut entropy,
+        );
+    }
     let mut owned = Vec::new();
     let (workspace, payload_off): (&[u8], usize) = if hist_prefix.is_empty() {
         (src, 0)
@@ -739,6 +754,87 @@ fn encode_frame_blocks(
     tables: &mut MatchTables,
     reps: &mut [u32; 3],
     entropy: &mut EntropyState,
+    ldm_tables: Option<&mut crate::ldm::LdmTables>,
+) -> Result<(), Error> {
+    let mut run = BlockRun::new(payload_off, checksum);
+    {
+        let _b = crate::prof::scope(crate::prof::Stage::EncodeBlocks);
+        let end = workspace.len();
+        encode_block_run(
+            out,
+            workspace,
+            payload_off,
+            RunBounds {
+                stop: end,
+                data_end: end,
+                size_hint: end,
+                last_run: true,
+            },
+            &mut run,
+            params,
+            window,
+            block_max,
+            adv,
+            tables,
+            reps,
+            entropy,
+            ldm_tables,
+        )?;
+    }
+    finish_checksum(out, run.xxh, src_len);
+    Ok(())
+}
+
+/// Where a run of blocks stands. Carried across the in-place hand-over
+/// (issue #32), so the second half continues the first's block-size
+/// feedback and checksum.
+struct BlockRun {
+    off: usize,
+    last_sync: usize,
+    xxh: Option<Xxh64>,
+    r_prev: f32,
+    r_prev2: f32,
+}
+
+impl BlockRun {
+    fn new(off: usize, checksum: bool) -> Self {
+        Self {
+            off,
+            last_sync: off,
+            xxh: if checksum { Some(Xxh64::new()) } else { None },
+            r_prev: -1.0,
+            r_prev2: -1.0,
+        }
+    }
+}
+
+/// Limits of one [`encode_block_run`] call, in workspace indices.
+#[derive(Clone, Copy)]
+struct RunBounds {
+    /// Code blocks while the cursor is below this.
+    stop: usize,
+    /// No block extends past this.
+    data_end: usize,
+    /// Length `adaptive_block_max` is told about.
+    size_hint: usize,
+    /// The block ending at `data_end` is the frame's last.
+    last_run: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_block_run(
+    out: &mut Vec<u8>,
+    workspace: &[u8],
+    payload_off: usize,
+    b: RunBounds,
+    run: &mut BlockRun,
+    params: CompressionParameters,
+    window: usize,
+    block_max: usize,
+    adv: AdvancedOptions,
+    tables: &mut MatchTables,
+    reps: &mut [u32; 3],
+    entropy: &mut EntropyState,
     mut ldm_tables: Option<&mut crate::ldm::LdmTables>,
 ) -> Result<(), Error> {
     // Reached with `rsyncable` only without `std` (no job splitter) and from
@@ -749,64 +845,186 @@ fn encode_frame_blocks(
     } else {
         0
     };
-    let mut last_sync = payload_off;
-    let mut off = payload_off;
-    let mut xxh = if checksum { Some(Xxh64::new()) } else { None };
-    {
-        let _b = crate::prof::scope(crate::prof::Stage::EncodeBlocks);
-        let mut r_prev: f32 = -1.0;
-        let mut r_prev2: f32 = -1.0;
-        while off < workspace.len() {
-            let bmax = adaptive_block_max(
-                block_max,
-                r_prev,
-                r_prev2,
-                tables.rep_yield,
-                params.strategy,
-                workspace.len(),
-            );
-            let mut end = (off + bmax).min(workspace.len());
-            if adv.rsyncable {
-                let from = (last_sync + crate::ldm::RSYNC_MIN_BLOCK - 1).max(off);
-                if let Some(cut) = crate::ldm::rsync_next(workspace, from, end, rbits) {
-                    if cut < workspace.len() {
-                        end = cut;
-                        last_sync = cut;
-                    }
+    while run.off < b.stop {
+        let off = run.off;
+        let bmax = adaptive_block_max(
+            block_max,
+            run.r_prev,
+            run.r_prev2,
+            tables.rep_yield,
+            params.strategy,
+            b.size_hint,
+        );
+        let mut end = (off + bmax).min(b.data_end);
+        if adv.rsyncable {
+            let from = (run.last_sync + crate::ldm::RSYNC_MIN_BLOCK - 1).max(off);
+            if let Some(cut) = crate::ldm::rsync_next(workspace, from, end, rbits) {
+                if cut < b.data_end {
+                    end = cut;
+                    run.last_sync = cut;
                 }
             }
-            let last = end == workspace.len();
-            let before_block = out.len();
-            tables.far_reps_ok = end - payload_off <= window;
-            encode_block(
-                out,
-                workspace,
-                off,
-                end,
-                window,
-                params,
-                tables,
-                reps,
-                entropy,
-                last,
-                ldm_tables.as_deref_mut(),
-                adv.ldm,
-            )?;
-            if let Some(h) = xxh.as_mut() {
-                h.update(&workspace[off..end]);
-            }
-            // feed this block's own outcome forward -- free, it is already known
-            let produced = out.len() - before_block;
-            r_prev2 = r_prev;
-            r_prev = produced as f32 / (end - off).max(1) as f32;
-            off = end;
         }
+        let last = b.last_run && end == b.data_end;
+        let before_block = out.len();
+        tables.far_reps_ok = end - payload_off <= window;
+        encode_block(
+            out,
+            workspace,
+            off,
+            end,
+            window,
+            params,
+            tables,
+            reps,
+            entropy,
+            last,
+            ldm_tables.as_deref_mut(),
+            adv.ldm,
+        )?;
+        if let Some(h) = run.xxh.as_mut() {
+            h.update(&workspace[off..end]);
+        }
+        // feed this block's own outcome forward -- free, it is already known
+        let produced = out.len() - before_block;
+        run.r_prev2 = run.r_prev;
+        run.r_prev = produced as f32 / (end - off).max(1) as f32;
+        run.off = end;
     }
+    Ok(())
+}
+
+fn finish_checksum(out: &mut Vec<u8>, xxh: Option<Xxh64>, src_len: usize) {
     if let Some(h) = xxh {
         let _c = crate::prof::scope(crate::prof::Stage::EncodeChecksum);
         crate::prof::note_checksum_bytes(src_len as u64);
         out.extend_from_slice(&(h.digest() as u32).to_le_bytes());
     }
+}
+
+/// Bytes past a block's end kept readable in the hand-over's first half.
+/// The finders read at most 8 past `block_end` (`ABSORB_LOOKAHEAD` in the
+/// streaming encoder makes the same promise), so its blocks are coded exactly
+/// as they would be with the whole input present.
+const HANDOVER_LOOKAHEAD: usize = 32;
+
+/// Does a one-shot frame with a dictionary or prefix code its tail in place
+/// (issue #32)? Only when the input is long enough that the prefix falls out
+/// of reach well before the end: at least twice `window + BLOCKSIZE_MAX`.
+/// Shorter inputs (every row-sized message) keep the single copied workspace
+/// and their exact bytes. LDM, rsyncable and prime-only frames keep it too.
+fn hand_over_in_place(
+    prefix_len: usize,
+    src_len: usize,
+    window: usize,
+    adv: AdvancedOptions,
+) -> bool {
+    let keep = window.saturating_add(BLOCKSIZE_MAX as usize);
+    prefix_len != 0
+        && !adv.prime_only
+        && !adv.rsyncable
+        && !adv.ldm.enable
+        && src_len >= keep.saturating_mul(2)
+}
+
+/// THE IN-PLACE HAND-OVER (issue #32). A one-shot frame with a dictionary or
+/// prefix used to copy the WHOLE input behind the prefix tail, so the finders
+/// saw one contiguous buffer: a 32 MiB input with a 4 KiB dictionary peaked
+/// at 64.4 MiB against 33.5 MiB without one.
+///
+/// Nothing past `window + BLOCKSIZE_MAX` into the payload can reach the
+/// prefix (the bound GATE 2 @ L3 proves), so only that much is copied. Blocks
+/// are coded from the copy until the cursor passes it; then the tables are
+/// reset and re-primed over the input's own last window (the streaming
+/// encoder's slide, the same two calls), and the rest is coded from `src`
+/// itself. The copy is freed before the second half runs.
+///
+/// Output equals the copied path's up to the hand-over block; after it, only
+/// the re-primed table state differs (it is a different, valid frame).
+#[allow(clippy::too_many_arguments)]
+fn encode_handover(
+    out: &mut Vec<u8>,
+    src: &[u8],
+    hist_prefix: &[u8],
+    params: CompressionParameters,
+    window: usize,
+    block_max: usize,
+    checksum: bool,
+    adv: AdvancedOptions,
+    tables: &mut MatchTables,
+    reps: &mut [u32; 3],
+    entropy: &mut EntropyState,
+) -> Result<(), Error> {
+    let keep = window.saturating_add(BLOCKSIZE_MAX as usize);
+    let cut = if prefix_bound_enabled() {
+        hist_prefix.len().saturating_sub(keep)
+    } else {
+        0
+    };
+    let hp = &hist_prefix[cut..];
+    let hl = hp.len();
+    // `hand_over_in_place` guarantees `src.len() >= 2 * keep`, which is more
+    // than `keep + BLOCKSIZE_MAX + HANDOVER_LOOKAHEAD`: the first half never
+    // reaches the end of the input, so none of its blocks is the last.
+    let data_end = keep + BLOCKSIZE_MAX as usize;
+    let read_end = (data_end + HANDOVER_LOOKAHEAD).min(src.len());
+    debug_assert!(read_end < src.len());
+    let mut owned = Vec::with_capacity(hl + read_end);
+    owned.extend_from_slice(hp);
+    owned.extend_from_slice(&src[..read_end]);
+    prime_tables(tables, &owned, hl, window, params);
+    let mut run = BlockRun::new(hl, checksum);
+    let size_hint = hl + src.len();
+    {
+        let _b = crate::prof::scope(crate::prof::Stage::EncodeBlocks);
+        encode_block_run(
+            out,
+            &owned,
+            hl,
+            RunBounds {
+                stop: hl + keep,
+                data_end: hl + data_end,
+                size_hint,
+                last_run: false,
+            },
+            &mut run,
+            params,
+            window,
+            block_max,
+            adv,
+            tables,
+            reps,
+            entropy,
+            None,
+        )?;
+        let at = run.off - hl;
+        drop(owned);
+        tables.reset();
+        prime_tables(tables, src, at, window, params);
+        run.off = at;
+        run.last_sync = at;
+        encode_block_run(
+            out,
+            src,
+            0,
+            RunBounds {
+                stop: src.len(),
+                data_end: src.len(),
+                size_hint,
+                last_run: true,
+            },
+            &mut run,
+            params,
+            window,
+            block_max,
+            adv,
+            tables,
+            reps,
+            entropy,
+            None,
+        )?;
+    }
+    finish_checksum(out, run.xxh, src.len());
     Ok(())
 }
 
@@ -1508,6 +1726,12 @@ fn encode_with_digest(
         0
     };
     let tail = &content[cut..];
+    // Long inputs take the in-place hand-over instead: the working set would
+    // copy the whole message behind the tail (issue #32).
+    if hand_over_in_place(content.len(), src.len(), window, AdvancedOptions::default()) {
+        note_digest(4);
+        return None;
+    }
     let Some(key) = DigestKey::for_frame(params, src.len(), content.len(), tail.len()) else {
         note_digest(4);
         return None;
