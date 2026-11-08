@@ -60,7 +60,7 @@ static REGION: Region<{ good_region_size(HEAP_BYTES) }> = Region::new();
 static ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 
 #[cfg(feature = "arm-rusty-alloc")]
-const ARM: &str = "rusty_alloc 2.0.5";
+const ARM: &str = "rusty_alloc 2.4.0";
 #[cfg(feature = "arm-esp-alloc")]
 const ARM: &str = "esp-alloc 0.11.0";
 
