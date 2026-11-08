@@ -6,6 +6,21 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ## [Unreleased]
 
+### Released -- 0.5.0 (2026-11-08): the held-over issues (#25, #32, #33)
+
+The three issues 0.4.1 left open because their fixes change output or API.
+
+| # | what | fix | evidence |
+|---|---|---|---|
+| 25 | trainer is quadratic: 287 s for 256 KiB of samples | FASTCOVER and COVER ported from libzstd, linear | 256 KiB: 0.26 s (zstd 0.46 s); 8 MiB: 0.44 s (zstd 1.1 s); COVER 8 MiB 2.9 s (zstd 55 s). FASTCOVER content equals libzstd's byte for byte (unit test pins three configurations); same-parameter dictionaries compress samples 0.2-2% smaller than libzstd's |
+| 32 | one-shot dictionary/prefix compression copies the whole input | the first `window + 128 KiB` comes from a copy, then the tables are re-primed and the rest is coded in place | peak heap webster L3 79.6 -> 51.4 MiB; sizes within ±0.5%; 36/36 frames decode in libzstd; row-sized inputs byte-identical |
+| 33 | ~190 hidden setters compiled into default builds | behind `bench-arms` with the env knobs | `compile_fail` doctest; CI runs `digest_arms` and clippy `-D warnings` on a `bench-arms` build |
+
+Also: the CLI's `--train-fastcover=` parser dropped a character and always
+failed; `split=` is a percentage again; `--train` follows zstd's sample
+assembly (`-B#`, the 128 KiB cap, the shuffled file order). The ESP32-S3
+firmware under `bare-metal/` pins rusty_alloc 2.4.0 (was 2.2.6).
+
 ### Released -- 0.4.2 (2026-11-07): `compress_into_with`, rusty_alloc 2.4.0
 
 - `compress_into_with` appends a one-shot frame to a caller's `Vec`

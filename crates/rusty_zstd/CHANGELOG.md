@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.4.2...rusty_zstd-v0.5.0) - 2026-11-08
+
+The three issues held over from the 0.4.0 batch. Breaking: the campaign
+setters leave default builds, trained dictionaries change, and one-shot
+dictionary or prefix frames of long inputs change bytes after their first
+window. Everything else is byte-identical to 0.4.2.
+
+### Changed
+
+- **Breaking** *(api)*: the `#[doc(hidden)]` campaign setters and counters,
+  including the deprecated `set_hash_tight_arm`, exist only with the
+  `bench-arms` feature. A default build has no way to move an arm off its
+  shipping default, the same gate 0.4.1 put on the `RZSTD_*` environment
+  variables. A `compile_fail` doctest keeps it that way (#33)
+- **Breaking** *(train)*: `train` is a port of libzstd's FASTCOVER and COVER
+  trainers (#25). Each d-mer is hashed or grouped once and each epoch is one
+  sliding pass, so a build is linear in the training data:
+
+  | samples (dickens, 1 KiB each) | 0.4.2 | 0.5.0 FASTCOVER | `zstd --train` | 0.5.0 COVER | `zstd --train-cover` |
+  |---:|---:|---:|---:|---:|---:|
+  | 32 KiB | 6.8 s | 0.034 s | 0.49 s | 0.012 s | 3.2 s |
+  | 256 KiB | 287 s | 0.26 s | 0.46 s | 0.25 s | 4.2 s |
+  | 8 MiB | -- | 0.44 s | 1.10 s | 2.9 s | 55 s |
+
+  FASTCOVER content matches libzstd 1.5.7 byte for byte for the same samples
+  and parameters (pinned by a unit test). COVER cannot match exactly, because
+  libzstd's own result depends on the platform's `qsort` order; it counts the
+  distinct samples per d-mer, as COVER intends. With the same parameters, these
+  dictionaries compress their samples 0.2-2% smaller than libzstd's own. k is
+  now chosen by the held-out samples' compressed size plus the dictionary's
+  size (k from 50 to 2000 in `steps` steps), not by content length. Option
+  changes: `TrainOptions::fastcover()` holds out 25% of samples for that
+  search (`split: 0.75`, zstd's CLI default; was 1.0), and `split` applies only
+  when k or d is searched; `steps: 0` means 40; `d: 0` searches {6, 8};
+  `selectivity` is accepted but unused; `TrainAlgo::Legacy` is a single
+  FastCover build. The entropy harvest codes at most ~600 samples for a
+  110 KiB dictionary, an evenly spaced subset, because it re-primes the
+  dictionary for every sample
+- *(encode)* one-shot compression with a dictionary or prefix no longer copies
+  the whole input (#32). An input of at least `2 x (window + 128 KiB)` is
+  coded from a copy of its first `window + 128 KiB`, past which the prefix is
+  out of reach. The tables are then re-primed over the input's own last
+  window, as the streaming encoder does when it slides, and the rest is coded
+  in place. Peak heap, L3: webster (41 MB) 79.6 -> 51.4 MiB, mozilla (51 MB)
+  98.4 -> 67.4 MiB, samba 41.6 -> 25.6 MiB. Size changes stay within ±0.5% on
+  36 silesia frames (dictionary and prefix, levels -1 to 19), and libzstd
+  1.5.7 decodes all of them. Shorter inputs, including every row-sized
+  message, are byte-identical to 0.4.2
+
+### Fixed
+
+- *(cli)* `--train-fastcover=k=...` dropped the first character of its
+  parameter list, so it always failed with "unknown trainer option"
+- *(cli)* `split=` is a percentage, as in zstd (`split=75`). It was read as a
+  fraction, so `split=75` meant 1.0
+- *(cli)* `--train` now shuffles its file list with zstd's seed, cuts files
+  into `-B#`-byte samples, and truncates whole-file samples to 128 KiB, as
+  `zstd --train` does. With the same files and fixed parameters, the trained
+  FASTCOVER content is zstd's
+
 ## [0.4.2](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.4.1...rusty_zstd-v0.4.2) - 2026-11-07
 
 Compressed and decoded output are byte-identical to 0.4.1.
