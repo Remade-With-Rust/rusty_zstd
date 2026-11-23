@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.5.0...rusty_zstd-v0.5.1) - 2026-11-23
+
+### Other
+
+- bump rusty_alloc-api to 2.6.0 ([#41](https://github.com/Remade-With-Rust/rusty_zstd/pull/41))
+
 ## [0.5.0](https://github.com/Remade-With-Rust/rusty_zstd/compare/rusty_zstd-v0.4.2...rusty_zstd-v0.5.0) - 2026-11-08
 
 The three issues held over from the 0.4.0 batch. Breaking: the campaign
